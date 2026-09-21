@@ -616,6 +616,54 @@ def classify_destroy_output(output) -> "DestroyOutcome":
     return DestroyOutcome.FAILED
 
 
+def blade_create_json_error_text(content) -> str | None:
+    """Failure evidence inside a blade CLI JSON result, or ``None`` to abstain.
+
+    This carrier's ``result_shape_tool_names`` declaration for the
+    framework's single-source failure verdict (``agent/tool_verdicts.py``).
+    Both CREATE tools return the CLI's raw stdout on exit 0 (cli.py's and
+    cli_python.py's ``return result.stdout``), and the blade CLI can report a
+    failure INSIDE that JSON with a zero exit code — a shape the generic
+    ``Error`` prefix verdict cannot see, which is why ``execute_loop``'s
+    replan scan used to carry an ``if name == "blade_create"`` branch with
+    its own ``json.loads``.
+
+    The predicate mirrors :func:`parse_blade_destroy_result`'s
+    (``success`` truthy or ``code == 200`` → passed) so the framework's
+    verdict and the recover Layer-1 verdict cannot disagree on the same
+    bytes. A key-less error JSON (``{"code":500,"error":...}``) is a failure
+    by the same rule :func:`_destroy_output_proves_death` pins. A body
+    carrying NEITHER key is not this dialect, and an unparseable one is a
+    compacted receipt — both ABSTAIN, because "I do not recognise this" may
+    degrade to silence but never to a verdict.
+
+    Deliberately create-scoped. The read tools (``blade_status`` /
+    ``blade_query_k8s``) and the destroy tools are NOT declared: for them
+    ``success:false`` is often the ANSWER — code 406 and the "not found"
+    wording both mean "already destroyed", which
+    :func:`classify_destroy_output` scores as its own NOT_FOUND state and
+    recover.py's ``parse_blade_status_destroyed`` scores as PASSED. Folding
+    those shapes into a generic failure verdict would invert a recovery
+    judgement, and only the destroy authority may read them.
+    """
+    from chaos_agent.agent.tool_verdicts import loads_dict
+
+    data = loads_dict(content)
+    if data is None:
+        return None
+    if "success" not in data and "code" not in data:
+        return None
+    if data.get("success") or data.get("code") == 200:
+        return None
+    error = str(data.get("error") or "").strip()
+    if error:
+        return error
+    result = data.get("result")
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+    return f"blade reported code={data.get('code')} success=false"
+
+
 # ---------------------------------------------------------------------------
 # Execution-event alignment (round-26 root fix — the receipt-side half of
 # the composite-command family)
@@ -1983,7 +2031,7 @@ async def _run_layer1_via_kubectl_exec(
     tracker = get_tracker(task_id) if task_id else None
 
     try:
-        from chaos_agent.tools.kubectl import build_kubectl_cmd
+        from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
         from chaos_agent.transports import (
             PROFILE_K8S,
             TransportTarget,
@@ -2462,7 +2510,7 @@ async def _run_host_blade_layer1(
             _all_text = ((layer1_details or "") + (raw or "")).lower()
             if any(kw in _all_text for kw in _conn_keywords):
                 try:
-                    from chaos_agent.tools.kubectl import kubectl_read as _kro
+                    from chaos_agent.tools.kubectl_cli import kubectl_read as _kro
                     _node_out = await _kro.ainvoke({
                         "subcommand": "get",
                         "v_args": "nodes",

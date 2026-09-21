@@ -310,6 +310,17 @@ class FaultProvider(Protocol):
     #: create", not the tool itself. Unioned across providers for the
     #: whitelist scan.
     reconcile_read_tool_names: frozenset[str] = frozenset()
+    #: Tool names whose RESULT SHAPE this backend owns the failure verdict
+    #: for. The framework's generic verdict reads ``status == "error"`` and
+    #: the textual ``Error`` / ``[target_guard]`` renderings; a tool that
+    #: reports failures STRUCTURALLY (a JSON receipt) is invisible to both,
+    #: so the carrier that can read its own receipt declares the tool here
+    #: and answers :meth:`tool_result_error_text`. Consulted through
+    #: ``agent/tool_verdicts.py`` — the single source every failure-detection
+    #: consumer routes through, so a new JSON-shaped tool needs a
+    #: declaration, not a new ``if name == ...`` branch in each consumer.
+    #: Text-dialect tools declare the empty set and stay on the generic path.
+    result_shape_tool_names: frozenset[str] = frozenset()
 
     def matches_channel(self, profile: str) -> bool:
         """True if this backend can operate against a ``profile`` ("k8s"|"host").
@@ -451,6 +462,21 @@ class FaultProvider(Protocol):
         is byte-identical (the guard is a security layer)."""
         return None
 
+    def tool_result_error_text(
+        self, tool_name: str, content: str
+    ) -> Optional[str]:
+        """This backend's failure verdict on one of its OWN tool results.
+
+        Return the failure evidence (the message a classifier should read)
+        when the result IS a failure, ``None`` otherwise. ``None`` is an
+        ABSTENTION, not a success verdict: it covers "this shape is not a
+        failure" and "I do not recognise this shape" alike, and callers must
+        not invert it — a compacted receipt is JSON-shaped but unparseable,
+        and unknown is not success. The default abstains on everything;
+        only tools declared in :attr:`result_shape_tool_names` are ever
+        routed here (``agent/tool_verdicts.provider_error_text``)."""
+        return None
+
     def parse_injection_params(
         self, tool_name: str, tool_args: dict
     ) -> Optional[dict]:
@@ -484,28 +510,6 @@ class FaultProvider(Protocol):
         channel so host carriers only claim on a host channel. Consulted
         via ``FaultProviderRegistry.issue_time_method`` so the generic
         classifier never names a carrier-specific tool or method."""
-        return None
-
-    async def verify_landing_readback(
-        self, messages: list, state: dict, *, kubeconfig: str = ""
-    ) -> Optional[dict]:
-        """Landing-integrity verdict for this backend's freshly-LANDED
-        carrier apply visible in ``messages``, or ``None`` when there is
-        nothing of this backend's to verify.
-
-        Post-landing readback seam (faultdrill-cr-channel task 2.1,
-        design D5): the execute loop consults the registry in its
-        post-execution block — AFTER the landing tool result is visible
-        in history, BEFORE the response is published — and each backend
-        that declares a landing form runs its own integrity check
-        PROGRAMMATICALLY on that same iteration, never on an LLM turn
-        (a prompt-layer readback is observation, not a guard; safety
-        rails are not delegable). ``state`` carries the idempotence
-        bookkeeping (``fault_readback_verified``) the hook consumes; a
-        FAILED verdict is the hard-abort signal the generic seam turns
-        into the ``fail_state`` error triple — no reconciliation entry
-        ever runs behind a landing whose integrity is unproven.
-        Backends without a landing-integrity contract pin ``None``."""
         return None
 
     def build_reconcile_fingerprint(
@@ -654,17 +658,32 @@ class FaultProvider(Protocol):
 
     async def layer1_destroy(
         self, uid: str, kubeconfig: str = "", *, messages: list | None = None,
-        injection_method: str | None = None,
+        injection_method: str | None = None, artifacts: list | None = None,
     ) -> "Layer1Result":
         """Deterministic Layer-1 RECOVERY execution for this backend (the
         experiment destroy + destroyed-state verification), consumed by the
         recover nodes' LLM flow before Layer 2.
 
-        Experiment carriers run their own destroy pipeline; UID-less carriers
-        have nothing to destroy deterministically and return ``skipped``.
+        Experiment carriers run their own destroy pipeline; a backend with
+        nothing to destroy deterministically returns ``skipped``.
         ``uid`` empty mirrors :meth:`run_layer1_destroy`'s semantics: a
         create-attempted-but-UID-less state is ``failed`` (terminal), a
-        UID-less fault is ``skipped`` (Layer 2 proceeds)."""
+        UID-less fault is ``skipped`` (Layer 2 proceeds). A UID-less carrier
+        can still own a deterministic replay — it hydrates its recovery
+        identity from the evidence arguments below instead of from ``uid``.
+
+        ``messages`` and ``artifacts`` are the two evidence sources for that
+        hydration, and both are passed because neither alone survives every
+        recover entry: ``messages`` is the inject history, which a CROSS-TASK
+        recover (``blade-ai recover --task-id``) does not inherit at all —
+        the recover-state builder in ``state_mgmt.recovery_state`` flattens it
+        into the ``inject_context`` string — and which ``memory.tool_compactor``
+        truncates outside the recent window even within one task;
+        ``artifacts`` is ``state["execution_artifacts"]``, the durable ledger
+        that DOES cross both boundaries. A backend that records its recovery
+        identity in the ledger reads it from here; one that does not leaves
+        the argument unused. Neutral by design — the list is generic state,
+        and recognising any particular artifact type stays provider-side."""
         ...
 
     async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:

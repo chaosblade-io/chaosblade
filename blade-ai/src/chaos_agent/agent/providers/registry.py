@@ -321,6 +321,45 @@ class FaultProviderRegistry:
         return None
 
     @classmethod
+    def tool_result_error_text(
+        cls, tool_name: str, content: str
+    ) -> "str | None":
+        """The failure verdict on a tool result, enacted by the provider that
+        OWNS the tool's result shape, else ``None``.
+
+        Result-shape seam for ``agent/tool_verdicts.py``: the generic verdict
+        there covers ``status == "error"`` and the textual ``Error`` /
+        ``[target_guard]`` renderings, which every backend shares. A tool
+        that reports failures STRUCTURALLY (a JSON receipt) is invisible to
+        both, so its carrier declares the tool in ``result_shape_tool_names``
+        and answers here — the generic scan never names a carrier tool or
+        parses a carrier receipt.
+
+        ``None`` is an ABSTENTION and callers must not read it as success:
+        it covers "not a failure", "no provider owns this tool" and "the
+        owner does not recognise this shape" (a compacted receipt is exactly
+        the last case). Providers that omit the hook contribute nothing
+        (getattr default); registration order decides overlapping claims.
+        """
+        if not tool_name:
+            return None
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            if tool_name not in (
+                getattr(provider, "result_shape_tool_names", frozenset())
+                or frozenset()
+            ):
+                continue
+            hook = getattr(provider, "tool_result_error_text", None)
+            if hook is None:
+                continue
+            text = hook(tool_name, content)
+            if text is not None:
+                return text
+        return None
+
+    @classmethod
     def classify_inline_blade_command(
         cls,
         inner: list[str],
@@ -401,6 +440,51 @@ class FaultProviderRegistry:
         return payload.has_destroy and not payload.has_create
 
     @classmethod
+    def recovery_carrier_allowed_images(cls) -> "frozenset[str]":
+        """Domain-routing seam for the recovery-carrier image allowlist
+        (faultdrill-cluster-native-recovery M1).
+
+        The faultdrill recovery-carrier assembler picks its carrier image
+        from the SAME configured ∪ auto-discovered allowlist the k8s-native
+        classifier legislates (``k8s_native.classifier.
+        _recovery_carrier_allowed_images`` — the union behind condition 4
+        of the carrier SHAPE predicate). A separately reimplemented union
+        would drift from the classifier's verdict: the assembler could pick
+        an image the in-net registration gate then rejects, or honour an
+        allowlist the gate no longer consults. One union, one
+        implementation, reached through the registry — the providers
+        package's legitimate vertical routing point (phase-14 G3 pattern),
+        so no carrier sub-package reaches sideways into another.
+        """
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _recovery_carrier_allowed_images,
+        )
+
+        return _recovery_carrier_allowed_images()
+
+    @classmethod
+    def is_recovery_carrier_run_shape(cls, run_v_args: list, name: str) -> bool:
+        """Domain-routing seam for the recovery-carrier pod SHAPE
+        predicate (faultdrill-cluster-native-recovery M1).
+
+        The faultdrill recovery-carrier assembler self-checks its
+        constructed ``kubectl run`` against the canonical five-condition
+        shape predicate (``k8s_native.classifier._is_recovery_carrier_run``
+        — construction guarantee asserted, not re-derived): the assembler's
+        template must stay in lockstep with the classifier's verdict, or a
+        malformed carrier would pass its own self-check yet fail the in-net
+        registration gate (or the reverse — a legal carrier refused at
+        construction). One predicate, one implementation, reached through
+        the registry keeps the no-cross-carrier-import rule (phase-14 G3
+        pattern) while the assembler keeps its single-source guarantee.
+        """
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _is_recovery_carrier_run,
+        )
+
+        return _is_recovery_carrier_run(list(run_v_args), name)
+
+    @classmethod
     def parse_injection_params(cls, tool_name: str, tool_args: dict) -> "dict | None":
         """Structured injection parameters for a freshly issued tool call,
         parsed by the first provider that recognises the call, else ``None``.
@@ -452,94 +536,6 @@ class FaultProviderRegistry:
             if method is not None:
                 return method
         return None
-
-    @classmethod
-    async def verify_landing_readback(
-        cls,
-        messages: list,
-        state: dict,
-        *,
-        kubeconfig: str = "",
-    ) -> Optional[dict]:
-        """Post-landing readback guard, enacted by the first provider that
-        recognises a freshly-landed carrier apply in ``messages``, else
-        ``None``.
-
-        Readback seam (faultdrill-cr-channel task 2.1, design D5): the
-        execute loop consults the registry in its post-execution block,
-        AFTER the landing tool result is visible in history — each
-        backend recognises its own landed forms and runs its own
-        landing-integrity check PROGRAMMATICALLY, never on an LLM turn
-        (a prompt-layer readback is observation, not a guard; safety
-        rails are not delegable). A provider returning ``None`` means
-        "nothing of mine to verify" — the scan continues. Providers that
-        omit the hook contribute nothing (getattr default).
-        """
-        if not cls._providers:
-            cls.register_builtins()
-        for provider in cls._providers.values():
-            hook = getattr(provider, "verify_landing_readback", None)
-            if hook is None:
-                continue
-            verdict = await hook(messages, state, kubeconfig=kubeconfig)
-            if verdict is not None:
-                return verdict
-        return None
-
-    @classmethod
-    async def ensure_crd(cls, kubeconfig: str = "") -> Optional[dict]:
-        """Channel-installability seam (faultdrill-cr-channel, design
-        D2/D7): the CR-channel route gate consults this BEFORE admitting
-        a FaultDrill CR apply — the first legitimate CR write triggers
-        the channel's own lazy install (probe → programmatic apply →
-        Established poll), never an LLM-triggered CRD apply. Providers
-        that omit the hook contribute nothing (getattr default — every
-        backend but the CR channel: installability is a channel
-        capability, not a universal contract like the readback guard).
-        Returns the availability verdict as a provider-neutral dict
-        (``usable`` / ``status`` / ``reason`` / ``detail``); ``None``
-        when no registered provider claims the install responsibility
-        (the dark-launch window never gets here — the route gate
-        rejects on the flag before consulting this seam).
-        """
-        if not cls._providers:
-            cls.register_builtins()
-        for provider in cls._providers.values():
-            hook = getattr(provider, "ensure_crd", None)
-            if hook is None:
-                continue
-            verdict = await hook(kubeconfig)
-            if verdict is not None:
-                return verdict
-        return None
-
-    @classmethod
-    def arm_session_reconciler(
-        cls, handle_value: str, kubeconfig: str = ""
-    ) -> bool:
-        """Arm the session-side reconcile loop for a verified carrier
-        landing; ``True`` when a provider took the arm.
-
-        Reconciler-arming seam (faultdrill-cr-channel task 2.2, design
-        D4): the execute loop calls this with the handle the readback
-        guard just verified (``state["fault_readback_verified"]`` — the
-        bookkeeping written ONLY on a passing verdict, so a stripped
-        landing never arms: the hard abort leaves the loop first).
-        Providers that omit the hook (every backend but the CR channel
-        — a session-side reconciler is a carrier capability, not a
-        universal contract like the readback guard) contribute nothing
-        (getattr default). Arming is idempotent per handle — a live
-        reconciler re-reads the CR every pass, so re-arms are no-ops.
-        """
-        if not cls._providers:
-            cls.register_builtins()
-        for provider in cls._providers.values():
-            hook = getattr(provider, "arm_session_reconciler", None)
-            if hook is None:
-                continue
-            if hook(handle_value, kubeconfig):
-                return True
-        return False
 
     @classmethod
     def collect_provider_artifacts(
@@ -736,14 +732,19 @@ class FaultProviderRegistry:
         ):
             cls.register(provider_cls())
 
-        # FaultDrill CR channel (openspec faultdrill-cr-channel) — registered
-        # LAST and gated by ``faultdrill_enabled`` (dark launch, default
-        # False). Order-insensitive like chaosblade_python: this backend
-        # claims no verb/tool vocabulary (attribution keys on the stdin
-        # manifest DOCUMENT KIND, which no other backend scans), so it never
-        # competes for recency — it can only ever win by positive evidence.
-        # When the flag is off the channel does not exist structurally:
-        # there is no runtime faultdrill branch anywhere in the graph.
+        # FaultDrill carrier (openspec faultdrill-cluster-native-recovery)
+        # — registered LAST and gated by ``faultdrill_enabled``. Post-CR-
+        # channel (M2) the provider hosts the programmatic recovery-
+        # carrier assembler (its EXECUTE tool), the migration-window CR
+        # attribution face, and the ledger-model recover — the flag is
+        # the provider's registration switch, not a channel dark-launch.
+        # Order-insensitive like chaosblade_python: this backend claims
+        # no verb/tool vocabulary (attribution keys on the assembler
+        # tool name and the stdin manifest DOCUMENT KIND, which no other
+        # backend scans), so it never competes for recency — it can only
+        # ever win by positive evidence. When the flag is off the
+        # provider does not exist structurally: there is no runtime
+        # faultdrill branch anywhere in the graph.
         from chaos_agent.config.settings import settings
 
         if bool(getattr(settings, "faultdrill_enabled", False)):
@@ -755,7 +756,7 @@ class FaultProviderRegistry:
         else:
             # Flag off — reconcile DOWN too, never leave a stale registration
             # behind a re-register: ``register`` overwrites but never removes,
-            # so the dark-launch invariant (channel structurally absent) is
+            # so the disabled invariant (provider structurally absent) is
             # this pop, not just the skipped register above.
             from chaos_agent.agent.providers.faultdrill.declaration import (
                 CARRIER_ID as _FAULTDRILL_CARRIER_ID,

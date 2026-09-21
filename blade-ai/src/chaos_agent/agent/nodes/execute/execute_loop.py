@@ -66,6 +66,7 @@ from chaos_agent.agent.replan import (
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.agent.target_guard.types import GuardVerdict
+from chaos_agent.agent.tool_verdicts import tool_result_failed
 from chaos_agent.agent.state import (
     AgentState,
     has_active_fault,
@@ -253,27 +254,23 @@ def _build_replan_context(state: AgentState, request: ReplanRequest) -> dict:
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
             tool_call_id = getattr(msg, "tool_call_id", "")
 
-            # Collect failed blade_create calls
-            if name == "blade_create":
-                try:
-                    data = json.loads(content)
-                    if not data.get("success", True):
-                        failed_calls.append({
-                            "name": name,
-                            "tool_call_id": tool_call_id,
-                            "error": content[:500],
-                        })
-                except (json.JSONDecodeError, TypeError):
-                    if "error" in content.lower() or "fail" in content.lower():
-                        failed_calls.append({
-                            "name": name,
-                            "tool_call_id": tool_call_id,
-                            "error": content[:500],
-                        })
-            elif (
-                getattr(msg, "status", None) == "error"
-                or content.startswith("Error")
-                or content.startswith("[target_guard]")
+            # Single-source failure verdict (agent/tool_verdicts.py): the
+            # generic renderings plus whatever shape the owning provider
+            # declares. This used to be an ``if name == "blade_create"``
+            # branch with its own json.loads — a per-tool special case in a
+            # generic node, which every further JSON-shaped tool (the
+            # faultdrill assembler receipt) would have had to duplicate.
+            #
+            # One deliberate behaviour change: the old branch's non-JSON
+            # fallback matched ``"error" in content.lower()``, which swept in
+            # blade_create's ``Warning: ... outcome uncertain`` rendering.
+            # That shape is explicitly UNKNOWN, not failed (cli.py's transport
+            # exception path), and its own text instructs the agent to POLL
+            # rather than replan — so it no longer lands in failed_calls. Its
+            # UID is not lost: ``_fire_replan_seam`` fills
+            # ``existing_experiment_uids`` from the canonical extractor.
+            if tool_result_failed(
+                name, content, status=getattr(msg, "status", None)
             ):
                 failed_calls.append({
                     "name": name,
@@ -572,96 +569,6 @@ def _project_fault_handle(state: AgentState, result: dict) -> None:
         result["fault_handle"] = next_handle
 
 
-async def _landing_readback_guard(
-    state: AgentState, result: dict, messages: list
-) -> None:
-    """Post-landing readback guard — the D5 hard-abort seam.
-
-    faultdrill-cr-channel task 2.1 (productised from the v2 experiment's
-    ``exit(5)`` guard): a carrier landing the registry recognises gets
-    its landing integrity verified PROGRAMMATICALLY on THIS iteration —
-    never deferred to an LLM turn (a prompt-layer readback is
-    observation, not a guard; safety rails are not delegable). A failed
-    verification is a HARD ABORT: the ``fail_state`` error triple routes
-    the turn out of the loop BEFORE any reconciliation entry — a
-    landed-but-stripped recipe reconciling on empty patches IS the v1
-    bare-injection incident. A passed verification writes the
-    ``fault_readback_verified`` bookkeeping the provider's idempotence
-    gate consumes (one readback per CR per epoch). Extracted as a helper
-    so the guard's dispatch contract is unit-testable without a full
-    execute-loop fixture.
-    """
-    from chaos_agent.agent.providers import FaultProviderRegistry
-
-    verdict = await FaultProviderRegistry.verify_landing_readback(
-        messages, state, kubeconfig=_resolve_kubeconfig(state),
-    )
-    if verdict is None:
-        return
-    if verdict.get("ok"):
-        handle = str(verdict.get("handle") or "")
-        if handle:
-            result["fault_readback_verified"] = handle
-        return
-    reason = str(verdict.get("reason") or "unknown")
-    handle = str(verdict.get("handle") or "")
-    detail = str(verdict.get("detail") or "")
-    # "not found" in the detail is load-bearing wording: a
-    # stripped/unreadable landing is recipe-layer evidence the replan
-    # classifier can act on (fix the recipe, or route to the SOP
-    # recovery form) — the same auto-replan channel every other
-    # replanable execution error rides.
-    result.update(fail_state(
-        FailureCategory.EXECUTION_FAILED,
-        (
-            f"carrier landing readback guard aborted the injection "
-            f"(reason={reason}, handle={handle or 'unnameable'}): "
-            f"{detail}. Injection is HALTED before reconciliation — "
-            "reconciling a landing whose recipe did not survive is the "
-            "bare-injection hazard (v1 incident law). Fix the recipe or "
-            "route to the SOP recovery form and retry."
-        ),
-        messages,
-    ))
-    logger.warning(
-        "landing readback guard: HARD ABORT (reason=%s, handle=%s)",
-        reason, handle or "<unnameable>",
-    )
-
-
-def _arm_fault_reconciler(state: AgentState, result: dict) -> None:
-    """Arm the session-side reconciler for a verified carrier landing —
-    the D4 recovery seam.
-
-    faultdrill-cr-channel task 2.2 (design D4): the readback guard's
-    PASSING verdict writes ``fault_readback_verified`` (task 2.1); this
-    seam arms the background reconcile loop on exactly that handle —
-    the loop owns the fault window from here (Pending → Injected → TTL
-    → Recovered), so the execute loop's LLM turns stay ~3 (apply /
-    readback / observe) instead of driving the injection by hand. A
-    stripped landing NEVER arms: the guard's hard abort leaves the loop
-    before this point. Arming is idempotent per handle (a live
-    reconciler re-reads the CR every pass), and the replan seam keeps
-    the reconciler alive by design — a re-apply under the same name is
-    reconciled with the new recipe by the already-running task.
-    """
-    handle = str(
-        result.get("fault_readback_verified")
-        or state.get("fault_readback_verified")
-        or ""
-    )
-    if not handle:
-        return
-    from chaos_agent.agent.providers import FaultProviderRegistry
-
-    if FaultProviderRegistry.arm_session_reconciler(
-        handle, kubeconfig=_resolve_kubeconfig(state),
-    ):
-        logger.info(
-            "session reconciler armed for verified landing %s", handle,
-        )
-
-
 def _epoch_bounded_messages(messages: list, state: AgentState) -> list:
     """Messages belonging to the CURRENT attribution epoch.
 
@@ -787,14 +694,6 @@ def reset_attribution_state(
         # describes was invalidated with it (keep_experiment_uid keeps both — a
         # live experiment keeps its handle for the recover graph).
         result["fault_handle"] = None
-        # The readback-verified bookkeeping mirrors the handle's fate: a
-        # kept handle keeps its verified landing (keep_experiment_uid
-        # carries a live fault whose landing was already proven intact),
-        # while a cleared handle invalidates the verification — the next
-        # attempt's re-apply may carry a DIFFERENT recipe under the same
-        # carrier name, and a stale verification would wave a stripped
-        # landing through (faultdrill-cr-channel task 2.1).
-        result["fault_readback_verified"] = None
         # The combo marker belongs to the same attribution: the UID's
         # native companion is invalidated together with it (keep_experiment_uid
         # keeps both — a live experiment keeps its native component).
@@ -1886,7 +1785,7 @@ def _target_absence_proven_in_epoch(state: AgentState) -> bool:
     The proof is two halves paired by ``tool_call_id``:
 
     1. A framework-generated EMPTY-SET RECEIPT — the ``EMPTY_SELECTOR_HINT``
-       that ``tools/kubectl.py`` appends only when a ``get`` carrying a
+       that ``tools/kubectl_cli.py`` appends only when a ``get`` carrying a
        label selector returns NOTHING. The model cannot write ToolMessages,
        so this half cannot be fabricated (the 71fa78b6 failure mode).
     2. The issuing call ANCHORS the approved target: a read-only
@@ -1964,7 +1863,7 @@ def _target_absence_proven_in_epoch(state: AgentState) -> bool:
     epoch_msgs = _epoch_bounded_messages(state.get("messages") or [], state)
     if not epoch_msgs:
         return False
-    from chaos_agent.tools.kubectl import EMPTY_SELECTOR_HINT
+    from chaos_agent.tools.kubectl_cli import EMPTY_SELECTOR_HINT
 
     receipts_by_id: dict[str, list[ToolMessage]] = {}
     for msg in epoch_msgs:
@@ -2930,18 +2829,10 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     result["injection_start_time"] = now_iso()
                     logger.info("Set injection_start_time (%s detected)", detected_method or current_injection_method)
 
-        # Post-landing readback guard (faultdrill-cr-channel task 2.1,
-        # design D5): a freshly-landed carrier apply is integrity-verified
-        # programmatically on THIS iteration — see
-        # :func:`_landing_readback_guard` for the hard-abort law.
-        await _landing_readback_guard(state, result, messages)
-
-        # Session-reconciler arming (faultdrill-cr-channel task 2.2,
-        # design D4): a PASSING readback verdict arms the background
-        # reconcile loop — the handle comes from the same bookkeeping the
-        # guard wrote, so a stripped landing (hard abort above) never
-        # arms. See :func:`_arm_fault_reconciler`.
-        _arm_fault_reconciler(state, result)
+        # Post-landing readback guard + session-reconciler arming: retired
+        # with the CR channel (M2 task 2.4) — the programmatic carrier
+        # assembler verifies its own landing inline, and the migration-
+        # window CR applies recover from the task ledger (task 2.3).
 
         # Extract kubectl exec injection pod name for verifier preference
         current_pod_name = state.get("kubectl_exec_pod_name")

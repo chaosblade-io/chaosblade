@@ -239,7 +239,9 @@ def extract_kubectl_exec_pod_name(messages: list) -> str | None:
 # ---------------------------------------------------------------------------
 
 # Regex for: blade create k8s <scope>-<target> <action>
-# e.g. "blade create k8s pod-network drop --percent 100 ..."
+# e.g. "blade create k8s pod-network drop --destination-ip 10.0.0.1 ..."
+# (drop page measured flags: --destination-ip/--source-port/--timeout/...;
+# it has NO --percent — eq-form probe 2026-09)
 _BLADE_CREATE_K8S_RE = re.compile(r"blade\s+create\s+k8s\s+(\w+)-(\w+)\s+(\w+)")
 
 
@@ -920,6 +922,25 @@ class ChaosbladeProvider:
     reconcile_read_tool_names = frozenset(
         {"blade_status", "blade_query_k8s", "kubectl_read"}
     )
+    # The MUTATING create tool returns the CLI's raw stdout on exit 0
+    # (cli.py's ``return result.stdout``), and the blade CLI can report a
+    # failure INSIDE that JSON (``{"code":54000,"success":false,...}``) with
+    # a zero exit code — invisible to the generic ``Error`` prefix verdict.
+    # This backend reads its own dialect. The read and destroy tools are
+    # deliberately absent: see ``verify.blade_create_json_error_text``.
+    result_shape_tool_names = frozenset({"blade_create"})
+
+    def tool_result_error_text(
+        self, tool_name: str, content: str
+    ) -> Optional[str]:
+        """Failure verdict on the blade CLI's JSON dialect (single source:
+        ``verify.blade_create_json_error_text``, shared with the python
+        carrier so the two cannot drift)."""
+        if tool_name not in self.result_shape_tool_names:
+            return None
+        from .verify import blade_create_json_error_text
+
+        return blade_create_json_error_text(content)
 
     def matches_channel(self, profile: str) -> bool:
         # ChaosBlade operates on both cluster and bare-host targets.
@@ -1399,16 +1420,6 @@ class ChaosbladeProvider:
 
         return format_batch_held_feedback(other_tool_name)
 
-    async def verify_landing_readback(
-        self, messages: list, state: dict, *, kubeconfig: str = ""
-    ) -> Optional[dict]:
-        """Landing readback guard (faultdrill-cr-channel task 2.1, design
-        D5): this carrier's landings carry no CR recipe-integrity contract
-        to verify — pinned ``None`` (the registry scan continues; the
-        faultdrill channel's D5 seam is the only owner of the post-apply
-        readback)."""
-        return None
-
     def issue_disproven(self, messages: list, *, is_teardown=None) -> bool:
         """Experiment attribution is RESULT-born (committed only when the UID
         appears in a successful create result), so there is no issue-time
@@ -1522,6 +1533,10 @@ class ChaosbladeProvider:
         *,
         messages: list | None = None,
         injection_method: str | None = None,
+        # Protocol parity with the ledger rung: this backend's Layer-1
+        # identity IS the experiment UID, so there is no recipe to hydrate
+        # from ``execution_artifacts`` and the list stays unread.
+        artifacts: list | None = None,
     ) -> "Layer1Result":
         """Deterministic Layer-1 recovery: ``blade_destroy`` + ``blade_status``
         destroyed-state verification (delegates to ``_chaosblade_recover`` —

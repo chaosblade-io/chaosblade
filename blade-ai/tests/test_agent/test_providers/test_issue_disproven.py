@@ -16,7 +16,10 @@ the counter-evidence semantics that revoke a proven-failed attempt:
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from chaos_agent.agent.providers.message_scanning import scan_native_issue_disproven
+from chaos_agent.agent.providers.message_scanning import (
+    is_budget_expiry_unknown,
+    scan_native_issue_disproven,
+)
 from chaos_agent.agent.providers.chaosblade.provider import ChaosbladeProvider
 from chaos_agent.agent.providers.chaosblade.python_provider import (
     ChaosbladePythonProvider,
@@ -45,6 +48,33 @@ def _attempt(subcommand: str, v_args: str = "", tc_id: str = "tc1") -> AIMessage
 
 def _result(tc_id: str, content: str) -> ToolMessage:
     return ToolMessage(content=content, tool_call_id=tc_id, name="kubectl")
+
+
+# -- the single-source third-state predicate (R66) -----------------------------
+
+class TestBudgetExpiryPredicate:
+    """``is_budget_expiry_unknown`` — the ONE definition of the
+    outcome-UNKNOWN third state, shared by the native carrier's
+    revocation scan and the faultdrill carrier's issue_disproven."""
+
+    def test_matches_both_fix_shapes_case_insensitively(self):
+        assert is_budget_expiry_unknown(
+            "Error: kubectl scale: Command timed out after 300s\nOutcome UNKNOWN: ..."
+        ) is True
+        assert is_budget_expiry_unknown("Error: task timed out after 300s") is True
+        assert is_budget_expiry_unknown("Error: Command TIMED OUT after 5s") is True
+
+    def test_genuine_failures_are_not_the_third_state(self):
+        assert is_budget_expiry_unknown("Error: not found") is False
+        assert is_budget_expiry_unknown("Error: forbidden: denied") is False
+        assert is_budget_expiry_unknown("deployment.apps/app scaled") is False
+        # "timeout" (the bare noun) is NOT the fix branches' feature —
+        # the R58/R59 renders always carry "timed out".
+        assert is_budget_expiry_unknown("Error: timeout") is False
+
+    def test_non_string_content_is_safe(self):
+        assert is_budget_expiry_unknown(None) is False
+        assert is_budget_expiry_unknown(["Error: task timed out after 300s"]) is False
 
 
 # -- scan semantics -----------------------------------------------------------
@@ -157,6 +187,60 @@ class TestScanNativeIssueDisproven:
             [HumanMessage(content="hi")], WRITE_SUBS
         ) is False
 
+    def test_r57_unknown_shape_is_never_counter_evidence(self):
+        """R65: the R57 caller-budget expiry renders "Error: ... Outcome
+        UNKNOWN" — the local wait was killed while the server-side call may
+        have LANDED (R57 measured a 70s task's marker landing at t+72s). For
+        a millisecond object-write this is the forensic paradox: never
+        counter-evidence, even though the text starts with "Error:"."""
+        msgs = [
+            _attempt("scale", "deployment/app --replicas=0"),
+            _result(
+                "tc1",
+                "Error: kubectl scale: Command timed out after 300s: kubectl"
+                " scale deployment/app --replicas=0\n"
+                "Outcome UNKNOWN: only the local wait was killed — the"
+                " command may STILL be running server-side. A blind retry"
+                " can double-execute a side-effecting command. Reconcile"
+                " first: re-check the target's actual state with a read"
+                " command, then retry only what is genuinely missing.",
+            ),
+        ]
+        assert scan_native_issue_disproven(msgs, WRITE_SUBS) is False
+
+    def test_r59_receipt_unknown_shape_is_never_counter_evidence(self):
+        """R65: the R59 wiz-receipt shape ("Error: task timed out after Ns"
+        + the UNKNOWN note) is the same paradox — never counter-evidence."""
+        msgs = [
+            _attempt("cordon", "node-1"),
+            _result(
+                "tc1",
+                "Error: task timed out after 300s\n"
+                "\n"
+                "Outcome UNKNOWN: the CLI's own wait expired — the command"
+                " may STILL be running server-side. A blind retry can"
+                " double-execute a side-effecting command. Reconcile first:"
+                " re-check the target's actual state with a read command,"
+                " then retry only what is genuinely missing.",
+            ),
+        ]
+        assert scan_native_issue_disproven(msgs, WRITE_SUBS) is False
+
+    def test_unknown_expiry_does_not_confirm_either(self):
+        """R65: an UNKNOWN expiry is unjudgeable BOTH ways — it must not
+        ride the confirmation pre-pass as a landed write either (it starts
+        with "Error:", so today it cannot; this pin keeps that true)."""
+        msgs = [
+            _attempt("scale", "--replicas=0", tc_id="t1"),
+            _result(
+                "t1",
+                "Error: kubectl scale: Command timed out after 300s\n"
+                "Outcome UNKNOWN: only the local wait was killed — the"
+                " command may STILL be running server-side.",
+            ),
+        ]
+        assert scan_native_issue_disproven(msgs, WRITE_SUBS) is False
+
 
 # -- provider hooks ------------------------------------------------------------
 
@@ -192,6 +276,23 @@ class TestProviderIssueDisproven:
         msgs = [
             _attempt("exec", "iptables -A INPUT -j DROP"),
             _result("tc1", "Error: command terminated with exit code 137"),
+        ]
+        assert p.issue_disproven(msgs) is False
+
+    def test_kubectl_native_unknown_outcome_stands(self):
+        """R65: a budget-expiry UNKNOWN result on the latest object-write
+        leaves the issue-time attribution standing (forensic paradox — the
+        write may have landed). Mirrors the host carrier's unconditional
+        False instead of revoking a possibly-live fault."""
+        p = K8sNativeProvider()
+        msgs = [
+            _attempt("scale", "deployment/app --replicas=0"),
+            _result(
+                "tc1",
+                "Error: kubectl scale: Command timed out after 300s\n"
+                "Outcome UNKNOWN: only the local wait was killed — the"
+                " command may STILL be running server-side.",
+            ),
         ]
         assert p.issue_disproven(msgs) is False
 
@@ -303,6 +404,85 @@ class TestRevocationSeams:
         # host_native: paradox — never vetoed
         hp = FaultProviderRegistry.resolve_by_method("host_native")
         assert _issue_disproven_in_epoch({"messages": []}, msgs, hp) is False
+
+    def test_unknown_outcome_neither_revoked_nor_vetoed(self):
+        """R65: a budget-expiry UNKNOWN result must not drive the revocation
+        seam (attribution facts stay intact) nor the RESUME veto."""
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _issue_disproven_in_epoch,
+            _maybe_revoke_issue_time_attribution,
+        )
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+        p = FaultProviderRegistry.resolve_by_method("kubectl_native")
+        msgs = [
+            _attempt("scale", "--replicas=0", tc_id="t1"),
+            _result(
+                "t1",
+                "Error: kubectl scale: Command timed out after 300s\n"
+                "Outcome UNKNOWN: only the local wait was killed — the"
+                " command may STILL be running server-side.",
+            ),
+        ]
+        assert _issue_disproven_in_epoch({"messages": []}, msgs, p) is False
+        state = {"messages": [], "injection_method": "kubectl_native"}
+        result = {}
+        assert _maybe_revoke_issue_time_attribution(
+            state, result, msgs, "kubectl_native"
+        ) is False
+        assert "injection_method" not in result
+
+    def test_faultdrill_unknown_apply_neither_revoked_nor_vetoed(self):
+        """R66: the faultdrill carrier's apply face routes through the same
+        third-state predicate — a budget-expiry UNKNOWN apply must not
+        drive the revocation seam nor the RESUME veto (the live CR stays
+        attributable). The full chain is exercised: method → provider
+        resolution → predicate → both seams."""
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _issue_disproven_in_epoch,
+            _maybe_revoke_issue_time_attribution,
+        )
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+        p = FaultProviderRegistry.resolve_by_method("faultdrill_cr")
+        manifest = (
+            "apiVersion: drill.blade-ai.io/v1alpha1\n"
+            "kind: FaultDrill\n"
+            "metadata:\n"
+            "  name: fd-x\n"
+            "  namespace: cms-demo\n"
+            "spec:\n"
+            "  action: secretSwap\n"
+        )
+        msgs = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "id": "c1",
+                    "name": "kubectl",
+                    "args": {
+                        "subcommand": "apply",
+                        "v_args": "-f -",
+                        "stdin_data": manifest,
+                    },
+                }],
+            ),
+            _result(
+                "c1",
+                "Error: kubectl apply: Command timed out after 300s\n"
+                "Outcome UNKNOWN: only the local wait was killed — the"
+                " command may STILL be running server-side.",
+            ),
+        ]
+        assert _issue_disproven_in_epoch({"messages": []}, msgs, p) is False
+        state = {"messages": [], "injection_method": "faultdrill_cr"}
+        result = {}
+        assert _maybe_revoke_issue_time_attribution(
+            state, result, msgs, "faultdrill_cr"
+        ) is False
+        assert "injection_method" not in result
 
 
 # -- tail projection -----------------------------------------------------------

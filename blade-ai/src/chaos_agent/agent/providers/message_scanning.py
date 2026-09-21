@@ -81,6 +81,41 @@ def reached_target(content: object) -> bool:
     return not any(m in low for m in PRE_EXEC_REJECTION_MARKERS)
 
 
+def is_budget_expiry_unknown(content: object) -> bool:
+    """True when a tool result renders a CALLER-BUDGET EXPIRY — the
+    outcome-UNKNOWN third state, neither success nor failure.
+
+    R57 (the ToolTimeoutError exception branch) and R59 (the wiz
+    ``task timed out`` receipt branch) BOTH render this state behind an
+    ``Error:`` contract head — the local wait was killed while "the
+    command may STILL be running server-side". A budget expiry is
+    therefore UNJUDGEABLE: consuming it as a failure verdict is the
+    B39/B40 family defect (an ``Error:`` prefix read as a failure
+    judgement), the disease that recurred at every consumer that reads
+    results in two states only.
+
+    This is the single-source THIRD-STATE predicate. It lives here, in
+    the neutral home, for the same reason the vocabularies below do:
+    every judgement face that reads tool results (the native carrier,
+    the faultdrill carrier, any future carrier) MUST agree on what
+    "unknown" means or their attributions drift apart. Consumers decide
+    the DIRECTION of the third state per face (counter-evidence: keep
+    the attribution; attribution: count it as having reached; query:
+    report an unknown status — see ``chaosblade/verify._QueryK8sResult
+    ("unknown", ...)`` for the project's canonical query-side sample);
+    the predicate only names it. An earlier inline copy lived in
+    ``scan_native_issue_disproven``'s judge loop (R65) and its
+    faultdrill twin fed a bare ``Error:`` prefix reading (R66) — both
+    now route here.
+
+    Matching the FEATURE (``timed out``), not the fix branches' exact
+    wording: a future re-wording of the R57/R59 notes degrades to this
+    same reading instead of silently reverting to the failure verdict.
+    """
+    low = (content if isinstance(content, str) else "").lower()
+    return "timed out" in low
+
+
 # ---------------------------------------------------------------------------
 # kubectl tool-domain vocabulary (phase-14 G2, design D2)
 #
@@ -1112,6 +1147,15 @@ def scan_native_issue_disproven(
                 content = result_msg.content if isinstance(
                     result_msg.content, str
                 ) else str(result_msg.content)
+                if is_budget_expiry_unknown(content):
+                    # R65 (third case of the B39/B40 family): a budget
+                    # expiry is outcome-UNKNOWN, not a failure — for a
+                    # millisecond object-write it most likely LANDED, so
+                    # it is the forensic paradox again (same ruling as
+                    # the command-mode branch below and the host
+                    # carrier): never counter-evidence. Direction and
+                    # wording rationale live on the predicate.
+                    return False
                 return content.startswith("Error:")
             if (
                 subcommand in command_subcommands
@@ -1222,6 +1266,7 @@ def scan_host_native_index(
 __all__ = [
     "PRE_EXEC_REJECTION_MARKERS",
     "build_tool_call_args_lookup",
+    "is_budget_expiry_unknown",
     "reached_target",
     "scan_host_native_injection",
     "scan_host_native_index",

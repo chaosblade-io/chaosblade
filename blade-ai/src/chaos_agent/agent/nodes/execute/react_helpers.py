@@ -9,11 +9,13 @@ here is either:
     difference is a constant name.
 """
 
+import json
 import logging
 import re
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from chaos_agent.agent.tool_verdicts import message_result_error_text
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import ErrorClass, classify_error
 
@@ -436,12 +438,22 @@ def suggest_verify_command(tool_name: str) -> str:
 
 _LOOP_HINTS: dict[str, str] = {
     "intent": (
+        # 4th direction (2026-09-20 review backfill, task-1707c16e): this
+        # hint fires on identical calls with identical outputs — the state
+        # where the answer is already in hand. #1 (broaden the query) and
+        # #4 (accept the repeated result) are in deliberate tension: #1 is
+        # for an invalid query syntax (the REFLECT line above), #4 for the
+        # case where the same answer keeps coming back and re-querying
+        # wider is exactly what the capability-boundary rule (planning
+        # Reject 4b) prohibits.
         "REFLECT: Your discovery method doesn't match how the system actually works. "
         "The query syntax or approach itself may be invalid.\n\n"
         "NEXT:\n"
         "1. Simplify — reduce your query to its broadest possible form.\n"
         "2. Change — try a fundamentally different discovery approach.\n"
-        "3. Escalate — present what you found to the user, let them guide you."
+        "3. Escalate — present what you found to the user, let them guide you.\n"
+        "4. Accept — a result that keeps returning identical IS the answer; "
+        "report what you already have instead of re-querying wider."
     ),
     "planning": (
         "REFLECT: What you're trying to verify may not exist in the expected form. "
@@ -608,8 +620,12 @@ def detect_action_stagnation(messages: list, threshold: int | None = None, phase
 
     That guard was also the only thing keeping false positives down, since this
     detector never looked at tool output. Removing it therefore comes with an
-    output check: a streak is only reported when the repeated calls produced
-    identical results, matching detect_repeated_tool_calls.
+    output check, layered since the frequency-ceiling fix (task-c7c75263):
+    below ``stagnation_frequency_ceiling`` a streak is reported only when the
+    repeated calls produced identical results, matching
+    detect_repeated_tool_calls; at or above the ceiling the streak itself is
+    the evidence — live metric samples never repeat byte-for-byte, so an
+    output-equality gate alone stays silent on real stalls.
 
     Returns:
         (hint_message, stagnant_tool_name) or (None, None) if no stagnation.
@@ -906,11 +922,17 @@ def detect_tool_error_hint(messages: list) -> str | None:
     for msg in reversed(recent):
         if not isinstance(msg, ToolMessage):
             continue
-        content = msg.content if isinstance(msg.content, str) else ""
-        if not content.startswith("Error"):
+        # Single-source verdict (agent/tool_verdicts.py): the generic
+        # ``Error`` / ``[target_guard]`` renderings plus the owning
+        # provider's declared result shape. ``error_text`` IS ``content``
+        # for every generic result, so the text-dialect path is unchanged;
+        # for a structured receipt it is the message the provider extracted,
+        # which is what ``classify_error`` can actually match on.
+        error_text = message_result_error_text(msg)
+        if error_text is None:
             continue
 
-        result = classify_error(content)
+        result = classify_error(error_text)
         if not _should_trigger_introspection(result.error_class):
             continue
 
@@ -924,10 +946,67 @@ def detect_tool_error_hint(messages: list) -> str | None:
         ):
             continue
 
-        rejected = extract_rejected_params(content)
-        return _build_introspection_hint(tool_name, content, rejected)
+        rejected = extract_rejected_params(error_text)
+        return _build_introspection_hint(tool_name, error_text, rejected)
 
     return None
+
+
+#: Result shapes carrying POSITIVE success evidence. ``partial`` is
+#: deliberately absent — a half-landed mutation (carrier armed, injection
+#: unconfirmed) is not a healed blip and must not earn a fresh budget.
+_SUCCESS_STATUS_VALUES = frozenset({"success", "ok", "passed", "succeeded"})
+
+
+def _result_proves_success(content: str) -> bool:
+    """True only when a tool result carries positive success evidence.
+
+    The POSITIVE half of the retry-budget decision; the negative half is
+    :func:`chaos_agent.agent.tool_verdicts.message_result_error_text`, and
+    the caller asks it FIRST. This predicate is only consulted for a result
+    the single-source verdict did not already rule a failure, so it never
+    has to recognise a failure shape — it answers "is this proof the blip
+    healed?", and nothing else.
+
+    The budget reset it guards used to be the inversion of a pattern MISS:
+    anything not starting with ``Error`` was read as "healed" and cleared
+    that tool's transient count. Under an OPEN set of result shapes that
+    inference is unsound — a tool reporting failures structurally
+    (``{"status": "failed", ...}``) never matches the prefix, so every one
+    of its failures reset its own count and the guard stayed permanently
+    silent for it. ``faultdrill_assemble_carrier`` is the case that exposed
+    it: its honest receipt is JSON by design and its exceptions are caught
+    in-tool, so it carries neither the ``Error:`` prefix nor
+    ``status="error"``.
+
+    Unrecognised shapes get SILENCE, not a verdict — the same rule the
+    error-text matchers follow (a matcher may degrade to silence, it may
+    not assert). Unparseable JSON-shaped bodies (a compacted receipt is
+    exactly this) therefore leave the count untouched, while plain
+    successful output keeps resetting it.
+    """
+    text = (content or "").lstrip()
+    if not text:
+        return False
+    if text.startswith("Error") or text.startswith("[target_guard]"):
+        return False
+    if text[0] not in "{[":
+        return True
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        # JSON-shaped but unparseable — unknown, and unknown is not success.
+        return False
+    if not isinstance(data, dict):
+        return True
+    if "status" in data:
+        return str(data.get("status") or "").lower() in _SUCCESS_STATUS_VALUES
+    if "success" in data:
+        return bool(data.get("success"))
+    if "code" in data:
+        code = data.get("code")
+        return code == 0 or (isinstance(code, int) and 200 <= code < 300)
+    return True
 
 
 def detect_transient_retry_exhaustion(messages: list) -> str | None:
@@ -953,8 +1032,16 @@ def detect_transient_retry_exhaustion(messages: list) -> str | None:
     * Per tool, transient errors are counted chronologically within the
       detection window; ``budget`` counts RETRIES after the first failure, so
       the hint fires on the (budget + 1)-th transient failure.
-    * A SUCCESSFUL result (non-``Error`` ToolMessage) resets that tool's
-      count — a healed blip earns a fresh budget.
+    * The failure verdict is the single source's
+      (``agent/tool_verdicts.py``): generic ``Error`` / ``[target_guard]``
+      renderings plus the shape the owning provider declares, so a tool
+      reporting failures STRUCTURALLY is counted here like any text error.
+    * A result carrying POSITIVE success evidence resets that tool's count
+      — a healed blip earns a fresh budget. Absence of a failure verdict is
+      NOT that evidence: an unrecognised shape (an undeclared structured
+      receipt, a compacted JSON body) leaves the count untouched, since "I
+      don't recognise this" may degrade to silence but never to a verdict
+      (:func:`_result_proves_success`).
     * ``budget <= 0`` disables the guard (same convention as the other
       budget settings).
     """
@@ -972,11 +1059,22 @@ def detect_transient_retry_exhaustion(messages: list) -> str | None:
             continue
         name = getattr(msg, "name", "") or "tool"
         content = msg.content if isinstance(msg.content, str) else ""
-        if not content.startswith("Error"):
-            # A successful result proves the blip healed — fresh budget.
-            counts.pop(name, None)
+        # Failure FIRST, then positive success, then silence — the order is
+        # the whole point. Reading "no ``Error`` prefix" as "healed" (the old
+        # branch) inverted a pattern MISS into a verdict, so a tool reporting
+        # failures STRUCTURALLY reset its own counter on every failure and
+        # this guard stayed permanently silent for it. The single-source
+        # verdict (agent/tool_verdicts.py) asks the owning provider, so a
+        # declared failure shape is COUNTED here like any ``Error:`` text.
+        error_text = message_result_error_text(msg)
+        if error_text is None:
+            if _result_proves_success(content):
+                # Positive success evidence: the blip healed — fresh budget.
+                counts.pop(name, None)
+            # Otherwise: an unrecognised shape (an undeclared structured
+            # receipt, a compacted body) leaves the count exactly as it was.
             continue
-        result = classify_error(content)
+        result = classify_error(error_text)
         if result.error_class is not ErrorClass.INFRA_TRANSIENT:
             continue
         counts[name] = counts.get(name, 0) + 1

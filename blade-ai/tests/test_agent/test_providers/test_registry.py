@@ -48,6 +48,10 @@ class _FakeProvider:
     # gate's declaration pair — the fake stays outside the gate.
     reconcile_create_tool_names: frozenset[str] = frozenset()
     reconcile_read_tool_names: frozenset[str] = frozenset()
+    # Result-shape verdict seam (agent/tool_verdicts.py): same conformance
+    # requirement — the fake owns no tool result shape, so the shared
+    # verdict stays on the generic path for it.
+    result_shape_tool_names: frozenset[str] = frozenset()
 
     # Phase-8 Form B: same conformance requirement for the optional
     # vocabulary hooks — the fake stays inert (a non-participating
@@ -61,6 +65,11 @@ class _FakeProvider:
     def build_reconcile_fingerprint(self, tool_name, tool_args):
         # Create-reconcile seam (D6): default None pinned structurally
         # (runtime_checkable conformance requires the method).
+        return None
+
+    def tool_result_error_text(self, tool_name, content):
+        # Result-shape verdict seam: default None (abstain) pinned
+        # structurally (runtime_checkable conformance requires the method).
         return None
 
     async def reconcile_hold_feedback(
@@ -77,12 +86,6 @@ class _FakeProvider:
 
     def reconcile_batch_held_feedback(self, tool_name, other_tool_name):
         # Create-reconcile seam (D6): default None pinned structurally.
-        return None
-
-    async def verify_landing_readback(self, messages, state, *, kubeconfig=""):
-        # Landing readback seam (faultdrill-cr-channel task 2.1): default
-        # None pinned structurally (runtime_checkable conformance requires
-        # the coroutine method).
         return None
 
     def __init__(
@@ -172,7 +175,8 @@ class _FakeProvider:
         return DestroyOutcome.FAILED
 
     async def layer1_destroy(
-        self, uid, kubeconfig="", *, messages=None, injection_method=None
+        self, uid, kubeconfig="", *, messages=None, injection_method=None,
+        artifacts=None,
     ) -> Layer1Result:
         return Layer1Result(status=Layer1Status.SKIPPED, details=f"fake:{self.carrier}")
 
@@ -308,32 +312,6 @@ def test_clear_empties_registry():
     FaultProviderRegistry.clear()
     assert FaultProviderRegistry.all_providers() == ()
     assert FaultProviderRegistry.resolve_by_method("host_blade") is None
-
-
-@pytest.mark.asyncio
-async def test_ensure_crd_seam_dispatches_to_the_hooked_provider():
-    # Installability seam (faultdrill-cr-channel D2/D7): dispatch is
-    # getattr-optional — only a provider that OWNS the install question
-    # answers; the verdict passes through as a provider-neutral dict.
-    class _InstallableFake(_FakeProvider):
-        async def ensure_crd(self, kubeconfig=""):
-            self.seen_kubeconfig = kubeconfig
-            return {"usable": True, "status": "ready"}
-
-    fake = _InstallableFake("faultdrill_cr", ("kubectl_native",))
-    FaultProviderRegistry.register(fake)
-    verdict = await FaultProviderRegistry.ensure_crd(kubeconfig="/tmp/k")
-    assert verdict == {"usable": True, "status": "ready"}
-    assert fake.seen_kubeconfig == "/tmp/k"
-
-
-@pytest.mark.asyncio
-async def test_ensure_crd_seam_none_when_no_provider_claims_install():
-    # Every backend but the CR channel omits the hook — the seam's None
-    # means "nobody claims the install responsibility", which the route
-    # gate treats as pass-through (the apply's own error family governs).
-    FaultProviderRegistry.register(_FakeProvider("chaosblade", ("host_blade",)))
-    assert await FaultProviderRegistry.ensure_crd() is None
 
 
 # -- fault-handle orchestration (carrier-neutral entry points) ---------------

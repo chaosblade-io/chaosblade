@@ -137,6 +137,11 @@ class K8sNativeProvider:
     # protocol defaults, made explicit).
     reconcile_create_tool_names = frozenset()
     reconcile_read_tool_names = frozenset()
+    # Result-shape verdict (agent/tool_verdicts.py): kubectl renders every
+    # failure with the ``Error:`` prefix, so the generic verdict already
+    # reads this carrier's tools and there is no shape of its own to
+    # declare (the protocol default, made explicit).
+    result_shape_tool_names = frozenset()
     # Action vocabulary for the multi-step injection step self-check (high
     # tolerance): ``step_kubectl_verbs`` are the kubectl write verbs that may
     # appear in a skill case 演练步骤; ``chinese_verb_map`` maps Chinese step
@@ -477,16 +482,6 @@ class K8sNativeProvider:
         ``None``."""
         return None
 
-    async def verify_landing_readback(
-        self, messages: list, state: dict, *, kubeconfig: str = ""
-    ) -> Optional[dict]:
-        """Landing readback guard (faultdrill-cr-channel task 2.1, design
-        D5): this carrier's landings carry no CR recipe-integrity contract
-        to verify — pinned ``None`` (the registry scan continues; the
-        faultdrill channel's D5 seam is the only owner of the post-apply
-        readback)."""
-        return None
-
     async def rollback_handle(self, handle: dict, **kwargs) -> str:
         """Kubectl-native faults are undone by reversing the mutation in the
         recover graph, not by a synchronous failure-path rollback."""
@@ -567,6 +562,15 @@ class K8sNativeProvider:
         anyway; pinned explicitly so the protocol stays satisfied."""
         return DestroyOutcome.FAILED
 
+    def tool_result_error_text(
+        self, tool_name: str, content: str
+    ) -> Optional[str]:
+        """Text-dialect carrier: kubectl renders every failure with the
+        ``Error:`` prefix, which the generic verdict already reads, so there
+        is no result shape of this carrier's own to judge — pinned
+        abstaining explicitly so the protocol stays satisfied."""
+        return None
+
     async def layer1_destroy(
         self,
         uid: str,
@@ -574,6 +578,10 @@ class K8sNativeProvider:
         *,
         messages: list | None = None,
         injection_method: str | None = None,
+        # Protocol parity with the ledger rung: there is no deterministic
+        # Layer-1 here to hydrate an identity FOR (this returns ``skipped``
+        # and the LLM flow's undo is Layer 1), so the list stays unread.
+        artifacts: list | None = None,
     ) -> "Layer1Result":
         """No deterministic Layer-1 recovery exists for a kubectl-native fault:
         the mutation has no experiment to destroy — the LLM flow's undo IS

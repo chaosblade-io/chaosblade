@@ -25,6 +25,7 @@ from chaos_agent.agent.target_guard.classifier import (
     is_cluster_scoped_kind,
 )
 from chaos_agent.agent.target_guard.types import SCOPE_ESCAPE
+from chaos_agent.agent.tool_verdicts import message_result_failed
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ VEHICLE_ARTIFACT_TYPES: frozenset[str] = frozenset({
 
 
 def parse_debug_pod_metadata(content: str) -> dict:
-    """Parse the structured marker emitted by ``tools.kubectl``."""
+    """Parse the structured marker emitted by ``tools.kubectl_cli``."""
     if not isinstance(content, str):
         return {}
     match = _DEBUG_META_RE.search(content)
@@ -1133,10 +1134,18 @@ def _merge_discovered_artifact(current: dict, discovered: dict) -> None:
 
 
 def _tool_result_failed(message: ToolMessage) -> bool:
-    if getattr(message, "status", None) == "error":
-        return True
-    content = message.content if isinstance(message.content, str) else ""
-    return content.startswith("Error:") or content.startswith("[target_guard]")
+    """Delegate to the single-source verdict (``agent/tool_verdicts.py``).
+
+    Was ``status == "error" or content.startswith("Error:") or
+    content.startswith("[target_guard]")`` — the same three terms every
+    other consumer re-derived locally. Every caller here is already scoped
+    to a kubectl subcommand, so the practical effect of routing through the
+    shared verdict is the widened ``Error`` (colon-less) prefix; that is
+    fail-closed for this module, whose verdicts gate artifact registration
+    (a result that MIGHT be a failure must not register a recovery carrier
+    or a deleted-pod identity).
+    """
+    return message_result_failed(message)
 
 
 def _systemd_timer_seconds(inner: str) -> int:

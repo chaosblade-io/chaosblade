@@ -197,6 +197,14 @@ class ChaosbladePythonProvider:
     # made explicit).
     reconcile_create_tool_names = frozenset()
     reconcile_read_tool_names = frozenset()
+    # Result-shape verdict (agent/tool_verdicts.py): ``blade_python_create``
+    # returns the blade CLI's raw stdout on exit 0 (cli_python.py's ``return
+    # result.stdout``), so an in-JSON failure (``{"code":...,"success":
+    # false,...}``) with a zero exit code is invisible to the generic
+    # ``Error`` prefix verdict — the same dialect the OS carrier declares,
+    # read by the same shared predicate. The prepare/revoke tools are not
+    # declared: see ``verify.blade_create_json_error_text``.
+    result_shape_tool_names = frozenset({"blade_python_create"})
 
     def matches_channel(self, profile: str) -> bool:
         # ``blade create python`` talks to the in-process agent over
@@ -392,6 +400,18 @@ class ChaosbladePythonProvider:
 
         return classify_destroy_output(output)
 
+    def tool_result_error_text(
+        self, tool_name: str, content: str
+    ) -> Optional[str]:
+        """Failure verdict on the blade CLI's JSON dialect — the shared
+        predicate the OS carrier uses (``verify.blade_create_json_error_text``),
+        so the two blade carriers cannot drift on the same bytes."""
+        if tool_name not in self.result_shape_tool_names:
+            return None
+        from .verify import blade_create_json_error_text
+
+        return blade_create_json_error_text(content)
+
     def build_handle_from_messages(
         self, messages: list, retired=None, values: Optional[dict] = None
     ) -> Optional[dict]:
@@ -534,16 +554,6 @@ class ChaosbladePythonProvider:
         ``None``."""
         return None
 
-    async def verify_landing_readback(
-        self, messages: list, state: dict, *, kubeconfig: str = ""
-    ) -> Optional[dict]:
-        """Landing readback guard (faultdrill-cr-channel task 2.1, design
-        D5): this carrier's landings carry no CR recipe-integrity contract
-        to verify — pinned ``None`` (the registry scan continues; the
-        faultdrill channel's D5 seam is the only owner of the post-apply
-        readback)."""
-        return None
-
     def issue_disproven(self, messages: list, *, is_teardown=None) -> bool:
         """Experiment attribution is RESULT-born (committed only when the UID
         appears in a successful create result), so there is no issue-time
@@ -671,6 +681,10 @@ class ChaosbladePythonProvider:
         *,
         messages: list | None = None,
         injection_method: str | None = None,
+        # Protocol parity with the ledger rung: this backend's Layer-1
+        # identity IS the experiment UID, so there is no recipe to hydrate
+        # from ``execution_artifacts`` and the list stays unread.
+        artifacts: list | None = None,
     ) -> "Layer1Result":
         """Deterministic Layer-1 recovery: destroy the python-agent experiment
         via the canonical host Layer-1 path (it is recorded in the local DB of

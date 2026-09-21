@@ -237,12 +237,23 @@ class HostShellProvider:
     kubeconfig_scoped_tool_names = frozenset()
     audit_scoped_tool_names = frozenset({"host_inject", "host_read"})
     log_shipping_tool_names = frozenset()
-    # Create-reconcile gate (D6): raw-shell injection is a command with a
-    # deterministic exit — the uncertain-outcome marker never rides its
-    # returns, so the gate has nothing to arm on (the protocol defaults,
-    # made explicit).
+    # Create-reconcile gate (D6): the gate arms on the uncertain-outcome
+    # marker, which only create tools emit — host tools are not create
+    # tools and never emit it, so the gate has nothing to arm on (the
+    # protocol defaults, made explicit). R58 correction: the earlier claim
+    # that a raw-shell command has a "deterministic exit" was falsified by
+    # the R57 shared-transport measurement (the local wait can be killed
+    # while the command keeps running server-side) — host_inject surfaces
+    # that edge via its ToolTimeoutError branch. The empty sets stay
+    # correct: the gate is marker-driven, not exit-driven, and host
+    # returns never carry the marker.
     reconcile_create_tool_names = frozenset()
     reconcile_read_tool_names = frozenset()
+    # Result-shape verdict (agent/tool_verdicts.py): the host tools render
+    # failures as text (the ``Error:`` prefix / ToolTimeoutError branch), so
+    # the generic verdict already reads them and this carrier has no result
+    # shape of its own to declare (the protocol default, made explicit).
+    result_shape_tool_names = frozenset()
 
     def matches_channel(self, profile: str) -> bool:
         # Raw-shell faults only make sense against a bare host.
@@ -442,16 +453,6 @@ class HostShellProvider:
         ``None``."""
         return None
 
-    async def verify_landing_readback(
-        self, messages: list, state: dict, *, kubeconfig: str = ""
-    ) -> Optional[dict]:
-        """Landing readback guard (faultdrill-cr-channel task 2.1, design
-        D5): this carrier's landings carry no CR recipe-integrity contract
-        to verify — pinned ``None`` (the registry scan continues; the
-        faultdrill channel's D5 seam is the only owner of the post-apply
-        readback)."""
-        return None
-
     async def rollback_handle(self, handle: dict, **kwargs) -> str:
         """Host-native faults are undone by reverse commands in the recover
         graph, not by a synchronous failure-path rollback."""
@@ -519,6 +520,16 @@ class HostShellProvider:
         anyway; pinned explicitly so the protocol stays satisfied."""
         return DestroyOutcome.FAILED
 
+    def tool_result_error_text(
+        self, tool_name: str, content: str
+    ) -> Optional[str]:
+        """Text-dialect carrier: the host tools render failures as text (the
+        ``Error:`` prefix / the ToolTimeoutError branch), which the generic
+        verdict already reads, so there is no result shape of this carrier's
+        own to judge — pinned abstaining explicitly so the protocol stays
+        satisfied."""
+        return None
+
     async def layer1_destroy(
         self,
         uid: str,
@@ -526,6 +537,10 @@ class HostShellProvider:
         *,
         messages: list | None = None,
         injection_method: str | None = None,
+        # Protocol parity with the ledger rung: there is no deterministic
+        # Layer-1 here to hydrate an identity FOR (this returns ``skipped``
+        # and the LLM flow's undo is Layer 1), so the list stays unread.
+        artifacts: list | None = None,
     ) -> "Layer1Result":
         """No deterministic Layer-1 recovery exists for a host-native fault:
         the raw host command has no experiment to destroy — the LLM flow's

@@ -494,36 +494,6 @@ def test_fake_provider_satisfies_verify_hook_family():
 
 
 @pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
-def test_landing_readback_hook_family_contract(provider_cls):
-    """Structural contract of the landing readback hook family
-    (faultdrill-cr-channel task 2.1, design D5): the post-apply readback
-    guard is a coroutine function EVERY backend owns — the registry seam
-    AWAITS it, so a sync implementation would raise on the guard path.
-    Backends outside the faultdrill channel pin the ``None`` verdict (no
-    landing form to verify); only that channel's carrier computes
-    verdicts."""
-    import inspect as _inspect
-
-    prov = provider_cls()
-    assert isinstance(prov, FaultProvider)
-    assert callable(prov.verify_landing_readback)
-    assert _inspect.iscoroutinefunction(prov.verify_landing_readback)
-
-
-def test_fake_provider_satisfies_landing_readback_hook_family():
-    """The suite's test double satisfies the same landing readback hook
-    contract (the coroutine form the guard's await relies on)."""
-    import inspect as _inspect
-
-    from .test_registry import _FakeProvider
-
-    fake = _FakeProvider("chaosblade", ("host_blade",))
-    assert isinstance(fake, FaultProvider)
-    assert callable(fake.verify_landing_readback)
-    assert _inspect.iscoroutinefunction(fake.verify_landing_readback)
-
-
-@pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
 def test_reconcile_hook_family_contract(provider_cls):
     """Structural contract of the create-reconcile hook family
     (blade-create-reconcile-before-retry D6): the hold-feedback hook is a
@@ -559,6 +529,83 @@ def test_fake_provider_satisfies_reconcile_hook_family():
     assert _inspect.iscoroutinefunction(fake.reconcile_hold_feedback)
     assert not _inspect.iscoroutinefunction(fake.build_reconcile_fingerprint)
     assert not _inspect.iscoroutinefunction(fake.reconcile_batch_held_feedback)
+
+
+@pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
+def test_result_shape_hook_family_contract(provider_cls):
+    """Structural contract of the result-shape verdict family
+    (``agent/tool_verdicts.py``): the declaration is a frozenset of tool
+    names (possibly empty — a text-dialect carrier is read by the generic
+    verdict and pins it empty), and the hook is a SYNC callable that
+    ABSTAINS (returns ``None``) on a shape it does not own.
+
+    The abstain-on-unowned pin is the load-bearing half. The registry routes
+    by declaration membership, so a hook that answered on a tool it does not
+    declare would be unreachable — but a hook that answered on its OWN tool
+    with a verdict for an unreadable body would turn "I don't recognise this"
+    into a claim, and this family's whole reason to exist is that such a
+    claim was once inverted into a success verdict (a compacted receipt must
+    abstain, not assert)."""
+    import inspect as _inspect
+
+    prov = provider_cls()
+    decl = getattr(prov, "result_shape_tool_names")
+    assert isinstance(decl, frozenset)
+    assert all(isinstance(n, str) and n for n in decl)
+    assert callable(prov.tool_result_error_text)
+    assert not _inspect.iscoroutinefunction(prov.tool_result_error_text)
+
+    # Unowned tool: abstain regardless of content.
+    assert prov.tool_result_error_text("__not_this_carriers_tool__", "") is None
+    assert (
+        prov.tool_result_error_text(
+            "__not_this_carriers_tool__", '{"status": "failed"}'
+        )
+        is None
+    )
+    # Owned tool, unreadable body (a compacted receipt is JSON-shaped but
+    # truncated by bytes): abstain — unknown is not success AND not failure.
+    for tool_name in decl:
+        assert prov.tool_result_error_text(tool_name, "") is None
+        assert (
+            prov.tool_result_error_text(tool_name, '{"status": "failed", "er')
+            is None
+        )
+
+
+def test_fake_provider_satisfies_result_shape_hook_family():
+    """The suite's test double satisfies the same result-shape contract (the
+    runtime_checkable Protocol asserts the surface; this pins the abstain)."""
+    import inspect as _inspect
+
+    from .test_registry import _FakeProvider
+
+    fake = _FakeProvider("chaosblade", ("host_blade",))
+    assert isinstance(fake, FaultProvider)
+    assert fake.result_shape_tool_names == frozenset()
+    assert not _inspect.iscoroutinefunction(fake.tool_result_error_text)
+    assert fake.tool_result_error_text("host_blade", '{"status": "failed"}') is None
+
+
+@pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
+def test_declared_result_shape_tools_are_the_carriers_own(provider_cls):
+    """A declared result-shape tool must be a tool the carrier actually
+    contributes — a stale name would silently route nobody's verdicts here
+    while the real tool stayed invisible to the framework (the failure mode
+    this seam exists to prevent, reappearing one level up)."""
+    prov = provider_cls()
+    declared = set(getattr(prov, "result_shape_tool_names") or ())
+    if not declared:
+        return
+    own: set[str] = set()
+    for phase in (PLAN, EXECUTE, VERIFY, RECOVER_VERIFY):
+        for tool in prov.tools(phase) or ():
+            own.add(getattr(tool, "name", "") or "")
+    unknown = declared - own
+    assert not unknown, (
+        f"{prov.carrier} declares result shapes for tools it does not "
+        f"contribute: {sorted(unknown)}"
+    )
 
 
 @pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)

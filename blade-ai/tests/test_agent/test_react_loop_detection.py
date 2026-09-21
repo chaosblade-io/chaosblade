@@ -177,6 +177,23 @@ class TestHintIsRebuttable:
         hint, _ = detect_action_stagnation(self._stalled(), phase="execute", threshold=5)
         assert "results came back unchanged" in hint
 
+    def test_intent_hint_offers_accept_direction(self):
+        """The intent LOOP hint must offer "stop and report" as an option.
+
+        task-1707c16e: the model had the answer in hand (the enumerated
+        capability list lacks the requested one) and kept re-querying —
+        the hint's only forward advice was #1's broadening, the exact
+        action the capability-boundary rule (planning Reject 4b)
+        prohibits. Pinning the property, not just the new wording: the
+        Accept direction must exist in BOTH the intent and planning
+        bodies (planning already had it; this asserts the symmetry).
+        """
+        from chaos_agent.agent.nodes.execute.react_helpers import _LOOP_HINTS
+
+        assert "Accept" in _LOOP_HINTS["intent"]
+        assert "instead of re-querying wider" in _LOOP_HINTS["intent"]
+        assert "Accept" in _LOOP_HINTS["planning"]
+
 
 class TestWindowBounds:
     def test_message_cap_still_applies(self, monkeypatch):

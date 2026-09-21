@@ -954,3 +954,91 @@ class TestTransientRetryExhaustion:
         hint = detect_transient_retry_exhaustion(msgs)
         assert hint is not None
         assert "TRANSIENT RETRY BUDGET EXHAUSTED" in hint
+
+    def test_json_failure_does_not_reset_budget(self):
+        """``{"success": false}`` is a failure, not a healed blip.
+
+        ``blade_create`` returns the CLI's JSON stdout whenever the process
+        exits 0, and ChaosBlade reports admitted-then-failed creates inside
+        that JSON — the same shape ``execute_loop._build_replan_context``
+        already reads as a failure through its ``data.get("success")``
+        branch. The budget reset used to disagree with it: no ``Error``
+        prefix meant "success", so one JSON failure cleared the count the
+        prefixed failures had just accumulated, and two halves of the
+        framework reached opposite verdicts on the same result.
+        """
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        msgs = [
+            self._transient_error("blade_create"),
+            self._transient_error("blade_create"),
+            ToolMessage(
+                content='{"code":500,"success":false,"error":"target not found"}',
+                name="blade_create", tool_call_id="json-fail",
+            ),
+            self._transient_error("blade_create"),
+            self._transient_error("blade_create"),
+        ]
+        hint = detect_transient_retry_exhaustion(msgs)
+        assert hint is not None
+        assert "blade_create" in hint
+
+    def test_unparseable_json_does_not_reset_budget(self):
+        """A compacted receipt is JSON-shaped but no longer JSON.
+
+        ``tool_compactor`` truncates on a BYTE budget (1KB outside the recent
+        window) and its structure-preserving strip only covers K8s List
+        responses, so every other JSON body degrades into an unparseable head
+        cut. Unknown is not success — the count must survive it.
+        """
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        truncated = (
+            '{"status": "success", "artifact": {"name": "drill-rc-a1b2c3d4", '
+            '"recovery_han'
+        )
+        msgs = [
+            self._transient_error("kubectl"),
+            self._transient_error("kubectl"),
+            ToolMessage(content=truncated, name="kubectl", tool_call_id="cut"),
+            self._transient_error("kubectl"),
+            self._transient_error("kubectl"),
+        ]
+        assert detect_transient_retry_exhaustion(msgs) is not None
+
+    def test_success_verdict_needs_positive_evidence(self):
+        """The reset predicate, shape by shape.
+
+        Boundary of this fix, stated plainly: a structured failure is still
+        not COUNTED by the guard (it carries no ``Error`` prefix, so
+        ``classify_error`` never sees it) — recognising a new failure SHAPE
+        belongs to a single-source verdict, not here. What this pins is the
+        narrower contract: an unrecognised shape may not be laundered into a
+        success verdict.
+        """
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            _result_proves_success,
+        )
+        # Structured failures — the shapes that used to read as success.
+        assert _result_proves_success(
+            '{"status": "failed", "error": "SSAR denied"}'
+        ) is False
+        assert _result_proves_success(
+            '{"status": "partial", "carrier": {"armed": true}}'
+        ) is False
+        assert _result_proves_success('{"success": false, "code": 500}') is False
+        assert _result_proves_success('{"code": 500}') is False
+        # Positive evidence, including the shapes that already worked.
+        assert _result_proves_success(
+            '{"status": "success", "carrier": {"armed": true}}'
+        ) is True
+        assert _result_proves_success('{"code":200}') is True
+        assert _result_proves_success('{"success": true, "result": "uid-1"}') is True
+        assert _result_proves_success("pod/nginx created") is True
+        # Known failure prefixes and the empty body.
+        assert _result_proves_success("Error: kubectl get failed") is False
+        assert _result_proves_success("[target_guard] REJECT_BANNED") is False
+        assert _result_proves_success("") is False
+        assert _result_proves_success('{"status": "failed", ') is False

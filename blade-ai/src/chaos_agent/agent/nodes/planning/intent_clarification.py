@@ -62,6 +62,7 @@ from chaos_agent.persistence.task_identity import (
     new_recover_task_id,
 )
 from chaos_agent.agent.state import AgentState
+from chaos_agent.agent.tool_verdicts import message_result_failed
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.hook import merge_hook_updates
 from chaos_agent.memory.session_store import NO_SESSION_MARKER
@@ -88,6 +89,13 @@ def _has_successful_trailing_tool_result(messages: list, tool_name: str) -> bool
     execution fails. Only a successful result may advance an intent into the
     executable pipeline; an error stays in the normal ReAct conversation so
     the model can repair and resubmit it.
+
+    The failure half is the single-source verdict
+    (``agent/tool_verdicts.py``), not a local ``startswith("Error:")``: the
+    gate is fail-closed by construction here (an unread result keeps the
+    intent in the repair loop), so routing it through the shared verdict
+    costs nothing and keeps this predicate from drifting when a submission
+    tool grows a structured result shape.
     """
 
     for msg in reversed(messages):
@@ -95,11 +103,7 @@ def _has_successful_trailing_tool_result(messages: list, tool_name: str) -> bool
             break
         if getattr(msg, "name", "") != tool_name:
             continue
-        content = getattr(msg, "content", "")
-        return not (
-            getattr(msg, "status", None) == "error"
-            or (isinstance(content, str) and content.startswith("Error:"))
-        )
+        return not message_result_failed(msg)
     return False
 
 
@@ -776,6 +780,11 @@ def recover_task(task_id: str) -> str:
       - The user wants to undo / rollback / recover a specific prior injection.
       - If the user did NOT give a task_id, call ``query_active_experiments``
         FIRST to find it — never guess a task_id.
+      - NOT otherwise: merely MENTIONING recovery ("what happens if it
+        stays injected?", "how long does recovery take?") or planning
+        ahead ("to be safe, let me recover this") is NOT a recover intent
+        — a wrong call walks the user into a recovery flow (with a chat
+        confirmation they never asked for).
 
     Inputs:
       - task_id: the experiment's task_id (e.g. "inject-xxx" or "task-xxx"),

@@ -40,6 +40,7 @@ from chaos_agent.agent.spec.fault_spec import (
     strip_timeout_alias,
 )
 from chaos_agent.agent.state import AgentState, has_active_fault
+from chaos_agent.agent.tool_verdicts import message_result_failed
 from chaos_agent.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -377,9 +378,23 @@ def route_after_phase1_tools(state: AgentState) -> str:
     signal (finish_planning). ``save_fault_plan`` only persists the draft;
     Phase 1 must continue so the planner can explicitly finalize it.
 
-    Skips error ToolMessages (status="error" or an ``Error:`` result) — those
-    indicate the tool invocation failed (e.g. arg validation) and the LLM
-    should retry.
+    Skips error ToolMessages — those indicate the tool invocation failed
+    (e.g. arg validation) and the LLM should retry. The verdict is the
+    single source (``agent/tool_verdicts.py``), not a local
+    ``startswith("Error:")``: this route reads a planning-exit SIGNAL, so
+    misreading a failed ``propose_plan_change`` as a submitted one would
+    end Phase 1 on a proposal that was refused.
+
+    Both tools render failure as ``Error:`` today (factory.py), so this is
+    behaviour-preserving. What it buys is that the route now asks the same
+    question every other consumer asks, so a future structured result shape
+    is declared once on the owning provider instead of being missed here.
+    Deliberately NOT turned into a positive-proof gate (``_result_proves_
+    success``-style): this route EXITS Phase 1, and an unrecognised-but-
+    genuine ``Planning finalized.`` would wedge the planner in a loop —
+    the worse failure, and unreachable while the two tools return plain
+    text. An abstaining shape here would read as a signal; that is the
+    known limit of a failure-only verdict at this position.
     """
     messages = state.get("messages", [])
     if not messages:
@@ -388,10 +403,7 @@ def route_after_phase1_tools(state: AgentState) -> str:
     for msg in reversed(messages):
         if not isinstance(msg, ToolMessage):
             break
-        content = getattr(msg, "content", "")
-        if getattr(msg, "status", None) == "error" or (
-            isinstance(content, str) and content.startswith("Error:")
-        ):
+        if message_result_failed(msg):
             continue
         msg_name = getattr(msg, "name", "") or ""
         if msg_name in {"finish_planning", "propose_plan_change"}:
