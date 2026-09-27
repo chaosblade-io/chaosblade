@@ -82,6 +82,15 @@ ChaosBlade rejects `--namespace` and `--labels` for node scope — the
 | `node-network drop` | `--interface` flags same as pod scope, applied at node interface. **不支持 `--percent`**（全量丢包）。(v1.8.0: `delay`/`loss` 不可用) |
 | `node-process kill` | targets host processes — exercise extreme caution |
 
+> **No `io_hang` action exists** on `pod-disk` / `node-disk` (v1.8.0 ships
+> only `fill` and `burn`). `burn` saturates IO with `dd` — requests still
+> complete. To simulate IO requests that never return (processes stuck in
+> D state, `%iowait` up while `%util` stays flat), use the
+> `k8s-chaos-skills` script `inject_io_hang.py` (fsfreeze / dm-delay)
+> instead of `blade_create`; it has no `blade_uid`, so recovery goes
+> through `--action recover`. Case:
+> `references/catalogue/Node_磁盘IO挂起/`.
+
 ### Resource Mapping for `node-disk fill`
 
 `--path` typically maps to a partition as follows, but the actual
