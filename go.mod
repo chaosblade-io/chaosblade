@@ -18,9 +18,9 @@ go 1.25
 
 require (
         github.com/chaosblade-io/chaosblade-exec-cloud v1.8.0
-        github.com/chaosblade-io/chaosblade-exec-cri v1.8.0
+        github.com/chaosblade-io/chaosblade-exec-cri v1.8.1
         github.com/chaosblade-io/chaosblade-exec-middleware v1.8.0
-        github.com/chaosblade-io/chaosblade-exec-os v1.8.0
+        github.com/chaosblade-io/chaosblade-exec-os v1.8.1
         github.com/chaosblade-io/chaosblade-spec-go v1.8.0
         github.com/glebarez/sqlite v1.11.0
         github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
@@ -40,7 +40,7 @@ require (
         github.com/AdamKorcz/go-118-fuzz-build v0.0.0-20250520111509-a70c2aa677fa // indirect
         github.com/Microsoft/go-winio v0.6.2 // indirect
         github.com/Microsoft/hcsshim v0.13.0 // indirect
-        github.com/asaskevich/govalidator v0.0.0-20210307081110-f21760c49a8d // indirect
+        github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
         github.com/cilium/ebpf v0.17.3 // indirect
         github.com/containerd/cgroups v1.1.0 // indirect
         github.com/containerd/cgroups/v3 v3.0.5 // indirect
@@ -54,7 +54,7 @@ require (
         github.com/containerd/platforms v0.2.1 // indirect
         github.com/containerd/ttrpc v1.2.7 // indirect
         github.com/containerd/typeurl/v2 v2.2.3 // indirect
-        github.com/coreos/go-systemd/v22 v22.5.0 // indirect
+        github.com/coreos/go-systemd/v22 v22.6.0 // indirect
         github.com/cyphar/filepath-securejoin v0.6.0 // indirect
         github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
         github.com/dimchansky/utfbom v1.1.1 // indirect
@@ -71,7 +71,7 @@ require (
         github.com/glebarez/go-sqlite v1.21.2 // indirect
         github.com/go-logr/logr v1.4.3 // indirect
         github.com/go-logr/stdr v1.2.2 // indirect
-        github.com/go-ole/go-ole v1.2.6 // indirect
+        github.com/go-ole/go-ole v1.3.0 // indirect
         github.com/go-openapi/jsonpointer v0.21.0 // indirect
         github.com/go-openapi/jsonreference v0.20.2 // indirect
         github.com/go-openapi/swag v0.23.0 // indirect
@@ -82,7 +82,7 @@ require (
         github.com/google/gnostic-models v0.7.0 // indirect
         github.com/google/go-cmp v0.7.0 // indirect
         github.com/google/uuid v1.6.0 // indirect
-        github.com/howeyc/gopass v0.0.0-20190910152052-7cb4b85ec19c // indirect
+        github.com/howeyc/gopass v0.0.0-20210920133722-c8aef6fb66ef // indirect
         github.com/inconshreveable/mousetrap v1.1.0 // indirect
         github.com/jinzhu/inflection v1.0.0 // indirect
         github.com/jinzhu/now v1.1.5 // indirect
@@ -114,8 +114,8 @@ require (
         github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
         github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
         github.com/sirupsen/logrus v1.9.3 // indirect
-        github.com/tklauser/go-sysconf v0.3.12 // indirect
-        github.com/tklauser/numcpus v0.6.1 // indirect
+        github.com/tklauser/go-sysconf v0.3.15 // indirect
+        github.com/tklauser/numcpus v0.10.0 // indirect
         github.com/x448/float16 v0.8.4 // indirect
         github.com/yusufpapurcu/wmi v1.2.4 // indirect
         go.opencensus.io v0.24.0 // indirect
@@ -139,7 +139,7 @@ require (
         google.golang.org/grpc v1.76.0 // indirect
         google.golang.org/protobuf v1.36.10 // indirect
         gopkg.in/inf.v0 v0.9.1 // indirect
-        gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
+        gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
         gopkg.in/yaml.v2 v2.4.0 // indirect
         gopkg.in/yaml.v3 v3.0.1 // indirect
         gorm.io/gorm v1.25.7 // indirect
