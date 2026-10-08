@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Optional
 
 from chaos_agent.utils.truncation import (
+    TRUNCATION_MARKERS,
+    is_synthetic_message_id,
     build_truncation_notice as _shared_build_notice,
 )
 
@@ -38,6 +40,35 @@ TIME_BASED_MC_GAP_MINUTES = 5.0
 TIME_BASED_MC_KEEP_RECENT = 3
 # Marker replacing cleared tool result content
 CLEARED_MARKER = "[Old tool result content cleared]"
+
+
+def is_compaction_artifact(text: str) -> bool:
+    """True when ``text`` carries a compaction-layer signature — a
+    truncation notice (``TRUNCATION_MARKERS``, tail-appended by this
+    module and the tool-layer safety valve), the quantified elision
+    marker (``... [N chars elided] ...``, strip_large_outputs), or the
+    time-based cleared marker — rather than original tool output.
+
+    Compaction is lossy BY DESIGN (the original bytes live on disk or
+    are regenerable), so a scanner that needs the original verdict must
+    treat an artifact-marked text as UNJUDGEABLE, never as
+    counter-evidence. 2026-09-21 inject-2340dac9: a landed ``partial``
+    assembler receipt (3786B, the restore recipe's full Corefile) fell
+    out of the 5-slot recency window and was head-cut to the 1KB
+    historical budget; the revocation scan then read the stub through
+    ``parse_receipt`` — unparseable → "never landed" → the live
+    attribution was revoked and the task finished with NO
+    injection_method. Same unjudgeable-third-state posture as the
+    budget-expiry-unknown predicate: revocation needs a TRUSTWORTHY
+    verdict, and a stub's bytes are by construction not the receipt's.
+    """
+    if not text:
+        return False
+    return (
+        any(marker in text for marker in TRUNCATION_MARKERS)
+        or " chars elided]" in text
+        or CLEARED_MARKER in text
+    )
 
 
 def is_tool_message(msg) -> bool:
@@ -592,7 +623,7 @@ def build_truncation_notice(
     original_size: int,
     max_bytes: int,
     is_recent: bool,
-    cache_path: str = "",
+    message_id: str | None = None,
 ) -> str:
     """Build a truncation notice with strategy hints.
 
@@ -600,20 +631,56 @@ def build_truncation_notice(
     compact notice for old outputs (1KB budget).
 
     Thin delegation to the shared truncation contract
-    (chaos_agent.utils.truncation): markers, guidance semantics, and
-    cache wordings are preserved verbatim — the shared module is the
-    single home of the notice family (new call sites import from
-    there). The historical variant gains the original size field
-    (three-field invariant skeleton: marker + size + retrieval path).
+    (chaos_agent.utils.truncation): markers and guidance semantics are
+    preserved verbatim — the shared module is the single home of the
+    notice family (new call sites import from there). The historical
+    variant gains the original size field (three-field invariant
+    skeleton: marker + size + a way back).
+
+    The third field is the kind's BUILT-IN guidance, not a cache path.
+    This wrapper used to forward the artifact path as ``retrieve_path``,
+    which printed ``Cache: /Users/<user>/.blade-ai/memory/tool_cache/
+    <8hex>.txt`` into model-visible context. Nothing could legitimately
+    act on it:
+
+    * the artifacts have been write-only since the round-41 bridge
+      retirement, and ``_evict_expired_cache`` legislates that no read
+      path may grow back without re-earning a security review;
+    * the only reachable reader is ``read_file``, whose own cap returns
+      the same truncated head (#13-R: the notice-directed re-read
+      survived 0.3s before re-demotion);
+    * the wording is forgeable — workload stdout can plant an identical
+      ``Cache:`` line (see the recover-side spoofing tests), so a
+      legitimate-looking path in context is indistinguishable from a
+      planted one. Not emitting ours removes the disguise.
+
+    What remained was the cost: the model treated the printed path as a
+    retrieval channel and reconstructed it from memory. inject-6ebf341c
+    turn 22 issued ``read_file /Users/jiangyulin/...`` — the 8-hex
+    filename exact, the home directory invented (that username appears
+    nowhere in the repo or in ``~/.blade-ai``) — and spent a turn on
+    ``Path not found``. A handle the consumer must transcribe is a
+    handle the consumer will get wrong; the writer owns it, so the
+    writer records it (``logger.info`` in ``_cache_to_disk``) where a
+    human or a forensic pass can read it, and the notice carries only
+    guidance the model can actually follow.
+
+    ``message_id`` routes framework-synthesized messages (the
+    ``synthetic:`` prefix — verifier/recover baseline pairs, unanswered
+    placeholders) onto non-replayable guidance: their re-run/re-query
+    directives name a command that never existed, and re-sampling a
+    snapshot observation (e.g. a pre-injection baseline captured before
+    the injection) would mislabel current state as the historical one.
     """
+    non_replayable = is_synthetic_message_id(message_id)
     if is_recent:
         return _shared_build_notice(
             "success-output", original_size // 1024, unit="KB",
-            retrieve_path=cache_path,
+            non_replayable=non_replayable,
         )
     return _shared_build_notice(
         "historical", original_size, unit="bytes",
-        retrieve_path=cache_path,
+        non_replayable=non_replayable,
     )
 
 
@@ -694,7 +761,10 @@ class ToolResultCompactor:
                 f"{cache_path} ({exc!r}); truncating without a retrieval path"
             )
             return ""
-        logger.debug(f"Cached oversized output to {cache_path}")
+        logger.info(
+            f"Cached oversized tool output for task {task_id or '(none)'} "
+            f"at {cache_path} ({len(content)} chars)"
+        )
         self._evict_expired_cache()
         return str(cache_path)
 
@@ -786,10 +856,14 @@ class ToolResultCompactor:
 
             if len(content.encode("utf-8", errors="replace")) > max_bytes:
                 original_size = len(content.encode("utf-8", errors="replace"))
-                cache_path = self._cache_to_disk(content, task_id)
+                # Written for forensics and recorded by the writer's own log
+                # line; the path deliberately does NOT enter the notice (see
+                # build_truncation_notice for the three reasons).
+                self._cache_to_disk(content, task_id)
 
                 notice = build_truncation_notice(
-                    original_size, max_bytes, is_recent, cache_path
+                    original_size, max_bytes, is_recent,
+                    message_id=getattr(msg, "id", None),
                 )
                 notice_bytes = len(notice.encode("utf-8", errors="replace"))
                 truncate_budget = max(max_bytes - notice_bytes, max_bytes // 2)

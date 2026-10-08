@@ -39,7 +39,7 @@ class TestCompactMemoryWithLLM:
 
     async def test_with_previous_summary(self, mock_llm):
         msgs = [MagicMock(content="more context")]
-        result = await compact_memory(msgs, previous_summary="old summary", llm=mock_llm)
+        await compact_memory(msgs, previous_summary="old summary", llm=mock_llm)
         # The prompt should include previous summary
         call_args = mock_llm.ainvoke.call_args[0][0]
         prompt_text = call_args[0].content
@@ -477,7 +477,7 @@ class TestCompactMemoryWithModes:
 
     async def test_base_mode_default(self, mock_llm):
         msgs = [MagicMock(content="test message")]
-        result = await compact_memory(msgs, llm=mock_llm, mode=CompactionMode.BASE)
+        await compact_memory(msgs, llm=mock_llm, mode=CompactionMode.BASE)
         mock_llm.ainvoke.assert_called_once()
         # Verify prompt includes BASE mode content
         call_args = mock_llm.ainvoke.call_args[0][0]
@@ -486,14 +486,14 @@ class TestCompactMemoryWithModes:
 
     async def test_partial_mode_prompt(self, mock_llm):
         msgs = [MagicMock(content="test message")]
-        result = await compact_memory(msgs, llm=mock_llm, mode=CompactionMode.PARTIAL)
+        await compact_memory(msgs, llm=mock_llm, mode=CompactionMode.PARTIAL)
         call_args = mock_llm.ainvoke.call_args[0][0]
         prompt = call_args[0].content
         assert "RECENT portion" in prompt
 
     async def test_up_to_mode_prompt(self, mock_llm):
         msgs = [MagicMock(content="test message")]
-        result = await compact_memory(msgs, llm=mock_llm, mode=CompactionMode.UP_TO)
+        await compact_memory(msgs, llm=mock_llm, mode=CompactionMode.UP_TO)
         call_args = mock_llm.ainvoke.call_args[0][0]
         prompt = call_args[0].content
         assert "continuing session" in prompt
@@ -630,7 +630,6 @@ class TestBuildPostCompactContextWithSkillContent:
 # manual /compact path). Hook-level coverage lives in
 # ``test_hook.py::TestPreReasoningHookForceCompact``.
 # ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------

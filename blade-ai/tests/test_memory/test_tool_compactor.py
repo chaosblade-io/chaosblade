@@ -1,6 +1,7 @@
 """Tests for tool output two-stage truncation."""
 
 import json
+import logging
 import os
 import random
 import time
@@ -20,6 +21,7 @@ from chaos_agent.memory.tool_compactor import (
     truncate_json_at_boundary,
     truncate_text,
 )
+from chaos_agent.utils.truncation import TRUNCATION_CACHE_RE
 
 
 # ---------------------------------------------------------------------------
@@ -301,15 +303,23 @@ class TestToolResultCompactorWithTimeMC:
 
 class TestTruncationNotice:
     """Problem D: a compacted historical notice must steer the model away
-    from acting destructively on output whose structure is no longer visible."""
+    from acting destructively on output whose structure is no longer visible.
+
+    The notice must also NOT advertise the cache artifact's path — see
+    ``build_truncation_notice`` for the three reasons (write-only since the
+    round-41 bridge retirement, a ``read_file`` re-read returns the same
+    capped head per #13-R, and the ``Cache:`` wording is forgeable by
+    workload stdout). inject-6ebf341c measured the cost of advertising it:
+    the model treated the printed path as a retrieval channel and rebuilt it
+    from memory — 8-hex filename exact, home directory invented — burning a
+    turn on ``Path not found``.
+    """
 
     def test_historical_notice_warns_against_destructive_action(self):
         notice = build_truncation_notice(
             original_size=100_000, max_bytes=1024, is_recent=False,
-            cache_path="/tmp/cache/out.txt",
         )
         assert "TRUNCATED" in notice
-        assert "/tmp/cache/out.txt" in notice
         assert "NEVER execute a destructive or structural change" in notice
         # Command-agnostic narrowing directive (not the cache re-read —
         # a re-read returns the full original as a demotable tool
@@ -320,33 +330,135 @@ class TestTruncationNotice:
     def test_recent_notice_keeps_strategy_hints(self):
         notice = build_truncation_notice(
             original_size=100_000, max_bytes=16 * 1024, is_recent=True,
-            cache_path="/tmp/cache/out.txt",
         )
         assert "OUTPUT_TRUNCATED" in notice
         assert "field-selector" in notice
 
     # ── truncation-governance-consistency: three-field invariant ──
-    # Both variants now carry the shared skeleton: marker + original
-    # size + retrieval path (the historical variant gained the size
-    # field when the construction was delegated to the shared module).
+    # Marker + honest original size + a way back. The third field is the
+    # kind's BUILT-IN guidance, not a cache path: no reader exists for the
+    # artifact, so a printed path promises a channel that cannot deliver —
+    # a retrieval field that lies is worse than one pointing at the re-run
+    # the model can actually perform.
 
     def test_historical_notice_three_field_invariant(self):
         notice = build_truncation_notice(
             original_size=100_000, max_bytes=1024, is_recent=False,
-            cache_path="/tmp/cache/out.txt",
         )
         assert "⚠️ TRUNCATED" in notice        # marker family member
         assert "100000 bytes" in notice        # honest original size
-        assert "/tmp/cache/out.txt" in notice  # retrieval path
+        assert "re-run the command that produced it" in notice  # the way back
 
     def test_recent_notice_three_field_invariant(self):
         notice = build_truncation_notice(
             original_size=100_000, max_bytes=16 * 1024, is_recent=True,
-            cache_path="/tmp/cache/out.txt",
         )
         assert "⚠️ OUTPUT_TRUNCATED" in notice
         assert "97KB" in notice                # size in the recent KB convention
-        assert "Full output cached at: /tmp/cache/out.txt" in notice
+        assert "field-selector" in notice      # narrowing strategies = the way back
+
+    def test_no_cache_path_is_advertised_in_any_variant(self):
+        """A path in the notice is an invitation to transcribe it, and a
+        transcribed path is a reconstructed one: the distinctive part comes
+        back exactly while the boilerplate (the home directory) gets
+        regenerated. Nothing here can be acted on, so nothing is printed."""
+        for is_recent in (True, False):
+            notice = build_truncation_notice(
+                original_size=100_000, max_bytes=1024, is_recent=is_recent,
+            )
+            assert TRUNCATION_CACHE_RE.search(notice) is None, is_recent
+            assert "tool_cache" not in notice, is_recent
+
+    def test_writer_logs_the_path_it_no_longer_prints(self, tmp_path, caplog):
+        """Forensics did not vanish with the notice line — it moved to the
+        layer that owns the artifact, where a human or a post-hoc pass reads
+        it and no model is tempted to."""
+        compactor = ToolResultCompactor(cache_dir=tmp_path)
+        with caplog.at_level(
+            logging.INFO, logger="chaos_agent.memory.tool_compactor",
+        ):
+            path = compactor._cache_to_disk("x" * 5000, "task-abc")
+        assert path and Path(path).exists()
+        assert path in caplog.text
+
+    def test_compact_writes_the_artifact_without_printing_it(self, tmp_path):
+        """End-to-end shape: the oversized result is still cached on disk,
+        and the notice the model sees carries no path."""
+        compactor = ToolResultCompactor(cache_dir=tmp_path)
+        ai_msg = MagicMock()
+        ai_msg.type = "ai"
+        ai_msg.additional_kwargs = {}
+        ai_msg.content = "assistant response"
+        tool_msg = MagicMock()
+        tool_msg.type = "tool"
+        tool_msg.id = "call_1"
+        tool_msg.additional_kwargs = {}
+        tool_msg.content = "pod line\n" * 4000
+
+        result = compactor.compact([ai_msg, tool_msg], task_id="task-abc")
+        content = result[-1].content
+        assert "TRUNCATED" in content
+        assert "tool_cache" not in content
+        assert TRUNCATION_CACHE_RE.search(content) is None
+        assert list(tmp_path.glob("*.txt")), "artifact was not written"
+
+
+class TestSyntheticMessageNoticeRouting:
+    """Framework-synthesized messages (``synthetic:`` id prefix — the
+    verifier/recover baseline pairs, the unanswered placeholders) must NOT
+    receive re-run guidance: their "command" never existed, and
+    re-sampling a snapshot observation later would mislabel current state
+    as the historical one (live case inject-3dae7b4f: the compacted
+    baseline pair told the model to re-run a nonexistent command)."""
+
+    def _tool_msg(self, content, msg_id, name="kubectl"):
+        msg = MagicMock()
+        msg.type = "tool"
+        msg.name = name
+        msg.id = msg_id
+        msg.content = content
+        msg.additional_kwargs = {}
+        return msg
+
+    def test_wrapper_routes_synthetic_id_to_non_replayable(self):
+        notice = build_truncation_notice(
+            original_size=100_000, max_bytes=1024, is_recent=False,
+            message_id="synthetic:verifier:baseline:result",
+        )
+        assert "re-run the command" not in notice
+        assert "FRAMEWORK-SYNTHESIZED" in notice
+        # three-field skeleton still intact
+        assert "100000 bytes" in notice
+        assert "read-only history" in notice
+
+    def test_wrapper_keeps_re_run_for_real_tool_ids(self):
+        notice = build_truncation_notice(
+            original_size=100_000, max_bytes=1024, is_recent=False,
+            message_id="call_abc123",
+        )
+        assert "re-run the command that produced it" in notice
+
+    def test_compact_end_to_end_routes_synthetic_baseline_pair(self):
+        # The live shape: the verifier injects the baseline pair; five
+        # newer tool results demote it to the 1KB tier; the notice must
+        # not teach the model to re-run a nonexistent command.
+        compactor = ToolResultCompactor(cache_dir=None)
+        synthetic = self._tool_msg(
+            "x" * 3000, "synthetic:verifier:baseline:result",
+            name="baseline_collector",
+        )
+        newer = [self._tool_msg("ok", f"call_{i}") for i in range(6)]
+        result = compactor.compact([synthetic] + newer, task_id="t")
+        content = result[0].content
+        assert "FRAMEWORK-SYNTHESIZED" in content
+        assert "re-run the command" not in content
+
+    def test_compact_end_to_end_real_tool_keeps_re_run(self):
+        compactor = ToolResultCompactor(cache_dir=None)
+        real = self._tool_msg("x" * 3000, "call_abc123")
+        newer = [self._tool_msg("ok", f"call_{i}") for i in range(6)]
+        result = compactor.compact([real] + newer, task_id="t")
+        assert "re-run the command that produced it" in result[0].content
 
 
 class TestSmartStripStructuralValidity:
@@ -629,12 +741,20 @@ class TestCacheWriteBestEffort:
         assert cached[0].read_text(encoding="utf-8") == raw.replace(
             "\ud800", "?"
         )
-        assert str(cached[0]) in result[0].content  # retrieval path emitted
+        # The artifact exists but its path is NOT advertised: nothing can
+        # legitimately read it back (round-41 write-only; a read_file re-read
+        # returns the same capped head), and a printed path is a handle the
+        # model will reconstruct — inject-6ebf341c got the 8-hex filename
+        # right and invented the home directory.
+        assert str(cached[0]) not in result[0].content
+        assert "tool_cache" not in result[0].content
 
     def test_cache_io_failure_downgrades_to_no_retrieval_path(self, tmp_path):
         """IO family: an unwritable cache_dir must not abort truncation —
-        the notice simply omits the retrieval path (a dead cache path
-        advertised to the model would be worse than none)."""
+        compaction still lands an honest notice within budget. The
+        "no dead path advertised" property this test was written for now
+        holds on BOTH branches (the notice carries no path at all), so the
+        assertion below is the write-failure half of a stronger invariant."""
         blocker = tmp_path / "blocker"
         blocker.write_text("i am a file, not a directory")
         compactor = ToolResultCompactor(cache_dir=blocker / "sub")

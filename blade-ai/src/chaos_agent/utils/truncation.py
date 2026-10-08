@@ -26,6 +26,8 @@ __all__ = [
     "TRUNCATION_MARKERS",
     "TRUNCATION_CACHE_RE",
     "TOOL_OUTPUT_SAFETY_VALVE_BYTES",
+    "SYNTHETIC_MESSAGE_ID_PREFIX",
+    "is_synthetic_message_id",
     "build_truncation_notice",
     "truncate_head_tail",
     "apply_output_safety_valve",
@@ -72,6 +74,31 @@ TRUNCATION_CACHE_RE = re.compile(r"(?:Cache:|Full output cached at:)\s*(\S+)")
 _RETRIEVE_PATH_OMITTED_KINDS = frozenset({"file-content"})
 
 
+# Framework-synthesized message ids all carry this prefix (verifier's
+# baseline pair, recover's baseline pair, resilient_llm's unanswered
+# placeholders). Single-source contract: a message whose id starts with
+# this prefix was NOT produced by a real tool call — there is no command
+# behind it to re-run, narrow, or re-sample. Consumers that phrase
+# retrieval guidance as "re-run the producing command" (the compactor's
+# notices) must consult this predicate first: telling the model to re-run
+# a nonexistent command wastes a turn, and re-sampling a snapshot
+# observation (e.g. a pre-injection baseline) at a later phase mislabels
+# current state as the historical one.
+SYNTHETIC_MESSAGE_ID_PREFIX = "synthetic:"
+
+
+def is_synthetic_message_id(message_id: str | None) -> bool:
+    """True iff ``message_id`` declares a framework-synthesized message.
+
+    See :data:`SYNTHETIC_MESSAGE_ID_PREFIX` for the contract. Tolerates
+    ``None``/non-string (LangGraph ids are optional in places) — an
+    absent id is NOT evidence of synthesis.
+    """
+    return bool(message_id) and str(message_id).startswith(
+        SYNTHETIC_MESSAGE_ID_PREFIX
+    )
+
+
 def build_truncation_notice(
     kind: str,
     original_size: int,
@@ -80,6 +107,7 @@ def build_truncation_notice(
     unit: str = "bytes",
     strategy_hint: str | None = None,
     state_hint: str | None = None,
+    non_replayable: bool = False,
 ) -> str:
     """Build a truncation notice under the shared three-field contract.
 
@@ -121,6 +149,15 @@ def build_truncation_notice(
     optionally, by ``"success-output"`` (replaces the default kubectl
     narrowing strategies when the oversized output is not a kubectl
     query); other kinds carry their guidance natively.
+
+    ``non_replayable`` reroutes the guidance of the two kinds whose
+    retrieval phrasing assumes a REAL tool call (``"success-output"``
+    re-query, ``"historical"`` re-run): set it when the truncated message
+    is framework-synthesized (see
+    :func:`is_synthetic_message_id`) — there is no producing command to
+    re-run, and re-sampling a snapshot observation would mislabel current
+    state as the historical one. The other kinds' guidance never
+    directs a re-run, so the flag is a no-op for them.
     """
     marker = _KIND_MARKER.get(kind)
     if marker is None:
@@ -168,6 +205,17 @@ def build_truncation_notice(
         )
         if retrieve_path:
             notice += f"\nFull output cached at: {retrieve_path}"
+        if non_replayable:
+            # Framework-synthesized snapshot (message id carries the
+            # ``synthetic:`` prefix): there is no query to re-run or
+            # narrow, and re-sampling the observation now would replace
+            # the recorded state with the current one.
+            notice += (
+                "\nThis is a FRAMEWORK-SYNTHESIZED evidence snapshot, not "
+                "a tool result: there is no query to re-run or narrow — "
+                "treat the kept fields above as read-only history."
+            )
+            return notice
         notice += "\nDo NOT repeat the same query!"
         # Guidance follows the CONTENT's lifecycle: the default strategies
         # are the compactor's kubectl narrowing list (preserved verbatim —
@@ -195,6 +243,23 @@ def build_truncation_notice(
         )
         if retrieve_path:
             notice += f" Cache: {retrieve_path}"
+        if non_replayable:
+            # Framework-synthesized snapshot (message id carries the
+            # ``synthetic:`` prefix): there IS no producing command — the
+            # content is a snapshot the framework injected at capture
+            # time. "Re-run the command" is impossible, and re-sampling
+            # the same observation now would mislabel current state as
+            # the historical one (a re-collected "pre-injection" baseline
+            # after the injection is baseline poisoning). The compacted
+            # head is the record; treat it as read-only history.
+            notice += (
+                " This is a FRAMEWORK-SYNTHESIZED evidence snapshot, not a "
+                "tool result: there is no command to re-run, and re-sampling "
+                "the observation now would replace the recorded historical "
+                "state with the current one. Treat the compacted content "
+                "above as read-only history."
+            )
+            return notice
         # Action directive — deliberately command-AGNOSTIC. The
         # producing command is still visible to the model one message
         # up (the tool call this result hangs off), so the notice never

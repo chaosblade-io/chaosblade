@@ -21,6 +21,7 @@ from chaos_agent.utils.truncation import (
     apply_output_safety_valve,
     build_truncation_notice,
     elided_preview,
+    is_synthetic_message_id,
     truncate_head_tail,
 )
 
@@ -369,3 +370,54 @@ class TestStateEvidenceKind:
         be = build_truncation_notice("baseline-evidence", 999, unit="characters")
         assert "side_effects" not in be
         assert "state evidence" not in be  # marker annotations stay distinct
+
+
+class TestSyntheticMessageRouting:
+    """Framework-synthesized messages (``synthetic:`` id prefix) must not
+    receive re-run/re-query guidance: there is no producing command, and
+    re-sampling a snapshot observation would mislabel current state as
+    the historical one (live case inject-3dae7b4f: the compacted baseline
+    pair carried an un-actionable "re-run the command" directive)."""
+
+    def test_predicate_prefix_contract(self):
+        # The three production families all carry the prefix.
+        assert is_synthetic_message_id("synthetic:verifier:baseline:result")
+        assert is_synthetic_message_id("synthetic:recover:baseline:caller")
+        assert is_synthetic_message_id("synthetic:unanswered:tc-1")
+        assert not is_synthetic_message_id("call_abc123")
+        assert not is_synthetic_message_id("synthetic")  # bare word, no colon
+        assert not is_synthetic_message_id("")
+        assert not is_synthetic_message_id(None)
+
+    def test_historical_synthetic_notice_has_no_re_run_directive(self):
+        notice = build_truncation_notice(
+            "historical", 2423, non_replayable=True,
+            retrieve_path="/tmp/tool_cache/ab12.txt",
+        )
+        assert "re-run the command" not in notice
+        assert "FRAMEWORK-SYNTHESIZED" in notice
+        assert "read-only history" in notice
+        # three-field skeleton preserved
+        assert "2423 bytes" in notice
+        assert "Cache: /tmp/tool_cache/ab12.txt" in notice
+
+    def test_historical_real_tool_notice_keeps_re_run_directive(self):
+        notice = build_truncation_notice("historical", 2423)
+        assert "re-run the command that produced it" in notice
+
+    def test_success_output_synthetic_notice_has_no_re_query(self):
+        notice = build_truncation_notice(
+            "success-output", 70_000, non_replayable=True,
+        )
+        assert "Do NOT repeat the same query!" not in notice
+        assert "--field-selector" not in notice
+        assert "jsonpath" not in notice
+        assert "FRAMEWORK-SYNTHESIZED" in notice
+
+    def test_non_replayable_is_noop_for_re_run_free_kinds(self):
+        # error / baseline-evidence guidance never directs a re-run, so
+        # the flag must not change their wording.
+        for kind in ("error", "baseline-evidence"):
+            plain = build_truncation_notice(kind, 70_000)
+            flagged = build_truncation_notice(kind, 70_000, non_replayable=True)
+            assert plain == flagged, kind
