@@ -1,6 +1,7 @@
 """Tests for the error classification hierarchy."""
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from chaos_agent.errors import (
     ChaosAgentError,
@@ -18,7 +19,9 @@ from chaos_agent.errors import (
     ToolGuardError,
     ToolTimeoutError,
     _CLASSIFY_RULES,
+    _DIAGNOSIS_FALLBACK,
     classify_error,
+    extract_llm_diagnosis,
     is_recoverable,
     is_transient,
     should_auto_replan,
@@ -217,13 +220,6 @@ class TestLLMContextOverflowErrorIsReservedNotWired:
 # Tests for extract_llm_diagnosis
 # ---------------------------------------------------------------------------
 
-from chaos_agent.errors import (
-    _DIAGNOSIS_FALLBACK,
-    extract_llm_diagnosis,
-)
-from langchain_core.messages import AIMessage, HumanMessage
-
-
 class TestExtractLlmDiagnosis:
     """Test extract_llm_diagnosis helper."""
 
@@ -273,8 +269,6 @@ class TestExtractLlmDiagnosis:
         )
         result = extract_llm_diagnosis([msg])
         assert "Content diagnosis" in result
-
-
 
 
 class TestShouldAutoReplan:

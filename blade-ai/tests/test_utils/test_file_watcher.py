@@ -11,12 +11,9 @@ facade tests when they exercise their respective registries end-to-end.
 from __future__ import annotations
 
 import logging
-import sys
-import threading
 import time
 from pathlib import Path
 
-import pytest
 
 from chaos_agent.utils.file_watcher import FileSystemWatcher, WatchSpec
 

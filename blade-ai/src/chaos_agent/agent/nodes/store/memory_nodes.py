@@ -30,7 +30,6 @@ async def load_memory(state: AgentState) -> dict:
     from Layer 3 (Operational Memory) to the agent.
     """
     task_id = state.get("task_id", "") or ""
-    working_dir = settings.working_dir
     memory_dir = settings.resolved_memory_dir
     # Wipe per-turn transient fields that should NOT bleed across turns
     # via the LangGraph checkpoint. ``approved_target`` is the most

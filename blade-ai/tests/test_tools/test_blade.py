@@ -642,7 +642,6 @@ class TestBladeCreateUncertainMarker:
 
     def _patch_transport(self, mocker, side_effect=None, return_value=None):
         import chaos_agent.agent.providers.chaosblade.cli as blade_mod
-        from chaos_agent.tools.guard import CommandResult
         mocker.patch.object(blade_mod, "_get_blade_path", return_value="blade")
 
         if side_effect is not None:

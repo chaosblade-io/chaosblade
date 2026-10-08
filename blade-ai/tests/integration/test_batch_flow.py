@@ -14,15 +14,11 @@ with lightweight stubs. The test verifies:
   5. State isolation: messages cleared between faults
 """
 
-import asyncio
-from typing import Optional
-from unittest.mock import patch
 
 import pytest
-from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command, interrupt
 
 from chaos_agent.agent.nodes.batch.batch_next import batch_next
@@ -31,7 +27,7 @@ from chaos_agent.agent.router import (
     route_after_batch_next,
     route_after_save_memory,
 )
-from chaos_agent.agent.state import AgentState, infer_task_state
+from chaos_agent.agent.state import AgentState
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +42,6 @@ _DEFAULT_FAULTS = [
     {"scope": "pod", "target": "network", "action": "delay",
      "namespace": "test-ns", "names": ["pod-c"]},
 ]
-
 
 
 async def stub_agent_loop(state: AgentState) -> dict:

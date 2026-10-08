@@ -114,7 +114,7 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.post = AsyncMock(return_value={"code": 0})
 
-        result = await client.inject(scope="pod", target="pod", action="delete", target_name="my-pod", namespace="default")
+        await client.inject(scope="pod", target="pod", action="delete", target_name="my-pod", namespace="default")
         client.post.assert_called_once()
         call_args = client.post.call_args
         assert call_args[0][0] == "/api/v1/inject"
@@ -173,7 +173,7 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.get = AsyncMock(return_value={"code": 0})
 
-        result = await client.metric(task_id="task-123")
+        await client.metric(task_id="task-123")
         client.get.assert_called_once_with("/api/v1/metric/task-123")
 
     @pytest.mark.asyncio
@@ -181,7 +181,7 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.get = AsyncMock(return_value={"code": 0})
 
-        result = await client.metric()
+        await client.metric()
         client.get.assert_called_once_with("/api/v1/metric")
 
     @pytest.mark.asyncio
@@ -189,7 +189,7 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.get = AsyncMock(return_value={"code": 0})
 
-        result = await client.metric(task_id="task-123")
+        await client.metric(task_id="task-123")
         client.get.assert_called_once_with("/api/v1/metric/task-123")
 
     @pytest.mark.asyncio
@@ -197,7 +197,7 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.get = AsyncMock(return_value={"code": 0})
 
-        result = await client.list_skills()
+        await client.list_skills()
         client.get.assert_called_once()
 
     @pytest.mark.asyncio
@@ -205,7 +205,7 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.post = AsyncMock(return_value={"code": 0})
 
-        result = await client.confirm(task_id="task-123", action="approve")
+        await client.confirm(task_id="task-123", action="approve")
         client.post.assert_called_once()
 
     @pytest.mark.asyncio
@@ -213,7 +213,7 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.get = AsyncMock(return_value={"code": 0})
 
-        result = await client.health()
+        await client.health()
         client.get.assert_called_once_with("/api/v1/health")
 
     @pytest.mark.asyncio
@@ -221,5 +221,5 @@ class TestAgentClientConvenience:
         client = AgentClient(base_url="http://localhost:8089")
         client.get = AsyncMock(return_value={"code": 0})
 
-        result = await client.version()
+        await client.version()
         client.get.assert_called_once_with("/api/v1/version")

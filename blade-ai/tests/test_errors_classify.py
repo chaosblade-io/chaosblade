@@ -6,7 +6,6 @@ it on top of :func:`classify_error`. Both APIs are exercised here.
 
 from __future__ import annotations
 
-import pytest
 
 from chaos_agent.errors import (
     ErrorAction,

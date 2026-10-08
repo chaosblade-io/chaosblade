@@ -260,8 +260,6 @@ class TestAuxLlmCallAudit:
         assert all(ids) and len(set(ids)) == len(ids)
 
 
-
-
 class TestHasActive:
     """``has_active`` is the public read of the in-memory active set.
 
@@ -532,7 +530,7 @@ class TestAppendOnly:
                 "task-lines", {"type": "human", "content": f"msg-{i}"}
             )
         jsonl_text = (task_dir / "task-lines.jsonl").read_text()
-        lines = [l for l in jsonl_text.strip().split("\n") if l.strip()]
+        lines = [line for line in jsonl_text.strip().split("\n") if line.strip()]
         assert len(lines) == 3
 
     def test_snapshot_unchanged_on_append(self, store, task_dir):
@@ -1217,7 +1215,6 @@ class TestBugBCounter:
         # Now counter is at threshold OR has been reset by compact.
         # Patch unlink to fail on .jsonl.compacted cleanup path so
         # counter-reset short-circuits.
-        original_unlink = type(store._compacted_path("x")).unlink
         def _fail(self, *a, **kw):
             raise OSError("simulated")
         # Force a fresh compact attempt and have its cleanup fail.

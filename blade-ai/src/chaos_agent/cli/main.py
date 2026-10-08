@@ -1,5 +1,8 @@
 """CLI entry point: Typer app with all commands registered."""
 
+# ruff: noqa: E402 — the imports below MUST follow the warning filter
+# installed in this block (it has to run before langchain_core/pydantic
+# get imported); hoisting them would defeat the suppression.
 import os
 import shutil
 import sys

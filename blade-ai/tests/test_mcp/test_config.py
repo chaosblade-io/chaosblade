@@ -1,13 +1,11 @@
 """Tests for chaos_agent.mcp.config — mcp.json parsing + validation."""
 
 import json
-from pathlib import Path
 
 import pytest
 
 from chaos_agent.mcp.config import (
     McpConfigError,
-    McpServerConfig,
     _interpolate,
     load_mcp_config,
 )

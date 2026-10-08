@@ -7,10 +7,8 @@ import time
 import pytest
 
 from chaos_agent.agent.attempt_tracker import (
-    REASON_GRAPH_REPLAN,
     REASON_INITIAL,
     REASON_LLM_TARGET_SWITCH,
-    REASON_USER_RERUN,
     begin_attempt,
     detect_target_switch,
     end_attempt,
