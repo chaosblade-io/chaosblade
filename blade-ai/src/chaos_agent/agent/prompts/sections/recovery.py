@@ -83,7 +83,7 @@ def get_recover_skill_priority_section() -> str:
     framework.
     """
     return f"""### Skill Use-Case Priority
-If a skill use-case is provided in the instructions, treat its **恢复验证** section
+If a skill use-case is provided in the instructions, treat its `## 恢复验证` section
 as the PRIMARY evidence contract. Prefer its methods when available; when an
 equivalent observation is needed, record the deviation and why it proves the
 same recovery requirement. Never silently omit an evidence requirement.

@@ -182,6 +182,30 @@ class TestSectionFunctions:
         assert "verification work" in section
         assert "skip it" in section
 
+    def test_execution_directives_behavioral_probe_obligation(self):
+        # Live case inject-3dae7b4f: the executor obeyed "then STOP" over
+        # the red line (行为判据未采集不得结束执行段 — SKILL.md 生效确认
+        # 硬门禁) and finished 46s before the verifier's first behavioral
+        # probe, surviving only on fault-window slack. The watching bans
+        # keep their carve (9bf2dddd / 3a745506 anchors above); the ONE
+        # probe that makes effect-evidence survival deterministic is now
+        # an explicit pre-finish obligation.
+        section = get_execution_directives_section()
+        # Line-wrapping in the source strings breaks raw substring matches,
+        # so the assertions run on the whitespace-normalised text (the same
+        # trick test_planned_wait_step_exemption uses).
+        flat = " ".join(section.split())
+        # (1) the ban is narrowed: repeated watching, not the single probe
+        assert "That ban targets repeated watching" in flat
+        assert "the single behavioral probe" in flat
+        # (2) red-line substance: window mortality + mechanism cannot
+        # substitute for effect evidence
+        assert "effect evidence dies with the fault window" in flat
+        assert "mechanism readback (rules/spec confirmed) cannot" in flat
+        assert "substitute for it" in flat
+        # (3) STOP is conditional on the probe being in hand
+        assert "With the probe in hand and the LAST mutation step" in flat
+
     def test_verification_heuristics_encodes_timeout_discipline(self):
         # Postmortem lesson (task-e951696f) generalized: a timeout/failed
         # observation is never proof of success, and partial coverage must not
@@ -826,13 +850,37 @@ class TestExecutorEffectObservationBoundary:
         # concept); the STOP rule stays step-aware ("ALL steps"), so
         # multi-step / hybrid injections never stop after the first receipt.
         assert "A step is complete when its mutation is ISSUED" in section
-        assert "When ALL steps are issued, STOP" in section
-        assert "do not wait for, sample, or stabilize the fault effect" in section
+        assert "When ALL steps are issued" in section
+        # 2026-09-22 M1 fix (r68 review, live r43): STOP is conditioned on
+        # the ONE behavioral probe — this primacy-zone bullet must agree
+        # with the execution directives' carve instead of competing with
+        # them (the old unconditional "When ALL steps are issued, STOP" +
+        # ban is what the live model quoted: "STOP, don't sample the
+        # effect"). The three verbs keep their force, but only BEYOND that
+        # probe — repeated watching stays banned, the single probe is owed.
+        assert (
+            "When ALL steps are issued and the one behavioral probe of the "
+            "fault's user-visible effect is in hand, STOP" in section
+        )
+        assert (
+            "beyond that probe, do not wait for, sample, or stabilize the "
+            "fault effect" in section
+        )
         # the replan channel is named so the right-to-switch-method survives
         assert "returns to you through replan" in section
         # (The REMEMBER twin of this test is gone with the 2026-09-20
         # execute cleanup — the executor mirror was removed; recency rides
         # the message tail, so this primacy carrier is the rule's only one.)
+
+    def test_finish_execution_action_carries_probe_condition(self):
+        # M1 (same ruling): the finish_execution ACTION bullet taught the
+        # unconditional declare trigger "When ALL steps are issued" — a
+        # second hole the model could finish through, bypassing the probe.
+        section = get_executor_core_principles_section()
+        assert (
+            "When ALL steps are issued and the one behavioral probe is in "
+            "hand, declare it by calling `finish_execution`" in section
+        )
 
     def test_receipt_authority_wording_not_eroded(self):
         # The old phrasing taught the model that its receipt cannot be

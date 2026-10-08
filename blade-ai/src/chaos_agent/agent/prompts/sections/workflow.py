@@ -100,13 +100,24 @@ _EXECUTOR_PRINCIPLES: tuple[str, ...] = (
     # receipt/trace/effect triad: exit on receipt; effect observation
     # belongs to verification, a missing effect flows back via replan.
     # Wording frozen by tests/test_agent/test_prompts.py (receipt authority).
-    "A step is complete when its mutation is ISSUED — the receipt (experiment handle or success status; lacking one, a single check that the mutated object is in place) is sufficient proof. When ALL steps are issued, STOP — do not wait for, sample, or stabilize the fault effect: verification is automatic, and a missing effect returns to you through replan",
+    # 2026-09-22 M1 fix (r68 review, live case inject-3dae7b4f/r43): this
+    # primacy-zone bullet kept an UNCONDITIONAL "STOP + do not sample"
+    # while the execution-directives rewrite (same date) conditioned STOP
+    # on the behavioral probe — two competing exit rules in one prompt,
+    # and the live model's "Per the directives: STOP, don't sample the
+    # effect" quoted this bullet's verbs. Same carve as the directives:
+    # the ban targets repeated watching; the ONE behavioral probe
+    # precedes STOP (effect evidence dies with the fault window).
+    "A step is complete when its mutation is ISSUED — the receipt (experiment handle or success status; lacking one, a single check that the mutated object is in place) is sufficient proof. When ALL steps are issued and the one behavioral probe of the fault's user-visible effect is in hand, STOP — beyond that probe, do not wait for, sample, or stabilize the fault effect: verification is automatic, and a missing effect returns to you through replan",
     # The STOP rule's ACTION (#39 third-retest tail tension): "STOP" alone
     # read as "output a text conclusion", which the stall guard answered
     # with EXECUTION REQUIRED — the model then burned rounds alternating
     # text and redundant read-only probes, pressured toward out-of-authority
     # actions. The clean exit is a TOOL CALL the harness recognises.
-    "When ALL steps are issued, declare it by calling `finish_execution` with a 1-3 sentence summary — that is the STOP action; a text-only conclusion is not an exit, and verification starts automatically after the call",
+    # (2026-09-22 M1 fix, same ruling as the receipt bullet above: the
+    # declare trigger carries the same behavioral-probe condition so this
+    # ACTION bullet cannot re-open the unconditional-exit hole.)
+    "When ALL steps are issued and the one behavioral probe is in hand, declare it by calling `finish_execution` with a 1-3 sentence summary — that is the STOP action; a text-only conclusion is not an exit, and verification starts automatically after the call",
     # Residue cleanup before switching + method-switch discipline; the
     # safety guard, not the doc, arbitrates danger. Wording frozen by
     # tests/test_agent/test_factory.py (partial-failure cleanup guidance).
@@ -219,7 +230,7 @@ def get_workflow_section() -> str:
     side. Intent-side capability exploration is now covered only by the
     loop budget — accepted residual.
     """
-    return f"""## Workflow
+    return """## Workflow
 You operate in TWO phases — the system transitions automatically.
 
 ### Phase 1 (current): Planning — read-only by enforcement
