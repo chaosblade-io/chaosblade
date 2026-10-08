@@ -216,7 +216,19 @@ class TestExtractToolMetrics:
 
     def test_multiple_tool_messages_each_processed(self):
         ai1 = _ai_with_tool_call("tc-1", "kubectl", {"v_args": "describe pod x"})
-        tm1 = _tool_msg("tc-1", "Restart Count: 7\nReady             True\n")
+        # Shape-faithful describe: the pod-metric extractor is
+        # section-aware (2026-09-22, live case inject-3dae7b4f — see
+        # _parse_describe_pod), so Restart Count needs its Containers:
+        # section header present to be extracted (a headerless fragment
+        # now fails closed).
+        tm1 = _tool_msg(
+            "tc-1",
+            "Containers:\n"
+            "  main:\n"
+            "    Restart Count: 7\n"
+            "Conditions:\n"
+            "  Ready             True\n",
+        )
         ai2 = _ai_with_tool_call("tc-2", "kubectl", {"v_args": "exec x -- df -h"})
         tm2 = _tool_msg("tc-2",
             "Filesystem      Size  Used Avail Use% Mounted on\n"
@@ -305,9 +317,14 @@ class TestExtractToolMetrics:
         # ``truncate_text`` (1KB) must not lose the summary. Simulate
         # with a 5KB raw output that gets head-truncated to 1KB.
         ai = _ai_with_tool_call("tc-1", "kubectl", {"v_args": "describe pod x"})
+        # Section-aware extractor (see _parse_describe_pod): the header
+        # lines keep the filler inside the business section so Restart
+        # Count still extracts; the truncation-survival point is
+        # unchanged (summary prepended before the 1KB head cut).
         raw = (
-            "Restart Count: 8\n"
-            "Ready             True\n"
+            "Containers:\n"
+            "  main:\n"
+            "    Restart Count: 8\n"
             + "padding line\n" * 500  # ~5KB of filler
         )
         tm = _tool_msg("tc-1", raw)
