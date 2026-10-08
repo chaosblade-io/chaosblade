@@ -260,6 +260,10 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     # count answers "how often have I corrected THIS run", so carrying it
     # into the next fault would open with "reminder #21" on a clean slate.
     _p("hint_repeat_counts", "loop_control", batch={}, recover={}),
+    # Reset alongside the counter it dedups for: it records which errors THIS
+    # run has already been corrected about, so carrying it into the next fault
+    # would suppress the new fault's first hint as "already answered".
+    _p("hinted_error_calls", "loop_control", batch={}, recover={}),
     _p("pipeline_started_at", "loop_control", batch=0.0, recover=0.0),
     _p("transient_retry_count", "loop_control", batch=0, recover=0),
     _p("pipeline_attempt", "loop_control", batch=0, recover=0),
@@ -282,13 +286,10 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("issue_report", "outcome", batch=None, recover=None),
     _p("created_at", "outcome", durable=True),
     _p("finished_at", "outcome", durable=True, batch=None, recover=None),
+    # Issued stamp — doubles as the fault-window hold's window origin
+    # (hold-reanchor-recovery-grace). Cleared at replan seams by
+    # reset_attribution_state together with its attribution siblings.
     _p("injection_start_time", "outcome", durable=True, batch=None),
-    # Fault-window hold origin (verifier-entry stamp = execute-loop end).
-    # Same lifecycle as its attribution sibling: durable within an operation,
-    # reset per batch fault, cleared at replan seams by
-    # reset_attribution_state (NOT by these policies — the replan seam is
-    # the only re-arm channel).
-    _p("injection_window_start_time", "outcome", durable=True, batch=None),
 
     # ── Memory ─────────────────────────────────────────────────────
     _p("compressed_summary", "memory", durable=True, batch=None),
