@@ -47,6 +47,130 @@ class TestBuildSkillTools:
         })
         assert result is not None
 
+    def test_read_skill_resource_wrapper_is_stage_agnostic(self, mock_registry):
+        # The wrapper text outlives the planning turn (skill_case_content
+        # re-quotes it to the verifier and the recover loop), so it must
+        # not hard-code the planning standpoint: the old "In Phase 1
+        # (current) … DO NOT execute them yourself in this phase" was
+        # true for planning and actively wrong for verification, whose
+        # whole job is running the check commands (live case
+        # inject-3dae7b4f: the Phase-1 preamble reached the verify
+        # prompt). The anti-pre-empt guard survives, phase-relative.
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "scripts/verify.py",
+        })
+        assert "[Skill resource — SCENARIO PLAYBOOK]" in result
+        assert "never pre-empt" in result
+        # No frozen stage self-reference in the wrapper.
+        assert "Phase 1 (current)" not in result
+        assert "DO NOT execute them yourself in this phase" not in result
+
+    def test_read_skill_resource_did_you_mean_typo(self, mock_registry):
+        # A5: a near-miss path names its closest candidate up front — the
+        # model corrects in ONE round instead of re-reading the listing.
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "references/troubleshootng.md",
+        })
+        assert result.startswith("Error:")
+        assert "Did you mean:" in result
+        assert "- references/troubleshooting.md" in result
+        # the full listing stays (fallback when the hint misses)
+        assert "Available resources:" in result
+
+    def test_read_skill_resource_resolves_unique_basename(self, mock_registry):
+        # The dropped-directory shape ("verify.py" for "scripts/verify.py"):
+        # the registry owns the namespace and there is exactly one answer, so
+        # the program closes the gap instead of returning an ERROR that costs
+        # a turn. The same mistake is recorded twice in live runs
+        # (inject-6e14c7d2, inject-6ebf341c idx=52 asked for
+        # "references/recovery-carrier.md" when the skill holds
+        # "references/carrier/recovery-carrier.md") — a model that read a path
+        # once compresses it and drops a level, and re-transcribing is the
+        # soft-constraint side of the same contract.
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "verify.py",
+        })
+        assert not result.startswith("Error:")
+        assert "print('verify')" in result
+        # Announced, not silent: the model must learn the real path rather
+        # than keep using one that does not exist.
+        assert "[Path resolved]" in result
+        assert "scripts/verify.py" in result
+        # The playbook wrapper still applies to resolved reads.
+        assert "[Skill resource — SCENARIO PLAYBOOK]" in result
+
+    def test_read_skill_resource_exact_path_gets_no_resolution_note(
+        self, mock_registry,
+    ):
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "scripts/verify.py",
+        })
+        assert "print('verify')" in result
+        assert "[Path resolved]" not in result
+
+    def test_read_skill_resource_ambiguous_basename_still_errors(
+        self, mock_registry, tmp_skills_dir,
+    ):
+        # Uniqueness is the whole licence to resolve: two resources sharing a
+        # filename is a real collision, and guessing would serve the wrong
+        # playbook — a silent wrong answer is worse than a turn spent asking.
+        (tmp_skills_dir / "test-skill" / "references" / "verify.py").write_text(
+            "print('other verify')", encoding="utf-8",
+        )
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "verify.py",
+        })
+        assert result.startswith("Error:")
+        assert "Did you mean:" in result
+        assert "- scripts/verify.py" in result
+        assert "- references/verify.py" in result
+
+    def test_read_skill_resource_no_hint_when_unrelated(self, mock_registry):
+        # A path sharing nothing with any resource gets no did-you-mean
+        # (a bogus hint is worse than none) — just the full listing.
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "zzz/qqq.xyz",
+        })
+        assert result.startswith("Error:")
+        assert "Did you mean:" not in result
+        assert "Available resources:" in result
+
     def test_activate_skill_has_description(self, mock_registry):
         """activate_skill tool should have a docstring/description."""
         tools = _build_skill_tools(mock_registry)

@@ -1,5 +1,6 @@
 """Agent factory: creates compiled graphs with checkpointer and tools."""
 
+import difflib
 import logging
 from dataclasses import dataclass
 
@@ -585,6 +586,45 @@ def with_thinking_disabled(llm):
     return llm.model_copy(update={"extra_body": _payload})
 
 
+def _resolve_unique_basename(
+    registry: SkillRegistry, skill_name: str, resource_path: str,
+) -> str | None:
+    """Resolve a near-miss resource path to its unique basename match.
+
+    Returns the resolved path when EXACTLY ONE resource in the skill carries
+    the requested filename; ``None`` otherwise (no match, several matches, or
+    an unreadable registry), which leaves the caller's error path in charge.
+
+    The registry owns the resource namespace, so closing the last step of a
+    near-miss path is the program's job, not the model's. The tool already
+    computed this answer for its did-you-mean list and then handed it back as
+    an ERROR, which cost a turn on a question the program had settled — the
+    same mistake is recorded in two runs (inject-6e14c7d2 as a planning
+    detour, inject-6ebf341c again at message 52), because a model that read a
+    path once compresses it and drops a directory level
+    (``references/recovery-carrier.md`` for
+    ``references/carrier/recovery-carrier.md``). Asking the model to
+    re-transcribe is the soft-constraint side of the same contract; resolving
+    in the owner layer is the enforced side.
+
+    Ambiguity is never guessed: two resources sharing a filename is a real
+    collision and the caller must show both.
+    """
+    try:
+        available = registry.list_resources(skill_name)
+    except Exception:
+        # Not activated, missing dir, unreadable — the caller's own handlers
+        # produce a more precise message than a resolution attempt could.
+        return None
+    base = str(resource_path).rsplit("/", 1)[-1]
+    if not base:
+        return None
+    matches = [
+        r for r in (available or []) if r.rsplit("/", 1)[-1] == base
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _build_skill_tools(registry: SkillRegistry):
     """Build skill-related tools with dynamic catalog from registry."""
     from langchain_core.tools import tool as lc_tool
@@ -623,7 +663,9 @@ def _build_skill_tools(registry: SkillRegistry):
 
     @lc_tool
     def read_skill_resource(skill_name: str, resource_path: str) -> str:
-        """Phase 1 / Phase 2 read-only. Read a resource file from a skill.
+        """Read-only, any read-capable phase (clarification / planning /
+        verifier / recover-verifier — NOT bound in execution). Read a
+        resource file from a skill.
 
         **PREREQUISITE**: You MUST call `activate_skill` first. This tool
         only works on an already-activated skill. If you haven't activated
@@ -631,9 +673,9 @@ def _build_skill_tools(registry: SkillRegistry):
         before activation.
 
         Templates inside (blade/kubectl command snippets) are EXECUTION
-        templates Phase 2 runs automatically — do NOT execute them yourself
-        in Phase 1. Use them to understand WHAT will happen and decide IF
-        the plan is safe.
+        templates the EXECUTOR runs after the plan is approved — do NOT
+        execute them yourself in a read-only phase. Use them to
+        understand WHAT will happen and decide IF the plan is safe.
 
         When to use:
           - You need a reference (commands.md, examples.yaml, ...) bundled
@@ -656,36 +698,85 @@ def _build_skill_tools(registry: SkillRegistry):
           - Skill must be activated first (activate_skill); otherwise returns
             "Skill not found" error.
         """
+        # Resolve a near-miss path in the owner layer before reading, so a
+        # dropped directory level costs nothing instead of a turn (see
+        # _resolve_unique_basename). Announced in the result: the model must
+        # learn the real path, not silently receive content for a path that
+        # does not exist.
+        resolution_note = ""
+        _resolved = _resolve_unique_basename(registry, skill_name, resource_path)
+        if _resolved and _resolved != resource_path:
+            resolution_note = (
+                f"[Path resolved] '{resource_path}' does not exist in skill "
+                f"'{skill_name}'; '{_resolved}' is the only resource with that "
+                f"filename, so it was read instead. Use the resolved path in "
+                f"any later call.\n\n"
+            )
+            resource_path = _resolved
         try:
             result = registry.read_resource(skill_name, resource_path)
             if not result or not result.strip():
                 return f"Resource '{resource_path}' in skill '{skill_name}' is empty or contains no content."
-            # Phase-aware wrapper. Every skill use-case markdown contains
+            # Stage-agnostic wrapper. Every skill use-case markdown contains
             # `blade create k8s pod-cpu fullload ...` style EXECUTION
-            # TEMPLATES that Phase 2 runs automatically. Without this
-            # header, an LLM in Phase 1 reading a template tends to
-            # mimic it via whatever tools it has (kubectl exec ... blade
-            # create) — caught in task-ce9647931ce1 where the LLM read
-            # Pod_CPU_应用资源争抢.md, saw the blade-create template, and
-            # immediately ran the equivalent via kubectl exec. The header
-            # sets the right frame ("this is a recipe you're reading,
-            # not following") so the LLM treats the commands as plan
-            # input rather than imperatives.
+            # TEMPLATES. Without this header, an LLM reading a template
+            # tends to mimic it via whatever tools it has (kubectl exec
+            # ... blade create) — caught in task-ce9647931ce1 where the
+            # LLM read Pod_CPU_应用资源争抢.md, saw the blade-create
+            # template, and immediately ran the equivalent via kubectl
+            # exec. The header sets the right frame ("this is a recipe
+            # you're reading, not following") so the LLM treats the
+            # commands as reference rather than imperatives.
+            # Stage-AGNOSTIC on purpose: the wrapped text outlives the
+            # planning turn (the tool result flows into state via
+            # skill_case_content and is re-quoted by the verifier and the
+            # recover loop). An earlier wording hard-coded "In Phase 1
+            # (current) … DO NOT execute them yourself in this phase" —
+            # true for planning, actively WRONG for verification, whose
+            # whole job is running the check commands. The guard that
+            # matters is phase-relative: injection commands never run
+            # before an approved plan, at ANY stage; check commands adapt
+            # to the current stage. The tool docstring keeps the
+            # planning-specific warning for the CALLING decision.
             wrapped = (
-                "[Skill resource — REFERENCE for planning]\n"
-                "The injection / verification commands shown below are\n"
-                "EXECUTION TEMPLATES that Phase 2 will run automatically\n"
-                "once your plan is approved. In Phase 1 (current), use them\n"
-                "to understand WHAT will happen and decide IF the plan is\n"
-                "safe. DO NOT execute them yourself in this phase.\n"
+                "[Skill resource — SCENARIO PLAYBOOK]\n"
+                "The commands below are the skill's playbook. The\n"
+                "injection commands run only in the execution phase,\n"
+                "after an approved plan — never pre-empt them on your\n"
+                "own initiative. The verification commands describe how\n"
+                "the scenario is meant to be checked. Treat both as\n"
+                "reference: adapt to the current stage and target rather\n"
+                "than copying verbatim.\n"
                 "─────────────────────────────────────────────────────\n\n"
                 f"{result}"
             )
-            return wrapped
+            return resolution_note + wrapped
         except FileNotFoundError:
             available = registry.list_resources(skill_name)
             available_str = "\n".join(f"  - {r}" for r in available) if available else "  (none found)"
-            return f"Error: Resource '{resource_path}' not found in skill '{skill_name}'.\nAvailable resources:\n{available_str}"
+            # A5 did-you-mean: a near-miss path (typo, dropped directory
+            # segment) gets its closest candidates named up front — the
+            # model corrects in ONE round instead of re-reading the full
+            # listing and re-guessing. Basename fallback covers the
+            # common "commands.md" for "references/commands.md" shape.
+            matches = difflib.get_close_matches(
+                resource_path, available, n=2, cutoff=0.6,
+            ) if available else []
+            if not matches:
+                _base = str(resource_path).rsplit("/", 1)[-1]
+                matches = [
+                    r for r in available
+                    if r.rsplit("/", 1)[-1] == _base
+                ][:2]
+            hint = (
+                "Did you mean:\n"
+                + "\n".join(f"  - {m}" for m in matches)
+                + "\n"
+            ) if matches else ""
+            return (
+                f"Error: Resource '{resource_path}' not found in skill "
+                f"'{skill_name}'.\n{hint}Available resources:\n{available_str}"
+            )
         except KeyError:
             return f"Error: Skill '{skill_name}' not found. Activate it first with activate_skill."
         except Exception as e:

@@ -51,7 +51,7 @@ class TestSkillLoadingFlow:
         assert "test-skill" in skills
 
         # But instructions should not be loaded yet
-        skill = registry.get_skill("test-skill")
+        registry.get_skill("test-skill")
         # Instructions loaded lazily on activate
 
         # Activate should load instructions

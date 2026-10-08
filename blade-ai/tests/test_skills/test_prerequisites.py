@@ -48,7 +48,7 @@ class TestPrerequisitesCheckToolVersion:
 
     async def test_tool_available(self, mocker):
         mocker.patch("shutil.which", return_value="/usr/bin/blade")
-        mock_run = mocker.patch(
+        mocker.patch(
             "chaos_agent.skills.prerequisites.run_command",
             new_callable=AsyncMock,
             return_value=CommandResult(
