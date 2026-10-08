@@ -9,12 +9,21 @@ import pytest
 from chaos_agent.skills.catalog_generator import (
     _content_fingerprint,
     _dir_fingerprint,
+    _extract_fault_symptom,
     _generate_from_catalogue,
     _parse_llm_json,
     build_nl_cmd,
     generate_skill_catalog,
     infer_blade_params,
     infer_scope,
+)
+
+_SKILLS_ROOT = Path(__file__).resolve().parents[2] / "skills"
+_REAL_CASES = sorted(_SKILLS_ROOT.glob("*/references/catalogue/**/*.md"))
+_CATALOGUE_DIRS = sorted(
+    (d / "references" / "catalogue")
+    for d in _SKILLS_ROOT.iterdir()
+    if (d / "references" / "catalogue").is_dir()
 )
 
 
@@ -440,3 +449,69 @@ class TestGenerateFromCatalogueIntegration:
         assert result and len(result) == 1
         uc = result[0]
         assert "命名空间为<namespace>" in uc["example_cmd"]
+
+
+class TestExtractFaultSymptom:
+    """_extract_fault_symptom 回归——迁移打断的「第 8 个抽取器」。
+
+    历史缺陷：它用独立硬正则匹配加粗标记 ``**故障现象**``（不走单源
+    skill_case_section），bold→markdown 迁移后对全语料返回空
+    （95/95 → 0/95），fault_symptom 字段全空回落占位符；而满绿套件无一
+    变红——旧 fixture 用旧加粗形态、且从不断言 fault_symptom。
+    """
+
+    def test_md_heading_form(self, tmp_path):
+        # 迁移后的 ## 主形态——历史缺陷形态（旧硬正则在此返回空）
+        f = tmp_path / "case.md"
+        f.write_text(
+            "## 故障现象\n\n1. 主机 CPU 持续超过 90%\n2. Load 升高\n",
+            encoding="utf-8",
+        )
+        assert _extract_fault_symptom(f) == "主机 CPU 持续超过 90%"
+
+    def test_legacy_bold_form(self, tmp_path):
+        # legacy 加粗形态（第三方旧技能）仍须兼容——双形态
+        f = tmp_path / "case.md"
+        f.write_text("**故障现象**：\n1. OOM Killed\n", encoding="utf-8")
+        assert _extract_fault_symptom(f) == "OOM Killed"
+
+    def test_same_line_content(self, tmp_path):
+        # 同行内容下移后的首行纯文本（无列表标记）
+        f = tmp_path / "case.md"
+        f.write_text("## 故障现象\n节点持续不可达\n", encoding="utf-8")
+        assert _extract_fault_symptom(f) == "节点持续不可达"
+
+    def test_bullet_form(self, tmp_path):
+        f = tmp_path / "case.md"
+        f.write_text("## 故障现象\n- 内存占用持续增长\n", encoding="utf-8")
+        assert _extract_fault_symptom(f) == "内存占用持续增长"
+
+    def test_no_section_returns_empty(self, tmp_path):
+        f = tmp_path / "case.md"
+        f.write_text("## 演练步骤\n步骤\n", encoding="utf-8")
+        assert _extract_fault_symptom(f) == ""
+
+
+@pytest.mark.skipif(not _REAL_CASES, reason="语料不在测试环境")
+class TestExtractFaultSymptomRealCorpus:
+    """真实语料端到端非空率——关键抽取器必须在真实语料断言非空率，不能
+    只测合成 fixture（这正是历史回归满绿不可见的根因）。"""
+
+    def test_fault_symptom_nonempty_rate(self):
+        # 迁移后全语料 fault_symptom 必须 95/95 非空（历史缺陷：0/95）
+        empty = [p for p in _REAL_CASES if not _extract_fault_symptom(p)]
+        assert not empty, (
+            f"fault_symptom 空返回 {len(empty)}/{len(_REAL_CASES)}："
+            f"{[p.name for p in empty][:5]}"
+        )
+
+    def test_generate_from_catalogue_fills_symptom(self):
+        # 端到端主路径：每个技能 catalogue 产出条目的 fault_symptom 填充率 100%
+        for catalogue_dir in _CATALOGUE_DIRS:
+            result = _generate_from_catalogue(catalogue_dir, catalogue_dir.name)
+            assert result, f"{catalogue_dir}: catalogue 产出为空"
+            unfilled = [uc for uc in result if not uc.get("fault_symptom")]
+            assert not unfilled, (
+                f"{catalogue_dir}: {len(unfilled)}/{len(result)} 条 "
+                f"fault_symptom 为空，例如 {unfilled[0].get('resource_path')}"
+            )

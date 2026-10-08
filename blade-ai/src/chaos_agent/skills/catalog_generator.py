@@ -15,6 +15,7 @@ from typing import Optional
 
 from chaos_agent.config.settings import settings
 from chaos_agent.utils.fault_type import extract_fault_type
+from chaos_agent.utils.skill_case_section import find_section
 
 logger = logging.getLogger(__name__)
 
@@ -418,17 +419,27 @@ def _generate_from_catalogue(catalogue_dir: Path, skill_name: str) -> Optional[l
 
 
 def _extract_fault_symptom(md_file: Path) -> str:
-    """Try to extract the first fault symptom line from a catalogue .md file."""
+    """Extract the first fault-symptom list item from a catalogue .md file.
+
+    Section located via the single-source parser (``find_section``), which is
+    form-agnostic — it handles both the migrated ``## 故障现象`` markdown
+    heading and the legacy ``**故障现象**：`` bold form. The previous
+    hard-coded ``\\*\\*故障现象\\*\\*`` regex was an independent consumer that
+    bypassed the single source; after the bold→markdown migration it silently
+    returned ``""`` for every catalogue file (95/95 → 0/95), emptying the
+    ``fault_symptom`` field. Returns the first non-empty line with any leading
+    list marker (``1.`` / ``-``) stripped, matching the historical value.
+    """
     try:
         content = md_file.read_text(encoding="utf-8")
-        # Common patterns: **故障现象**：\n1. xxx  or  **故障现象** xxx
-        import re
-        m = re.search(r"\*\*故障现象\*\*[：:]\s*\n1\.\s*(.+)", content)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r"\*\*故障现象\*\*[：:]\s*(.+)", content)
-        if m:
-            return m.group(1).strip()
+        section = find_section(content, "故障现象")
+        if not section:
+            return ""
+        for line in section.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            return re.sub(r"^(?:\d+[.、]|[-*+])\s*", "", stripped).strip()
     except Exception:
         pass
     return ""
