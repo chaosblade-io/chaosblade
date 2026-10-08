@@ -729,23 +729,17 @@ def _extract_recover_task_id(messages: list) -> str:
 
 
 @lc_tool
-async def query_active_experiments() -> str:
-    """Read-only. List the active fault experiments that can still be recovered.
+async def query_active_experiments(limit: int = 20, offset: int = 0) -> str:
+    """Read-only. List this tenant's active fault experiments that can still be
+    recovered, newest first, one page at a time.
 
-    When to use:
-      - The user wants to recover / undo / rollback a fault but did NOT give a
-        task_id — call this FIRST to discover candidates, then
-        ``recover_task(task_id="<id from the list>")``.
-      - Do NOT use to inspect cluster/experiment health (use blade_status /
-        kubectl); this only lists THIS tenant's recoverable experiments.
+    Use when the user wants to recover/undo a fault but gave no task_id: call
+    this, then ``recover_task(task_id="<id>")``. Not for cluster-health checks
+    (use blade_status / kubectl).
 
-    Inputs: none.
-
-    Output: a numbered list (newest first, up to 10) of recoverable experiments,
-      each with task_id / fault_type / target / namespace / inject time; or a
-      "no active experiments" message when none remain.
-
-    Side effects: None (read-only query of the task store).
+    ``limit`` = page size, ``offset`` = rows to skip; the header reports the
+    total and the offset that fetches the next page. Each row shows task_id /
+    fault_type / target / inject time plus observed carrier facts.
     """
     from chaos_agent.config.settings import settings
     from chaos_agent.persistence.task_store import get_task_store
@@ -762,14 +756,32 @@ async def query_active_experiments() -> str:
     from chaos_agent.agent.experiment_display import format_experiment_line
     # Newest first so "刚才 / 昨天" maps to the top rows.
     active = sorted(active, key=lambda t: t.get("gmt_create", ""), reverse=True)
-    lines = [f"There are {len(active)} recoverable active experiment(s) (most recently injected first):"]
-    for i, t in enumerate(active[:10], 1):
-        lines.append(format_experiment_line(i, t))
-    lines.append(
-        "\nUse the fault type / target resource / injection time to decide which one to recover, "
-        'then call recover_task(task_id="...").'
+    # Transparent pagination, NOT silent truncation — delegated to the shared
+    # bounded-yet-complete contract (utils.pagination) so the geometry (true
+    # total / "showing rows X-Y" / N withheld / next offset / past-end
+    # explanation) cannot drift from any future list tool. Paging stays ABOVE
+    # the store: ``active`` is the FULL set (query_active is never given
+    # limit/offset — memory_nodes.load_memory and cli/runner depend on the
+    # complete list); paginate only slices a view of it.
+    from chaos_agent.utils.pagination import PageLabels, paginate
+
+    labels = PageLabels(
+        summary=lambda n: f"There are {n} recoverable active experiment(s)",
+        withheld=lambda n: f"{n} older experiment(s) not shown",
+        ordering=" (most recently injected first)",
+        footer=(
+            "Use the fault type / target resource / injection time to decide "
+            'which one to recover, then call recover_task(task_id="...").'
+        ),
+        past_end_hint="pass offset=0 to start from the most recently injected.",
     )
-    return "\n".join(lines)
+    return paginate(
+        active,
+        limit=limit,
+        offset=offset,
+        renderer=format_experiment_line,
+        labels=labels,
+    )
 
 
 @lc_tool

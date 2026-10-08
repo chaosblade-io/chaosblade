@@ -66,6 +66,89 @@ class TestQueryActiveExperimentsTool:
             out = await query_active_experiments.ainvoke({})
         assert "no active fault-injection experiments" in out
 
+    @staticmethod
+    def _mk_rows(n):
+        # gmt_create ascends with the index, so newest-first == reverse index.
+        return [
+            {
+                "task_id": f"task-{i:03d}",
+                "skill": "k8s-chaos-skills",
+                "fault_type": "pod-cpu-fullload",
+                "target": {"namespace": "default", "names": [f"pod-{i:03d}"]},
+                "gmt_create": f"2026-06-20T09:00:{i:02d}+08:00",
+                "plan_summary": "",
+            }
+            for i in range(n)
+        ]
+
+    async def _invoke(self, rows, **kwargs):
+        mock_store = AsyncMock()
+        mock_store.query_active = AsyncMock(return_value=rows)
+        with patch("chaos_agent.persistence.task_store.get_task_store",
+                   return_value=mock_store):
+            from chaos_agent.agent.nodes.planning.intent_clarification import (
+                query_active_experiments,
+            )
+            out = await query_active_experiments.ainvoke(dict(kwargs))
+        return out, mock_store
+
+    @pytest.mark.asyncio
+    async def test_first_page_is_transparent_not_silent(self):
+        out, _ = await self._invoke(self._mk_rows(25))
+        # Default limit=20: the header states the TRUE total (25, not 20) plus
+        # the exact withheld count and next offset. That is what separates
+        # transparent paging from a silent [:N] cap the model cannot see past.
+        assert "There are 25 recoverable" in out
+        assert "showing rows 1-20" in out
+        assert "5 older experiment(s) not shown" in out
+        assert "offset=20" in out
+        # Newest row is on page 1; the oldest is withheld to a later page.
+        assert "task-024" in out
+        assert "task-000" not in out
+
+    @pytest.mark.asyncio
+    async def test_second_page_numbering_is_continuous(self):
+        out, _ = await self._invoke(self._mk_rows(25), offset=20)
+        assert "showing rows 21-25" in out
+        # Row numbers continue from 21 instead of restarting at 1.
+        assert "\n      21." in out or " 21." in out
+        assert "task-004" in out and "task-000" in out
+        # Last page: no further-page hint remains.
+        assert "older experiment(s) not shown" not in out
+
+    @pytest.mark.asyncio
+    async def test_offset_past_end_explains(self):
+        out, _ = await self._invoke(self._mk_rows(5), offset=999)
+        assert "past the end" in out
+        assert "offset=0" in out
+
+    @pytest.mark.asyncio
+    async def test_paging_covers_every_row_no_loss(self):
+        # The load-bearing contract: unlike a silent cap that permanently drops
+        # rows, walking the pages surfaces EVERY candidate, so the real target
+        # is only ever deferred to a later page, never lost.
+        rows = self._mk_rows(45)
+        seen, offset = set(), 0
+        while True:
+            out, _ = await self._invoke(rows, limit=20, offset=offset)
+            for i in range(45):
+                if f"task-{i:03d}" in out:
+                    seen.add(f"task-{i:03d}")
+            if f"offset={offset + 20}" not in out:
+                break
+            offset += 20
+        assert seen == {f"task-{i:03d}" for i in range(45)}
+
+    @pytest.mark.asyncio
+    async def test_pagination_stays_in_tool_layer(self):
+        # Paging must NOT sink into store.query_active: memory_nodes.load_memory
+        # and cli/runner both depend on its full set. The store is still called
+        # with no limit/offset — slicing happens strictly above it.
+        _, mock_store = await self._invoke(self._mk_rows(25), limit=5)
+        mock_store.query_active.assert_awaited_once()
+        _, called_kwargs = mock_store.query_active.call_args
+        assert "limit" not in called_kwargs and "offset" not in called_kwargs
+
 
 class TestRecoverHandler:
     """Tests for recover_handler bridge node."""
