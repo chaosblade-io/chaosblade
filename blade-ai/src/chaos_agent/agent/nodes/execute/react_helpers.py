@@ -910,17 +910,58 @@ def _build_introspection_hint(
     return "\n".join(parts)
 
 
-def detect_tool_error_hint(messages: list) -> str | None:
+def detect_tool_error_hint(
+    messages: list,
+    *,
+    hinted_calls: dict | None = None,
+) -> tuple[str, str, str] | None:
     """Scan recent ToolMessages for errors that warrant introspection.
 
-    Returns a hint string if a qualifying error is found and no
-    duplicate hint already exists in messages. Returns None otherwise.
+    Returns ``(hint_text, tool_name, tool_call_id)`` for the most recent error
+    not yet answered by a hint, else ``None``.
+
+    Two dedup designs; this is the second, and the first was measured broken. It
+    suppressed a hint when the recency window already held a hint MESSAGE naming
+    the same tool — judging "already hinted" by message POSITION plus a text
+    match, which fails in both directions. Too broad: a NEW failure of the same
+    tool is suppressed because an older hint happens to name it. Too narrow: a
+    persisted hint keeps its FIRST insertion position (``add_messages`` replaces
+    in place under a stable id), so once the drill outgrows the window that copy
+    sits outside it permanently and suppression stops working altogether — every
+    turn re-fires. inject-6ebf341c measured exactly this: the planning-phase
+    ``tool_error`` count reached 6 over 10 errors from 3 different tools
+    (``kubectl_read`` x8 spanning exit codes 1/2/7/52, plus
+    ``read_skill_resource`` and ``read_file``), all merged into one counter.
+
+    The judgement is therefore about the ERROR INSTANCE and is carried on state
+    (``hinted_calls`` maps ``tool_call_id`` -> hint key) instead of being
+    inferred from where messages sit — the same reasoning that moved
+    ``hint_repeat_counts`` onto state: compaction rewrites ``messages`` and
+    leaves other fields alone, so whatever must survive a long drill cannot be
+    reconstructed by scanning history.
+
+    ``messages[-10:]`` is kept, but as the RELEVANCE range only (which errors are
+    recent enough to be worth interrupting the model about), no longer as the
+    dedup judgement.
+
+    ``tool_name`` is returned because the caller must use it as the hint key: the
+    detector is the only layer that knows which tool failed, so the key is
+    produced here rather than guessed at the call site. Keying by phase merged
+    unrelated tools into one counter and one message slot, which turned the
+    accumulated text ("the previous 5 did not change the outcome — repeating the
+    same action again will not either") into a false statement: those 5 were
+    different tools failing differently.
     """
     window = min(len(messages), 10)
     recent = messages[-window:]
+    hinted = hinted_calls or {}
 
     for msg in reversed(recent):
         if not isinstance(msg, ToolMessage):
+            continue
+        # Instance-level dedup: this exact error has already been answered.
+        call_id = getattr(msg, "tool_call_id", "") or ""
+        if call_id and call_id in hinted:
             continue
         # Single-source verdict (agent/tool_verdicts.py): the generic
         # ``Error`` / ``[target_guard]`` renderings plus the owning
@@ -937,17 +978,12 @@ def detect_tool_error_hint(messages: list) -> str | None:
             continue
 
         tool_name = getattr(msg, "name", "") or ""
-        if any(
-            isinstance(m, HumanMessage)
-            and isinstance(m.content, str)
-            and _HINT_MARKER in m.content
-            and f"`{tool_name}`" in m.content
-            for m in recent
-        ):
-            continue
-
         rejected = extract_rejected_params(error_text)
-        return _build_introspection_hint(tool_name, error_text, rejected)
+        return (
+            _build_introspection_hint(tool_name, error_text, rejected),
+            tool_name,
+            call_id,
+        )
 
     return None
 

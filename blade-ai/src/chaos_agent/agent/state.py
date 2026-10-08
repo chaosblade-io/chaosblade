@@ -1348,6 +1348,19 @@ class AgentState(MessagesState):
     # zero and the model is told "reminder #1" after twenty real occurrences —
     # exactly the amnesia the persistence was added to fix.
     hint_repeat_counts: dict[str, int] = {}
+    # Which error INSTANCES a corrective hint has already answered, keyed by
+    # ``tool_call_id`` -> hint key. Same compaction rationale as the counter
+    # above, and the same lesson left half-applied: the count was moved onto
+    # state, but the dedup judgement stayed behind, scanning message POSITIONS
+    # inside a recency window. A persisted hint keeps its FIRST insertion
+    # position (``add_messages`` replaces in place under a stable id), so that
+    # copy slid out of the window for good and suppression stopped working —
+    # every turn re-fired, inflating the counter above. Judging by instance, on
+    # state, is what makes the two mechanisms agree instead of cancel out:
+    # dedup stops re-answering one error, while genuinely new errors keep
+    # accumulating the count until it crosses ``hint_escalate_after`` and the
+    # notices start piling up as legislated.
+    hinted_error_calls: dict[str, str] = {}
     pipeline_started_at: float = 0.0     # Wall-clock guard (0.0 = not yet stamped)
     transient_retry_count: int = 0       # INFRA_TRANSIENT short-retry budget
     # Deferred LIFECYCLE REVIEW text for a REJECTED plan_invalid replan arriving

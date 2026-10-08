@@ -81,6 +81,34 @@ def resolve_hint_count(
     return max(from_state, count_prior_hints(history, kind, key))
 
 
+def fold_hint_state(
+    result: dict,
+    state: dict,
+    counts: dict | None,
+    hinted_calls: dict | None = None,
+) -> None:
+    """Fold hint bookkeeping into a node's state update — in exactly one place.
+
+    Five loop nodes each carried their own copy of the compare-then-assign for
+    ``hint_repeat_counts``. Adding a second carrier field to five call sites is
+    precisely how a field ends up written by some nodes and silently dropped by
+    others — the failure mode this mechanism has already produced once, when the
+    count moved onto state but the dedup judgement was left scanning message
+    positions. So the fold is a function: a new carrier is added HERE once and
+    every node inherits it, and a test can assert the callers exist rather than
+    hoping each one remembered.
+
+    Writes only when the local copy actually differs, so a node that never
+    touched its hints emits nothing and cannot clobber state.
+    """
+    prior_counts = state.get("hint_repeat_counts") or {}
+    if counts and counts != prior_counts:
+        result["hint_repeat_counts"] = counts
+    prior_hinted = state.get("hinted_error_calls") or {}
+    if hinted_calls and hinted_calls != prior_hinted:
+        result["hinted_error_calls"] = hinted_calls
+
+
 def persist_corrective_hint(
     injections: list,
     history: list | None,
@@ -113,6 +141,18 @@ def persist_corrective_hint(
       change behaviour: at that point the visible weight of many notices is the
       signal, and a weak model does not have to interpret a counter to feel it.
 
+    ``escalate_after=None`` means INHERIT the legislation
+    (``settings.hint_escalate_after``), not disable it. Escalation is a standing
+    rule about how corrective hints behave, so its threshold has exactly one
+    authoritative source and every kind of hint is born subject to it; a call
+    site may pass a value to OVERRIDE that threshold, but it cannot silently opt
+    out by forgetting the kwarg. That opt-out-by-omission was the measured
+    failure: ``tool_error`` and ``transient_exhaustion`` never passed it, so
+    ``escalated`` was permanently False for them — inject-6ebf341c ran the
+    planning-phase ``tool_error`` count up to 6 (the model reported reading
+    reminder #7) while history still held ONE overwritten copy, i.e. the exact
+    condition the escalation mode exists for, with the mode never engaging.
+
     ``counts`` is ``state["hint_repeat_counts"]`` and is where the number really
     lives; the updated value is written into ``counts_out`` for the node to fold
     into its state update. The messages are for the model to SEE the mistake and
@@ -142,7 +182,10 @@ def persist_corrective_hint(
     # the count out of the wrapped content.
     stamped = wrap_system_reminder(f"{body}\n<!--hint-repeat:{count}-->")
 
-    escalated = escalate_after is not None and count > escalate_after
+    # None = inherit the legislation, not "never escalate" (see docstring).
+    if escalate_after is None:
+        escalate_after = settings.hint_escalate_after
+    escalated = count > escalate_after
     msg_id = f"{_hint_id(kind, key)}#{count}" if escalated else _hint_id(kind, key)
     injections.append(HumanMessage(content=stamped, id=msg_id))
     # The turn-local copy carries no id: it must not collide with the persisted
@@ -268,11 +311,22 @@ def post_invoke_debug(
     count: int,
     label: str,
 ) -> None:
-    """Emit debug-level LLM response summary to the progress tracker."""
+    """Emit debug-level LLM response summary to the progress tracker.
+
+    The header names the CONTENT of the summary, not a measured span. It used
+    to read ``Iteration 5 LLM:`` while the renderer appended the tracker's
+    single cumulative number, which spans the whole node — hook, prompt
+    assembly, model call and everything after. The two adjacent facts read as
+    one, so the node's total was audited as model latency (inject-6ebf341c
+    turn 1: ``(71751ms)`` beside ``LLM:``). The honest per-phase split now
+    rides in ``detail["segments"]`` — see :meth:`StatusTracker.mark` — and the
+    renderer prints it inline, so the number next to a message is labelled
+    with what it actually measures.
+    """
     if not settings.is_debug:
         return
     debug_info, tool_names = summarize_llm_response(response)
     tracker.update(
-        f"{label} {count} LLM:\n{debug_info}",
+        f"{label} {count} LLM response:\n{debug_info}",
         {"debug": True, "iteration": count, "tool_calls": tool_names},
     )

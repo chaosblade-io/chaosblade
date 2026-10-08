@@ -710,8 +710,11 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             )
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is not None
+        got = detect_tool_error_hint(msgs)
+        assert got is not None
+        hint, tool, call = got
+        assert tool == "blade_create"
+        assert call == "tc1"
         assert "RUNTIME EVIDENCE" in hint
         assert "`--percent`" in hint
         assert "blade" in hint
@@ -726,8 +729,9 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             )
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is not None
+        got = detect_tool_error_hint(msgs)
+        assert got is not None
+        hint = got[0]
         assert "RUNTIME EVIDENCE" in hint
         assert "tool observation" in hint
 
@@ -739,9 +743,10 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             )
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is not None
-        assert "kubectl" in hint
+        got = detect_tool_error_hint(msgs)
+        assert got is not None
+        assert got[1] == "kubectl"
+        assert "kubectl" in got[0]
 
     def test_unknown_tool(self):
         msgs = [
@@ -751,9 +756,10 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             )
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is not None
-        assert "some_new_tool" in hint
+        got = detect_tool_error_hint(msgs)
+        assert got is not None
+        assert got[1] == "some_new_tool"
+        assert "some_new_tool" in got[0]
 
     def test_skips_transient(self):
         msgs = [
@@ -763,8 +769,7 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             )
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is None
+        assert detect_tool_error_hint(msgs) is None
 
     def test_skips_non_error_content(self):
         msgs = [
@@ -774,10 +779,33 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             )
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is None
+        assert detect_tool_error_hint(msgs) is None
 
-    def test_dedup_same_tool_error(self):
+    def test_hinted_instance_is_not_re_answered(self):
+        """Dedup judges the ERROR INSTANCE, and the judgement is carried on state.
+
+        Replaces the old ``test_dedup_same_tool_error``, which suppressed any new
+        failure of a tool whose name appeared in a hint inside the recency window.
+        That made a repeated mistake go permanently silent after one notice —
+        exactly the failure ``hint_escalate_after`` legislates against ("the
+        overwrite mode has demonstrably failed to change behaviour"). Suppression
+        is now about ONE error already having been answered, not about a tool
+        having been mentioned.
+        """
+        msgs = [
+            ToolMessage(
+                content="Error: unknown flag: --percent",
+                name="blade_create",
+                tool_call_id="tc1",
+            )
+        ]
+        assert detect_tool_error_hint(
+            msgs, hinted_calls={"tc1": "tool_error:blade_create"},
+        ) is None
+
+    def test_new_instance_of_same_error_is_still_answered(self):
+        """A repeated mistake keeps accumulating, so the count can reach the
+        escalation threshold and the notices start piling up as legislated."""
         msgs = [
             ToolMessage(
                 content="Error: unknown flag: --percent",
@@ -793,28 +821,65 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc2",
             ),
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is None
+        got = detect_tool_error_hint(msgs, hinted_calls={"tc1": "tool_error:blade_create"})
+        assert got is not None
+        assert got[2] == "tc2"
 
-    def test_dedup_allows_different_tool(self):
+    def test_dedup_does_not_depend_on_message_position(self):
+        """The judgement survives a history longer than the relevance window.
+
+        The old scan looked for the hint MESSAGE inside ``messages[-10:]``, but a
+        persisted hint keeps its FIRST insertion position (``add_messages``
+        replaces in place under a stable id), so the copy slid out of the window
+        for good and every later turn re-fired. inject-6ebf341c ran the count to 6
+        that way. State does not slide.
+        """
+        hinted_msg = HumanMessage(
+            content="**RUNTIME EVIDENCE**: `blade_create` returned an error."
+        )
+        early_error = ToolMessage(
+            content="Error: unknown flag: --percent",
+            name="blade_create",
+            tool_call_id="tc1",
+        )
+        filler = [
+            ToolMessage(content="ok", name="kubectl_read", tool_call_id=f"f{i}")
+            for i in range(20)
+        ]
+        late_error = ToolMessage(
+            content="Error: unknown flag: --percent",
+            name="blade_create",
+            tool_call_id="tc2",
+        )
+        msgs = [early_error, hinted_msg] + filler + [late_error]
+        # The hinted copy is now far outside the window; state still suppresses it.
+        assert detect_tool_error_hint(
+            msgs, hinted_calls={"tc1": "tool_error:blade_create"},
+        )[2] == "tc2"
+        # And once tc2 is answered too, the well runs dry instead of re-firing.
+        assert detect_tool_error_hint(
+            msgs,
+            hinted_calls={
+                "tc1": "tool_error:blade_create",
+                "tc2": "tool_error:blade_create",
+            },
+        ) is None
+
+    def test_returns_the_tool_name_for_the_callers_hint_key(self):
+        """The detector is the only layer that knows which tool failed, so the key
+        is produced here rather than guessed at the call site. Keying by phase
+        merged 3 different tools into one counter in inject-6ebf341c."""
         msgs = [
-            ToolMessage(
-                content="Error: unknown flag: --percent",
-                name="blade_create",
-                tool_call_id="tc1",
-            ),
-            HumanMessage(
-                content="**RUNTIME EVIDENCE**: `blade_create` returned an error."
-            ),
             ToolMessage(
                 content="Error: unknown flag: --foo",
                 name="kubectl",
-                tool_call_id="tc2",
+                tool_call_id="tc9",
             ),
         ]
-        hint = detect_tool_error_hint(msgs)
-        assert hint is not None
-        assert "kubectl" in hint
+        got = detect_tool_error_hint(msgs)
+        assert got is not None
+        assert got[1] == "kubectl"
+        assert got[2] == "tc9"
 
 
 class TestClassifyErrorInterfaceMismatch:

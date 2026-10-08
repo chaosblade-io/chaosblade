@@ -17,6 +17,7 @@ from langgraph.graph.message import add_messages
 
 from chaos_agent.agent.nodes.execute.llm_step_helpers import (
     count_prior_hints,
+    fold_hint_state,
     persist_corrective_hint,
 )
 
@@ -35,16 +36,29 @@ class TestPersistedHintAccumulation:
         assert "You are repeating." in returned.content
 
     def test_repeat_overwrites_instead_of_piling_up(self):
+        """Within the escalation threshold, repeats overwrite instead of piling up.
+
+        Bounded by ``settings.hint_escalate_after`` rather than a literal 5: past
+        the threshold the mode deliberately switches to accumulating entries, so
+        a fixed count above it would be asserting that escalation never happens.
+        That assertion is what this test used to make by omitting the kwarg —
+        i.e. it pinned the opt-out-by-omission bug as a contract. See
+        :class:`TestEscalationLegislationAppliesByConstruction`.
+        """
+        from chaos_agent.config.settings import settings
+
+        triggers = settings.hint_escalate_after
         history: list = []
-        for _ in range(5):
+        for _ in range(triggers):
             injections: list = []
             persist_corrective_hint(
                 injections, history, "stagnation", "kubectl_read:top", "Repeating.",
             )
             history = add_messages(history, injections)
-        # Five triggers, one entry: the reducer replaced by id each time.
+        # Every trigger at or below the threshold, one entry: the reducer replaced
+        # by id each time.
         assert len(history) == 1
-        assert count_prior_hints(history, "stagnation", "kubectl_read:top") == 5
+        assert count_prior_hints(history, "stagnation", "kubectl_read:top") == triggers
 
     def test_text_states_the_running_count_and_that_prior_ones_failed(self):
         history: list = []
@@ -331,3 +345,104 @@ class TestEscalationThresholdIsConfigurable:
         assert entries_at[3] == 1
         assert entries_at[4] == 2
         assert entries_at[8] == 6
+
+
+class TestEscalationLegislationAppliesByConstruction:
+    """``escalate_after=None`` INHERITS the legislation; it does not disable it.
+
+    Opt-out-by-omission was the measured failure: ``tool_error`` and
+    ``transient_exhaustion`` never passed the kwarg, so ``escalated`` was
+    permanently False for them. inject-6ebf341c ran the planning-phase
+    ``tool_error`` count to 6 — the model reported reading reminder #7 — while
+    history still held ONE overwritten copy. That is the exact condition the
+    escalation mode exists for, with the mode never engaging.
+
+    A source-text assertion cannot catch this, and the four omissions surviving
+    beside ten correct call sites is the proof: such an assertion passes as soon
+    as ANY call site in the module spells the kwarg. The guarantee has to be
+    behavioural — the mechanism defaults to the legislation, so a call site can
+    override the threshold but cannot forget to be subject to it.
+    """
+
+    @staticmethod
+    def _run(turns: int, **kw) -> dict:
+        history: list = []
+        counts: dict = {}
+        entries: dict = {}
+        for turn in range(1, turns + 1):
+            injections: list = []
+            persist_corrective_hint(
+                injections, history, "tool_error", "kubectl_read", "x",
+                counts=counts, counts_out=counts, **kw,
+            )
+            history = add_messages(history, injections)
+            entries[turn] = sum(
+                1 for m in history
+                if (getattr(m, "id", "") or "").startswith("hint:tool_error:")
+            )
+        return entries
+
+    def test_omitting_the_kwarg_matches_passing_the_setting(self):
+        from chaos_agent.config.settings import settings
+
+        assert self._run(6) == self._run(
+            6, escalate_after=settings.hint_escalate_after,
+        )
+
+    def test_omitting_the_kwarg_actually_escalates(self):
+        entries = self._run(6)
+        # 1..3 collapse onto one entry, 4..6 each add one.
+        assert entries[3] == 1
+        assert entries[4] == 2
+        assert entries[6] == 4
+
+    def test_an_explicit_override_still_wins(self):
+        # Inheriting by default must not remove the ability to override.
+        assert self._run(6, escalate_after=10)[6] == 1
+
+
+class TestFoldHintState:
+    """One fold for every carrier field.
+
+    Five loop nodes each hand-rolled the compare-then-assign for
+    ``hint_repeat_counts``. Adding a second carrier to five sites is how a field
+    ends up written by some nodes and dropped by others, so the fold is a
+    function and a guard below asserts nobody hand-rolls it again.
+    """
+
+    def test_writes_both_carriers(self):
+        result: dict = {}
+        state = {"hint_repeat_counts": {}, "hinted_error_calls": {}}
+        fold_hint_state(
+            result, state,
+            {"tool_error:kubectl_read": 2},
+            {"tc1": "tool_error:kubectl_read"},
+        )
+        assert result["hint_repeat_counts"] == {"tool_error:kubectl_read": 2}
+        assert result["hinted_error_calls"] == {"tc1": "tool_error:kubectl_read"}
+
+    def test_unchanged_state_emits_nothing(self):
+        result: dict = {}
+        state = {"hint_repeat_counts": {"a": 1}, "hinted_error_calls": {"tc1": "k"}}
+        fold_hint_state(result, state, {"a": 1}, {"tc1": "k"})
+        assert result == {}
+
+    def test_empty_local_copy_cannot_clobber_state(self):
+        result: dict = {}
+        state = {"hint_repeat_counts": {"a": 1}, "hinted_error_calls": {"tc1": "k"}}
+        fold_hint_state(result, state, {}, {})
+        assert result == {}
+
+    def test_no_node_hand_rolls_the_writeback(self):
+        import importlib
+        import inspect
+
+        for path in (
+            "chaos_agent.agent.nodes.execute.agent_loop",
+            "chaos_agent.agent.nodes.execute.execute_loop",
+            "chaos_agent.agent.nodes.verify.verifier",
+        ):
+            src = inspect.getsource(importlib.import_module(path))
+            assert "fold_hint_state(" in src, path
+            # The hand-rolled form, in either variable spelling.
+            assert '["hint_repeat_counts"] = _hint_counts' not in src, path
