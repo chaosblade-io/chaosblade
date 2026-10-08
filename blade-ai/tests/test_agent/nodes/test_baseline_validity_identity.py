@@ -161,6 +161,142 @@ class TestExecutorEmptyStamp:
 
 
 # ---------------------------------------------------------------------------
+# W-67-4 — Dimension stamp: the class survives resolution → execution
+# ---------------------------------------------------------------------------
+
+
+class TestExecutorClassStamp:
+    """The observation must carry the dimension it was derived under.
+
+    Without this stamp the only ``class`` in play at retry time is the one the
+    retry LLM re-declares, and the class↔form gate — which compares a
+    replacement's class against its OWN command's shape, never against the
+    original — cannot notice a relabel. Case #67: a replacement refused as
+    ``node_level`` came back verbatim as ``container_internal`` one round
+    later, executed, and the receipt read ``5/5 commands succeeded``.
+    """
+
+    @staticmethod
+    def _patches(fake_result):
+        return (
+            patch("chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+                  new_callable=AsyncMock, return_value=fake_result),
+            patch("chaos_agent.agent.nodes.baseline._executors.dispatch_node_message",
+                  new_callable=AsyncMock),
+            patch("chaos_agent.agent.nodes.baseline._executors.get_tracker",
+                  return_value=None),
+        )
+
+    @pytest.mark.asyncio
+    async def test_class_survives_resolution_into_the_observation(self):
+        """End-to-end threading invariant: ``BaselineCommand.class_value`` →
+        ``_resolve_one_baseline['_class']`` → ``observation['_class']``.
+        Dropping any link fails here, not silently in the field."""
+        from chaos_agent.agent.nodes.baseline._executors import (
+            _execute_observations,
+        )
+        from chaos_agent.agent.nodes.baseline.baseline_capture import (
+            BaselineCommand,
+            _resolve_templates,
+        )
+
+        state = {
+            "fault_scope": "node",
+            "fault_target": "disk",
+            "fault_action": "fill",
+            "target": {"namespace": "", "names": ["cn-node-1"], "labels": {}},
+        }
+        resolved = _resolve_templates(
+            [BaselineCommand(
+                "Node disk usage",
+                "kubectl exec {debug_pod} -n default -- df -h",
+                mode="debug_two_step",
+                class_value="node_level",
+            )],
+            state, "k8s",
+        )
+        assert resolved[0]["_class"] == "node_level"
+
+        fake_result = MagicMock(exit_code=0, stdout="Filesystem Size\n/dev 10G", stderr="")
+        p1, p2, p3 = self._patches(fake_result)
+        with p1, p2, p3, patch(
+            "chaos_agent.agent.nodes.baseline._executors."
+            "_create_and_wait_debug_pod_with_reason",
+            new_callable=AsyncMock,
+            return_value=(("dbg-1", "default"), ""),
+        ):
+            obs = await _execute_observations(resolved, "kubeconfig", "t-cls")
+        assert obs[0]["_class"] == "node_level"
+
+    @pytest.mark.asyncio
+    async def test_failed_observation_carries_the_class_too(self):
+        """The stamp matters MOST on the failure path — that is the only path
+        that re-enters the retry loop."""
+        from chaos_agent.agent.nodes.baseline._executors import (
+            _execute_observations,
+        )
+
+        resolved = [{
+            "description": "Node disk usage",
+            "command": "kubectl exec dbg -- df -h",
+            "subcommand": "exec",
+            "v_args": "exec dbg -- df -h",
+            "mode": "debug_two_step",
+            "_node_name": "cn-node-1",
+            "_class": "node_level",
+        }]
+        # No carrier and no fallback registered → the exec path returns -1.
+        p1, p2, p3 = self._patches(MagicMock(exit_code=1, stdout="", stderr="x"))
+        with p1, p2, p3:
+            obs = await _execute_observations(resolved, "kubeconfig", "t-cls2")
+        assert obs[0]["exit_code"] == -1
+        assert obs[0]["_class"] == "node_level"
+
+    @pytest.mark.asyncio
+    async def test_unresolved_skip_marker_carries_the_class(self):
+        """The skip path appends outside the main chokepoint, so it needs its
+        own stamp — an unresolved observation is a failed one and therefore a
+        retry candidate."""
+        from chaos_agent.agent.nodes.baseline._executors import (
+            _execute_observations,
+        )
+
+        resolved = [{
+            "description": "Node disk usage",
+            "command": "kubectl exec {debug_pod} -- df -h {node_name}",
+            "mode": "debug_two_step",
+            "_unresolved": True,
+            "_node_name": "",
+            "_class": "node_level",
+        }]
+        p1, p2, p3 = self._patches(MagicMock(exit_code=0, stdout="", stderr=""))
+        with p1, p2, p3:
+            obs = await _execute_observations(resolved, "kubeconfig", "t-cls3")
+        assert obs[0]["_class"] == "node_level"
+
+    @pytest.mark.asyncio
+    async def test_registry_command_without_a_class_stamps_none(self):
+        """Registry-sourced commands declare no class (their form is trusted by
+        construction); the stamp must then be None, which is the retry gate's
+        signal to fall back to the LLM's own declaration rather than pin."""
+        from chaos_agent.agent.nodes.baseline._executors import (
+            _execute_observations,
+        )
+
+        resolved = [{
+            "description": "Deployment",
+            "command": "kubectl get deployment d1",
+            "subcommand": "get",
+            "v_args": ["get", "deployment", "d1"],
+            "mode": "simple",
+        }]
+        fake_result = MagicMock(exit_code=0, stdout="NAME READY\nd1 1/1", stderr="")
+        p1, p2, p3 = self._patches(fake_result)
+        with p1, p2, p3:
+            obs = await _execute_observations(resolved, "kubeconfig", "t-cls4")
+        assert obs[0]["_class"] is None
+
+# ---------------------------------------------------------------------------
 # Fix C — Validity: assembly keeps valid / empty counts separate
 # ---------------------------------------------------------------------------
 

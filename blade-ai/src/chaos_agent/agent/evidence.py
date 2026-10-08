@@ -28,6 +28,27 @@ _CROSS_PATTERNS = {
     "process": ("describe", "event", "ps ", "systemctl", "status"),
 }
 
+# K8s-channel observation vocabulary, MERGED onto (not swapped for) the base
+# tables above at lookup time. The base tables were written from host
+# observation shapes; on the K8s channel the primary network metric arrives
+# as timing probes (Case #58 inject-3dae7b4f: ``curl -w connect=%{time_connect}``
+# timed in at 0.0008s pre-injection) or cluster-side queries, none of which
+# carry the host vocabulary — so every k8s:*:network case was structurally
+# judged ``primary_metric: missing`` even when the capture itself was correct.
+# The merge MUST stay a union: ``kubectl exec <pod> -- ss -s`` is a legal K8s
+# observation whose vocabulary still comes from the base table. Only network
+# needs additions today — cpu/mem/disk/process K8s baselines run
+# ``kubectl top`` / ``describe`` / ``df`` / ``ps`` whose vocabulary is already
+# present in the base tables. The cross table needs no K8s additions either:
+# its "describe" / "endpoint" entries already match the K8s cross-evidence
+# shapes (``kubectl describe pod``, ``kubectl get endpoints``).
+_K8S_PRIMARY_ADDITIONS = {
+    "network": (
+        "curl", "wget", "time_connect", "time_starttransfer",
+        "latency", "rtt", "qdisc", "netem", "ping",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class EvidenceCoverage:
@@ -88,7 +109,7 @@ class EvidenceProfile:
         covered: list[str] = []
         if self._has_identity(texts):
             covered.append("target_identity")
-        primary_patterns = _PRIMARY_PATTERNS.get(self.target, (self.target,))
+        primary_patterns = _primary_patterns(self.transport_profile, self.target)
         primary_indices = {
             index for index, text in enumerate(texts)
             if _matches(text, primary_patterns)
@@ -126,6 +147,22 @@ class EvidenceProfile:
 
 def _matches(text: str, patterns: tuple[str, ...]) -> bool:
     return any(pattern in text for pattern in patterns)
+
+
+def _primary_patterns(transport_profile: str, target: str) -> tuple[str, ...]:
+    """Base vocabulary for ``target``, unioned with K8s additions if on K8s.
+
+    Deduplicated defensively in case a future addition collides with a base
+    entry — a duplicate pattern is harmless but would suggest the two tables
+    have drifted apart.
+    """
+    base = _PRIMARY_PATTERNS.get(target, (target,))
+    if transport_profile != PROFILE_K8S:
+        return base
+    additions = _K8S_PRIMARY_ADDITIONS.get(target, ())
+    if not additions:
+        return base
+    return base + tuple(pattern for pattern in additions if pattern not in base)
 
 
 # Read-only host probes that anchor evidence-coverage gaps. Shared by baseline

@@ -10,6 +10,7 @@ from chaos_agent.agent.nodes.baseline.baseline_capture import (
     BASELINE_COMMANDS,
     _LLM_BASELINE_MAX_RETRIES,
     _TOOL_POD_NAMESPACE,
+    _llm_derive_baseline_commands,
     _llm_retry_failed_commands,
     _lookup_baseline_commands,
     _resolve_templates,
@@ -24,6 +25,7 @@ from chaos_agent.agent.nodes.baseline.baseline_capture import (
 from chaos_agent.agent.nodes.baseline._baseline_profiles import (
     build_baseline_system_prompt,
 )
+from chaos_agent.agent.nodes.execute._debug_pod import CARRIER_OK
 from chaos_agent.agent.spec.fault_spec import FaultSpec
 
 
@@ -76,7 +78,13 @@ class TestTemplateResolution:
     """Test _resolve_templates variable substitution."""
 
     def test_simple_resolution(self):
+        # ``fault_scope`` is load-bearing (W-67-1): ``{node_name}`` is only
+        # filled from ``names[0]`` under node scope, because under pod /
+        # workload scope that entry is the victim POD, not a node. The
+        # sibling test below already declares its scope; this one used to get
+        # away without it because the substitution was unconditional.
         state = {
+            "fault_scope": "node",
             "target": {
                 "namespace": "cms-demo",
                 "names": ["cn-hongkong.10.0.2.69"],
@@ -88,6 +96,57 @@ class TestTemplateResolution:
         assert len(result) == 1
         assert result[0]["v_args"] == "node cn-hongkong.10.0.2.69"
         assert result[0]["_unresolved"] is False
+
+    def test_node_name_is_not_filled_from_a_pod_scope_target(self):
+        """W-67-1 negative pin: under pod scope ``names[0]`` is the victim POD,
+        so ``{node_name}`` / ``_node_name`` must stay empty — never the pod
+        name. Filling it produced ``kubectl debug node/<POD-NAME>`` and ten
+        image rotations against ``nodes "<POD>" not found``. The node must
+        arrive via the pre-resolved ``target_node`` fact instead."""
+        state = {
+            "fault_scope": "pod",
+            "target": {
+                "namespace": "default",
+                "names": ["drill-sts-pvc-target-0"],
+                "labels": {},
+            },
+        }
+        cmds = [BaselineCommand(
+            "Host IO", "kubectl exec {debug_pod} -- iostat -xd 1 {node_name}",
+        )]
+
+        # Without the pre-resolved node: unresolved, hence skipped by the
+        # viability gate — a visible absence, not a silent wrong value.
+        bare = _resolve_templates(cmds, state)[0]
+        assert bare["_unresolved"] is True
+        assert bare["_node_name"] == ""
+        assert "{node_name}" in bare["command"]
+
+        # With it: the same template resolves to the NODE, and the carrier
+        # field the debug_two_step path reads agrees.
+        resolved = _resolve_templates(
+            cmds, state, target_node="cn-shanghai.25.209.71.167",
+        )[0]
+        assert resolved["_unresolved"] is False
+        assert resolved["_node_name"] == "cn-shanghai.25.209.71.167"
+        assert "drill-sts-pvc-target-0" not in resolved["_node_name"]
+
+    def test_target_node_placeholder_substitution(self):
+        """``{target_node}`` obeys the same fail-open contract as
+        ``{target_pod}``: substitute the pre-resolved literal, or mark the
+        observation unresolved — never emit the placeholder text."""
+        state = {
+            "fault_scope": "pod",
+            "target": {"namespace": "default", "names": ["victim-0"]},
+        }
+        cmds = [BaselineCommand(
+            "Host df", "kubectl debug node/{target_node} -- df -h",
+        )]
+        assert _resolve_templates(cmds, state)[0]["_unresolved"] is True
+        ok = _resolve_templates(cmds, state, target_node="node-a")[0]
+        assert ok["_unresolved"] is False
+        assert "node/node-a" in ok["command"]
+        assert "{target_node}" not in ok["command"]
 
     def test_unresolved_namespace(self):
         state = {"target": {"names": ["my-pod"]}}
@@ -128,7 +187,106 @@ class TestTemplateResolution:
         }
 
 
-class TestTargetCoverage:
+class TestPayloadPlaceholderGrammarSeparation:
+    """Grammar-domain separation: payload placeholders vs template variables.
+
+    Case #58 (inject-3dae7b4f): the LLM baseline strategy derived a correct
+    curl timing probe carrying ``-w 'connect=%{time_connect} ...'`` — literal
+    curl ``-w`` format syntax — but the unknown-variable scan treated
+    ``%{time_connect}`` as an unresolved template variable, killed the
+    command at the viability gate (llm 4/5 → partial), and the network
+    primary metric lost its only production path.
+    """
+
+    def _resolve(self, command: str):
+        state = {
+            "target": {
+                "namespace": "default",
+                "names": ["drill-reorder-target"],
+                "labels": {},
+            },
+            "fault_spec": {
+                "scope": "pod",
+                "namespace": "default",
+                "names": ["drill-reorder-target"],
+                "labels": {},
+            },
+        }
+        cmds = [BaselineCommand("probe", command)]
+        result = _resolve_templates(cmds, state)
+        return result[0]
+
+    def test_curl_w_format_placeholders_are_not_template_variables(self):
+        """#58 verbatim command: viability must pass and text stay literal."""
+        entry = self._resolve(
+            "kubectl exec drill-reorder-target -n default -- curl -s -o /dev/null "
+            "-w 'connect=%{time_connect} total=%{time_total}' "
+            "--connect-timeout 3 -k https://172.19.0.1:443/"
+        )
+        assert entry["_unresolved"] is False
+        # The detection input is masked, the command itself keeps the original
+        # text — curl must still see its own placeholders at run time.
+        assert "%{time_connect}" in entry["command"]
+        assert "%{time_total}" in entry["command"]
+
+    def test_shell_parameter_expansion_is_not_a_template_variable(self):
+        entry = self._resolve(
+            "kubectl exec drill-reorder-target -n default -- "
+            "sh -c 'echo ${HOME}'"
+        )
+        assert entry["_unresolved"] is False
+        assert "${HOME}" in entry["command"]
+
+    def test_genuinely_unknown_template_variable_still_kills(self):
+        """Negative control: the guard's original job is intact."""
+        entry = self._resolve("kubectl get pod {pod_nam} -n default")
+        assert entry["_unresolved"] is True
+
+
+class TestPodRegistryByNameContract:
+    """Pod-level registry entries are reachable BY NAME (labels={} form).
+
+    The names[0] assumption is documented in ``_commands.py`` — pod-scope
+    injection always carries a precise pod name, so every pod-level registry
+    command must resolve under it. ``kubectl get endpoints`` violated the
+    contract (label-only reachability): under #58's labels={} spec it made
+    every pod-level network/process entry structurally partial.
+    """
+
+    @pytest.mark.parametrize("key", [
+        ("pod", "network"),
+        ("pod", "network", "drop"),
+        ("pod", "process", "kill"),
+    ])
+    def test_pod_entries_fully_viable_with_empty_labels(self, key):
+        cmds = BASELINE_COMMANDS[key]
+        assert cmds, f"registry key {key} must exist"
+        for cmd in cmds:
+            assert "{label_selector}" not in cmd.command, (
+                f"{key} entry '{cmd.description}' breaks the by-name contract"
+            )
+
+    def test_pod_network_entry_resolves_under_case58_spec(self):
+        """End-to-end viability replay of the #58 spec shape (labels={})."""
+        cmds = _lookup_baseline_commands("k8s", "pod", "network", "delay")
+        state = {
+            "target": {
+                "namespace": "default",
+                "names": ["drill-reorder-target"],
+                "labels": {},
+            },
+            "fault_spec": {
+                "scope": "pod",
+                "namespace": "default",
+                "names": ["drill-reorder-target"],
+                "labels": {},
+            },
+        }
+        resolved = _resolve_templates(cmds, state)
+        assert all(not entry["_unresolved"] for entry in resolved)
+
+
+
     def test_aggregate_baseline_reports_partial_coverage_for_az_wide_target(self):
         spec = FaultSpec(
             scope="node",
@@ -180,8 +338,12 @@ class TestEvidenceSupplements:
             [{"description": "Node CPU", "command": "kubectl top node node-a"}],
         )
 
+        # Cross-metric evidence is machine-readable: ``get -o json`` (the
+        # API server's authoritative shape), not ``describe`` (whose
+        # per-section container blocks poison last-wins parsing — see
+        # _parse_describe_pod's live-case note).
         assert [command.command for command in supplements] == [
-            "kubectl describe node {node_name}",
+            "kubectl get node {node_name} -o json --show-managed-fields=false",
         ]
 
     def test_container_scope_collects_identity_from_its_owning_pod(self):
@@ -198,7 +360,8 @@ class TestEvidenceSupplements:
 
         assert [command.command for command in supplements] == [
             "kubectl get pod {pod_name} -n {namespace}",
-            "kubectl describe pod {pod_name} -n {namespace}",
+            "kubectl get pod {pod_name} -n {namespace} -o json"
+            " --show-managed-fields=false",
         ]
 
 
@@ -311,69 +474,367 @@ class TestLLMJsonParsing:
 
 
 class TestCommandValidation:
-    """Test _validate_and_filter_commands whitelist enforcement (k8s + host)."""
+    """Test _validate_and_filter_commands whitelist enforcement (k8s + host).
+
+    Contract (Case #63): returns ``(accepted, rejected)`` — *rejected*
+    carries ``(command, reason)`` pairs so the gate's refusal is a
+    first-class fact instead of a dropped log line.
+    """
 
     def test_allowed_commands(self):
         cmds = [
             {"description": "test", "command": "kubectl get nodes", "mode": "simple"},
             {"description": "test2", "command": "kubectl top nodes", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds, "k8s")
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 2
+        assert rejected == []
 
     def test_rejected_subcommand(self):
         cmds = [
             {"description": "hack", "command": "kubectl delete pod x", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds, "k8s")
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 0
+        assert len(rejected) == 1
+        assert rejected[0][0] == "kubectl delete pod x"
+        assert "delete" in rejected[0][1]
 
     def test_exec_with_allowed_command(self):
         cmds = [
             {"description": "disk", "command": "kubectl exec pod-x -n ns -- df -h", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds, "k8s")
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 1
+        assert rejected == []
 
     def test_exec_with_disallowed_command(self):
         cmds = [
             {"description": "hack", "command": "kubectl exec pod-x -n ns -- rm -rf /", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds, "k8s")
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 0
+        assert len(rejected) == 1
+        assert rejected[0][0] == "kubectl exec pod-x -n ns -- rm -rf /"
+        assert rejected[0][1]  # enforcement reason is stated, not just logged
 
     def test_non_dict_input_skipped(self):
         cmds = ["not a dict", 42]
-        result = _validate_and_filter_commands(cmds, "k8s")
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 0
+        assert rejected == []
 
     def test_host_allowed_commands(self):
         cmds = [
             {"description": "cpu", "command": "top -bn1", "mode": "simple"},
             {"description": "mem", "command": "free -m", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds, "host")
+        result, _rejected = _validate_and_filter_commands(cmds, "host")
         assert len(result) == 2
         assert all(c.mode == "simple" for c in result)
 
     def test_host_rejects_kubectl(self):
         cmds = [{"description": "x", "command": "kubectl get pods", "mode": "simple"}]
-        assert _validate_and_filter_commands(cmds, "host") == []
+        accepted, _rejected = _validate_and_filter_commands(cmds, "host")
+        assert accepted == []
 
     def test_host_rejects_pipe(self):
         cmds = [{"description": "x", "command": "ps aux | grep java", "mode": "simple"}]
-        assert _validate_and_filter_commands(cmds, "host") == []
+        accepted, _rejected = _validate_and_filter_commands(cmds, "host")
+        assert accepted == []
 
     def test_host_mode_forced_simple(self):
         cmds = [{"description": "x", "command": "top -bn1", "mode": "debug_two_step"}]
-        result = _validate_and_filter_commands(cmds, "host")
+        result, _rejected = _validate_and_filter_commands(cmds, "host")
         assert len(result) == 1
         assert result[0].mode == "simple"
+
+
+class TestNodeReadBoundGate:
+    """D8 (inject-6ebf341c): ``kubectl describe node`` with an existence-only
+    label selector matches every node and floods the baseline context — the
+    live receipt was 429,784 chars of ~40 nodes' full ``describe`` output, the
+    largest single message in the task. The bound is programmatically decidable,
+    so ``_validate_and_filter_commands`` enforces it (fourth gate) instead of
+    leaving "add ``=value``" as an appeal to model self-discipline.
+
+    The gate is deliberately narrow: only ``describe`` on a node kind with an
+    existence-only selector is refused. ``get``/``top`` are tabular and use
+    existence-only selectors to ENUMERATE a subset legitimately (the
+    AZ-network-partition playbook ships ``kubectl get nodes -l
+    node-role.kubernetes.io/control-plane``), so those must stay accepted.
+    """
+
+    def test_rejects_existence_only_selector_on_describe_node(self):
+        cmds = [{
+            "description": "node conditions",
+            "command": "kubectl describe node -l kubernetes.io/hostname",
+            "mode": "simple",
+        }]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert result == []
+        assert len(rejected) == 1
+        assert rejected[0][0] == "kubectl describe node -l kubernetes.io/hostname"
+        # the reason is actionable: it names the fix, not just the violation
+        assert "=<value>" in rejected[0][1]
+        assert "kubectl describe node <node-name>" in rejected[0][1]
+
+    def test_rejects_attached_and_long_selector_forms(self):
+        for cmd in (
+            "kubectl describe node -lkubernetes.io/hostname",
+            "kubectl describe nodes --selector=kubernetes.io/hostname",
+            "kubectl describe no --selector kubernetes.io/hostname",
+        ):
+            result, rejected = _validate_and_filter_commands(
+                [{"description": "d", "command": cmd, "mode": "simple"}], "k8s",
+            )
+            assert result == [], cmd
+            assert len(rejected) == 1, cmd
+
+    def test_allows_describe_node_by_name(self):
+        cmds = [{
+            "description": "node conditions",
+            "command": "kubectl describe node cn-node-1",
+            "mode": "simple",
+        }]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert len(result) == 1
+        assert rejected == []
+
+    def test_allows_describe_node_with_equality_selector(self):
+        cmds = [{
+            "description": "node conditions",
+            "command": "kubectl describe node -l kubernetes.io/hostname=cn-node-1",
+            "mode": "simple",
+        }]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert len(result) == 1
+        assert rejected == []
+
+    def test_allows_describe_node_template_placeholder(self):
+        # The taught node-read form binds by NAME, not selector.
+        cmds = [{
+            "description": "node status",
+            "command": "kubectl describe node {node_name}",
+            "mode": "simple",
+        }]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert len(result) == 1
+        assert rejected == []
+
+    def test_allows_existence_only_selector_on_get_nodes_enumeration(self):
+        # The catalogue counterexample: existence-only is the CORRECT way to
+        # select control-plane nodes, and ``get`` is tabular — cheap, not a
+        # flood. Gating this would break the AZ-network-partition playbook.
+        cmds = [{
+            "description": "control-plane nodes",
+            "command": "kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide",
+            "mode": "simple",
+        }]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert len(result) == 1
+        assert rejected == []
+
+    def test_allows_existence_only_selector_on_top_nodes(self):
+        cmds = [{
+            "description": "node metrics",
+            "command": "kubectl top nodes -l some-label",
+            "mode": "simple",
+        }]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert len(result) == 1
+        assert rejected == []
+
+    def test_allows_bare_node_enumeration(self):
+        # No selector at all is an explicit enumeration, not a failed binding.
+        cmds = [
+            {"description": "nodes", "command": "kubectl get nodes", "mode": "simple"},
+            {"description": "top", "command": "kubectl top nodes", "mode": "simple"},
+        ]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert len(result) == 2
+        assert rejected == []
+
+    def test_bound_gate_does_not_reach_pod_reads(self):
+        # A pod read with an existence-only selector is normal targeting and
+        # out of the node-kind gate's scope.
+        cmds = [{
+            "description": "pods",
+            "command": "kubectl get pods -n default -l app",
+            "mode": "simple",
+        }]
+        result, rejected = _validate_and_filter_commands(cmds, "k8s")
+        assert len(result) == 1
+        assert rejected == []
 
 
 # ---------------------------------------------------------------------------
 # Debug pod name parsing
 # ---------------------------------------------------------------------------
+
+
+class TestRejectedDerivationSurfacing:
+    """Case #63 (inject-2ee3bdc7): a correctly-derived write-form probe
+    (``dd ... conv=fsync``) was refused by the read-only gate and dropped
+    with only a log line — the baseline receipt said ``7/7`` with no trace
+    that a command had ever been rejected. The refusal must now surface as
+    a FACT in the message archive (sync_node_status_to_session), so the
+    verifier's context — the message stream — carries which derived probes
+    never ran and why."""
+
+    _DERIVE_OUTPUT = json.dumps([
+        {"description": "Pod CPU/Memory usage",
+         "command": "kubectl top pod drill-sts-pvc-target-0 -n default",
+         "mode": "simple"},
+        {"description": "Pod status and phase",
+         "command": "kubectl get pod drill-sts-pvc-target-0 -n default -o wide",
+         "mode": "simple"},
+        {"description": "Pod disk space usage",
+         "command": "kubectl exec drill-sts-pvc-target-0 -n default -- df -h /var/lib/data",
+         "mode": "simple"},
+        {"description": "Pod disk IO counters baseline",
+         "command": "kubectl exec drill-sts-pvc-target-0 -n default -- cat /proc/diskstats",
+         "mode": "simple"},
+        # #63's sixth derive entry verbatim: a legitimate write-latency
+        # domain probe the read-only channel must refuse.
+        {"description": "Pod write latency baseline via dd fsync",
+         "command": "kubectl exec drill-sts-pvc-target-0 -n default -- "
+                    "dd if=/dev/zero of=/var/lib/data/.iolatency.tmp "
+                    "bs=1M count=10 conv=fsync",
+         "mode": "simple"},
+        {"description": "Pod running processes",
+         "command": "kubectl exec drill-sts-pvc-target-0 -n default -- ps aux",
+         "mode": "simple"},
+    ])
+
+    @pytest.mark.asyncio
+    async def test_rejected_probe_surfaced_and_accepted_clean(self, monkeypatch):
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(
+            return_value=MagicMock(content=self._DERIVE_OUTPUT),
+        )
+
+        synced = []
+
+        def fake_sync(state, node_name, message, detail=None):
+            synced.append((state, node_name, message, detail))
+
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.store._store_sync.sync_node_status_to_session",
+            fake_sync,
+        )
+
+        accepted = await _llm_derive_baseline_commands(
+            mock_llm, "case content", "pod", "disk", "burn",
+            profile="k8s", namespace="default",
+            names=("drill-sts-pvc-target-0",), task_id="t-63",
+        )
+
+        # The five read-only probes survive; the dd probe does not.
+        assert len(accepted) == 5
+        assert not any("dd " in c.command for c in accepted)
+
+        # The refusal is a first-class fact in the message archive.
+        assert len(synced) == 1
+        state, node_name, message, detail = synced[0]
+        assert state["task_id"] == "t-63"
+        assert node_name == "baseline_capture"
+        assert "rejected by the read-only gate" in message
+        assert "dd if=/dev/zero" in message
+        assert detail["rejected"][0]["command"].endswith("conv=fsync")
+        assert detail["rejected"][0]["reason"]  # reason stated, not implied
+
+    @pytest.mark.asyncio
+    async def test_all_accepted_no_sync_noise(self, monkeypatch):
+        """No rejections → no rejection record (receipt stays clean)."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(
+            return_value=MagicMock(content=json.dumps([
+                {"description": "Pod status",
+                 "command": "kubectl get pod p1 -n default",
+                 "mode": "simple"},
+            ])),
+        )
+
+        synced = []
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.store._store_sync.sync_node_status_to_session",
+            lambda *a, **kw: synced.append(a),
+        )
+
+        accepted = await _llm_derive_baseline_commands(
+            mock_llm, "case content", "pod", "disk", "burn",
+            profile="k8s", namespace="default",
+            names=("p1",), task_id="t-clean",
+        )
+
+        assert len(accepted) == 1
+        assert synced == []
+
+    def test_retry_path_rejection_also_surfaced(self, monkeypatch):
+        """Symmetry guard (Case #63 self-audit): the retry round re-derives
+        replacements for failed observations; a replacement refused by the
+        read-only gate must surface exactly like a primary-path refusal —
+        the audit found this path still dropped rejections on the floor
+        after the primary path was fixed."""
+        from chaos_agent.agent.nodes.baseline._llm_derive import (
+            _split_retry_decisions,
+        )
+
+        synced = []
+
+        def fake_sync(state, node_name, message, detail=None):
+            synced.append((state, node_name, message, detail))
+
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.store._store_sync.sync_node_status_to_session",
+            fake_sync,
+        )
+
+        decisions = [{
+            "verdict": "replace",
+            "description": "write latency via dd",
+            "command": "kubectl exec p1 -n default -- "
+                       "dd if=/dev/zero of=/tmp/x bs=1M count=10 conv=fsync",
+            "mode": "simple",
+        }]
+        failed = [{"command": "old-probe", "exit_code": 1, "output": ""}]
+
+        result = _split_retry_decisions(decisions, failed, "k8s", "t-retry")
+
+        assert result["replace"] == []        # dd refused again
+        assert result["expected"] == []
+        assert len(synced) == 1               # refusal surfaced, not dropped
+        state, node_name, message, detail = synced[0]
+        assert state["task_id"] == "t-retry"
+        assert node_name == "baseline_capture"
+        assert "dd if=/dev/zero" in message
+        assert detail["rejected"][0]["reason"]
+
+    def test_retry_path_all_accepted_no_noise(self, monkeypatch):
+        """Control: an accepted replacement produces no rejection record."""
+        from chaos_agent.agent.nodes.baseline._llm_derive import (
+            _split_retry_decisions,
+        )
+
+        synced = []
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.store._store_sync.sync_node_status_to_session",
+            lambda *a, **kw: synced.append(a),
+        )
+
+        decisions = [{
+            "verdict": "replace",
+            "description": "pod status",
+            "command": "kubectl get pod p1 -n default",
+            "mode": "simple",
+        }]
+        failed = [{"command": "old-probe", "exit_code": 1, "output": ""}]
+
+        result = _split_retry_decisions(decisions, failed, "k8s", "t-clean2")
+
+        assert len(result["replace"]) == 1
+        assert synced == []
 
 
 class TestDebugPodParsing:
@@ -606,7 +1067,7 @@ class TestModeAutoCorrection:
              "command": "kubectl exec {debug_pod} -n chaosblade -- iostat -xd 1 3",
              "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds, "k8s")
+        result, _rejected = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 1
         assert result[0].mode == "debug_two_step"
 
@@ -617,7 +1078,7 @@ class TestModeAutoCorrection:
              "command": "kubectl exec {debug_pod} -n chaosblade -- iostat -xd 1 3",
              "mode": "debug_two_step"},
         ]
-        result = _validate_and_filter_commands(cmds, "k8s")
+        result, _rejected = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 1
         assert result[0].mode == "debug_two_step"
 
@@ -1112,20 +1573,27 @@ class TestExtractorFramework:
 
 
 class TestPodProcessKillRegistryEntry:
-    """Verify (pod, process, kill) exact match returns endpoints + pod status."""
+    """Verify (pod, process, kill) exact match returns by-name pod entries.
+
+    Updated with the by-name contract fix (Case #58): the former
+    ``Service endpoints {label_selector}`` entry was removed — label-only
+    reachability broke the pod-level names[0] assumption (labels={} specs
+    structurally degraded the entry to partial). Service-layer observation
+    belongs to the LLM strategy / verify phase.
+    """
 
     def test_exact_match_exists(self):
         result = _lookup_baseline_commands("k8s", "pod", "process", "kill")
-        assert len(result) == 3
+        assert len(result) == 2
         descriptions = [c.description for c in result]
-        assert "Service endpoints" in descriptions
         assert "Pod status/restarts" in descriptions
         assert "Pod events" in descriptions
 
-    def test_endpoints_uses_label_selector(self):
+    def test_no_label_selector_dependency(self):
+        """Contract: every command resolves by pod name alone."""
         result = _lookup_baseline_commands("k8s", "pod", "process", "kill")
-        ep_cmd = next(c for c in result if c.description == "Service endpoints")
-        assert "{label_selector}" in ep_cmd.command
+        for c in result:
+            assert "{label_selector}" not in c.command
 
     def test_pod_status_uses_wide_output(self):
         result = _lookup_baseline_commands("k8s", "pod", "process", "kill")
@@ -1928,7 +2396,8 @@ class TestHostProfileBaseline:
             "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
             new=fake_transport,
         ), patch(
-            "chaos_agent.agent.nodes.baseline._executors._create_and_wait_debug_pod",
+            "chaos_agent.agent.nodes.baseline._executors."
+            "_create_and_wait_debug_pod_with_reason",
             new_callable=AsyncMock,
         ) as mock_debug, patch(
             "chaos_agent.agent.nodes.baseline._executors.discover_tool_pod_on_node",
@@ -2147,9 +2616,10 @@ class TestK8sProfileBaseline:
             "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
             new=fake_transport,
         ), patch(
-            "chaos_agent.agent.nodes.baseline._executors._create_and_wait_debug_pod",
+            "chaos_agent.agent.nodes.baseline._executors."
+            "_create_and_wait_debug_pod_with_reason",
             new_callable=AsyncMock,
-            return_value=("dbg-pod", _TOOL_POD_NAMESPACE),
+            return_value=(("dbg-pod", _TOOL_POD_NAMESPACE), CARRIER_OK),
         ) as mock_create, patch(
             "chaos_agent.agent.nodes.baseline._executors._delete_debug_pod",
             new_callable=AsyncMock,

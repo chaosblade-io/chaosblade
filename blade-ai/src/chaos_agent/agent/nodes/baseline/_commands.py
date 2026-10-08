@@ -54,13 +54,24 @@ class BaselineCommand:
                            #   host: "top -bn1"
                            # registry entries may carry template variables
                            # ({node_name}/{pod_name}/{namespace}/
-                           # {label_selector}/{debug_pod}); LLM-derived
-                           # commands are already concrete.
+                           # {label_selector}/{debug_pod}/{target_pod});
+                           # LLM-derived commands are already concrete.
     mode: str = "simple"   # "simple" | "debug_two_step"
     # Optional list of structured-field extractors. Empty for free-form
     # commands (LLM-derived baseline commands at runtime). See the
     # ``BaselineCommand`` docstring above for the contract.
     extractors: list[Extractor] = field(default_factory=list)
+    # Optional observation-dimension class tag (baseline-observation-contract).
+    # Closed enum: ``container_internal`` | ``api_object`` | ``node_level`` |
+    # ``host_level``. Declared by the derive/retry LLM to make the intent
+    # behind a command inspectable, and cross-checked against the command's
+    # syntactic form by ``_validate_and_filter_commands`` (a mismatch is
+    # rejected, not silently relabeled). Registry-sourced commands leave
+    # this at None: their form is trusted by construction and the class is
+    # derived (label-only, never rejected) at consistency-check time.
+    # Field name is ``class_value`` because ``class`` is a Python keyword;
+    # the JSON schema field emitted by the LLM is still ``class``.
+    class_value: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -81,13 +92,20 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
                         f"kubectl exec {{debug_pod}} -n {_TOOL_POD_NAMESPACE} -- iostat -xd 1 3",
                         mode="debug_two_step"),
     ],
+    # Pod-level entries comply with the names[0] assumption documented at
+    # the target-level fallback block below: every command must be reachable
+    # BY NAME. ``kubectl get endpoints`` is a service-layer observation that
+    # is only reachable by label selector — under the by-name contract it
+    # structurally degrades every pod-level entry to partial (Case #58
+    # inject-3dae7b4f: labels={} → registry 1/2 viable → strategy falls
+    # through). Service-layer observation is the LLM strategy's / verify
+    # phase's job, not the by-name registry's.
     ("pod", "process", "kill"): [
-        BaselineCommand("Service endpoints", "kubectl get endpoints -n {namespace} {label_selector}"),
         BaselineCommand("Pod status/restarts", "kubectl get pod {pod_name} -n {namespace} -o wide"),
         BaselineCommand("Pod events", "kubectl describe pod {pod_name} -n {namespace}"),
     ],
     ("pod", "network", "drop"): [
-        BaselineCommand("Service endpoints", "kubectl get endpoints -n {namespace} {label_selector}"),
+        BaselineCommand("Pod status/IP", "kubectl get pod {pod_name} -n {namespace} -o wide"),
         BaselineCommand("Pod conditions", "kubectl describe pod {pod_name} -n {namespace}"),
     ],
     # ── Target-level fallback: (scope, target) ──
@@ -114,7 +132,7 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
         BaselineCommand("Container disk usage", "kubectl exec {pod_name} -n {namespace} -- df -h"),
     ],
     ("pod", "network"): [
-        BaselineCommand("Service endpoints", "kubectl get endpoints -n {namespace} {label_selector}"),
+        BaselineCommand("Pod status/IP", "kubectl get pod {pod_name} -n {namespace} -o wide"),
         BaselineCommand("Pod conditions", "kubectl describe pod {pod_name} -n {namespace}"),
     ],
     ("pod", "process"): [

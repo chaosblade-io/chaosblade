@@ -2,8 +2,9 @@
 
 Split out of ``baseline_capture.py`` (Phase 2 module split). Resolves the
 ``{node_name}`` / ``{pod_name}`` / ``{namespace}`` / ``{label_selector}`` /
-``{debug_pod}`` template variables in registry / fallback ``BaselineCommand``
-entries into concrete, executable command dicts (with multi-target sampling),
+``{debug_pod}`` / ``{target_pod}`` / ``{target_node}`` template variables in
+registry / fallback ``BaselineCommand`` entries into concrete, executable
+command dicts (with multi-target sampling),
 reports how much of a multi-target baseline was actually observed, and derives
 deterministic evidence-gap supplement commands. Depends only on the command
 data layer (``_commands``), the evidence contract, the fault spec, and the
@@ -30,6 +31,14 @@ from chaos_agent.transports import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Payload-placeholder dialects that share the brace glyph with our template
+# variables but belong to the COMMAND PAYLOAD's own grammar, not ours. They
+# are literal runtime syntax (curl ``-w`` format, POSIX shell parameter
+# expansion), must survive template resolution verbatim, and must never be
+# mistaken for unresolved template variables. See the grammar-domain
+# separation comment at the detection site (Case #58).
+_PAYLOAD_PLACEHOLDER_RE = re.compile(r"(?:%|\$)\{[a-z_]+\}")
 
 
 # When a fault targets multiple resources (e.g. 44 nodes in an AZ-wide
@@ -76,6 +85,8 @@ def _resolve_one_baseline(
     namespace: str,
     label_selector: str,
     profile: str,
+    target_pod: str = "",
+    target_node: str = "",
 ) -> dict:
     """Resolve a single BaselineCommand with the given target name.
 
@@ -88,11 +99,42 @@ def _resolve_one_baseline(
     exec helpers keep working unchanged. For ``profile == "host"`` the
     command is a plain shell diagnostic (usually variable-free) and is
     executed verbatim via the transport layer.
+
+    ``target_pod`` (baseline-observation-contract change): the literal pod
+    name pre-resolved by ``baseline_capture._resolve_target_pod`` for
+    exec-class probes. Empty string means "not resolved" — commands that
+    reference ``{target_pod}`` under an empty value are marked
+    ``_unresolved`` and skipped by the viability gate (fail-open to the
+    existing absence mechanism, never silently substituted with the
+    workload name). Distinct from ``{pod_name}`` which resolves to
+    ``spec.names[0]`` (a DEPLOYMENT name under workload scope — kubectl
+    exec's bare-name form only accepts pod names).
     """
     command = cmd.command
     unresolved = False
 
-    node_name = name  # always set; only used when template has {node_name}
+    # ``node_name`` is the NODE an observation is anchored on — not whatever
+    # ``spec.names[0]`` happens to be. Under node scope the two coincide;
+    # under pod/workload scope ``name`` is the victim POD and the node must
+    # come from the pre-resolved ``target_node`` fact (``_resolve_target_node``,
+    # isomorphic to ``{target_pod}``'s ``_resolve_target_pod``).
+    #
+    # Case #67 (W-67-1): this was an unconditional ``node_name = name`` whose
+    # comment claimed "only used when template has {node_name}" — but
+    # ``_node_name`` is ALSO read unconditionally by the debug_two_step path
+    # (_executors: pre-create debug pods, the pod cache lookup, and both exec
+    # helpers), so a pod-scope run issued ``kubectl debug node/<POD-NAME>``,
+    # got ``nodes "<POD-NAME>" not found``, and retried TEN times rotating the
+    # image — a retry dimension that cannot fix a wrong node name. Two single
+    # sources already in this file stated the correct rule and went
+    # unconsulted: the ``_SCOPE_NAME_VAR`` registry (pod scope → ``{pod_name}``,
+    # never ``{node_name}``) and ``_evidence_supplement_commands``'s
+    # ``"{node_name}" if spec.scope == "node"`` guard.
+    #
+    # Fail-open: an unresolved ``target_node`` leaves this empty, so commands
+    # carrying ``{node_name}`` are marked ``_unresolved`` and skipped by the
+    # viability gate — visible absence, never a silent pod-name substitution.
+    node_name = name if scope == "node" else (target_node or "")
     pod_name = name if scope not in ("node", "host") else ""
     host_name = name if scope == "host" else ""
 
@@ -121,6 +163,30 @@ def _resolve_one_baseline(
             command = command.replace("{label_selector}", label_selector)
         else:
             unresolved = True
+    if "{target_pod}" in command:
+        if target_pod:
+            command = command.replace("{target_pod}", target_pod)
+        else:
+            # Fail-open: pre-resolution did not yield a literal pod name
+            # (workload-scope selector query failed / returned empty, or
+            # the caller did not prewarm). Mark unresolved so the viability
+            # gate skips this observation instead of executing a command
+            # with the literal ``{target_pod}`` text (kubectl would reject
+            # it with an obscure error, and the retry LLM would then have
+            # to guess what went wrong).
+            unresolved = True
+    if "{target_node}" in command:
+        if target_node:
+            command = command.replace("{target_node}", target_node)
+        else:
+            # Fail-open, same contract as {target_pod}: the node was not
+            # pre-resolvable (non-applicable scope, or the nodeName query
+            # failed / returned empty). Mark unresolved so the viability gate
+            # skips the observation instead of executing a command with the
+            # literal ``{target_node}`` text — and, critically, instead of
+            # letting the debug_two_step path build a carrier against a name
+            # that was never a node.
+            unresolved = True
     # {debug_pod} is resolved later in the debug_two_step execution path.
 
     # Deep defense: auto-correct mode if {debug_pod} present but mode is wrong.
@@ -147,9 +213,33 @@ def _resolve_one_baseline(
             command = f"kubectl {subcommand} {v_args}".strip()
 
     # Detect unknown template variables left after known-variable replacement.
+    # Grammar-domain separation (Case #58 inject-3dae7b4f): the template
+    # variable namespace (``{pod_name}`` & co, our registry dialect) and the
+    # PAYLOAD placeholder dialect (curl's ``-w '%{time_connect}'``, shell's
+    # ``${var}``) are two different languages that happen to share the brace
+    # glyph. A curl timing probe is a fully concrete LLM-derived command —
+    # ``%{time_connect}`` is literal syntax curl expands at run time, not an
+    # unresolved template. The old single-regex scan treated it as an unknown
+    # variable, killed the command at the viability gate, and the llm strategy
+    # degraded to partial (4/5) — the network primary metric never had any
+    # production path (llm killed here, registry partial on empty labels,
+    # fallback carries no network command). Strip payload placeholders BEFORE
+    # scanning for template variables; ``command`` itself keeps the original
+    # text (only the detection input is masked).
     if not unresolved:
-        remaining_vars = re.findall(r'\{([a-z_]+)\}', command)
-        unknown_vars = [v for v in remaining_vars if v != "debug_pod"]
+        detection_text = _PAYLOAD_PLACEHOLDER_RE.sub(" ", command)
+        remaining_vars = re.findall(r'\{([a-z_]+)\}', detection_text)
+        # Exemption list (mechanism-shared with {debug_pod}, memory a98c6772):
+        # placeholders resolved LATER in the execution path must survive the
+        # unknown-var scan. {debug_pod} is resolved by _exec_debug_two_step;
+        # {target_pod} is resolved by pre-execution substitution above (any
+        # surviving occurrence here means the value was empty, already
+        # caught by the unresolved flag). {target_node} is substituted above
+        # under the same pre-resolution contract.
+        unknown_vars = [
+            v for v in remaining_vars
+            if v not in ("debug_pod", "target_pod", "target_node")
+        ]
         if unknown_vars:
             logger.warning(
                 "Unknown template variable(s) in baseline command '%s': %s",
@@ -167,6 +257,16 @@ def _resolve_one_baseline(
         "_unresolved": unresolved,
         "_node_name": node_name,
         "_extractors": cmd.extractors,
+        # The declared observation DIMENSION travels with the resolved command
+        # so it can be stamped onto the observation (see
+        # ``_executors._execute_observations``). ``class_value`` is validated
+        # against the command's FORM at derive time; carrying it forward is
+        # what lets the retry path check CONTINUITY — a replacement may repair
+        # the command, not redefine what was being measured. ``None`` for
+        # registry-sourced commands (form trusted by construction), which is
+        # also the signal for the retry gate to fall back to the LLM's own
+        # declaration instead of pinning.
+        "_class": cmd.class_value,
     }
 
 
@@ -174,6 +274,8 @@ def _resolve_templates(
     commands: list[BaselineCommand],
     state: AgentState,
     profile: str | None = None,
+    target_pod: str | None = None,
+    target_node: str | None = None,
 ) -> list[dict]:
     """Resolve template variables in BaselineCommand list.
 
@@ -183,6 +285,20 @@ def _resolve_templates(
     ``profile`` (k8s/host) selects the execution semantics. When omitted it
     is derived from the connection channel; the node passes its already-
     computed profile so the value has a single source per invocation.
+
+    ``target_pod`` (baseline-observation-contract change): the literal pod
+    name pre-resolved by ``_resolve_target_pod`` in baseline_capture, or
+    ``None`` when unavailable (workload-scope selector query failed / not
+    applicable scope). Threaded through to ``_resolve_one_baseline`` for
+    ``{target_pod}`` substitution.
+
+    ``target_node`` (Case #67 / W-67-1): the literal NODE name pre-resolved by
+    ``_resolve_target_node``, or ``None`` when unavailable. Under node scope it
+    equals ``spec.names[0]``; under pod/workload scope it is the victim's host
+    node (``.spec.nodeName``), which never appears in ``spec.names``. Feeds both
+    ``{target_node}`` substitution and the ``_node_name`` field the
+    debug_two_step path builds its carrier against — the same fact, one source,
+    so the carrier can no longer be aimed at a pod name.
 
     Multi-target expansion: when the fault spec contains more than one
     target name (e.g. AZ-wide network partition with 44 nodes), each
@@ -194,10 +310,12 @@ def _resolve_templates(
 
     if profile is None:
         profile = profile_of(resolve_channel_name(state))
+    _tp = target_pod or ""
+    _tn = target_node or ""
     spec = read_fault_spec(state)
     if spec is None:
         return [
-            _resolve_one_baseline(cmd, "", "", "", "", profile)
+            _resolve_one_baseline(cmd, "", "", "", "", profile, _tp, _tn)
             for cmd in commands
         ]
 
@@ -239,6 +357,7 @@ def _resolve_templates(
             for i, name in enumerate(expansion_names):
                 entry = _resolve_one_baseline(
                     cmd, name, spec.scope, namespace, label_selector, profile,
+                    _tp, _tn,
                 )
                 entry["description"] = f"{cmd.description} ({name})"
                 entry["_target_name"] = name
@@ -252,6 +371,7 @@ def _resolve_templates(
             name = names[0] if names else ""
             entry = _resolve_one_baseline(
                 cmd, name, spec.scope, namespace, label_selector, profile,
+                _tp, _tn,
             )
             resolved.append(entry)
 
@@ -366,8 +486,20 @@ def _evidence_supplement_commands(
             "Target identity", f"kubectl get {resource} {name_var}{namespace}",
         ))
     if "independent_cross_metric" in missing:
+        # Machine judgement needs machine-readable output (live case
+        # inject-3dae7b4f): ``describe`` prints per-container blocks under
+        # EVERY section, and once a pod-scoped ``kubectl debug`` has ever
+        # run against the target, its permanently-accumulating ``Ephemeral
+        # Containers:`` section made the last-wins describe parser read a
+        # dead debugger's RestartCount 0 / container ID as the pod's
+        # baseline (business truth: RestartCount 329). ``get -o json`` is
+        # the API server's authoritative shape and feeds the structured
+        # first-container parser instead; ``--show-managed-fields=false``
+        # drops the tens-of-KB managedFields blob the same pod carries.
         supplements.append(BaselineCommand(
-            "Target conditions", f"kubectl describe {resource} {name_var}{namespace}",
+            "Target conditions",
+            f"kubectl get {resource} {name_var}{namespace} -o json"
+            " --show-managed-fields=false",
         ))
     return supplements
 

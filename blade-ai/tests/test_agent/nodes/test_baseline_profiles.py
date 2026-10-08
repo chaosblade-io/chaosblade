@@ -14,6 +14,7 @@ from chaos_agent.agent.nodes.baseline._baseline_profiles import (
     DIAG_BINARY_WHITELIST,
     build_baseline_system_prompt,
     validate_command,
+    validate_command_with_reason,
 )
 from chaos_agent.transports import profile_of
 
@@ -329,3 +330,89 @@ class TestNodeHostLevelChannelGuidance:
         assert "-- iostat" not in example_block.replace(
             "nsenter -t 1 -m -u -i -n -p -- iostat", ""
         )
+
+
+# ---------------------------------------------------------------------------
+# validate_command k8s exec target-zone form gate (Case #61 / W-61-1)
+#
+# The exec branch of validate_command_with_reason previously inspected only
+# the INNER command after ``--`` (via kubectl_exec_rejection_reason whose
+# judgement starts at the ``--`` boundary, prefix inert). Case #61 showed
+# the LLM generalizing ``-l`` from get/top to exec, producing commands that
+# failed at runtime with ``unknown shorthand flag: 'l'`` and were then
+# laundered by retry into ``expected_absence`` (receipt said 7/7 while four
+# container-internal dimensions were never measured). The form gate closes
+# the prefix blind spot; these tests anchor the wiring.
+# ---------------------------------------------------------------------------
+
+
+class TestExecTargetFormGateWiring:
+    """#61 four illegal commands are all rejected at validate_command with
+    a reason that names the offending flag and points at the {target_pod}
+    fix. Also anchors: (a) execute-side legal forms still pass; (b) Case #63
+    dd conv=fsync rejection path is untouched."""
+
+    # The exact four illegal commands from .b4tmp/c61_run1.log (LLM's ``-l``
+    # generalization from get/top to exec). Verified verbatim via
+    # ``grep -o "kubectl exec -l [^\"]*" .b4tmp/c61_run1.log``.
+    C61_ILLEGAL_EXEC_COMMANDS = [
+        "kubectl exec -l app=drill-perms-target -n default -- id",
+        "kubectl exec -l app=drill-perms-target -n default -- ls -laR /tmp",
+        "kubectl exec -l app=drill-perms-target -n default -- mount",
+        "kubectl exec -l app=drill-perms-target -n default -- ps aux",
+    ]
+
+    @pytest.mark.parametrize("cmd", C61_ILLEGAL_EXEC_COMMANDS)
+    def test_c61_illegal_commands_rejected_with_reason(self, cmd):
+        reason = validate_command_with_reason(cmd, "k8s")
+        assert reason is not None, f"#61 illegal command must be rejected: {cmd}"
+        # Reason-fix pairing: names the offending selector flag AND points
+        # to the {target_pod} placeholder as the fix.
+        assert "selector" in reason.lower()
+        assert "{target_pod}" in reason
+        # Boolean view agrees with reason view (same single source).
+        assert validate_command(cmd, "k8s") is False
+
+    @pytest.mark.parametrize("cmd", [
+        # #61 execute-side legal form: deploy/name prefix (used by inject
+        # path itself).
+        "kubectl exec deploy/drill-perms-target -n default -- id",
+        # Literal pod name form.
+        "kubectl exec drill-perms-target-6d4f8-x2k9p -n default -- cat /app/config.yaml",
+        # Placeholder form (what the LLM should emit after this change).
+        "kubectl exec {target_pod} -n default -- stat /app/config.yaml",
+    ])
+    def test_execute_side_legal_forms_pass(self, cmd):
+        assert validate_command_with_reason(cmd, "k8s") is None
+        assert validate_command(cmd, "k8s") is True
+
+    def test_c63_dd_write_rejection_path_unchanged(self):
+        """Case #63 (inject-2ee3bdc7): ``dd conv=fsync`` is a WRITE probe
+        (baseline must be read-only) — the inner judge rejects it, and this
+        rejection path must survive the form-gate wiring unchanged."""
+        cmd = "kubectl exec some-pod -n default -- dd if=/dev/zero of=/tmp/x bs=1M count=1 conv=fsync"
+        reason = validate_command_with_reason(cmd, "k8s")
+        assert reason is not None
+        # The rejection must come from the inner read-only judge, NOT from
+        # the new form gate (form is fine: bare pod name + --).
+        assert "selector" not in reason.lower()
+        assert "{target_pod}" not in reason
+
+    def test_form_gate_fires_before_inner_judge(self):
+        """When BOTH gates would reject (selector flag + non-readonly inner),
+        the form gate fires first (it is checked before the inner judge in
+        the exec branch), so the reason mentions the form issue."""
+        cmd = "kubectl exec -l app=foo -n default -- rm -rf /"
+        reason = validate_command_with_reason(cmd, "k8s")
+        assert reason is not None
+        assert "selector" in reason.lower()  # form-gate reason
+        # Not the inner judge's reason (which would mention rm or write).
+
+    def test_missing_separator_still_uses_canonical_reason(self):
+        """No ``--`` separator → existing canonical-form error (form gate
+        abstains on this input, per its out-of-domain contract)."""
+        cmd = "kubectl exec some-pod cat /etc/hosts"
+        reason = validate_command_with_reason(cmd, "k8s")
+        assert reason is not None
+        assert "--" in reason
+        assert "canonical" in reason.lower()

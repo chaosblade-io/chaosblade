@@ -105,7 +105,7 @@ from chaos_agent.agent.nodes.baseline._templates import (  # noqa: E402
 # ---------------------------------------------------------------------------
 from chaos_agent.agent.nodes.baseline._executors import (  # noqa: E402
     _DEBUG_CONTAINER_NAME as _DEBUG_CONTAINER_NAME,
-    _create_and_wait_debug_pod as _create_and_wait_debug_pod,
+    _create_and_wait_debug_pod_with_reason as _create_and_wait_debug_pod_with_reason,
     _delete_debug_pod as _delete_debug_pod,
     _exec_debug_two_step as _exec_debug_two_step,
     _exec_host_simple as _exec_host_simple,
@@ -238,6 +238,12 @@ def _assemble_baseline_result(
             "success_count": len(successful_observations),
             "valid_count": len(usable_observations),
             "empty_count": len(empty_observations),
+            # W-67-4: ``valid_count`` is the USABLE total (measured values +
+            # judged absences), so a consumer reading only success/valid
+            # cannot tell how much of the baseline is an actual measurement.
+            # Ship the third component explicitly; the receipt wording below
+            # decomposes with it.
+            "absent_count": len(absent_observations),
             # Denominator must ship WITH the counts: persistent-layer
             # consumers render "N/M succeeded" from this dict alone
             # (verify/_verifier_messages, recover/_recover_layer1).
@@ -289,6 +295,10 @@ async def _emit_baseline_observability(
     _success = result["baseline_data"]["success_count"]
     _valid = result["baseline_data"]["valid_count"]
     _empty = result["baseline_data"]["empty_count"]
+    _absent = result["baseline_data"].get("absent_count", 0)
+    # ``valid_count`` is the USABLE total (measured + judged-absent), so the
+    # plain measurement count has to be derived, not read.
+    _measured = max(_valid - _absent, 0)
     _total = len(observations)
     # Build output previews for detail dict. Failure previews keep BOTH
     # ends (elided_preview): kubectl puts the causal error LAST, and the
@@ -309,18 +319,25 @@ async def _emit_baseline_observability(
             "exit_code": obs.get("exit_code", -1),
             "stdout_preview": _preview,
         })
-    # Honest counting (#16 fix C): "{_success}/{_total} succeeded" reads as a
-    # quality claim, but 4/4 with 3 of them empty-spinning is a degraded
-    # baseline, not a healthy one. Append the valid/empty split whenever
-    # unexplained empties exist so every consumer of the receipt (tracker,
-    # session status, message history) sees the same honest number.
-    _counts = (
-        f"{_success}/{_total} commands succeeded"
-        if _empty <= 0
-        else f"{_success}/{_total} commands succeeded "
-        f"({_valid} valid + {_empty} empty — empty observations captured "
-        f"no value and cannot serve as comparison baselines)"
-    )
+    # Honest counting (#16 fix C, extended by W-67-4): "N/M succeeded" reads
+    # as a quality claim, but the aggregate mixes three epistemically distinct
+    # outcomes — a MEASURED value, an exit-0 observation that captured
+    # NOTHING, and an EXPECTED ABSENCE the retry LLM judged to be the baseline
+    # value. #16 surfaced the empty split; case #67 showed the absence split
+    # hiding behind a clean "5/5 commands succeeded" where one of the five was
+    # a judged absence and another was a retry substitution. Decompose
+    # whenever ANY component is not a plain measurement, so no consumer of the
+    # receipt (tracker, session status, message history, the verify-phase LLM)
+    # can read the aggregate as "every dimension was measured".
+    _counts = f"{_success}/{_total} commands succeeded"
+    if _empty > 0 or _absent > 0:
+        _counts += (
+            f" [{_valid} usable = {_measured} measured"
+            f" + {_absent} expected-absence; {_empty} empty]"
+            " — an expected-absence is a judged pre-injection state and an"
+            " empty observation captured no value; neither is a measurement"
+            " that can serve as a comparison baseline"
+        )
     tracker.complete(
         f"Baseline capture done: {source} strategy, {_counts}",
         detail={
@@ -328,6 +345,7 @@ async def _emit_baseline_observability(
             "success_count": _success,
             "valid_count": _valid,
             "empty_count": _empty,
+            "absent_count": _absent,
             "total_count": _total,
             "observations": _obs_previews,
         },
@@ -342,6 +360,7 @@ async def _emit_baseline_observability(
             "success_count": _success,
             "valid_count": _valid,
             "empty_count": _empty,
+            "absent_count": _absent,
             "total_count": _total,
         },
     )
@@ -420,6 +439,26 @@ class _BaselineCtx:
     # ...) all assume spec-scope identity, and a pod selector is cross-kind
     # identity. Writing it there would pollute the whole chain.
     pod_selector: dict[str, str] | None = None
+    # baseline-observation-contract: the literal pod name pre-resolved for
+    # ``{target_pod}`` placeholder substitution in exec-class probes.
+    # pod scope → ``spec.names[0]`` directly; workload scope → one
+    # ``kubectl get pods -l <selector> -o jsonpath`` query (using
+    # ``pod_selector`` above, or ``spec.labels`` fallback), cached per-run.
+    # ``None`` on any failure / non-applicable scope → ``{target_pod}``
+    # survives unresolved and the viability gate skips the observation
+    # (visible absence, not silent wrong-value).
+    target_pod: str | None = None
+    # Case #67 (W-67-1): the literal NODE name a baseline observation is
+    # anchored on, pre-resolved by ``_resolve_target_node`` — the isomorphic
+    # twin of ``target_pod`` above. node scope → ``spec.names[0]`` directly;
+    # pod/workload scope → one ``.spec.nodeName`` query (the victim's host
+    # node, which never appears in ``spec.names``); host scope → ``None``.
+    # Feeds ``{target_node}`` substitution AND the ``_node_name`` field the
+    # debug_two_step path aims ``kubectl debug node/<n>`` at. ``None`` on any
+    # failure → ``_node_name`` stays empty and ``{node_name}`` /
+    # ``{target_node}`` commands are skipped by the viability gate, so a
+    # carrier can never again be built against a pod name.
+    target_node: str | None = None
 
 
 def _build_baseline_ctx(state: AgentState, llm, task_id: str, tracker) -> _BaselineCtx:
@@ -547,6 +586,206 @@ async def _discover_pod_selector(ctx: _BaselineCtx) -> dict[str, str] | None:
     return selector
 
 
+async def _resolve_target_pod(ctx: _BaselineCtx) -> str | None:
+    """baseline-observation-contract: resolve the literal pod name for the
+    ``{target_pod}`` placeholder used by exec-class baseline probes.
+
+    Case #61 (W-61-1) root cause: the derive LLM had no access to a literal
+    pod name under workload scope, so it invented ``kubectl exec -l app=...
+    -- cmd`` (generalizing ``-l`` from get/top where it IS legitimate). The
+    command failed at runtime with ``unknown shorthand flag: 'l'``, retry
+    laundered it as ``expected_absence``, and the receipt said ``7/7
+    succeeded`` while four container-internal dimensions were never
+    measured. This function closes the loop on the LLM's missing fact:
+    the program pre-resolves the pod name once, the LLM emits
+    ``{target_pod}``, and ``_templates._resolve_one_baseline`` substitutes.
+
+    Resolution rules by scope:
+
+    * ``pod``: ``spec.names[0]`` IS the literal pod name (frozen by
+      confirmation_gate as part of the approved_target snapshot) — zero
+      extra calls.
+    * workload (``deployment``/``statefulset``/``daemonset``/``service``):
+      one ``kubectl get pods -l <sel> -o jsonpath={.items[0].metadata.name}``
+      query, using ``ctx.pod_selector`` (Phase 1.5 authoritative) or
+      ``spec.labels`` as fallback.
+    * ``node``/``host``: not applicable — ``None``.
+
+    Fail-open (any error / non-zero exit / empty output / missing selector):
+    return ``None``. ``_resolve_one_baseline`` marks commands carrying
+    ``{target_pod}`` as ``_unresolved`` when the value is empty, so the
+    viability gate skips the observation — visible absence, never a silent
+    workload-name substitution.
+
+    Result is written to the tracker so the verifier can see which pod the
+    baseline was actually sampled from (Identity axiom transparency).
+
+    Mechanism is isomorphic to ``_exec_in_debug_pod``'s per-node debug-pod
+    cache: resolve once, reuse per-run.
+    """
+    spec = ctx.spec
+    if ctx.profile != PROFILE_K8S or spec is None:
+        return None
+
+    scope = ctx.scope
+    if scope == "pod":
+        if not spec.names:
+            return None
+        pod = spec.names[0]
+        ctx.tracker.update(
+            f"Target pod (pod scope): {pod}",
+            {"step": "target_pod_resolution", "scope": scope, "pod": pod},
+        )
+        return pod
+
+    if scope not in _POD_OWNER_SELECTOR_JSONPATH:
+        return None  # node/host — {target_pod} not applicable
+
+    # Workload scope: Phase 1.5 selector first (authoritative, from the
+    # workload's own spec), fall back to spec.labels if Phase 1.5 fail-opened.
+    selector = ctx.pod_selector or (dict(spec.labels) if spec.labels else None)
+    if not selector:
+        return None
+    selector_str = ",".join(f"{k}={v}" for k, v in selector.items())
+    namespace = spec.namespace or ""
+
+    v_args = ["pods", "-l", selector_str]
+    if namespace:
+        v_args += ["-n", namespace]
+    v_args += ["-o", "jsonpath={.items[0].metadata.name}"]
+    try:
+        cmd = build_kubectl_cmd("get", v_args, kubeconfig=ctx.kubeconfig)
+        result = await execute_via_transport(
+            cmd, TransportTarget.from_state({}),
+            timeout=settings.timeout_kubectl, task_id=ctx.task_id,
+            expect_profile=PROFILE_K8S,
+        )
+    except Exception as e:
+        logger.info(
+            "Target pod resolution for %s failed: %s", scope, e,
+        )
+        return None
+    pod = (result.stdout or "").strip()
+    if result.exit_code != 0 or not pod:
+        return None
+    ctx.tracker.update(
+        f"Target pod ({scope} scope, selector {selector_str}): {pod}",
+        {"step": "target_pod_resolution", "scope": scope,
+         "selector": selector, "pod": pod},
+    )
+    return pod
+
+
+async def _resolve_target_node(ctx: _BaselineCtx) -> str | None:
+    """Case #67 (W-67-1): resolve the literal NODE name a baseline observation
+    is anchored on — the isomorphic twin of ``_resolve_target_pod``.
+
+    Root cause this closes: under pod/workload scope ``spec.names[0]`` is the
+    victim POD, but a ``debug_two_step`` observation needs the victim's HOST
+    NODE to aim ``kubectl debug node/<n>`` at. ``_resolve_one_baseline`` used
+    to fill ``_node_name`` unconditionally from ``spec.names[0]``, so a
+    pod-scope run built ``kubectl debug node/<POD-NAME>`` and the API server
+    answered ``Error from server (NotFound): nodes "<POD-NAME>" not found``.
+    The retry loop then rotated the debug image ten times — a dimension that
+    cannot fix a wrong node name — the observation never got a carrier, and
+    the receipt still reported ``5/5 commands succeeded``.
+
+    That is the same shape as Case #61 (W-61-1): the LLM/command layer lacked
+    a literal fact, invented or misused a substitute, and the failure was
+    laundered by a retry into a green receipt. The fix is the same shape too —
+    the program pre-resolves the fact once, upstream of any command
+    construction, and an unresolvable value fails open into a visible absence.
+
+    Resolution rules by scope:
+
+    * ``node``: ``spec.names[0]`` IS the node name (frozen by
+      confirmation_gate as part of the approved_target snapshot) — zero extra
+      calls.
+    * ``pod``: one ``kubectl get pod <name> -o jsonpath={.spec.nodeName}``.
+    * workload (``deployment``/``statefulset``/``daemonset``/``service``): one
+      ``kubectl get pods -l <sel> -o jsonpath={.items[0].spec.nodeName}``,
+      using ``ctx.pod_selector`` (Phase 1.5 authoritative) or ``spec.labels``
+      as fallback.
+    * ``host``: not applicable — ``None``. A bare host runs its diagnostics
+      verbatim through the transport layer; there is no carrier to aim.
+
+    Single-target limitation (shared with ``_resolve_target_pod``, deliberately
+    not widened here): a multi-target pod/workload spec resolves the node of
+    ``names[0]`` / ``items[0]`` only. Per-name node resolution would cost one
+    API call per target against an expansion cap of
+    ``_BASELINE_NAME_EXPANSION_CAP``; node-scope multi-target expansion is
+    unaffected because it fills ``node_name`` from the per-entry ``name``.
+
+    Fail-open (any error / non-zero exit / empty output / missing selector):
+    return ``None`` — never a guess, never ``spec.names[0]`` as a substitute.
+
+    Result is written to the tracker so the verifier can see which node the
+    baseline was actually sampled from (Identity axiom transparency).
+    """
+    spec = ctx.spec
+    if ctx.profile != PROFILE_K8S or spec is None:
+        return None
+
+    scope = ctx.scope
+    if scope == "node":
+        if not spec.names:
+            return None
+        node = spec.names[0]
+        ctx.tracker.update(
+            f"Target node (node scope): {node}",
+            {"step": "target_node_resolution", "scope": scope, "node": node},
+        )
+        return node
+
+    if scope != "pod" and scope not in _POD_OWNER_SELECTOR_JSONPATH:
+        return None  # host / unknown — no carrier to aim
+
+    namespace = spec.namespace or ""
+    if scope == "pod":
+        if not spec.names:
+            return None
+        v_args = ["pod", spec.names[0]]
+        if namespace:
+            v_args += ["-n", namespace]
+        v_args += ["-o", "jsonpath={.spec.nodeName}"]
+        via = f"pod {spec.names[0]}"
+    else:
+        selector = ctx.pod_selector or (
+            dict(spec.labels) if spec.labels else None
+        )
+        if not selector:
+            return None
+        selector_str = ",".join(f"{k}={v}" for k, v in selector.items())
+        v_args = ["pods", "-l", selector_str]
+        if namespace:
+            v_args += ["-n", namespace]
+        v_args += ["-o", "jsonpath={.items[0].spec.nodeName}"]
+        via = f"{scope} selector {selector_str}"
+
+    try:
+        cmd = build_kubectl_cmd("get", v_args, kubeconfig=ctx.kubeconfig)
+        result = await execute_via_transport(
+            cmd, TransportTarget.from_state({}),
+            timeout=settings.timeout_kubectl, task_id=ctx.task_id,
+            expect_profile=PROFILE_K8S,
+        )
+    except Exception as e:
+        logger.info("Target node resolution for %s failed: %s", scope, e)
+        return None
+    node = (result.stdout or "").strip()
+    if result.exit_code != 0 or not node:
+        logger.info(
+            "Target node resolution for %s yielded no node (exit=%s)",
+            scope, result.exit_code,
+        )
+        return None
+    ctx.tracker.update(
+        f"Target node ({via}): {node}",
+        {"step": "target_node_resolution", "scope": scope, "node": node},
+    )
+    return node
+
+
 def _build_strategy_chain(ctx: _BaselineCtx) -> list:
     """Phase 2a: build the lazy ``(name, factory)`` baseline strategy chain.
 
@@ -641,7 +880,10 @@ async def _select_baseline_strategy(
             continue
 
         # Viability Gate: how many commands survive template resolution
-        resolved_preview = _resolve_templates(strategy_commands, state, profile)
+        resolved_preview = _resolve_templates(
+            strategy_commands, state, profile,
+            target_pod=ctx.target_pod, target_node=ctx.target_node,
+        )
         viable_count = sum(1 for c in resolved_preview if not c.get("_unresolved"))
         total_count = len(strategy_commands)
 
@@ -876,11 +1118,17 @@ async def _collect_observations(
     scope, target, action, channel = ctx.scope, ctx.target, ctx.action, ctx.channel
 
     # 3. Resolve template variables
-    resolved = _resolve_templates(commands, state, profile)
+    resolved = _resolve_templates(
+        commands, state, profile,
+        target_pod=ctx.target_pod, target_node=ctx.target_node,
+    )
     evidence_supplements = _evidence_supplement_commands(profile, spec, resolved)
     if evidence_supplements:
         commands = [*commands, *evidence_supplements]
-        resolved = _resolve_templates(commands, state, profile)
+        resolved = _resolve_templates(
+            commands, state, profile,
+            target_pod=ctx.target_pod, target_node=ctx.target_node,
+        )
         logger.info(
             "Added %d baseline evidence supplement(s) for profile %s",
             len(evidence_supplements), profile,
@@ -1005,8 +1253,22 @@ async def _collect_observations(
                     "judged expected pre-injection absence by baseline retry"
                 )
             retry_commands = retry_decisions.get("replace") or []
+            # Task 5.1: replacements refused by the derive-side double
+            # gate (shape + class + whitelist). Each entry is
+            # ``(obs, cmd_text, reason)``. Without this channel the
+            # original failed observation would silently disappear from
+            # the merge (Case #61: a container_internal exec failure
+            # replaced by an api_object pod listing — the replacement
+            # passed the whitelist with exit 0, the failed dimension went
+            # unmeasured, and the receipt still said 7/7). Keeping the
+            # obs in ``all_pairs`` and stamping the reason onto it makes
+            # the failure visible to the next retry round's
+            # error_feedback (which reads obs['stderr'] / obs['error']).
+            rejected_replacements = (
+                retry_decisions.get("rejected_replacements") or []
+            )
 
-            if not retry_commands:
+            if not retry_commands and not rejected_replacements:
                 if not expected_pairs:
                     logger.info(
                         "LLM retry %d: no corrected commands returned",
@@ -1035,20 +1297,48 @@ async def _collect_observations(
                 _text = (getattr(_c, "command", "") or "").strip()
                 if _text and _text not in tried_commands:
                     tried_commands.append(_text)
+            # Task 5.2: tried_commands records the REJECTED replacements too.
+            # Rationale: the same LLM prompt next round would otherwise be
+            # free to re-emit the exact refused shape (e.g. the api_object
+            # substitution for a container_internal failure) — the refusal
+            # reason is now on the obs (feedback loop), and the command text
+            # is now on the tried list. Recording here (before the shape gate
+            # below) matches the existing timing discipline.
+            #
+            # Calling this list a "hard block" only became true with the attempt
+            # gate. Until then it reached the next round as PROMPT TEXT alone
+            # ("do not emit these again"), i.e. it asked the model not to repeat
+            # itself and nothing enforced that — neither gate accepted the list.
+            # ``_validate_and_filter_commands(already_tried=...)`` now refuses a
+            # fingerprint match before execution, which is what turns the record
+            # into a block rather than a request. inject-6ebf341c is the field
+            # sample of the old behaviour: retry 3 re-emitted retry 1's
+            # ``kubectl get daemonset kube-proxy -n kube-system -o wide``
+            # verbatim, so the dimension was probed twice, failed twice, and the
+            # receipt settled at 5/7 with confidence ``partial``.
+            for _obs, _cmd_text, _reason in rejected_replacements:
+                if _cmd_text and _cmd_text not in tried_commands:
+                    tried_commands.append(_cmd_text)
 
-            retry_resolved = _resolve_templates(retry_commands, state, profile)
+            retry_resolved = _resolve_templates(
+                retry_commands, state, profile,
+                target_pod=ctx.target_pod, target_node=ctx.target_node,
+            )
             retry_viable = [
                 c for c in retry_resolved if not c.get("_unresolved")
             ]
-            if not retry_viable:
+            if not retry_viable and not rejected_replacements:
                 if not expected_pairs:
                     break
                 # Only absence verdicts survived this round; marks already
                 # applied — continue so the loop check converges.
                 continue
 
-            retry_obs = await _execute_observations(
-                retry_resolved, kubeconfig, task_id,
+            retry_obs = (
+                await _execute_observations(
+                    retry_resolved, kubeconfig, task_id,
+                )
+                if retry_resolved else []
             )
 
             # Keep original VALID successes, keep judged-expected-absence
@@ -1084,8 +1374,43 @@ async def _collect_observations(
                 (r, o) for r, o in all_pairs
                 if o.get("expected_absence")
             ]
-            all_pairs = success_pairs + absence_pairs + list(
-                zip(retry_resolved, retry_obs)
+            # Task 5.1: pairs whose proposed replacement was REFUSED by
+            # the double gate. The obs stays in the failed set (it is not
+            # ``_is_observation_success``, not ``expected_absence``, and
+            # has no entry in ``zip(retry_resolved, retry_obs)``), so the
+            # next retry round picks it up again via ``failed_obs``. The
+            # reason is stamped onto the obs so the next round's
+            # error_feedback shows the LLM why its substitution shape
+            # was rejected — closing the Case #61 "launder through
+            # retry" loop.
+            rejected_pairs: list[tuple[dict, dict]] = []
+            if rejected_replacements:
+                rejected_obs_ids = {id(_o) for _o, _, _ in rejected_replacements}
+                # Preserve the ORIGINAL (resolved, obs) pair so downstream
+                # per-target bookkeeping fields (_target_name / _extractors /
+                # etc.) stay attached — same rationale as absence_pairs.
+                rejected_pairs = [
+                    (r, o) for r, o in all_pairs
+                    if id(o) in rejected_obs_ids
+                    and not o.get("expected_absence")
+                ]
+                # Stamp the rejection reason onto each obs. Use a
+                # dedicated field (not stderr) so we don't clobber the
+                # original error signal; the retry prompt's error_feedback
+                # block reads it explicitly (see _llm_derive.py).
+                for _obs, _cmd_text, _reason in rejected_replacements:
+                    _existing = _obs.get("retry_rejection_reason", "")
+                    _stamp = (
+                        f"replacement '{_cmd_text[:120]}' refused by the "
+                        f"shape/class gate: {_reason}"
+                    )
+                    _obs["retry_rejection_reason"] = (
+                        f"{_existing}\n{_stamp}" if _existing else _stamp
+                    )
+
+            all_pairs = (
+                success_pairs + absence_pairs + rejected_pairs
+                + list(zip(retry_resolved, retry_obs))
             )
 
         if all_pairs:
@@ -1140,7 +1465,10 @@ async def _collect_observations(
             if not _fb_commands:
                 _attempted.add(_fb_name)
                 continue
-            _fb_resolved_preview = _resolve_templates(_fb_commands, state, profile)
+            _fb_resolved_preview = _resolve_templates(
+                _fb_commands, state, profile,
+                target_pod=ctx.target_pod, target_node=ctx.target_node,
+            )
             _fb_viable = sum(
                 1 for c in _fb_resolved_preview
                 if not c.get("_unresolved")
@@ -1169,13 +1497,19 @@ async def _collect_observations(
 
             commands = list(_fb_commands)
             source = _fb_name
-            resolved = _resolve_templates(commands, state, profile)
+            resolved = _resolve_templates(
+                commands, state, profile,
+                target_pod=ctx.target_pod, target_node=ctx.target_node,
+            )
             _fb_supplements = _evidence_supplement_commands(
                 profile, spec, resolved,
             )
             if _fb_supplements:
                 commands.extend(_fb_supplements)
-                resolved = _resolve_templates(commands, state, profile)
+                resolved = _resolve_templates(
+                    commands, state, profile,
+                    target_pod=ctx.target_pod, target_node=ctx.target_node,
+                )
             observations = await _execute_observations(
                 resolved, kubeconfig, task_id,
             )
@@ -1212,6 +1546,15 @@ def make_baseline_capture(llm=None, registry=None):
             ctx = replace(
                 ctx, pod_selector=await _discover_pod_selector(ctx),
             )
+            # baseline-observation-contract: prewarm {target_pod} literal
+            # resolution (pod scope: free; workload scope: one get-pods
+            # query; node/host: None). Depends on pod_selector above.
+            ctx = replace(ctx, target_pod=await _resolve_target_pod(ctx))
+            # Case #67 (W-67-1): prewarm the NODE the debug_two_step carrier
+            # must be aimed at (node scope: free; pod/workload scope: one
+            # .spec.nodeName query; host: None). Depends on pod_selector above,
+            # same as target_pod.
+            ctx = replace(ctx, target_node=await _resolve_target_node(ctx))
             strategy_chain = _build_strategy_chain(ctx)
 
             # Phase 2b extracted to _select_baseline_strategy.

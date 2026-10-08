@@ -83,6 +83,103 @@ def test_host_evidence_supplements_unknown_target_yields_no_cross():
     assert supplements == [("Host identity", ("hostname",))]
 
 
+def test_k8s_network_primary_metric_accepts_timing_probe_shapes():
+    """Case #58 (inject-3dae7b4f): the K8s-channel primary network metric
+    arrives as a timing probe, not a host socket dump.
+
+    Pre-fix, ``curl -w connect=%{time_connect}`` matched zero entries of the
+    network vocabulary (all host-side commands: ss / netstat / ip -s), so
+    every k8s:*:network baseline was structurally judged incomplete — the
+    capture itself was correct, only the judge could not read it.
+    """
+    profile = EvidenceProfile.for_fault(
+        FaultSpec(scope="pod", names=("web-0",), fault_target="network"), "k8s",
+    )
+
+    coverage = profile.coverage([
+        {
+            "description": "TCP connect timing to target pod",
+            "command": "kubectl exec client -- curl -s -o /dev/null "
+                       "-w 'connect=%{time_connect}' http://web-0:80",
+            "stdout": "connect=0.000823",
+        },
+    ])
+    assert "primary_metric" in coverage.covered
+    assert "primary_metric" not in coverage.missing
+
+
+def test_k8s_network_primary_metric_accepts_qdisc_and_netem_shapes():
+    """tc-side observation shapes from the netem injection family."""
+    profile = EvidenceProfile.for_fault(
+        FaultSpec(scope="pod", names=("web-0",), fault_target="network"), "k8s",
+    )
+
+    coverage = profile.coverage([
+        {"command": "kubectl exec web-0 -- tc qdisc show dev eth0",
+         "stdout": "qdisc netem state UNKNOWN"},
+    ])
+    assert "primary_metric" in coverage.covered
+
+
+def test_k8s_channel_is_a_union_host_vocabulary_still_counts():
+    """``kubectl exec <pod> -- ss -s`` is a legal K8s observation.
+
+    The K8s additions must MERGE onto the base table, not replace it —
+    otherwise a container-side socket dump would lose coverage it used to
+    have.
+    """
+    profile = EvidenceProfile.for_fault(
+        FaultSpec(scope="pod", names=("web-0",), fault_target="network"), "k8s",
+    )
+
+    coverage = profile.coverage([
+        {"command": "kubectl exec web-0 -- ss -s"},
+    ])
+    assert "primary_metric" in coverage.covered
+
+
+def test_host_channel_primary_vocabulary_is_unchanged():
+    """Regression: the K8s additions must not leak into the host channel."""
+    profile = EvidenceProfile.for_fault(
+        FaultSpec(scope="host", fault_target="network"), "host",
+    )
+
+    # Base vocabulary still works on the host channel.
+    covered = profile.coverage([{"command": "ss -s"}])
+    assert "primary_metric" in covered.covered
+
+
+def test_k8s_non_network_domains_still_rely_on_base_vocabulary():
+    """Only network needed K8s additions — cpu/mem/disk/process K8s baselines
+    run kubectl top / describe / df / ps, whose vocabulary is already in the
+    base tables. Pinned so the "network-only additions" decision stays a
+    documented fact rather than an accident.
+    """
+    cpu_profile = EvidenceProfile.for_fault(
+        FaultSpec(scope="pod", names=("api-0",), fault_target="cpu"), "k8s",
+    )
+    coverage = cpu_profile.coverage([
+        {"command": "kubectl top pod api-0 -n prod", "stdout": "api-0 12m 128Mi"},
+    ])
+    assert "primary_metric" in coverage.covered
+
+
+def test_unknown_target_on_k8s_falls_back_to_target_word():
+    """Unknown fault targets keep the (target,) fallback on either channel."""
+    profile = EvidenceProfile.for_fault(
+        FaultSpec(scope="pod", names=("worker-0",), fault_target="gpu"), "k8s",
+    )
+
+    coverage = profile.coverage([
+        # Pod name deliberately avoids the target word: the fallback pattern
+        # is a bare substring ("gpu"), which would match a pod named gpu-0.
+        {"command": "kubectl top pod worker-0 -n prod", "stdout": "worker-0 12m 128Mi"},
+    ])
+    # No additions exist for unknown targets; the fallback ("gpu",) does not
+    # match this observation, so primary stays missing — unchanged behavior.
+    assert "primary_metric" in coverage.missing
+
+
 def test_execution_location_suffix_cannot_fake_coverage():
     """The displayed location must not count as evidence.
 

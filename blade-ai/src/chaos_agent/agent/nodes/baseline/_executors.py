@@ -23,8 +23,9 @@ from chaos_agent.agent.nodes.baseline._commands import (
     _is_observation_success,
 )
 from chaos_agent.agent.nodes.execute._debug_pod import (
+    CARRIER_TARGET_MISSING,
     DEBUG_CONTAINER_NAME,
-    create_and_wait_debug_pod,
+    create_and_wait_debug_pod_with_reason,
     delete_debug_pod,
     parse_debug_pod_name,
     wait_for_debug_pod_ready,
@@ -76,11 +77,34 @@ async def _execute_observations(
         node_names = set(c.get("_node_name", "") for c in debug_two_step_cmds)
         node_names.discard("")
         for node_name in node_names:
-            result = await _create_and_wait_debug_pod(
+            result, reason = await _create_and_wait_debug_pod_with_reason(
                 node_name, kubeconfig, task_id,
             )
             if result:
                 debug_pods[node_name] = result
+            elif reason == CARRIER_TARGET_MISSING:
+                # The carrier failed because the API server does not have this
+                # NODE. The tool-pod fallback selects candidates by
+                # ``spec.nodeName == node_name``, and no pod can be scheduled
+                # onto a node that does not exist — so the fallback is
+                # provably futile, not merely unlikely. Running it anyway is
+                # worse than wasted round-trips: ``discover_tool_pod_state_on_node``
+                # would answer ABSENT ("a query succeeded and nothing
+                # matched"), which its contract marks as safe to BLOCK on, and
+                # one unresolved name would harden into two independent-looking
+                # confirmations that the tool is genuinely absent.
+                logger.warning(
+                    "Skipping tool-pod fallback for %r: the node itself is "
+                    "absent, so no pod can be scheduled on it",
+                    node_name,
+                )
+                if tracker:
+                    tracker.update(
+                        f"No carrier for node {node_name}: node not found "
+                        f"(tool-pod fallback skipped as provably futile)",
+                        {"step": "debug_pod_create", "node": node_name,
+                         "status": "target_missing"},
+                    )
             else:
                 # Fallback: try to find a tool pod on this node
                 tool_pod_info = await discover_tool_pod_on_node(
@@ -89,9 +113,11 @@ async def _execute_observations(
                 if tool_pod_info:
                     tool_pod_fallbacks[node_name] = tool_pod_info
                     logger.info(
-                        "Debug pod unavailable for node %s, using tool pod %s "
-                        "in namespace %s as fallback for baseline commands",
-                        node_name, tool_pod_info[0], tool_pod_info[1],
+                        "Debug pod unavailable for node %s (reason=%s), using "
+                        "tool pod %s in namespace %s as fallback for baseline "
+                        "commands",
+                        node_name, reason or "ok", tool_pod_info[0],
+                        tool_pod_info[1],
                     )
 
     try:
@@ -110,6 +136,10 @@ async def _execute_observations(
                     "exit_code": -1,
                     "stdout": "",
                     "stderr": "skipped: unresolved template variable(s)",
+                    # Stamped even on the skip path: an unresolved observation
+                    # is a FAILED one, so it re-enters the retry loop, which is
+                    # exactly where the dimension must not be renegotiable.
+                    "_class": cmd_info.get("_class"),
                 })
                 if tracker:
                     tracker.update(
@@ -174,6 +204,20 @@ async def _execute_observations(
                 # feeds empties back for identity repair.
                 if _is_observation_success(obs) and _is_empty_observation(obs):
                     obs["empty_observation"] = True
+                # Dimension stamp (W-67-4): the declared observation class is
+                # a property of what the PLAN asked to measure, not of the
+                # command that happened to run. Carrying it on the observation
+                # is what lets the retry path pin it — without this the only
+                # class in play at retry time is the one the retry LLM
+                # re-declares, so a replacement refused under ``node_level``
+                # can be re-submitted verbatim under ``container_internal``
+                # and the class↔form gate (which never compares against the
+                # original) waves it through. Case #67 did exactly that and
+                # the receipt still read ``5/5 commands succeeded``.
+                # ``None`` for registry-sourced commands: their form is
+                # trusted by construction and the retry loop only runs for
+                # ``source == "llm"``, so nothing consumes the stamp there.
+                obs["_class"] = cmd_info.get("_class")
                 observations.append(obs)
 
                 # Emit per-command tracker update with output preview
@@ -386,14 +430,23 @@ async def _exec_debug_two_step(
     # Image candidate chain (explicit config > discovered DS images > busybox)
     # with per-candidate fast-fail retry, and namespace auto-discovery, live
     # inside create_and_wait_debug_pod.
-    create_result = await _create_and_wait_debug_pod(node_name, kubeconfig, task_id)
+    create_result, create_reason = await create_and_wait_debug_pod_with_reason(
+        node_name, kubeconfig, task_id,
+    )
     if not create_result:
         return {
             "description": cmd_info["description"],
             "command": "",
             "exit_code": -1,
             "stdout": "",
-            "stderr": f"Failed to create debug pod for node {node_name}",
+            # Name the disproven fact, not just the symptom: a receipt saying
+            # "failed to create" leaves the reader guessing whether the image,
+            # the privileges or the NODE was at fault — and only the last one
+            # means every sibling observation on this node is doomed too.
+            "stderr": (
+                f"Failed to create debug pod for node {node_name} "
+                f"({create_reason or 'unspecified'})"
+            ),
         }
 
     debug_pod, pod_ns = create_result
@@ -483,11 +536,22 @@ async def _wait_for_debug_pod_ready(
     return await wait_for_debug_pod_ready(pod_name, kubeconfig, task_id, timeout)
 
 
-async def _create_and_wait_debug_pod(
+async def _create_and_wait_debug_pod_with_reason(
     node_name: str, kubeconfig: str, task_id: str,
-) -> tuple[str, str] | None:
-    """Backward-compat wrapper — delegates to shared _debug_pod module."""
-    return await create_and_wait_debug_pod(node_name, kubeconfig, task_id)
+) -> tuple[tuple[str, str] | None, str]:
+    """Reason-aware wrapper — delegates to shared _debug_pod module.
+
+    The reason is not decoration: ``_execute_observations``' tool-pod fallback
+    rests on the same node name the carrier was aimed at, so it may only run
+    when that name was NOT the thing disproven. This is the ONLY debug-pod
+    creation seam in this module — the carrier-only
+    ``create_and_wait_debug_pod`` is deliberately not wrapped here, because a
+    second near-identical seam is a silent-patch trap (a test can mock the
+    unused one and pass while the real path runs).
+    """
+    return await create_and_wait_debug_pod_with_reason(
+        node_name, kubeconfig, task_id,
+    )
 
 
 async def _delete_debug_pod(
@@ -653,7 +717,7 @@ __all__ = [
     "_exec_in_debug_pod",
     "_parse_debug_pod_name",
     "_wait_for_debug_pod_ready",
-    "_create_and_wait_debug_pod",
+    "_create_and_wait_debug_pod_with_reason",
     "_delete_debug_pod",
     "_DEBUG_CONTAINER_NAME",
 ]
