@@ -503,6 +503,20 @@ def infer_effective_target(
     # which the screeners reject).
     if tool_name in ("read_knowledge_resource", "read_skill_resource",
                      "activate_skill", "submit_fault_intent",
+                     # Intent-phase routing/read signals — the same gap
+                     # class B81's ``finish_execution`` exposed: batch
+                     # submission and recover routing are state-machine
+                     # moves with no cluster side effect at the CALL site
+                     # (recover_task hands off to the recover pipeline,
+                     # which re-screens under its own guards);
+                     # query_active_experiments reads the local task
+                     # store. They sat outside every classifier-screened
+                     # phase until the intent screener gained its
+                     # read-only gate — without this row that gate
+                     # answers every routing/listing call with the
+                     # default-deny UNKNOWN and wedges the phase.
+                     "submit_batch_intent", "query_active_experiments",
+                     "recover_task",
                      "read_file", "save_fault_plan",
                      "finish_planning", "propose_plan_change",
                      "submit_verification", "submit_recover_verification",

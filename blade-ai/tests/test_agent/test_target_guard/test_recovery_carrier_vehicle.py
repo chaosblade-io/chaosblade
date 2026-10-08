@@ -16,6 +16,7 @@ The channel, in order:
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -34,6 +35,9 @@ from chaos_agent.agent.nodes.planning.tool_screener import (
 )
 from chaos_agent.agent.target_guard import freeze_approved_target
 from chaos_agent.config.settings import settings
+
+if TYPE_CHECKING:
+    from chaos_agent.agent.target_guard.types import ApprovedTarget, EffectiveTarget
 
 _DISCOVERY = (
     "chaos_agent.tools.pod_discovery"

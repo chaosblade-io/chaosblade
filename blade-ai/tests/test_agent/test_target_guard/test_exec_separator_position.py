@@ -169,8 +169,12 @@ class TestDebugClassifierSingleTargetKept:
         ("args", "scope", "names"),
         [
             # the live node-debug carrier shape: space-separated flag values
+            # and the inert ``-- sleep N`` keepalive the case docs actually
+            # create the carrier with (an escaping ``-- chroot /host bash``
+            # inner is ruled separately by P4 — see
+            # TestDebugOneShotInnerEscapeRuled — so it is not a "kept" shape).
             (
-                ["node/n1", "-it", "--image=ubuntu", "--", "chroot", "/host", "bash"],
+                ["node/n1", "-it", "--image=ubuntu", "--", "sleep", "3600"],
                 "node",
                 ("n1",),
             ),
@@ -186,6 +190,63 @@ class TestDebugClassifierSingleTargetKept:
         target = _debug(args)
         assert target.scope == scope
         assert tuple(target.names) == names
+
+
+class TestDebugOneShotInnerEscapeRuled:
+    """P4: a one-shot ``kubectl debug -- <cmd>`` inner is NOT inert.
+
+    A one-shot debug pod is ephemeral and never registered as a carrier, so
+    the exec-only carrier gate never reviewed what it ran against the host —
+    the P4 hole. The debug face now judges the ``-- <cmd>`` inner through the
+    SAME host-escape lens, and applies the exec carrier gate's own判据
+    (family + bounded recovery) inline so a self-recovering node-level
+    injection stays allowed while a non-self-recovering one is refused.
+    """
+
+    _NODE_ARGS = ["node/n1", "--profile=sysadmin", "--image=ubuntu", "--"]
+
+    def test_self_recovering_host_mutation_kept(self):
+        # the documented node-level injection shape: a systemd-run timer armed
+        # with the family inverse, then the mutation (process family here).
+        inner = [
+            "chroot", "/host", "sh", "-c",
+            "systemd-run --on-active=600s --unit=blade-restore-kubelet "
+            "kill -CONT $KPID && kill -STOP $KPID",
+        ]
+        target = _debug(self._NODE_ARGS + inner)
+        assert target.scope == "node"
+        assert tuple(target.names) == ("n1",)
+
+    def test_non_self_recovering_mutation_refused(self):
+        # a bare ``systemctl stop`` (banned verb, no bounded reversal) is the
+        # P4 hole: it must NOT ride a one-shot debug past the review.
+        inner = [
+            "chroot", "/host", "sh", "-c",
+            "systemctl stop blade-restore-hosts.timer",
+        ]
+        target = _debug(self._NODE_ARGS + inner)
+        assert target.scope == SCOPE_ESCAPE
+        assert "host-escape primitive" in (target.reject_detail or "")
+
+    def test_family_less_rm_refused(self):
+        inner = ["chroot", "/host", "sh", "-c", "rm -f /var/log/app-archive.log"]
+        target = _debug(self._NODE_ARGS + inner)
+        assert target.scope == SCOPE_ESCAPE
+
+    def test_readonly_host_probe_not_refused(self):
+        # a read-only probe through the escape primitive is a diagnostic, not
+        # an injection. At THIS face the escape verdict is None, so it falls
+        # through to the node target (the __readonly__ short-circuit lives in
+        # the parent ``_classify_kubectl``); the pin is that it is NOT refused.
+        target = _debug(self._NODE_ARGS + ["chroot", "/host", "df", "-h"])
+        assert target.scope == "node"
+        assert target.scope != SCOPE_ESCAPE
+
+    def test_bare_interactive_escape_shell_refused(self):
+        # an unbounded interactive host shell is neither read-only nor
+        # self-recovering — fail closed.
+        target = _debug(self._NODE_ARGS + ["chroot", "/host", "bash"])
+        assert target.scope == SCOPE_ESCAPE
 
 
 class TestHostCarrierGateRefusesExtraPositionals:

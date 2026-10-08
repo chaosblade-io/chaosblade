@@ -942,3 +942,102 @@ class TestJsonpathRenderSingleSource:
             "deployment", "prod", ("web",), {},
         )
         assert claims == ()  # fail-closed decision unchanged
+
+
+class TestDiscoverVictimNodes:
+    """W-56-1: derive the node(s) hosting the victim pod(s) — the freeze-time
+    discovery half of a ``name_from: victim_node`` mechanism write. The node
+    name is runtime-derived, so the case legislates the SEMANTIC and this
+    resolves the concrete name from the live cluster (never re-declared)."""
+
+    @staticmethod
+    def _make_transport(monkeypatch, answers: dict):
+        from chaos_agent.models.command_result import CommandResult
+
+        async def fake_execute(cmd, target, timeout=0,
+                               expect_profile=None, **kwargs):
+            tokens = [str(t) for t in cmd]
+            for needle, out in answers.items():
+                if needle in tokens:
+                    return CommandResult(exit_code=0, stdout=out, stderr="")
+            return CommandResult(exit_code=0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+
+    async def test_pod_by_name_resolves_node(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        self._make_transport(
+            monkeypatch, {"victim-pod": "cn-shanghai.25.209.71.148"},
+        )
+        nodes = await discover_victim_nodes(
+            "pod", "default", ("victim-pod",), {},
+        )
+        assert nodes == ("cn-shanghai.25.209.71.148",)
+
+    async def test_container_scope_normalises_to_pod(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        self._make_transport(monkeypatch, {"victim-pod": "node-a"})
+        nodes = await discover_victim_nodes(
+            "container", "default", ("victim-pod",), {},
+        )
+        assert nodes == ("node-a",)
+
+    async def test_multiple_pods_union_sorted(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        self._make_transport(
+            monkeypatch, {"pod-b": "node-z", "pod-a": "node-y"},
+        )
+        nodes = await discover_victim_nodes(
+            "pod", "default", ("pod-a", "pod-b"), {},
+        )
+        assert nodes == ("node-y", "node-z")
+
+    async def test_resolved_names_used_when_names_empty(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        self._make_transport(monkeypatch, {"labelled-pod": "node-l"})
+        nodes = await discover_victim_nodes(
+            "pod", "default", (), {}, resolved_names=("labelled-pod",),
+        )
+        assert nodes == ("node-l",)
+
+    async def test_label_only_path_queries_pods_by_selector(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        # No names / resolved_names → the label path resolves pods in one shot.
+        self._make_transport(monkeypatch, {"app=web": "node-1 node-2"})
+        nodes = await discover_victim_nodes(
+            "pod", "default", (), {"app": "web"},
+        )
+        assert nodes == ("node-1", "node-2")
+
+    async def test_non_pod_scope_yields_empty(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        # A node/host mechanism under a non-pod victim has no victim pod to
+        # derive from — the entry stays unmaterialized (fail closed).
+        self._make_transport(monkeypatch, {"web": "node-a"})
+        assert await discover_victim_nodes(
+            "deployment", "default", ("web",), {},
+        ) == ()
+
+    async def test_missing_namespace_yields_empty(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        self._make_transport(monkeypatch, {"victim-pod": "node-a"})
+        assert await discover_victim_nodes("pod", "", ("victim-pod",), {}) == ()
+
+    async def test_query_failure_fails_closed(self, monkeypatch):
+        from chaos_agent.agent.target_guard.freeze import discover_victim_nodes
+        from chaos_agent.models.command_result import CommandResult
+
+        async def fake_execute(cmd, target, timeout=0,
+                               expect_profile=None, **kwargs):
+            return CommandResult(exit_code=1, stdout="", stderr="NotFound")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        # Unscheduled / absent victim → no node → the derived entry is dropped
+        # at materialization (never frozen with empty names).
+        assert await discover_victim_nodes(
+            "pod", "default", ("ghost-pod",), {},
+        ) == ()

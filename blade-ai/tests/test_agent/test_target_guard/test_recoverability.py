@@ -96,6 +96,77 @@ class TestFamilyContractsPreserved:
         assert assess(cmd, "disk").recoverable is False
 
 
+class TestDeviceMapperInverse:
+    """A ``dmsetup create`` pairs with a ``dmsetup remove`` of the SAME name.
+
+    The device-mapper face of the disk family (the IO-error case's injection:
+    ``echo '0 1024 error' | dmsetup create <name>``). Its inverse is
+    name-keyed, the way the tc qdisc rule is device-keyed — a remove of some
+    other mapping leaves the created one live.
+    """
+
+    def test_dm_command_classifies_as_disk(self):
+        # The family must resolve, or the mutation is rejected as family-less
+        # exactly where the case needs it accepted.
+        assert classify_host_operation(
+            "chroot /host echo '0 1024 error' | dmsetup create errdev"
+        ) == "disk"
+
+    def test_create_paired_with_remove_same_name(self):
+        cmd = (
+            "systemd-run --on-active=600s dmsetup remove errdev && "
+            "echo '0 1024 error' | dmsetup create errdev"
+        )
+        assert assess(cmd, "disk").recoverable is True
+
+    def test_create_without_remove_not_bounded(self):
+        assert assess(
+            "echo '0 1024 error' | dmsetup create errdev", "disk"
+        ).recoverable is False
+
+    def test_remove_of_other_mapping_does_not_pair(self):
+        cmd = (
+            "dmsetup remove other-dev && "
+            "echo '0 1024 error' | dmsetup create errdev"
+        )
+        assert assess(cmd, "disk").recoverable is False
+
+    def test_every_created_mapping_needs_its_remove(self):
+        # ``a`` is removed, ``b`` is not — the leftover mapping keeps the
+        # command not-recoverable (per-name pairing, no substring match).
+        cmd = (
+            "dmsetup remove a; echo x | dmsetup create a; "
+            "echo y | dmsetup create b"
+        )
+        assert assess(cmd, "disk").recoverable is False
+
+    def test_remove_force_flag_still_pairs(self):
+        cmd = (
+            "dmsetup remove -f errdev; sleep 300; "
+            "echo x | dmsetup create errdev"
+        )
+        assert assess(cmd, "disk").recoverable is True
+
+    def test_bounded_dm_pair_is_recoverable(self):
+        # The case's arm shape: the removal rides a host-managed timer.
+        cmd = (
+            "echo '0 1024 error' | dmsetup create errdev && "
+            "systemd-run --on-active=600s --unit=blade-restore-dmerr "
+            "sh -c 'dmsetup remove errdev'"
+        )
+        assert assess(cmd, "disk").recoverable is True
+
+    def test_untimed_dm_pair_is_still_not_bounded(self):
+        # Pairing alone is not the bound — a timer must exist (same contract
+        # as the fill path).
+        cmd = "echo x | dmsetup create errdev; dmsetup remove errdev"
+        assert assess(cmd, "disk").recoverable is False
+
+    def test_missing_reason_names_the_dm_inverse(self):
+        result = assess("echo x | dmsetup create errdev", "disk")
+        assert any("dmsetup remove" in part for part in result.missing)
+
+
 class TestRegisteredRollbackEscape:
     """A registered rollback handle makes an inline timer unnecessary."""
 

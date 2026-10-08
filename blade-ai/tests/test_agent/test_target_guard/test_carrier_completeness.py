@@ -199,3 +199,70 @@ class TestMcpBoundaryRecordedNotAGap:
         et = infer_effective_target("coroot__query", {"q": "up"})
         assert et.scope == SCOPE_UNKNOWN
         assert et.scope != SCOPE_READONLY
+
+
+# ---------------------------------------------------------------------------
+# 载体 #9：faultdrill_assemble_carrier（确定性编排工具，M1）——LLM 面
+# classifier 认领回归（audit #9 补记的立法落地）
+# ---------------------------------------------------------------------------
+
+
+class TestFaultdrillAssemblerCarrierClaimed:
+    """``faultdrill_assemble_carrier``（faultdrill M1）是 EXECUTE-only 的确定性
+    编排工具：LLM 面是结构化 recipe（无自由命令串——比命令分类更强的封闭面），
+    内部 kubectl 由代码构造（ND3 deliberate，不走命令守卫）。
+
+    其 **LLM 可见面** MUST 被 ``classify_tool_target`` 认领进 ORDINARY net：
+    变更裁决（scope=targetRef kind）+ 完整目标身份（漂移守卫网同 kubectl
+    patch）；坏参数 fail-closed 到 SCOPE_UNKNOWN。这三个裁决把「内部命令不走
+    ToolGuard」与「未路由分类器的载体」区分开——前者是设计声明，后者才是
+    审计要测试失败的缺口。没有本类，未来读者会把 #9 误判为后者。
+    """
+
+    def test_assembler_call_is_a_mutation_with_full_identity(self):
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+
+        et = infer_effective_target("faultdrill_assemble_carrier", {
+            "target_kind": "Service", "target_name": "coredns",
+            "target_namespace": "kube-system",
+            "patches": "[]", "restore_patches": "[]",
+            "duration_seconds": 300,
+        })
+        # ORDINARY net: a mutation verdict carrying the full approved-target
+        # identity — the drift guard holds it exactly as a kubectl patch.
+        assert et.scope == "service"
+        assert et.scope != SCOPE_READONLY
+        assert et.namespace == "kube-system"
+        assert et.names == ("coredns",)
+
+    def test_unmappable_kind_fails_closed_unknown(self):
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+
+        et = infer_effective_target("faultdrill_assemble_carrier", {
+            "target_kind": "Bogus", "target_name": "x",
+            "target_namespace": "default",
+            "patches": "[]", "restore_patches": "[]",
+            "duration_seconds": 300,
+        })
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.scope != SCOPE_READONLY
+        assert "unmappable" in et.reject_detail
+
+    def test_missing_target_name_fails_closed_unknown(self):
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+
+        et = infer_effective_target("faultdrill_assemble_carrier", {
+            "target_kind": "Service", "target_name": "",
+            "target_namespace": "default",
+            "patches": "[]", "restore_patches": "[]",
+            "duration_seconds": 300,
+        })
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.scope != SCOPE_READONLY
+        assert "target_name" in et.reject_detail

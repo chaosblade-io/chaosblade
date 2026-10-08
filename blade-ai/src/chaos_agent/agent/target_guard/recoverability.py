@@ -163,6 +163,159 @@ def _disk_fill_path(command: str) -> str:
     return ""
 
 
+def disk_fill_path(command: str) -> str:
+    """Public face of :func:`_disk_fill_path`.
+
+    Shared by the carrier ledger (``_mark_bounded_host_recovery`` records the
+    filled path at arming time) and the early-recovery gate (which matches a
+    standalone reclaim against that record) — single-sourced so the extraction
+    rules cannot drift between the writer and the matcher (#59: the case's
+    prescribed early recovery was unreachable precisely because no channel
+    connected the armed fill to a later reclaim).
+    """
+    return _disk_fill_path(command)
+
+
+# A device-mapper mapping mutation and its inverse: ``dmsetup create <name>``
+# installs a mapping table (the IO-error case's device: an ``error`` target
+# over N sectors) and ``dmsetup remove <name>`` takes it back out. Paired by
+# the MAPPING NAME — a remove of some other mapping leaves the created one
+# live (the same device-level pairing the tc qdisc add/del rule uses). The
+# table itself arrives on stdin or via ``--table``, so only the first
+# non-option word after the verb is read; option words are skipped so
+# ``dmsetup remove -f <name>`` still parses. The verb is located
+# case-insensitively but the NAME is kept verbatim — mapping names are
+# case-sensitive, and the ledger/matcher match is exact.
+_DMSETUP_SEGMENT = re.compile(r"\bdmsetup\b([^;&|\n]*)", re.IGNORECASE)
+
+
+def _dm_mapping_names(text: str, verb: str) -> list[str]:
+    """Mapping names a ``dmsetup <verb>`` in *text* acts on, in order."""
+    names: list[str] = []
+    for match in _DMSETUP_SEGMENT.finditer(text):
+        verb_match = re.search(rf"\b{verb}\b(.*)$", match.group(1), re.IGNORECASE)
+        if not verb_match:
+            continue
+        name = next(
+            (t for t in verb_match.group(1).split() if not t.startswith("-")), ""
+        )
+        if name:
+            names.append(name.strip("\"'"))
+    return names
+
+
+def dm_mapping_name(command: str) -> str:
+    """Public face of the created-mapping name — the ``disk_fill_path`` peer.
+
+    Shared by the carrier ledger (``_mark_bounded_host_recovery`` records
+    what a ``dmsetup create`` armed, at arming time) and the early-recovery
+    gate (which matches a standalone ``dmsetup remove`` against that record)
+    — single-sourced so the extraction rules cannot drift between writer and
+    matcher (#59's lesson, applied to the device-mapper face).
+    """
+    names = _dm_mapping_names(command, "create")
+    return names[0] if names else ""
+
+
+def network_inserted_rules(command: str) -> list[tuple[str, str]]:
+    """Public face of the inserted-rule fingerprints — the ``disk_fill_path`` peer.
+
+    Shared by the carrier ledger (``_mark_bounded_host_recovery`` records
+    what an ``iptables -I/-A`` or ``tc qdisc add`` armed, at arming time)
+    and the early-recovery gate (which matches a standalone ``iptables -D``
+    or ``tc qdisc del`` against that record) — single-sourced so the
+    extraction rules cannot drift between writer and matcher (#59's lesson,
+    applied to the network face; W-67-8: recoverability already recognised
+    the network inverse via ``_network_inverse``/``_iptables_rules_are_reversed``/
+    ``_tc_rules_are_reversed``, but the carriers early-recovery lane had no
+    network branch — the judgement layer and the admission layer were not
+    wired together).
+
+    Returns a list of ``(binary, fingerprint)`` pairs for every inserted
+    rule in the command:
+
+    - iptables/ip6tables: fingerprint is the normalized rule spec (whitespace
+      collapsed, quotes stripped) — the same normalization
+      ``_iptables_rules_are_reversed`` uses for pairing, so a ``-D``
+      extracted by the early-recovery gate matches byte-for-byte.
+    - tc: fingerprint is the device name (``tc qdisc add dev eth0`` →
+      ``("tc", "eth0")``) — device-level pairing, matching
+      ``_tc_rules_are_reversed``'s discipline.
+
+    nft is deliberately excluded: a true inverse is ``nft delete rule ...
+    handle N`` and the handle exists only at runtime, so static text cannot
+    fingerprint it (the same reason ``_network_inverse`` accepts nft on
+    formal presence only).
+    """
+    inserted: list[tuple[str, str]] = []
+    # iptables/ip6tables: (binary, normalized_rule_spec). The regex is
+    # designed for LOWERED text (same as ``_iptables_rules_are_reversed``,
+    # which receives ``lowered`` from ``_network_inverse``) — iptables verbs
+    # are uppercase (-I/-A/-D) but the character class ``-[iad]`` is
+    # lowercase, so the command must be lowered first. The rule fingerprint
+    # is therefore lowercase-normalized, matching the pairing discipline of
+    # ``_iptables_rules_are_reversed`` byte-for-byte.
+    lowered = command.lower()
+    mutations = re.findall(
+        r"\b(ip6tables|iptables)\b\s+(?:--wait(?:=[0-9]+)?\s+|-w(?:\s+[0-9]+)?\s+)?"
+        r"(-[iad]|--insert|--append|--delete)\s+([^;&|]+)",
+        lowered,
+    )
+    for binary, action, rule in mutations:
+        if action not in ("-i", "-a", "--insert", "--append"):
+            continue
+        # The rollback command may end a quoted ``sh -c`` block and be
+        # followed by nohup redirection or systemd-run arguments. Neither
+        # part belongs to the rule itself (same split as
+        # ``_iptables_rules_are_reversed``).
+        rule = re.split(r"\s+(?:[0-9]*>|<)", rule, maxsplit=1)[0]
+        normalized = " ".join(rule.strip(" \t\r\n\"'").split())
+        item = (binary, normalized)
+        if item not in inserted:
+            inserted.append(item)
+    # tc: ("tc", device_name) — device-level pairing
+    for dev in _TC_QDISC_ADD.findall(lowered):
+        item = ("tc", dev)
+        if item not in inserted:
+            inserted.append(item)
+    return inserted
+
+
+def network_deleted_rules(command: str) -> list[tuple[str, str]]:
+    """Public face of the deleted-rule fingerprints — the ``network_inserted_rules`` peer.
+
+    Extracts every ``iptables -D`` / ``tc qdisc del`` rule fingerprint from
+    the command, using the same normalization as ``network_inserted_rules``
+    so a deleted rule matches an inserted one byte-for-byte. Shared by the
+    early-recovery gate (``carriers._pure_network_reclaim_rule``) to verify
+    a standalone reclaim is the exact inverse of an armed rule.
+    """
+    deleted: list[tuple[str, str]] = []
+    # Same lowered-text discipline as ``network_inserted_rules`` — the
+    # regex character class ``-[iad]`` is lowercase, iptables verbs are
+    # uppercase (-D), so the command must be lowered first. This keeps the
+    # writer and matcher normalizations byte-identical.
+    lowered = command.lower()
+    mutations = re.findall(
+        r"\b(ip6tables|iptables)\b\s+(?:--wait(?:=[0-9]+)?\s+|-w(?:\s+[0-9]+)?\s+)?"
+        r"(-[iad]|--insert|--append|--delete)\s+([^;&|]+)",
+        lowered,
+    )
+    for binary, action, rule in mutations:
+        if action not in ("-d", "--delete"):
+            continue
+        rule = re.split(r"\s+(?:[0-9]*>|<)", rule, maxsplit=1)[0]
+        normalized = " ".join(rule.strip(" \t\r\n\"'").split())
+        item = (binary, normalized)
+        if item not in deleted:
+            deleted.append(item)
+    for dev in _TC_QDISC_DEL.findall(lowered):
+        item = ("tc", dev)
+        if item not in deleted:
+            deleted.append(item)
+    return deleted
+
+
 # A qdisc mutation scoped to a device: ``tc qdisc add dev eth0 root ...``.
 _TC_QDISC_ADD = re.compile(r"\btc\s+qdisc\s+add\b[^;&|]*?\bdev\s+(\S+)")
 # Its reversal: ``tc qdisc del dev eth0 root``. An add and a del pair ONLY
@@ -245,6 +398,25 @@ def _disk_inverse(lowered: str) -> bool:
         is not None
         or re.search(rf"\bfallocate\s+-d\b[^;&|]*{escaped}", lowered) is not None
     )
+
+
+def _dm_inverse(lowered: str) -> bool:
+    """Every ``dmsetup create <name>`` needs a matching ``dmsetup remove``.
+
+    Paired per mapping name (the tc qdisc rule's discipline): removing a
+    different mapping, or removing none, leaves the created one live. A
+    command with no ``dmsetup create`` is not this rule's business and is
+    left to the other disk inverses.
+    """
+    created = _dm_mapping_names(lowered, "create")
+    if not created:
+        return False
+    removed = _dm_mapping_names(lowered, "remove")
+    for name in created:
+        if name not in removed:
+            return False
+        removed.remove(name)
+    return True
 
 
 # Terminate-style faults expressed through ``crictl stop`` — the documented
@@ -513,14 +685,17 @@ def assess(
         # do NOT qualify — see _IO_BURNER).
         if _is_bounded_listener_or_burn(lowered, _IO_BURNER):
             return Recoverability(True)
-        # Reclaim via truncate/fallocate (never ``rm``) targeting the SAME path.
+        # Reclaim via truncate/fallocate (never ``rm``) targeting the SAME
+        # path — or, for a device-mapper mapping, a ``dmsetup remove`` of the
+        # SAME mapping name.
         has_timer = _has_delayed_reversal(lowered)
-        has_inverse = _disk_inverse(lowered)
+        has_inverse = _disk_inverse(lowered) or _dm_inverse(lowered)
         return _combine(
             has_timer, has_inverse,
             inverse_hint="a reclaim of the same fill path (truncate -s 0 <path> "
-            "or fallocate -d <path>); an IO burn loop may instead be wrapped "
-            "in timeout N to self-terminate",
+            "or fallocate -d <path>), or a ``dmsetup remove <name>`` matching "
+            "every ``dmsetup create <name>`` in the same command; an IO burn "
+            "loop may instead be wrapped in timeout N to self-terminate",
         )
 
     return Recoverability(
@@ -543,4 +718,11 @@ def _combine(has_timer: bool, has_inverse: bool, *, inverse_hint: str) -> Recove
     return Recoverability(False, tuple(missing))
 
 
-__all__ = ["Recoverability", "assess"]
+__all__ = [
+    "Recoverability",
+    "assess",
+    "disk_fill_path",
+    "dm_mapping_name",
+    "network_inserted_rules",
+    "network_deleted_rules",
+]

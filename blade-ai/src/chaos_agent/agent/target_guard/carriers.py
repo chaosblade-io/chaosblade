@@ -28,13 +28,20 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from chaos_agent.agent.execution_artifacts import find_active_debug_pod
 from chaos_agent.agent.target_guard.recoverability import (
+    _disk_inverse,
+    _dm_inverse,
+    _network_inverse,
     assess as assess_recoverability,
+    disk_fill_path,
+    dm_mapping_name,
+    network_inserted_rules,
 )
 from chaos_agent.agent.target_guard.types import (
     ApprovedTarget,
@@ -145,9 +152,16 @@ _BANNED_VERB_GUIDANCE = {
     # inject-055c86cc: the model tore down its own systemd-run transient
     # unit with ``systemctl stop``; for a PROCESS fault the family-canonical
     # teardown is pkill. Under any other approval pkill is a foreign family
-    # verb that voids the match the same way systemctl did — there the
-    # canonical shape is in-chain self-recovery, which leaves no transient
-    # unit to manage at all.
+    # verb that voids the match the same way systemctl did.
+    #
+    # #59 (Pod_被驱逐重建_DiskPressure, 2026-09): the "*" guidance used to
+    # push every non-process family to an IN-CHAIN reversal — but a
+    # self-reflexive fault (disk/memory pressure) evicts the carrier itself,
+    # and the in-chain reversal dies with it, leaking the fill until a human
+    # intervenes. The preferred shape for those faults is the HOST-MANAGED
+    # timer whose payload is the family's own inverse: the timer lives under
+    # PID 1 and fires whether or not the carrier survives. In-chain stays
+    # acceptable only when the fault cannot terminate its own carrier.
     "systemctl": {
         "process": (
             "a transient unit armed via systemd-run is stopped by pkill-ing "
@@ -157,15 +171,24 @@ _BANNED_VERB_GUIDANCE = {
         "*": (
             "do NOT substitute pkill for systemctl here — pkill is a "
             "process-family verb and voids the match against the approved "
-            "'{family}' fault the same way. Keep self-recovery in-chain "
-            "instead: pair the mutation with its own inverse behind a sleep "
-            "in the same call (<mutation> && sleep <N> && <inverse>), so no "
-            "transient unit is left to manage"
+            "'{family}' fault the same way. Re-express the step with the "
+            "family's own binaries: arm the reversal as a host-managed "
+            "timer whose payload is the family's inverse (systemd-run "
+            "--on-active=<N>s --unit=<unique-name> <inverse> — truncate -s 0 "
+            "<path> / fallocate -d <path> for a disk fill, iptables -D ... "
+            "matching the -I for a network fault); the timer lives under "
+            "PID 1, survives the carrier's death, and needs no systemctl "
+            "to manage. An in-chain bound (<mutation> && sleep <N> && "
+            "<inverse>) is acceptable ONLY when the fault itself cannot "
+            "terminate the carrier — a disk/memory fill evicts it and "
+            "takes the in-chain reversal down with it"
         ),
     },
     "rm": (
         "a filled file is reclaimed by the fault family's own reversal "
-        "(truncate -s 0 / fallocate -d), never by rm"
+        "(truncate -s 0 / fallocate -d), never by rm — inside a recovery "
+        "timer use that same reversal as the payload (systemd-run "
+        "--on-active=<N>s truncate -s 0 <path>), never rm"
     ),
 }
 
@@ -380,7 +403,7 @@ _SHELL_WRAPPERS = ("sh", "bash", "ash", "dash", "/bin/sh", "/bin/bash")
 # judge ``tools.readonly._classify_argv`` at the B34 fix.
 _FAULT_BINARIES = frozenset({
     "iptables", "ip6tables", "nft", "tc", "stress", "stress-ng", "dd",
-    "fallocate", "fio",
+    "fallocate", "fio", "dmsetup",
 })
 
 
@@ -400,6 +423,326 @@ def _host_entry_tokens(inner: list[str]) -> list[str]:
             if nested:
                 return nested
     return inner
+
+
+def _pure_disk_reclaim_path(host_command: str) -> str:
+    """The fill path a STANDALONE disk reclaim targets, or ``''``.
+
+    The early-recovery face of the disk family's reversal: exactly one
+    ``truncate -s 0 <path>`` / ``fallocate -d <path>`` (optionally behind
+    the ``chroot /host`` entry token and one ``sh -c`` wrapper), with
+    nothing else mutating in the command. Anything more (a fill verb, a
+    timer, a second statement) is NOT a pure reclaim and keeps failing
+    closed through the ordinary gates.
+    """
+    try:
+        tokens = shlex.split(host_command)
+    except ValueError:
+        return ""
+    entry = _host_entry_tokens(tokens)
+    # Tolerate the ``chroot /host`` prefix pair the exec channel carries, and
+    # the ``/host/<binary>`` absolute form (its strip yields the host-inner
+    # absolute path, e.g. ``/host/bin/truncate`` → ``/bin/truncate``).
+    if entry[:2] == ["chroot", "/host"]:
+        entry = entry[2:]
+    elif entry and entry[0].startswith("/host/"):
+        entry[0] = entry[0][len("/host"):]
+    # The BINARY token may carry any path prefix (``/host/truncate``,
+    # ``/bin/truncate``); the verb is its basename. Only token[0] is
+    # normalized — the PATH argument keeps matching the ledger's recorded
+    # host-inner path exactly, so this cannot widen what a reclaim may hit.
+    if entry and "/" in entry[0]:
+        entry[0] = entry[0].rsplit("/", 1)[-1]
+    if len(entry) == 4 and entry[0] == "truncate" and entry[1] == "-s" \
+            and entry[2] == "0":
+        return entry[3].strip("\"'")
+    if len(entry) == 3 and entry[0] == "truncate" and entry[1] in (
+        "--size=0",
+    ):
+        return entry[2].strip("\"'")
+    if len(entry) == 4 and entry[0] == "truncate" and entry[1] == "--size" \
+            and entry[2] == "0":
+        return entry[3].strip("\"'")
+    if len(entry) == 3 and entry[0] == "fallocate" and entry[1] == "-d":
+        return entry[2].strip("\"'")
+    return ""
+
+
+def _pure_dm_reclaim_name(host_command: str) -> str:
+    """The mapping name a STANDALONE ``dmsetup remove`` targets, or ``''``.
+
+    The device-mapper face of the early-recovery lane: exactly one
+    ``dmsetup remove <name>`` (optionally behind the ``chroot /host`` entry
+    token and one ``sh -c`` wrapper), with nothing else in the command.
+    Option words are skipped so ``dmsetup remove -f <name>`` parses; two
+    names or any second statement are NOT a pure reclaim and keep failing
+    closed through the ordinary gates.
+    """
+    try:
+        tokens = shlex.split(host_command)
+    except ValueError:
+        return ""
+    entry = _host_entry_tokens(tokens)
+    if entry[:2] == ["chroot", "/host"]:
+        entry = entry[2:]
+    elif entry and entry[0].startswith("/host/"):
+        entry[0] = entry[0][len("/host"):]
+    if entry and "/" in entry[0]:
+        entry[0] = entry[0].rsplit("/", 1)[-1]
+    if not entry or entry[0] != "dmsetup":
+        return ""
+    rest = [t for t in entry[1:] if not t.startswith("-")]
+    if len(rest) == 2 and rest[0] == "remove":
+        return rest[1].strip("\"'")
+    return ""
+
+
+def _pure_network_reclaim_rule(host_command: str) -> tuple[str, str]:
+    """The (binary, fingerprint) a STANDALONE network reclaim targets, or ``("", "")``.
+
+    The early-recovery face of the network family's reversal: exactly one
+    ``iptables -D <chain> <rule>`` or ``tc qdisc del dev <dev>`` (optionally
+    behind the ``chroot /host`` entry token and one ``sh -c`` wrapper), with
+    no inserted rule in the same command. Anything more (an insert, a second
+    delete, a timer, a second statement) is NOT a pure reclaim and keeps
+    failing closed through the ordinary gates.
+
+    The fingerprint normalization is shared with
+    ``recoverability.network_inserted_rules`` (write-read single source, #59's
+    lesson applied to the network face) so a deleted rule matches an armed
+    inserted one byte-for-byte.
+    """
+    from chaos_agent.agent.target_guard.recoverability import (
+        network_deleted_rules,
+        network_inserted_rules,
+    )
+
+    try:
+        tokens = shlex.split(host_command)
+    except ValueError:
+        return ("", "")
+    entry = _host_entry_tokens(tokens)
+    # Tolerate the ``chroot /host`` prefix pair the exec channel carries, and
+    # the ``/host/<binary>`` absolute form (same normalization as the disk
+    # and dm reclaim faces).
+    if entry[:2] == ["chroot", "/host"]:
+        entry = entry[2:]
+    elif entry and entry[0].startswith("/host/"):
+        entry[0] = entry[0][len("/host"):]
+    if entry and "/" in entry[0]:
+        entry[0] = entry[0].rsplit("/", 1)[-1]
+    # Pure-inverse shape constraint (the network peer of the disk lane's
+    # token-count discipline): the command must START with a network family
+    # binary and carry no composite separator or timer wrapper. A
+    # ``systemd-run ... iptables -D`` is a re-arm (mutation-shaped), and
+    # ``iptables -D ... && echo done`` is a composite — neither is a
+    # standalone reclaim. The disk lane enforces this by exact token count
+    # (``len(entry) == 4``); the network rule spec is variable-length, so
+    # the constraint is on the head binary and the absence of separators.
+    if not entry or entry[0] not in ("iptables", "ip6tables", "tc"):
+        return ("", "")
+    rejoined = shlex.join(entry)
+    if re.search(r"&&|;|\||\bsystemd-run\b|\bsleep\b", rejoined):
+        return ("", "")
+    deleted = network_deleted_rules(rejoined)
+    inserted = network_inserted_rules(rejoined)
+    # Pure inverse: exactly one deleted rule, no inserted rules. A command
+    # that both inserts and deletes is a re-arm (second mutation), not a
+    # reclaim; a command with two deletes is not "exactly one" inverse.
+    if len(deleted) == 1 and not inserted:
+        return deleted[0]
+    return ("", "")
+
+
+# ===========================================================================
+# Bounded-RECLAIM recovery registry (root-cause I-c single source of truth)
+# ===========================================================================
+#
+# One record per bounded-RECLAIM face wires ALL FOUR enforcement layers a
+# recoverable host fault family must have, so a new family can never be
+# half-wired the way W-67-8's network face was (a judge present in
+# recoverability but no lane here → recoverable=True yet the window-internal
+# pure inverse fell NO_BOUNDED_RECOVERY — a fail-closed gap that read as "the
+# guard working"). The four layers:
+#
+#   judge   recoverability._*_inverse — recognises the paired inverse. assess()
+#           consults these directly; the registry is the single ENUMERATION
+#           that ties each to its other three faces.
+#   ledger  execution_artifacts._mark_bounded_host_recovery iterates the
+#           registry, calling ``ledger_extract`` and writing ``ledger_key``.
+#   lane    _resolve_carrier_from_artifact iterates the registry, calling
+#           ``lane_match`` and matching against the armed identities.
+#   render  provider.recovery_facts_render iterates the registry, calling
+#           ``render`` for the (what, inverse) wording.
+#
+# A record with ANY missing face raises at import time (module load builds
+# RECOVERY_FAMILIES), so the gap is a loud crash, never a silent fail-closed.
+# cpu/mem/process are bounded too but self-terminate or pair inline — they own
+# NO reclaim fingerprint, so they are correctly NOT faces here.
+#
+# This registry lives in carriers.py because carriers already imports
+# recoverability (a leaf) at module level; execution_artifacts and provider
+# both import it from here lazily, keeping the dependency graph acyclic.
+
+
+def _disk_fill_identity(host_command: str) -> tuple[str, ...]:
+    """Lane identity for the disk-fill face: ``(path,)``, or ``()`` if none."""
+    path = _pure_disk_reclaim_path(host_command)
+    return (path,) if path else ()
+
+
+def _dm_identity(host_command: str) -> tuple[str, ...]:
+    """Lane identity for the device-mapper face: ``(name,)``, or ``()``."""
+    name = _pure_dm_reclaim_name(host_command)
+    return (name,) if name else ()
+
+
+def _network_identity(host_command: str) -> tuple[str, ...]:
+    """Lane identity for the network face: ``(binary, fingerprint)``, or ``()``."""
+    binary, fingerprint = _pure_network_reclaim_rule(host_command)
+    return (binary, fingerprint) if binary else ()
+
+
+def _render_disk_fill(value: object) -> tuple[str, str]:
+    path = str(value or "")
+    return (f"the disk fill at {path}", f"truncate -s 0 {path}")
+
+
+def _render_dm(value: object) -> tuple[str, str]:
+    name = str(value or "")
+    return (f"the device-mapper mapping {name}", f"dmsetup remove {name}")
+
+
+def _render_network(value: object) -> tuple[str, str]:
+    rules = value or []
+    binary, fingerprint = rules[0]
+    if binary == "tc":
+        return (
+            f"the tc qdisc on {fingerprint}",
+            f"tc qdisc del dev {fingerprint} root",
+        )
+    return (f"the {binary} rule {fingerprint}", f"{binary} -D {fingerprint}")
+
+
+@dataclass(frozen=True)
+class RecoveryFamily:
+    """One bounded-reclaim face: the four layers it MUST wire (see above).
+
+    Every field is required; ``__post_init__`` raises on a missing/empty one so
+    a half-declared family fails at import time rather than fail-closed at
+    runtime.
+    """
+
+    name: str
+    family: str
+    ledger_key: str
+    judge: Callable[[str], bool]
+    ledger_extract: Callable[[str], object]
+    lane_match: Callable[[str], tuple[str, ...]]
+    render: Callable[[object], tuple[str, str]]
+    #: True when ``ledger_key`` holds a LIST of identities (network rules),
+    #: False when it holds one scalar (fill path / dm name).
+    armed_multi: bool = False
+    #: Tie-break when one artifact carries several faces' keys — reproduces the
+    #: render layer's historical dm > network > disk-fill if/elif/else priority.
+    #: MUST be UNIQUE across ``RECOVERY_FAMILIES``: ``min(present, key=...)``
+    #: breaks a tie silently by iteration order, so two faces sharing a value
+    #: would make the rendered face depend on registry position. Pinned by
+    #: ``test_render_precedence_is_unique`` (a per-instance ``__post_init__``
+    #: cannot see its siblings, so the uniqueness check lives in the invariant).
+    render_precedence: int = 0
+
+    def __post_init__(self) -> None:
+        for field in ("name", "family", "ledger_key"):
+            if not getattr(self, field):
+                raise ValueError(
+                    f"RecoveryFamily requires a non-empty {field!r}"
+                )
+        for field in ("judge", "ledger_extract", "lane_match", "render"):
+            if not callable(getattr(self, field)):
+                raise TypeError(
+                    f"RecoveryFamily {self.name!r} requires a callable "
+                    f"{field!r} — a bounded-reclaim family missing any one "
+                    f"layer is a silent fail-closed gap (W-67-8)"
+                )
+
+
+RECOVERY_FAMILIES: tuple[RecoveryFamily, ...] = (
+    RecoveryFamily(
+        name="disk_fill",
+        family="disk",
+        ledger_key="recovery_fill_path",
+        judge=_disk_inverse,
+        ledger_extract=disk_fill_path,
+        lane_match=_disk_fill_identity,
+        render=_render_disk_fill,
+        armed_multi=False,
+        render_precedence=2,
+    ),
+    RecoveryFamily(
+        name="dm",
+        family="disk",
+        ledger_key="recovery_dm_name",
+        judge=_dm_inverse,
+        ledger_extract=dm_mapping_name,
+        lane_match=_dm_identity,
+        render=_render_dm,
+        armed_multi=False,
+        render_precedence=0,
+    ),
+    RecoveryFamily(
+        name="network",
+        family="network",
+        ledger_key="recovery_network_rules",
+        judge=_network_inverse,
+        ledger_extract=network_inserted_rules,
+        lane_match=_network_identity,
+        render=_render_network,
+        armed_multi=True,
+        render_precedence=1,
+    ),
+)
+
+
+def _armed_identities_by_key(
+    artifacts: list | None,
+) -> dict[str, frozenset[tuple[str, ...]]]:
+    """ledger_key → the ``(node, *identity)`` tuples THIS task armed.
+
+    Registry-driven replacement for three hand-written armed_* comprehensions:
+    each face contributes its own ledger_key's identities from ONE enumeration,
+    so a new family cannot forget its lane's match set (the W-67-8 gap). A
+    record matches when it is in the live window (``recovery_armed``) or is the
+    void aftermath of a dead carrier (``cleaned`` + ``recovery_void``) — the two
+    states the early-recovery lane admits. Identities are ``(node, ...)``: the
+    fault was armed ON a specific node, so a reclaim through a carrier bound to
+    a DIFFERENT node must not match.
+    """
+
+    def _state_ok(item: dict) -> bool:
+        return item.get("status") == "recovery_armed" or (
+            item.get("status") == "cleaned" and bool(item.get("recovery_void"))
+        )
+
+    acc: dict[str, set[tuple[str, ...]]] = {
+        face.ledger_key: set() for face in RECOVERY_FAMILIES
+    }
+    for item in artifacts or []:
+        if not isinstance(item, dict) or not _state_ok(item):
+            continue
+        node = str((item.get("target") or {}).get("name") or "")
+        for face in RECOVERY_FAMILIES:
+            raw = item.get(face.ledger_key)
+            if not raw:
+                continue
+            if face.armed_multi:
+                for identity in raw:
+                    acc[face.ledger_key].add(
+                        (node, *[str(part) for part in identity])
+                    )
+            else:
+                acc[face.ledger_key].add((node, str(raw)))
+    return {key: frozenset(val) for key, val in acc.items()}
 
 
 def effective_target_from_registered_carrier(
@@ -445,8 +788,35 @@ def effective_target_from_registered_carrier(
             "unverified",
             _SUGGEST_REGISTER_POD,
         )
+    # The reclaim identities this task armed a rollback for (ledger view, #59),
+    # built by the recovery registry so every bounded-reclaim face (fill path /
+    # dm name / network rule) contributes its own keyed set from ONE
+    # enumeration — no per-face comprehension to forget when a family is added
+    # (the W-67-8 gap). The early-recovery gate below matches a standalone
+    # reclaim against this
+    # record — the connection the old legislation lacked entirely. Pairs
+    # are (node, path): the fill was armed ON a specific node through a
+    # specific carrier, so a reclaim executed through a carrier bound to a
+    # DIFFERENT node must not match — it would truncate that other node's
+    # file while the armed node's fault stays in place (adversarial
+    # self-review of the #59 fix: the path-only set opened exactly that
+    # cross-node lane in multi-carrier tasks).
+    #
+    # Two record states match. ``recovery_armed`` is the live window. A
+    # ``cleaned`` record carrying ``recovery_void`` is the AFTERMATH of a
+    # dead carrier whose carrier-resident reversal was stamped void at
+    # cleanup — the void stamp's whole meaning is "self-recovery is gone,
+    # ACTIVE recovery is required", and this lane is the only legal
+    # channel for that active recovery; without it the recover graph's
+    # re-issued truncate would hit the empty-family rejection exactly
+    # where it is most needed. A normally-cleaned record (timer already
+    # fired, manual delete of a live carrier) carries no void stamp and
+    # stays OUT — the fill is already reclaimed there, and fail-closed
+    # is the right default for anything unproven.
+    armed_by_key = _armed_identities_by_key(artifacts)
     return _resolve_carrier_from_artifact(
         artifact, pod_name, namespace, host_command, approved,
+        armed_by_key=armed_by_key,
     )
 
 
@@ -456,6 +826,8 @@ def _resolve_carrier_from_artifact(
     namespace: str,
     host_command: str,
     approved: ApprovedTarget,
+    *,
+    armed_by_key: dict[str, frozenset[tuple[str, ...]]] | None = None,
 ) -> CarrierResolution:
     """Shared validation logic for registered and discovered carriers."""
     # ``privileged`` is a NECESSARY condition, not a sufficient one, and the
@@ -501,6 +873,48 @@ def _resolve_carrier_from_artifact(
         )
 
     readonly_probe = is_readonly_host_probe(host_command)
+    # ---- Early reversal of an armed host recovery (#59 / W-67-8) ----------
+    # A fault whose rollback timer is armed may be recovered EARLY by running
+    # the family's OWN pure inverse for the SAME identity the arming exec
+    # recorded — that is the timer payload, run now. It is not a second
+    # mutation: it strictly shrinks the fault window (the timer firing
+    # afterwards is an idempotent no-op). Before this gate the pure inverse had
+    # NO legal channel at all: a standalone ``truncate`` / ``dmsetup remove`` /
+    # ``iptables -D`` maps to no fault family of its own (a delete is not an
+    # insert) and pairs with no forward mutation in the same command, so the
+    # ordinary gates (empty family → no-bounded-recovery) refused it exactly
+    # when it was the right move, leaving the timer as the only channel.
+    #
+    # The recovery registry drives EVERY face from one enumeration, so a family
+    # that gains a judge cannot skip its lane — the W-67-8 gap (network had
+    # ``_network_inverse`` in recoverability but no branch here, so judgement
+    # and admission were not wired together) is closed by construction rather
+    # than by remembering to add a fourth ``if``. Constrained to the approved
+    # family and to identities THIS TASK armed, so it can never reclaim an
+    # arbitrary resource.
+    if not readonly_probe:
+        approved_family = _normalise_family(approved.fault_target)
+        for face in RECOVERY_FAMILIES:
+            if face.family != approved_family:
+                continue
+            armed = (armed_by_key or {}).get(face.ledger_key) or frozenset()
+            if not armed:
+                continue
+            identity = face.lane_match(host_command)
+            # (node, *identity) all match: the reclaim runs on the SAME node
+            # the fault was armed on, whatever carrier pod it rides today.
+            if identity and (node_name, *identity) in armed:
+                return CarrierResolution.allow(
+                    EffectiveTarget(
+                        scope="node",
+                        namespace="",
+                        names=(node_name,),
+                        fault_target=face.family,
+                        confidence=ConfidenceLevel.HIGH,
+                        raw_command=f"kubectl exec {pod_name} -n {namespace} -- {host_command}",
+                    ),
+                    artifact,
+                )
     # A carrier with an armed rollback may still be inspected, but it must not
     # receive a second mutation before the first rollback deadline.
     if artifact.get("status") != "active" and not (
@@ -521,7 +935,10 @@ def _resolve_carrier_from_artifact(
             "carrier-lifecycle state, not the pod's Kubernetes phase)"
             + (
                 " — a rollback timer is already armed on it, so it must not "
-                "receive a second mutation until that timer fires"
+                "receive a second mutation until that timer fires; to recover "
+                "EARLY, exec the armed reversal's own payload as a standalone "
+                "command (e.g. `truncate -s 0 <the filled path>`) instead of "
+                "issuing a new mutation"
                 if artifact.get("status") == "recovery_armed"
                 else ""
             ),
@@ -752,13 +1169,29 @@ async def discover_unregistered_carrier(
             _SUGGEST_REGISTER_POD,
         )
 
-    # The pod's node must be in the approved target list.
+    # The pod's node must be in the approved target list — OR be authorized by
+    # a case-manifest derived node entry (W-56-1): a node-host mechanism under
+    # a namespaced (pod) victim writes the node the victim runs on, which never
+    # appears in ``approved.names`` (that holds the victim pod identity, not
+    # the node). The frozen ``mechanism_entries`` carry the materialized
+    # victim-node name — the SAME authorization the drift guard's manifest
+    # branch consults for the blade path — so the chroot/host-exec carrier path
+    # must consult it too; otherwise the identical node write is rejected here
+    # while the drift guard would allow it (the two enforcement points must
+    # agree).
     approved_names = set(approved.names or ())
-    if node_name not in approved_names:
+    derived_node_names = {
+        n
+        for e in (approved.mechanism_entries or ())
+        if e.scope == "node" and e.names
+        for n in e.names
+    }
+    authorized_nodes = approved_names | derived_node_names
+    if node_name not in authorized_nodes:
         return CarrierResolution.reject(
             CarrierRejectReason.NODE_NOT_APPROVED,
             f"pod '{pod_name}' runs on node '{node_name}', which is not in the "
-            f"approved target set ({', '.join(sorted(approved_names)) or 'none'})",
+            f"approved target set ({', '.join(sorted(authorized_nodes)) or 'none'})",
             _SUGGEST_APPROVED_NODE,
         )
 
@@ -986,7 +1419,14 @@ def classify_host_operation(command: str) -> str:
         r"\bsocat\b[^;&|\n]*\b(?:(?:exec|system):|shell\b)", lowered,
     ):
         families.add("network")
-    if re.search(r"(^|[\s/])(dd|fallocate|fio)(\s|$)", lowered):
+    # ``dmsetup`` rewrites the device-mapper mapping table — the same block
+    # storage the fill/IO binaries (dd/fallocate/fio) belong to, and the
+    # documented injection for the IO-error case (``echo '<sectors> error' |
+    # dmsetup create <name>``). Its own recovery (a paired ``dmsetup
+    # remove``) is decided by the recoverability gate, not here — but the
+    # family must resolve, or a dmsetup mutation is rejected as
+    # family-less exactly where the case needs it accepted.
+    if re.search(r"(^|[\s/])(dd|fallocate|fio|dmsetup)(\s|$)", lowered):
         families.add("disk")
     if re.search(r"(^|[\s/])(stress|stress-ng)(\s|$)", lowered):
         if re.search(r"--(vm|vm-bytes|brk|malloc)\b", lowered):

@@ -565,6 +565,75 @@ async def discover_pod_pvc_claims(
     return tuple(sorted(claims))
 
 
+async def discover_victim_nodes(
+    scope: str,
+    namespace: str,
+    names: tuple[str, ...],
+    labels: dict[str, str],
+    kubeconfig: str = "",
+    *,
+    resolved_names: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Resolve the node name(s) hosting the victim pod(s) — the anchor for a
+    derived ``name_from: victim_node`` mechanism write (W-56-1).
+
+    A node-host mechanism under a namespaced (pod/container) victim writes the
+    node the victim pod runs on, but that node name is runtime-derived (e.g.
+    ``cn-shanghai-cloudspe.25.209.71.148``) — neither statically listable in a
+    portable case manifest nor sharing a drill prefix, so ``names`` /
+    ``name_prefix`` cannot express it. This DERIVES it at freeze time (never
+    re-declared — the same discipline as :func:`discover_pod_pvc_claims` and
+    ``mechanism_writes.derive_pvc_claims_from_writes``): the case legislates
+    the SEMANTIC ("the victim's node"), code resolves the concrete name from
+    the live cluster and :func:`mechanism_writes.materialize_derived_entries`
+    injects it into the entry.
+
+    Only pod-bearing scopes yield nodes: ``pod`` / ``container`` read the named
+    (or label-resolved) pods' ``spec.nodeName``; a label-only approval queries
+    the matching pods in one shot. Every other scope returns an empty tuple —
+    a node/host mechanism under a non-pod victim has no victim pod to derive
+    from, so the entry stays unmaterialized and authorises nothing (fail
+    closed). Best-effort: any query failure yields an empty tuple (the derived
+    entry is then dropped at materialization — fail closed at the guard).
+    """
+    scope_l = (scope or "").strip().lower()
+    if scope_l == "container":
+        scope_l = "pod"
+    if scope_l != "pod" or not namespace:
+        return ()
+
+    nodes: set[str] = set()
+    pod_identities = tuple(names) if names else tuple(resolved_names)
+    if pod_identities:
+        for pod_name in pod_identities:
+            out = await query_kubectl(
+                _jsonpath_get_args(
+                    "pod", "{.spec.nodeName}",
+                    namespace=namespace, name=pod_name,
+                ),
+                kubeconfig,
+                log_name=f"victim-node {pod_name}",
+            )
+            nodes.update(w for w in out.words if w)
+    elif labels:
+        out = await query_kubectl(
+            _jsonpath_get_args(
+                "pods", "{.items[*].spec.nodeName}",
+                namespace=namespace, labels=labels,
+            ),
+            kubeconfig,
+            log_name="victim-nodes by labels",
+        )
+        nodes.update(w for w in out.words if w)
+
+    if nodes:
+        logger.info(
+            "discover_victim_nodes: victim pods %s in ns=%s run on node(s) %s",
+            list(pod_identities) or dict(labels), namespace, sorted(nodes),
+        )
+    return tuple(sorted(nodes))
+
+
 # B79 (case #39-R): scopes whose PVC claims are authored in the pod
 # TEMPLATE. The claimName a workload's pods mount is the same string the
 # pod channel reads off a live pod, so a workload-scope approval freezes
@@ -786,6 +855,7 @@ __all__ = [
     "discover_owner_names",
     "discover_pod_pvc_claims",
     "discover_statefulset_pvc_claims",
+    "discover_victim_nodes",
     "discover_workload_pvc_claims",
     "WORKLOAD_TEMPLATE_SCOPES",
     "freeze_approved_target",

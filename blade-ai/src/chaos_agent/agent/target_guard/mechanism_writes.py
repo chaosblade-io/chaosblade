@@ -35,6 +35,7 @@ consult.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -50,10 +51,164 @@ logger = logging.getLogger(__name__)
 # entry (logged) so a typo — ``names_prefix`` instead of ``name_prefix`` —
 # surfaces as "entry ignored" at load and as a guard rejection at run,
 # never as a silently-widened write set.
-_ENTRY_KEYS = frozenset({"scope", "namespace", "names", "name_prefix"})
+_ENTRY_KEYS = frozenset({
+    "scope", "namespace", "names", "name_prefix", "name_from", "namespace_from",
+})
+
+# ``name_from`` — a runtime-DERIVED selector for a write target the case
+# author CANNOT name statically. ``victim_node`` resolves at freeze time to
+# the node(s) hosting the victim pod (W-56-1: a node-host mechanism under a
+# namespaced victim writes the victim's node, whose name — e.g.
+# ``cn-shanghai-cloudspe.25.209.71.148`` — is runtime-derived, neither
+# listable in a portable case file nor sharing a drill prefix). The case
+# legislates the SEMANTIC; :func:`materialize_derived_entries` +
+# ``freeze.discover_victim_nodes`` inject the concrete name — DERIVED, never
+# re-declared (same discipline as the PVC claim anchor). Unknown values are
+# dropped at parse (never frozen), so a typo cannot silently widen the write
+# set — the same posture ``recovery_channel`` takes.
+NAME_FROM_VICTIM_NODE = "victim_node"
+KNOWN_NAME_FROM = frozenset({NAME_FROM_VICTIM_NODE})
+
+# ``namespace_from`` — the ORTHOGONAL derivation axis: a runtime-DERIVED
+# NAMESPACE for a write whose KIND the case CAN name but whose namespace must
+# track the victim's runtime location. ``victim`` resolves at freeze time to
+# the victim's own namespace (``approved.namespace``) and — unlike
+# ``name_from: victim_node`` — needs NO cluster query (the victim's ns is
+# already on the spec). A NetworkPolicy that must select the victim pod has to
+# live in the victim's namespace, which a portable case file cannot hardcode;
+# the case legislates ``namespace_from: victim`` and
+# :func:`materialize_derived_entries` injects the concrete ns. Contrast the
+# statically-namespaced precedents (NXDOMAIN → ``kube-system``, unbound PVC →
+# ``default``): those kinds live in a FIXED ns, a victim-scoped netpol does
+# not. Mutually exclusive with a static ``namespace``; unknown values are
+# dropped at parse (never frozen), the same posture ``name_from`` takes.
+NAMESPACE_FROM_VICTIM = "victim"
+KNOWN_NAMESPACE_FROM = frozenset({NAMESPACE_FROM_VICTIM})
 
 # Re-exported for consumers that prefer importing from this module.
 from .drift_policy import CLUSTER_SCOPED_KINDS  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Root cause III: the victim-runtime derivation REGISTRY — the single
+# declaration point for every "derive this entry's target location from the
+# victim's runtime placement" axis.
+#
+# An authorization entry sometimes has to name a target the case author
+# CANNOT write statically, because its location is decided by the victim's
+# RUNTIME placement (which node the victim pod landed on, which namespace it
+# lives in). Each such axis used to be hand-bolted through the whole chain —
+# parse-time validation, freeze-time materialization, the safety_check
+# discovery trigger — so a THIRD axis meant re-deriving all of it and
+# re-proving orthogonality / fail-closed by hand (the bolt-on defect).
+#
+# Now parse validation, materialization, serialization and the safety_check
+# trigger ALL iterate this table. Adding an axis is ONE new row here (plus
+# the matching dataclass field, which the serialization round-trip and the
+# ``test_derived_axes_enumeration_matches_registry`` invariant pin to the
+# registry). The fail-closed DROP semantics and the unknown-token rejection
+# come for free and are provably uniform, because exactly one code path —
+# :func:`materialize_derived_entries` and :func:`_parse_entry` — applies them.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _VictimRuntime:
+    """The victim's runtime facts a derivation may resolve against.
+
+    Populated at freeze time: ``victim_nodes`` from a live cluster query
+    (``freeze.discover_victim_nodes``), ``victim_namespace`` from the
+    already-known spec (no query). A resolver returns a falsy value when the
+    fact is unavailable → :func:`materialize_derived_entries` DROPS the entry
+    (fail closed — an empty selector would match ANY target).
+    """
+
+    victim_nodes: tuple[str, ...] = ()
+    victim_namespace: str = ""
+
+
+@dataclass(frozen=True)
+class _DerivedAxis:
+    """One victim-runtime derivation axis (a single registry row).
+
+    Attributes:
+        key: the frontmatter key AND the ``MechanismWriteEntry`` field name.
+        known: accepted derivation tokens; any other value is DROPPED at
+            parse (a typo must never silently widen the write set).
+        target_field: the entry field the resolved value materializes into
+            (``"names"`` for the name axis, ``"namespace"`` for the ns axis).
+        resolve: ``_VictimRuntime ->`` the concrete value; falsy → DROP.
+        needs_discovery: the resolver needs a live cluster query, so
+            ``safety_check`` must call ``discover_victim_nodes`` for it (a
+            namespace-only manifest skips the query).
+        is_selector: the axis participates in the ``names`` / ``name_prefix``
+            / derived-name three-way XOR (exactly one selector per entry).
+        mutex_static_field: a static field this axis cannot coexist with
+            (ambiguous authority → DROP).
+        reject_on_cluster_scoped: the axis is meaningless on a cluster-scoped
+            kind (no namespace to derive) → DROP at parse.
+        clears_name_prefix: materializing this axis also blanks the prefix
+            (the name axis replaces any selector with the derived names).
+    """
+
+    key: str
+    known: frozenset[str]
+    target_field: str
+    resolve: Callable[[_VictimRuntime], object]
+    needs_discovery: bool
+    is_selector: bool
+    mutex_static_field: str = ""
+    reject_on_cluster_scoped: bool = False
+    clears_name_prefix: bool = False
+
+
+_DERIVED_AXES: tuple[_DerivedAxis, ...] = (
+    _DerivedAxis(
+        key="name_from",
+        known=KNOWN_NAME_FROM,
+        target_field="names",
+        resolve=lambda rt: rt.victim_nodes,
+        needs_discovery=True,
+        is_selector=True,
+        clears_name_prefix=True,
+    ),
+    _DerivedAxis(
+        key="namespace_from",
+        known=KNOWN_NAMESPACE_FROM,
+        target_field="namespace",
+        resolve=lambda rt: rt.victim_namespace,
+        needs_discovery=False,
+        is_selector=False,
+        mutex_static_field="namespace",
+        reject_on_cluster_scoped=True,
+    ),
+)
+
+
+def _declared_axes(entry: "MechanismWriteEntry") -> tuple[_DerivedAxis, ...]:
+    """The axes ``entry`` actually declares (non-empty token), registry order."""
+    return tuple(a for a in _DERIVED_AXES if getattr(entry, a.key, ""))
+
+
+def derived_keys() -> tuple[str, ...]:
+    """Registry-driven derived field names (serialization / payload iterate this)."""
+    return tuple(a.key for a in _DERIVED_AXES)
+
+
+def entries_have_derived(entries) -> bool:
+    """True when ANY entry declares a derivation axis (the materialize trigger)."""
+    return any(_declared_axes(e) for e in entries)
+
+
+def entries_needing_discovery(entries) -> bool:
+    """True when any entry declares an axis whose resolver needs a live query.
+
+    ``safety_check`` consults this to decide whether to call
+    ``discover_victim_nodes`` — a namespace-only manifest skips the query. A
+    NEW discovery-backed axis is picked up automatically via its
+    ``needs_discovery`` flag; no safety_check edit required.
+    """
+    return any(a.needs_discovery for e in entries for a in _declared_axes(e))
 
 
 @dataclass(frozen=True)
@@ -68,23 +223,48 @@ class MechanismWriteEntry:
                        (e.g. ``drill-nxdomain-`` patch ConfigMaps).
       cluster-scoped — ``namespace`` empty, ``names`` pins cluster-level
                        objects (the node-mechanism shape: Case #4).
+      derived        — ``name_from`` names a runtime-derived selector the
+                       case CANNOT author statically (``victim_node`` = the
+                       node the victim pod runs on). Materialized into
+                       ``names`` at freeze time by
+                       :func:`materialize_derived_entries` (fed by
+                       ``freeze.discover_victim_nodes``); until then — and
+                       if discovery finds nothing — it authorises NOTHING
+                       (fail closed).
 
-    Exactly one of ``names`` / ``name_prefix`` is set — enforced at
-    parse time (``names`` XOR ``name_prefix``).
+    ``namespace_from`` is an ORTHOGONAL axis (not a name selector): it derives
+    the NAMESPACE rather than the name. ``victim`` materializes at freeze to
+    the victim's own namespace (``approved.namespace``, no cluster query
+    needed) — the shape a victim-scoped NetworkPolicy requires, since it must
+    live in the victim's ns to select it and a portable case cannot hardcode
+    that ns. Mutually exclusive with a static ``namespace``.
+
+    Exactly one of ``names`` / ``name_prefix`` / ``name_from`` is set —
+    enforced at parse time (``namespace_from`` is independent of this XOR).
     """
 
     scope: str
     namespace: str
     names: tuple[str, ...] = ()
     name_prefix: str = ""
+    name_from: str = ""
+    namespace_from: str = ""
 
     def describe(self) -> str:
         """Human-facing one-liner for logs, cards and payload rendering."""
         ns = self.namespace or "<cluster>"
+        if self.namespace_from and self.namespace:
+            ns += f" (derived from {self.namespace_from})"
+        elif self.namespace_from:
+            ns = f"<from {self.namespace_from}> (unresolved)"
         if self.names:
             sel = f"names={list(self.names)}"
-        else:
+            if self.name_from:
+                sel += f" (derived from {self.name_from})"
+        elif self.name_prefix:
             sel = f"name_prefix='{self.name_prefix}'"
+        else:
+            sel = f"name_from='{self.name_from}' (unresolved)"
         return f"{self.scope}/{ns}: {sel}"
 
 
@@ -117,8 +297,8 @@ def _parse_entry(item: object, *, index: int) -> Optional[MechanismWriteEntry]:
     if unknown:
         logger.warning(
             "mechanism_writes[%d]: unknown key(s) %s — entry ignored "
-            "(valid keys: scope, namespace, names, name_prefix)",
-            index, sorted(unknown),
+            "(valid keys: %s)",
+            index, sorted(unknown), ", ".join(sorted(_ENTRY_KEYS)),
         )
         return None
 
@@ -129,23 +309,86 @@ def _parse_entry(item: object, *, index: int) -> Optional[MechanismWriteEntry]:
         )
         return None
 
+    # Registry-driven derivation-axis reads + validation (root cause III):
+    # every axis is read, lowercased and token-checked through the SAME loop,
+    # so a new axis inherits the unknown-token DROP without a new branch.
+    axis_tokens: dict[str, str] = {}
+    for axis in _DERIVED_AXES:
+        token = str(item.get(axis.key) or "").strip().lower()
+        if not token:
+            continue
+        if token not in axis.known:
+            # An unknown derivation is dropped rather than frozen — a typo
+            # must not silently widen (or vacuously satisfy) the write set.
+            logger.warning(
+                "mechanism_writes[%d]: unknown %s=%r — entry ignored "
+                "(known: %s)", index, axis.key, token, sorted(axis.known),
+            )
+            return None
+        axis_tokens[axis.key] = token
+
+    # Axis structural rules, also registry-declared: mutual exclusion with a
+    # static field (ambiguous authority), and meaningless-on-cluster-scoped.
+    for axis in _DERIVED_AXES:
+        if axis.key not in axis_tokens:
+            continue
+        if axis.mutex_static_field and str(
+            item.get(axis.mutex_static_field) or ""
+        ).strip():
+            # Ambiguous authority: a static value AND a derived one. Drop
+            # rather than guess which governs (fail closed at the guard,
+            # with attribution).
+            logger.warning(
+                "mechanism_writes[%d]: %s and %s are mutually exclusive "
+                "— entry ignored (scope=%s)",
+                index, axis.mutex_static_field, axis.key, scope,
+            )
+            return None
+        if axis.reject_on_cluster_scoped and scope in CLUSTER_SCOPED_KINDS:
+            # A cluster-scoped kind has nothing for this axis to derive.
+            logger.warning(
+                "mechanism_writes[%d]: %s on cluster-scoped scope=%s "
+                "— entry ignored", index, axis.key, scope,
+            )
+            return None
+
     namespace = str(item.get("namespace") or "").strip()
+    derives_namespace = any(
+        a.target_field == "namespace"
+        for a in _DERIVED_AXES if a.key in axis_tokens
+    )
     if scope in CLUSTER_SCOPED_KINDS:
         # Cluster-scoped kinds have no namespace; normalise away any
         # stray value so comparison with the guard's cluster-scoped
         # branch (which expects "") never silently mismatches.
+        namespace = ""
+    elif derives_namespace:
+        # Derived namespace: leave empty; materialize_derived_entries injects
+        # the victim's ns at freeze. Do NOT default to "default" — that would
+        # silently pin the entry to the wrong ns for a non-default victim.
         namespace = ""
     elif not namespace:
         namespace = "default"
 
     names = _parse_names(item.get("names"))
     name_prefix = str(item.get("name_prefix") or "").strip()
-    if bool(names) == bool(name_prefix):
-        # Both set (ambiguous authority) or neither (no selector):
-        # the entry authorises nothing checkable — drop it.
+    # The three-way selector XOR, registry-driven: static names, static
+    # prefix, and every declared axis flagged ``is_selector`` (today:
+    # ``name_from``). Exactly one selector must be present.
+    selector_axes = sum(
+        1 for a in _DERIVED_AXES if a.is_selector and a.key in axis_tokens
+    )
+    selectors_set = (
+        sum(1 for present in (bool(names), bool(name_prefix)) if present)
+        + selector_axes
+    )
+    if selectors_set != 1:
+        # Several selectors (ambiguous authority) or none (nothing to check):
+        # either way the entry authorises nothing the guard can validate —
+        # drop it (fail closed at the guard, with manifest attribution).
         logger.warning(
-            "mechanism_writes[%d]: exactly one of names / name_prefix "
-            "is required — entry ignored (scope=%s ns=%s)",
+            "mechanism_writes[%d]: exactly one of names / name_prefix / "
+            "name_from is required — entry ignored (scope=%s ns=%s)",
             index, scope, namespace,
         )
         return None
@@ -153,6 +396,7 @@ def _parse_entry(item: object, *, index: int) -> Optional[MechanismWriteEntry]:
     return MechanismWriteEntry(
         scope=scope, namespace=namespace,
         names=names, name_prefix=name_prefix,
+        **{axis.key: axis_tokens.get(axis.key, "") for axis in _DERIVED_AXES},
     )
 
 
@@ -307,6 +551,99 @@ def derive_pvc_claims_from_writes(
     return tuple(sorted(names))
 
 
+def materialize_derived_entries(
+    entries: tuple[MechanismWriteEntry, ...],
+    *,
+    victim_nodes: tuple[str, ...] = (),
+    victim_namespace: str = "",
+) -> tuple[MechanismWriteEntry, ...]:
+    """Resolve every derived entry into a concrete static entry.
+
+    Two ORTHOGONAL derivation axes, both freeze-time MATERIALIZATION (the case
+    legislates a SEMANTIC, code injects the concrete value so every downstream
+    matcher works UNCHANGED on an ordinary static entry):
+
+      ``name_from: victim_node`` — the DISCOVERY half is
+        ``freeze.discover_victim_nodes`` (a live cluster query); the derived
+        node name(s) are injected into ``names``.
+      ``namespace_from: victim`` — NO discovery: the victim's own namespace
+        (``approved.namespace``) is already on the spec, so it is injected
+        straight into ``namespace``. This is the shape a victim-scoped
+        NetworkPolicy needs — it must live in the victim's ns to select it, and
+        a portable case cannot hardcode that ns.
+
+    Fail closed on BOTH axes: a ``victim_node`` entry with no discovered node
+    (victim unscheduled / absent / query failed) is DROPPED — an empty-names
+    entry would fall through ``names_within_entry``'s prefix branch
+    (``startswith("")`` is vacuously True) and authorise ANY node. A
+    ``namespace_from: victim`` entry with no victim namespace (cluster-scoped
+    victim, or a hand-built entry reaching freeze) is DROPPED — an empty ns
+    never matches the write's real ns, so dropping makes the rejection explicit
+    at the guard with manifest attribution.
+
+    Pure and idempotent: entries with neither derivation pass through verbatim,
+    so this is a no-op for every manifest that does not legislate a derived
+    write (freeze output stays byte-identical for those cases).
+    """
+    if not entries_have_derived(entries):
+        return entries
+    runtime = _VictimRuntime(
+        victim_nodes=tuple(victim_nodes or ()),
+        victim_namespace=(victim_namespace or "").strip(),
+    )
+    out: list[MechanismWriteEntry] = []
+    for entry in entries:
+        axes = _declared_axes(entry)
+        if not axes:
+            out.append(entry)
+            continue
+        # The materializable fields, seeded from the entry; each declared
+        # axis resolves into its ``target_field`` via the registry.
+        fields: dict[str, object] = {
+            "names": entry.names,
+            "name_prefix": entry.name_prefix,
+            "namespace": entry.namespace,
+        }
+        dropped = False
+        for axis in axes:
+            token = getattr(entry, axis.key)
+            if token not in axis.known:
+                # Unknown derivations are already rejected at parse; this
+                # guards a hand-built entry reaching freeze. Drop (fail closed).
+                logger.warning(
+                    "mechanism_writes: unknown %s=%r — entry dropped",
+                    axis.key, token,
+                )
+                dropped = True
+                break
+            resolved = axis.resolve(runtime)
+            if not resolved:
+                # No victim runtime fact to derive from (unscheduled / absent
+                # / query failed / cluster-scoped victim). DROP: an empty
+                # selector would fall through ``startswith("")`` (names) or
+                # never match a real ns (namespace) — fail closed either way.
+                logger.warning(
+                    "mechanism_writes: %s=%s entry (scope=%s) could not be "
+                    "materialized — victim runtime fact unavailable; entry "
+                    "dropped (fail closed)", axis.key, token, entry.scope,
+                )
+                dropped = True
+                break
+            fields[axis.target_field] = resolved
+            if axis.clears_name_prefix:
+                fields["name_prefix"] = ""
+        if dropped:
+            continue
+        out.append(MechanismWriteEntry(
+            scope=entry.scope,
+            namespace=fields["namespace"],
+            names=fields["names"],
+            name_prefix=fields["name_prefix"],
+            **{a.key: getattr(entry, a.key) for a in _DERIVED_AXES},
+        ))
+    return tuple(out)
+
+
 def load_case_mechanism_writes(
     skill_name: str, case_resource_path: str,
 ) -> tuple[MechanismWriteEntry, ...]:
@@ -363,6 +700,9 @@ def entries_to_list(entries) -> list[dict]:
             "namespace": e.namespace,
             "names": list(e.names),
             "name_prefix": e.name_prefix,
+            # Registry-driven derived fields: a new axis serializes with no
+            # edit here (the round-trip invariant pins the field to the row).
+            **{key: getattr(e, key) for key in derived_keys()},
         }
         for e in entries
     ]
@@ -387,12 +727,18 @@ def entries_from_list(raw: object) -> tuple[MechanismWriteEntry, ...]:
         names = tuple(str(n) for n in (item.get("names") or []) if n)
         prefix = str(item.get("name_prefix") or "").strip()
         if not names and not prefix:
+            # A name_from entry that never materialized (no names) carries no
+            # checkable authority — drop it (fail closed), same as parse time.
             continue
         out.append(MechanismWriteEntry(
             scope=scope,
             namespace=str(item.get("namespace") or "").strip(),
             names=names,
             name_prefix=prefix,
+            **{
+                key: str(item.get(key) or "").strip()
+                for key in derived_keys()
+            },
         ))
     return tuple(out)
 
@@ -501,6 +847,11 @@ def names_within_entry(
         return False
     if entry.names:
         return all(n in entry.names for n in effective.names)
+    if not entry.name_prefix:
+        # No selector materialized (an unresolved ``name_from`` entry): it
+        # authorises NOTHING. Falling through to ``startswith("")`` below
+        # would be vacuously True for every name — a fail-OPEN hole.
+        return False
     return all(n.startswith(entry.name_prefix) for n in effective.names)
 
 
@@ -520,7 +871,8 @@ def names_within_entries(
         return False
     for name in names:
         covered = any(
-            (name in e.names) if e.names else name.startswith(e.name_prefix)
+            (name in e.names) if e.names
+            else bool(e.name_prefix) and name.startswith(e.name_prefix)
             for e in entries
         )
         if not covered:
@@ -531,17 +883,38 @@ def names_within_entries(
 def entries_beyond_victim(approved: "ApprovedTarget") -> tuple[MechanismWriteEntry, ...]:
     """Entries whose domain the victim target does NOT already cover.
 
-    This is the unattended-CLI boundary-exit predicate: such entries
-    widen the write-set contract beyond what the victim approval
-    (plus its secondary net) governs, so an unattended run must
-    terminate before any cluster mutation instead of silently
-    auto-approving a widened contract no human has seen.
+    This is the write-set-contract WIDENING predicate. Its consumers are
+    VISIBILITY + AUDIT, not gating (see ``_write_set_boundary``): the
+    interactive card (TUI / ``--confirm``) renders these entries verbatim
+    for the human who is present; unattended channels still AUTO-approve
+    (``unattended_resume_value`` is always ``"approved"`` — the manifest is
+    the authority, per-run human approval of an unchanged manifest is a
+    rubber stamp) but emit an auditable ``auto_approved`` event carrying
+    these entries. An empty result leaves both surfaces silent, so this
+    predicate never blocks or pauses a run — it only decides what a present
+    human sees and what the audit log records.
 
-    Stricter than the guard's active-domain test: a cluster-scoped
-    secondary kind (node under a workload victim) is ACTIVE at the
-    guard (tightening) but NOT beyond the victim (the secondary net
-    already passes those writes today — no new authority is granted,
-    so unattended runs keep their established semantics).
+    Stricter than the guard's active-domain test for STATIC entries: a
+    static cluster-scoped secondary kind (node under a workload victim) is
+    ACTIVE at the guard (tightening) but NOT beyond the victim — the
+    secondary net already passes those NON-fault writes (taint/cordon), so
+    no new authority is granted.
+
+    A DERIVED entry (ANY ``_DERIVED_AXES`` axis — ``name_from`` today,
+    ``namespace_from`` likewise) is the exception and IS beyond the victim
+    even when its kind sits in the secondary net. The canonical case is
+    ``name_from``: it exists only to authorize a FAULT the secondary net
+    does NOT pass — ``drift_policy`` rejects a ``fault_target`` write on a
+    cluster-scoped kind under a namespaced victim (the ``blade <t> targets
+    node under pod approval`` branch) even though the kind is in the net, so
+    the derived entry is the SOLE authority that unlocks it. That is GRANTED
+    authority, not tightening, and must surface like any widened contract
+    (verified end-to-end: without the entry the same node write is
+    reject_drift). Every derived axis is treated uniformly (the guard reads
+    ``not _declared_axes(entry)``, never a per-axis ``name_from`` check), so
+    a NEW axis inherits this visibility by construction instead of needing
+    its own special case here: a derived authority ALWAYS stays visible,
+    and only STATIC entries take the secondary-net exemption.
     """
     if not approved.mechanism_entries:
         return ()
@@ -550,7 +923,13 @@ def entries_beyond_victim(approved: "ApprovedTarget") -> tuple[MechanismWriteEnt
     for entry in approved.mechanism_entries:
         if entry.scope == approved_scope and entry.namespace == approved.namespace:
             continue
-        if entry.scope in set(approved.secondary_scopes or ()):
+        # A DERIVED entry (any registry axis) never takes the secondary-net
+        # exemption — see the docstring: it authorizes a fault the net
+        # blocks, so it is granted authority that must stay visible.
+        if (
+            entry.scope in set(approved.secondary_scopes or ())
+            and not _declared_axes(entry)
+        ):
             if entry.scope in CLUSTER_SCOPED_KINDS:
                 continue  # secondary net already covers this domain
             sec_ns = (approved.secondary_namespace or "default").strip()
@@ -573,6 +952,7 @@ def format_entries_for_payload(entries) -> list[dict]:
             "namespace": e.namespace,
             "names": list(e.names),
             "name_prefix": e.name_prefix,
+            **{key: getattr(e, key) for key in derived_keys()},
             "description": e.describe(),
         }
         for e in entries
@@ -597,6 +977,8 @@ def format_mechanism_writes_for_display(payload_entries: list[dict]) -> str:
         names = e.get("names") or []
         if names:
             sel = ", ".join(str(n) for n in names)
+            if e.get("name_from"):
+                sel += f" (derived from {e['name_from']})"
         else:
             sel = f"'{e.get('name_prefix', '')}' (prefix)"
         lines.append(f"  - {e.get('scope')}/{ns}: {sel}")
@@ -605,10 +987,18 @@ def format_mechanism_writes_for_display(payload_entries: list[dict]) -> str:
 
 __all__ = [
     "CLUSTER_SCOPED_KINDS",
+    "KNOWN_NAME_FROM",
+    "KNOWN_NAMESPACE_FROM",
     "KNOWN_RECOVERY_CHANNELS",
+    "NAME_FROM_VICTIM_NODE",
+    "NAMESPACE_FROM_VICTIM",
     "RECOVERY_CHANNEL_APISERVER_WRITE",
     "MechanismWriteEntry",
+    "derived_keys",
     "entries_beyond_victim",
+    "entries_have_derived",
+    "entries_needing_discovery",
+    "materialize_derived_entries",
     "entries_from_list",
     "entries_to_list",
     "format_entries_for_payload",

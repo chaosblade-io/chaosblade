@@ -1740,18 +1740,23 @@ class TestDrillCarrierRbacSecondaryScope:
 
 
 class TestDurationAnchorDrift:
-    """Execution ``--timeout`` vs the frozen contract duration (E4).
+    """Execution ``--timeout`` vs the pinned recovery timer D+G (E4).
 
-    The timeout bounds the experiment's AUTO-RECOVERY — layer 3 of the
-    three-layer duration guarantee (1: recover's active destroy,
-    2: the cleanup chain, 3: blade's own ``--timeout``). Layer 3 was
-    unanchored: a free-form ``--timeout 999999`` rode the flags string
-    past every gate, so a task that died with a failed cleanup chain
-    left a live fault for 11.5 days. The net freezes
-    ``FaultSpec.duration_seconds`` into the approval and rejects an
-    execution timeout beyond the 2x headroom ceiling; legitimate
-    operational margin and the verbatim executor discipline (CLI
-    direct calls keep their explicit timeout) stay untouched.
+    On the blade surfaces ``--timeout`` IS the fault's self-destroy bound:
+    the experiment lives until it fires. Under the two-number window
+    contract the flag has exactly ONE legal value — the fault's own
+    recovery timer ``D + G`` (``recovery_timer_seconds``), the same single
+    source the issue-time pin arms every carrier with — NOT the bare
+    observation window ``D``. Layer 3 of the three-layer duration
+    guarantee (1: recover's active destroy, 2: the cleanup chain, 3:
+    blade's own ``--timeout``) was unanchored: a free-form ``--timeout
+    999999`` rode the flags string past every gate, so a task that died
+    with a failed cleanup chain left a live fault for 11.5 days. The net
+    freezes ``FaultSpec.duration_seconds`` (D) into the approval and
+    rejects ANY execution timeout that differs from D+G — longer (fault
+    residence beyond the safety-net window) or shorter (the fault ends
+    before the framework can actively recover, or before the approved
+    window closes).
     """
 
     def _approved(self, duration: int) -> ApprovedTarget:
@@ -1776,22 +1781,41 @@ class TestDurationAnchorDrift:
         assert "999999" in d.reason
         assert "300" in d.reason
 
-    def test_headroom_ceiling_boundary_allows(self):
-        # Exactly 2x is operational margin, not drift — strict > only.
+    def test_pinned_recovery_timer_allows(self):
+        # The only legal value: the recovery timer D+G the pin writes.
+        from chaos_agent.utils.fault_type import recovery_timer_seconds
         d = target_drift_guard(
-            self._effective(600), self._approved(300),
+            self._effective(recovery_timer_seconds(300)), self._approved(300),
         )
         assert d.verdict == GuardVerdict.ALLOW
 
-    def test_within_headroom_allows(self):
+    def test_bare_contract_duration_is_rejected(self):
+        # A bare D (no grace) ends the fault before the framework can
+        # actively recover — the old legal value is now drift.
         d = target_drift_guard(
-            self._effective(450), self._approved(300),
+            self._effective(300), self._approved(300),
         )
-        assert d.verdict == GuardVerdict.ALLOW
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+    def test_any_longer_timeout_is_rejected(self):
+        # No headroom beyond D+G: extra on this flag is extra fault residence.
+        from chaos_agent.utils.fault_type import recovery_timer_seconds
+        d = target_drift_guard(
+            self._effective(recovery_timer_seconds(300) + 300),
+            self._approved(300),
+        )
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+    def test_any_shorter_timeout_is_rejected(self):
+        # A short pulse ends the fault before the safety-net window closes.
+        d = target_drift_guard(
+            self._effective(240), self._approved(300),
+        )
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
 
     def test_no_execution_timeout_is_silent(self):
-        # Omitted --timeout: the executor injects the contract-derived
-        # bound itself; no anchor, no comparison.
+        # Omitted --timeout: the issue-time pin writes the contract value
+        # into the call, so this net has no flag to judge.
         d = target_drift_guard(
             self._effective(0), self._approved(300),
         )

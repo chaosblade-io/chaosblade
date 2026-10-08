@@ -33,10 +33,12 @@ Output:
        fault_target. Method switches (kubectl-native ↔ blade) are
        intentionally NOT drift.
     6.5 **duration anchor** (``_duration_anchor_drift``) — an execution
-       ``--timeout`` inflating the frozen contract ``duration_seconds``
-       beyond the headroom ceiling is drift: the timeout bounds the
-       experiment's auto-recovery, and an inflated bound converts the
-       approved window into unbounded fault residence.
+       ``--timeout`` differing from the frozen contract ``duration_seconds``
+       in EITHER direction is drift, with no tolerance: the timeout bounds
+       the experiment's auto-recovery, so an inflated bound converts the
+       approved window into fault residence the user never approved, and a
+       deflated one ends the fault before that window elapses (see the
+       constant note above the predicate).
 
 Why low-confidence is treated specially: the classifier can fail in
 two ways. ``UNKNOWN`` means it gave up entirely (malformed args, new
@@ -76,13 +78,12 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
-
-# Duration-headroom ceiling for ``_duration_anchor_drift``: the execution
-# ``--timeout`` may carry this much operational margin over the frozen
-# contract duration before the inflation counts as drift. 2x keeps every
-# skill-advised margin legal while catching the unbounded rewrites
-# (999999s ≈ 11.5 days against a 300s contract).
-_DURATION_DRIFT_FACTOR = 2
+# No tolerance on ``--timeout``: on the blade surfaces that flag IS the
+# fault's duration (the experiment lives until its own auto-destroy), so
+# there is exactly ONE legal value — the frozen contract duration. Any
+# "operational margin" on this flag is not margin at all, it is fault
+# residence the user never approved (twelfth-round finding E4:
+# ``--timeout 999999`` rode the free-form flags string past every anchor).
 
 
 def _fault_type_lock_drift(
@@ -183,49 +184,56 @@ def _duration_anchor_drift(
     approved: ApprovedTarget,
     effective: EffectiveTarget,
 ) -> Optional[GuardDecision]:
-    """REJECT when the execution timeout inflates the contract duration.
+    """REJECT when the execution ``--timeout`` differs from the contract.
 
-    Compares ``effective.timeout_seconds`` (the verbatim ``--timeout`` the
-    call's blade tokens carry, last-wins per pflag) against the frozen
-    contract duration (``approved.duration_seconds``, from
-    ``FaultSpec.duration_seconds`` at the single freeze point). Silent
-    when either side is zero — no anchor, no comparison (the executor
-    then injects the contract-derived timeout itself, and a sub-floor
-    contract stays verbatim per the DNS-hijack discipline). Only the
-    two blade surfaces populate ``timeout_seconds``, so the net is
-    naturally scoped to blade fault injection.
+    ``effective.timeout_seconds`` is the verbatim ``--timeout`` the call's
+    blade tokens carry (last-wins per pflag); ``approved.duration_seconds``
+    is the frozen contract duration ``D`` (``FaultSpec.duration_seconds``,
+    written at the single freeze point). On the blade surfaces that flag IS
+    the fault's self-destroy bound, and under the two-number window contract
+    it must carry the fault's own recovery timer ``D + G``
+    (``recovery_timer_seconds`` — the same single source the issue-time pin
+    arms every carrier with), NOT the bare observation window: the grace
+    ``G`` is what lets an actively dispatched framework recovery land
+    before self-recovery expiry. Any other value breaks the contract — a
+    larger one leaves the fault resident past ``D+G`` (and outlives the task
+    itself when the cleanup chain fails), a smaller one ends the fault
+    before the framework can actively recover.
 
-    The headroom factor exists because the timeout bounds the
-    experiment's AUTO-RECOVERY — layer 3 of the three-layer duration
-    guarantee — and legitimately carries operational margin (skills
-    advise slack for slow clusters). Beyond it, an inflated timeout is
-    not margin but a rewrite of the user-approved verification window
-    into an unbounded fault residence time, which survives the task's
-    own death and a failed cleanup chain (twelfth-round finding E4:
-    ``--timeout 999999`` rode the free-form flags string past every
-    anchor).
+    Silent when either side is zero: a legacy approval frozen without a
+    duration has no anchor to compare against, and a call carrying no
+    ``--timeout`` is written by the issue-time pin (see
+    ``FaultProviderRegistry.enforce_contract_duration``) or, on carriers
+    that pin does not own, by the executor's fallback — this net only
+    judges a flag it can actually see. A non-positive frozen ``D`` is
+    likewise anchorless here (the registry refuses to pin it upstream).
     """
     if not approved.duration_seconds or not effective.timeout_seconds:
         return None
-    ceiling = approved.duration_seconds * _DURATION_DRIFT_FACTOR
-    if effective.timeout_seconds > ceiling:
+    from chaos_agent.utils.fault_type import recovery_timer_seconds
+
+    try:
+        pinned = recovery_timer_seconds(approved.duration_seconds)
+    except ValueError:
+        return None
+    if effective.timeout_seconds != pinned:
         return GuardDecision(
             verdict=GuardVerdict.REJECT_DRIFT,
             reason=(
                 f"duration drift: execution --timeout "
-                f"{effective.timeout_seconds}s exceeds the approved contract "
-                f"duration {approved.duration_seconds}s beyond the "
-                f"{_DURATION_DRIFT_FACTOR}x headroom ceiling ({ceiling}s); "
-                f"the timeout bounds the experiment's auto-recovery, so an "
-                f"inflated value converts the approved verification window "
-                f"into unbounded fault residence when the task dies before "
-                f"its cleanup chain runs"
+                f"{effective.timeout_seconds}s does not match the pinned "
+                f"recovery timer {pinned}s (approved contract duration "
+                f"{approved.duration_seconds}s + recovery grace); the "
+                f"timeout IS the fault's self-destroy bound, so a longer "
+                f"value leaves the fault resident past the safety-net window "
+                f"and a shorter one ends it before the framework can "
+                f"actively recover"
             ),
             effective=effective,
             suggestion=(
-                f"Keep --timeout within {_DURATION_DRIFT_FACTOR}x the approved "
-                f"duration ({approved.duration_seconds}s), or omit it and let "
-                f"the executor derive the bound from the contract."
+                f"Use --timeout {pinned} — the contract duration plus the "
+                f"recovery grace, computed by the framework — or omit it and "
+                f"let the executor write the contract value."
             ),
         )
     return None

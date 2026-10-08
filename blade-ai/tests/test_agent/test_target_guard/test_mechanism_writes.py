@@ -23,6 +23,8 @@ from chaos_agent.agent.spec.fault_spec import FaultSpec
 from chaos_agent.agent.target_guard import approved_from_dict, freeze_approved_target_from_spec
 from chaos_agent.agent.target_guard.drift_policy import K8sDriftPolicy
 from chaos_agent.agent.target_guard.mechanism_writes import (
+    NAME_FROM_VICTIM_NODE,
+    NAMESPACE_FROM_VICTIM,
     RECOVERY_CHANNEL_APISERVER_WRITE,
     MechanismWriteEntry,
     entries_beyond_victim,
@@ -32,6 +34,8 @@ from chaos_agent.agent.target_guard.mechanism_writes import (
     load_case_mechanism_writes,
     load_case_recovery_channel,
     match_mechanism_entries,
+    materialize_derived_entries,
+    names_within_entries,
     names_within_entry,
     parse_mechanism_writes,
     parse_recovery_channel,
@@ -655,3 +659,542 @@ class TestDerivePvcClaimsFromWrites:
         # scope spelled persistentvolumeclaim in the case — the derived
         # set sees the canonical kind.
         assert derive_pvc_claims_from_writes(entries) == ("app-data-claim",)
+
+
+# ---------------------------------------------------------------------------
+# W-56-1: the DERIVED node entry — ``name_from: victim_node``
+#
+# A node-host mechanism under a namespaced (pod) victim writes the node the
+# victim runs on. That node name is runtime-derived, so ``names`` /
+# ``name_prefix`` cannot express it (the structural blind spot behind #53
+# verified / #56 drift_terminated on the SAME case). The case legislates the
+# SEMANTIC; ``materialize_derived_entries`` + ``freeze.discover_victim_nodes``
+# inject the concrete name at freeze time.
+# ---------------------------------------------------------------------------
+
+_DERIVED_NODE_FRONTMATTER = """---
+name: Pod_Terminating_节点宕机kubelet失联
+mechanism_writes:
+  - scope: node
+    name_from: victim_node
+---
+# Case body — the mechanism writes the victim pod's host node.
+"""
+
+
+class TestDerivedNodeParse:
+    def test_name_from_entry_parses(self):
+        entries = parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e.scope == "node"
+        assert e.namespace == ""  # cluster-scoped normalised away
+        assert e.name_from == NAME_FROM_VICTIM_NODE
+        assert e.names == ()  # not yet materialized
+        assert e.name_prefix == ""
+
+    def test_name_from_is_normalised_lowercase(self):
+        content = "---\nmechanism_writes:\n  - scope: node\n    name_from: ' Victim_Node '\n---\nbody\n"
+        entries = parse_mechanism_writes(content)
+        assert len(entries) == 1
+        assert entries[0].name_from == NAME_FROM_VICTIM_NODE
+
+    def test_name_from_with_names_rejects_entry(self):
+        # Three-way XOR: two selectors = ambiguous authority → dropped.
+        content = "---\nmechanism_writes:\n  - scope: node\n    names: [n1]\n    name_from: victim_node\n---\nbody\n"
+        assert parse_mechanism_writes(content) == ()
+
+    def test_unknown_name_from_rejects_entry(self):
+        # A typo must not silently widen (or vacuously satisfy) the write set.
+        content = "---\nmechanism_writes:\n  - scope: node\n    name_from: victim_node_ish\n---\nbody\n"
+        assert parse_mechanism_writes(content) == ()
+
+
+class TestMaterializeDerivedEntries:
+    def _derived(self):
+        return parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER)
+
+    def test_fills_names_from_discovered_nodes(self):
+        out = materialize_derived_entries(
+            self._derived(), victim_nodes=("cn-shanghai.25.209.71.148",),
+        )
+        assert len(out) == 1
+        assert out[0].names == ("cn-shanghai.25.209.71.148",)
+        assert out[0].scope == "node"
+        # Provenance survives so the card can say WHY these names are here.
+        assert out[0].name_from == NAME_FROM_VICTIM_NODE
+
+    def test_multiple_victim_nodes_all_materialize(self):
+        # discover_victim_nodes returns a sorted tuple; materialize preserves
+        # the order it is given (the union of every node the victim spans).
+        out = materialize_derived_entries(
+            self._derived(), victim_nodes=("node-a", "node-b"),
+        )
+        assert out[0].names == ("node-a", "node-b")
+
+    def test_empty_discovery_drops_entry_fail_closed(self):
+        # Victim pod unscheduled / absent / query failed → NO node derived.
+        # The entry is DROPPED, never frozen with empty names (an empty-names
+        # entry would match startswith("") = ANY node — a fail-OPEN hole).
+        assert materialize_derived_entries(self._derived(), victim_nodes=()) == ()
+
+    def test_no_derived_entries_is_passthrough(self):
+        # Byte-identical no-op for every manifest without a derived entry —
+        # the same tuple object comes back, so freeze output is unchanged.
+        entries = parse_mechanism_writes(_NXDOMAIN_FRONTMATTER)
+        assert materialize_derived_entries(entries, victim_nodes=("n1",)) is entries
+
+    def test_mixed_entries_materialize_only_derived(self):
+        entries = parse_mechanism_writes(_NXDOMAIN_FRONTMATTER) + self._derived()
+        out = materialize_derived_entries(entries, victim_nodes=("node-x",))
+        # Two configmap entries pass through verbatim + one materialized node.
+        assert [e.scope for e in out] == ["configmap", "configmap", "node"]
+        assert out[0].names == ("coredns-custom",)
+        assert out[2].names == ("node-x",)
+
+    def test_rematerialize_keys_on_name_from(self):
+        # A materialized entry still carries name_from, so a second pass
+        # re-derives from the nodes it is given. Production calls this ONCE at
+        # the safety_check freeze (confirmation_gate / tool_screener rehydrate
+        # the frozen names via entries_from_list and never re-materialize), so
+        # this documents that name_from — not empty names — is the derivation
+        # key, and a re-run stays deterministic off the same discovery.
+        once = materialize_derived_entries(self._derived(), victim_nodes=("node-x",))
+        twice = materialize_derived_entries(once, victim_nodes=("node-x",))
+        assert once == twice
+        assert twice[0].names == ("node-x",)
+
+
+class TestDerivedEntryFailClosedMatching:
+    def test_unmaterialized_entry_authorises_nothing(self):
+        # The guard-plug: a name_from entry with NEITHER names NOR prefix must
+        # NOT fall through to ``startswith("")`` (vacuously True = fail open).
+        unmaterialized = MechanismWriteEntry(
+            scope="node", namespace="", name_from=NAME_FROM_VICTIM_NODE,
+        )
+        assert not names_within_entry(
+            unmaterialized, EffectiveTarget(scope="node", namespace="", names=("any-node",)),
+        )
+        assert not names_within_entries(
+            (unmaterialized,), EffectiveTarget(scope="node", namespace="", names=("any-node",)),
+        )
+
+    def test_materialized_entry_matches_its_node_only(self):
+        materialized = MechanismWriteEntry(
+            scope="node", namespace="", names=("node-x",),
+            name_from=NAME_FROM_VICTIM_NODE,
+        )
+        assert names_within_entry(
+            materialized, EffectiveTarget(scope="node", namespace="", names=("node-x",)),
+        )
+        assert not names_within_entry(
+            materialized, EffectiveTarget(scope="node", namespace="", names=("node-evil",)),
+        )
+
+
+class TestDerivedNodeDriftPolicy:
+    """The #56 regression: a blade node fault under a POD victim is rejected
+    at drift_policy's cluster-scoped+fault_target branch UNLESS a materialized
+    derived node entry authorises it (branch 3.6, which fires first)."""
+
+    def setup_method(self):
+        self.policy = K8sDriftPolicy()
+        self.node_write = EffectiveTarget(
+            scope="node", namespace="", names=("cn-shanghai.25.209.71.148",),
+            fault_target="network",
+        )
+
+    def test_blade_node_write_without_entry_is_drift(self):
+        approved = _frozen_with_entries(())
+        d = self.policy.check_identity_drift(approved, self.node_write)
+        assert d is not None
+        assert d.verdict.value == "reject_drift"
+
+    def test_blade_node_write_with_materialized_entry_passes(self):
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER),
+            victim_nodes=("cn-shanghai.25.209.71.148",),
+        )
+        approved = _frozen_with_entries(materialized)
+        assert self.policy.check_identity_drift(approved, self.node_write) is None
+
+    def test_other_node_stays_drift_even_with_entry(self):
+        # Name-level precision: the derived entry pins the VICTIM's node; a
+        # different node is still drift (in-zone passes, another node doesn't).
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER),
+            victim_nodes=("cn-shanghai.25.209.71.148",),
+        )
+        approved = _frozen_with_entries(materialized)
+        d = self.policy.check_identity_drift(
+            approved,
+            EffectiveTarget(scope="node", namespace="", names=("some-other-node",),
+                            fault_target="network"),
+        )
+        assert d is not None
+
+    def test_derived_node_entry_is_beyond_victim(self):
+        # A DERIVED (name_from) node entry IS beyond the victim even though
+        # node sits in the pod victim's secondary net: the net does NOT pass
+        # a blade fault_target write on a cluster-scoped kind (drift_policy
+        # rejects it — see test_blade_node_write_without_entry_is_drift), so
+        # the entry is the SOLE authority that unlocks the node fault. That
+        # is GRANTED authority, not tightening, so it must surface on the
+        # interactive card and in the unattended auto_approved audit event
+        # like any widened contract. (Surfacing does NOT gate/pause unattended
+        # runs — AUTO delegation still approves; see _write_set_boundary.)
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER),
+            victim_nodes=("node-x",),
+        )
+        approved = _frozen_with_entries(materialized)
+        beyond = entries_beyond_victim(approved)
+        assert any(e.scope == "node" and e.name_from for e in beyond)
+
+
+class TestDerivedNodeSerialisation:
+    def test_round_trip_preserves_name_from_and_names(self):
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER),
+            victim_nodes=("node-x",),
+        )
+        assert entries_from_list(entries_to_list(materialized)) == materialized
+        assert entries_from_list(entries_to_list(materialized))[0].name_from == (
+            NAME_FROM_VICTIM_NODE
+        )
+
+    def test_freeze_hydrates_materialized_entry(self):
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER),
+            victim_nodes=("node-x",),
+        )
+        approved = _frozen_with_entries(materialized)
+        assert approved.mechanism_entries == materialized
+
+    def test_unmaterialized_entry_dropped_on_hydration(self):
+        # Defence in depth: even if an unmaterialized name_from entry reached
+        # the snapshot, hydration drops it (no names/prefix) — fail closed.
+        raw = [{"scope": "node", "namespace": "", "names": [],
+                "name_prefix": "", "name_from": NAME_FROM_VICTIM_NODE}]
+        assert entries_from_list(raw) == ()
+
+    def test_payload_description_shows_derivation(self):
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER),
+            victim_nodes=("node-x",),
+        )
+        payload = format_entries_for_payload(materialized)
+        assert payload[0]["name_from"] == NAME_FROM_VICTIM_NODE
+        assert "derived from victim_node" in payload[0]["description"]
+
+
+# ---------------------------------------------------------------------------
+# §5 namespace_from: victim — the DERIVED-NAMESPACE axis (#65 NetworkPolicy误配)
+#
+# A victim-scoped NetworkPolicy must live in the VICTIM's namespace to select
+# it, and networkpolicy is NOT in a pod victim's secondary_scopes — so without
+# a mechanism entry the apply is rejected at drift_policy step 4 (scope drift:
+# approved=pod effective=networkpolicy) and never reaches the execute-phase
+# armed gate. Unlike NXDOMAIN (configmap in a FIXED kube-system) or an unbound
+# PVC (default), the netpol's namespace tracks the victim's runtime location,
+# which a portable case cannot hardcode. ``namespace_from: victim`` legislates
+# the SEMANTIC; materialize_derived_entries injects spec.namespace at freeze —
+# NO cluster query (the victim's ns is already known), unlike name_from's
+# discover_victim_nodes.
+# ---------------------------------------------------------------------------
+
+_DERIVED_NETPOL_FRONTMATTER = """---
+name: Pod_网络故障_NetworkPolicy误配
+mechanism_writes:
+  - scope: networkpolicy
+    namespace_from: victim
+    name_prefix: drill-netpol-
+---
+# Case body — the mechanism applies a deny-all NetworkPolicy in the victim's
+# own namespace (it must live there to select the victim pod).
+"""
+
+
+def _victim_pod_spec_ns(namespace: str) -> FaultSpec:
+    return FaultSpec(
+        scope="pod", namespace=namespace, names=["victim-pod"],
+        fault_target="network", fault_action="loss",
+    )
+
+
+def _frozen_ns(entries, namespace="default"):
+    return approved_from_dict(
+        freeze_approved_target_from_spec(
+            _victim_pod_spec_ns(namespace), mechanism_entries=entries,
+        )
+    )
+
+
+def _netpol_eff(ns="default", name="drill-netpol-deny-x"):
+    return EffectiveTarget(scope="networkpolicy", namespace=ns, names=(name,))
+
+
+class TestParseNamespaceFrom:
+    def test_namespace_from_victim_parses(self):
+        entries = parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER)
+        assert len(entries) == 1
+        e = entries[0]
+        assert e.scope == "networkpolicy"
+        assert e.namespace == ""          # materialized at freeze, not parse
+        assert e.namespace_from == NAMESPACE_FROM_VICTIM
+        assert e.name_prefix == "drill-netpol-"
+
+    def test_namespace_and_namespace_from_are_mutually_exclusive(self):
+        content = ("---\nmechanism_writes:\n  - scope: networkpolicy\n"
+                   "    namespace: kube-system\n    namespace_from: victim\n"
+                   "    name_prefix: drill-\n---\nbody\n")
+        assert parse_mechanism_writes(content) == ()
+
+    def test_unknown_namespace_from_rejects_entry(self):
+        content = ("---\nmechanism_writes:\n  - scope: networkpolicy\n"
+                   "    namespace_from: victim_ish\n    name_prefix: drill-\n"
+                   "---\nbody\n")
+        assert parse_mechanism_writes(content) == ()
+
+    def test_namespace_from_on_cluster_scoped_rejects_entry(self):
+        # A cluster-scoped kind has no namespace to derive.
+        content = ("---\nmechanism_writes:\n  - scope: node\n"
+                   "    namespace_from: victim\n    names: [n1]\n---\nbody\n")
+        assert parse_mechanism_writes(content) == ()
+
+    def test_namespace_from_still_requires_a_name_selector(self):
+        # namespace_from is orthogonal to the name-selector XOR: an entry with
+        # a derived ns but NO names/name_prefix/name_from authorises nothing.
+        content = ("---\nmechanism_writes:\n  - scope: networkpolicy\n"
+                   "    namespace_from: victim\n---\nbody\n")
+        assert parse_mechanism_writes(content) == ()
+
+
+class TestMaterializeNamespaceFrom:
+    def _derived(self):
+        return parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER)
+
+    def test_fills_namespace_from_victim(self):
+        out = materialize_derived_entries(
+            self._derived(), victim_namespace="prod-team-a",
+        )
+        assert len(out) == 1
+        assert out[0].namespace == "prod-team-a"
+        assert out[0].name_prefix == "drill-netpol-"   # name axis untouched
+        # Provenance survives so the card can say WHY this ns is here.
+        assert out[0].namespace_from == NAMESPACE_FROM_VICTIM
+
+    def test_empty_victim_namespace_drops_entry_fail_closed(self):
+        # A cluster-scoped victim (no ns) or a hand-built entry → nothing to
+        # derive. DROP, never freeze an empty-ns entry.
+        assert materialize_derived_entries(
+            self._derived(), victim_namespace="",
+        ) == ()
+
+    def test_no_derived_entries_is_passthrough(self):
+        entries = parse_mechanism_writes(_NXDOMAIN_FRONTMATTER)
+        assert materialize_derived_entries(
+            entries, victim_namespace="prod-team-a",
+        ) is entries
+
+    def test_both_axes_materialize_independently(self):
+        # A manifest may derive a name (node) AND a namespace (netpol); each
+        # entry materializes on its own axis, input order preserved.
+        entries = (
+            parse_mechanism_writes(_DERIVED_NODE_FRONTMATTER) + self._derived()
+        )
+        out = materialize_derived_entries(
+            entries, victim_nodes=("node-x",), victim_namespace="prod-team-a",
+        )
+        assert [e.scope for e in out] == ["node", "networkpolicy"]
+        assert out[0].names == ("node-x",)
+        assert out[1].namespace == "prod-team-a"
+
+    def test_rematerialize_is_deterministic(self):
+        once = materialize_derived_entries(
+            self._derived(), victim_namespace="prod-team-a",
+        )
+        twice = materialize_derived_entries(
+            once, victim_namespace="prod-team-a",
+        )
+        assert once == twice
+
+
+class TestNamespaceFromBeyondVictim:
+    """A DERIVED (``namespace_from``) entry never takes the secondary-net
+    exemption, even when its kind sits in the victim's ``secondary_scopes``
+    AND its materialized ns equals ``secondary_namespace``. This pins the
+    generalized ``not _declared_axes(entry)`` guard in ``entries_beyond_victim``:
+    the pre-III-b form checked only ``not entry.name_from``, which would have
+    silently EXEMPTED a ``namespace_from`` entry here (empirically confirmed:
+    OLD -> ``[]``, NEW -> surfaced). The generalization is fail-safe — it only
+    surfaces MORE on the visibility/audit surface, never blocks a run or grants
+    new write authority — and treats every derived axis uniformly, so a future
+    axis inherits the same visibility by construction.
+    """
+
+    _CM_DERIVED = ("---\nmechanism_writes:\n  - scope: configmap\n"
+                   "    namespace_from: victim\n    name_prefix: drill-probe-\n"
+                   "---\nbody\n")
+
+    def test_derived_ns_entry_in_secondary_scope_is_beyond_victim(self):
+        # ``configmap`` IS in a pod victim's secondary_scopes, and the derived
+        # ns materializes to the victim's ns == secondary_namespace — so a
+        # STATIC entry in this exact domain would be exempt. A DERIVED one must
+        # stay visible.
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(self._CM_DERIVED), victim_namespace="default",
+        )
+        approved = _frozen_ns(materialized, namespace="default")
+        frozen = approved.mechanism_entries[0]
+        # Preconditions: the entry really sits in the secondary net with a
+        # matching ns (otherwise the exemption branch is never reached and the
+        # test would prove nothing).
+        assert frozen.scope in set(approved.secondary_scopes or ())
+        assert frozen.namespace == (approved.secondary_namespace or "default")
+        assert frozen.namespace_from == NAMESPACE_FROM_VICTIM
+        beyond = entries_beyond_victim(approved)
+        assert any(e.namespace_from == NAMESPACE_FROM_VICTIM for e in beyond), (
+            "a namespace_from entry in a secondary scope must stay beyond-victim"
+        )
+
+    def test_static_entry_in_same_secondary_scope_is_exempt(self):
+        # Contrast: the SAME configmap/default domain as a STATIC entry (no
+        # derivation) IS covered by the secondary net -> NOT beyond victim.
+        static = (MechanismWriteEntry(
+            scope="configmap", namespace="default", name_prefix="drill-probe-",
+        ),)
+        approved = _frozen_ns(static, namespace="default")
+        beyond = entries_beyond_victim(approved)
+        assert not any(
+            e.scope == "configmap" and e.namespace == "default" for e in beyond
+        ), "a static secondary-scope entry must take the secondary-net exemption"
+
+
+class TestNamespaceFromFailClosedMatching:
+    def test_unmaterialized_namespace_entry_is_inert(self):
+        # The fail-open pitfall guard: an entry whose namespace_from never
+        # materialized carries namespace="" — it must NOT match any write
+        # (match requires entry.namespace == effective ns, and "" never equals
+        # a real ns), so it authorises NOTHING rather than falling open.
+        unmaterialized = MechanismWriteEntry(
+            scope="networkpolicy", namespace="", name_prefix="drill-netpol-",
+            namespace_from=NAMESPACE_FROM_VICTIM,
+        )
+        approved = _frozen_ns((unmaterialized,), namespace="prod-team-a")
+        assert match_mechanism_entries(approved, _netpol_eff("prod-team-a")) == ()
+        d = K8sDriftPolicy().check_identity_drift(
+            approved, _netpol_eff("prod-team-a"),
+        )
+        assert d is not None and d.verdict.value == "reject_drift"
+
+
+class TestNetpolDriftPolicy:
+    """The #65 regression: a victim-scoped NetworkPolicy apply under a POD
+    victim is rejected at drift_policy step 4 (networkpolicy is not in the pod
+    secondary net) UNLESS a materialized ``namespace_from: victim`` entry
+    authorises it (branch 3.6, which fires first)."""
+
+    def setup_method(self):
+        self.policy = K8sDriftPolicy()
+
+    def test_netpol_apply_without_entry_is_drift(self):
+        # [i6-0 scenario 1] — the injection never reaches the armed gate.
+        approved = _frozen_ns((), namespace="default")
+        d = self.policy.check_identity_drift(approved, _netpol_eff("default"))
+        assert d is not None
+        assert d.verdict.value == "reject_drift"
+        assert "approved=pod effective=networkpolicy" in d.reason
+
+    def test_netpol_apply_with_materialized_entry_passes(self):
+        # [i6-0 scenario 2] — the entry (ns matched) authorises the write.
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER),
+            victim_namespace="default",
+        )
+        approved = _frozen_ns(materialized, namespace="default")
+        assert self.policy.check_identity_drift(
+            approved, _netpol_eff("default"),
+        ) is None
+
+    def test_entry_tracks_a_non_default_victim_namespace(self):
+        # THE i6-A WIN over i6-B: victim in prod-team-a → the derived entry
+        # materializes to prod-team-a and authorises the netpol there.
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER),
+            victim_namespace="prod-team-a",
+        )
+        approved = _frozen_ns(materialized, namespace="prod-team-a")
+        assert materialized[0].namespace == "prod-team-a"
+        assert self.policy.check_identity_drift(
+            approved, _netpol_eff("prod-team-a"),
+        ) is None
+
+    def test_static_default_entry_fails_a_non_default_victim(self):
+        # [i6-0 scenario 4] — the i6-B dead end locked as a regression: a
+        # STATIC ``namespace: default`` entry cannot track a prod-team-a
+        # victim, so the netpol apply in prod-team-a is rejected.
+        static = (MechanismWriteEntry(
+            scope="networkpolicy", namespace="default",
+            name_prefix="drill-netpol-",
+        ),)
+        approved = _frozen_ns(static, namespace="prod-team-a")
+        d = self.policy.check_identity_drift(
+            approved, _netpol_eff("prod-team-a"),
+        )
+        assert d is not None and d.verdict.value == "reject_drift"
+
+    def test_foreign_prefix_stays_drift_even_with_entry(self):
+        # Name-level precision: the prefix still governs — a netpol NOT under
+        # drill-netpol- is drift even in the right namespace.
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER),
+            victim_namespace="default",
+        )
+        approved = _frozen_ns(materialized, namespace="default")
+        d = self.policy.check_identity_drift(
+            approved, _netpol_eff("default", name="evil-policy"),
+        )
+        assert d is not None
+
+    def test_netpol_entry_is_beyond_victim(self):
+        # networkpolicy is NOT in a pod victim's secondary net, so the entry
+        # grants new authority and must surface on the interactive card +
+        # the unattended auto_approved audit event (visibility, not gating).
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER),
+            victim_namespace="default",
+        )
+        approved = _frozen_ns(materialized, namespace="default")
+        beyond = entries_beyond_victim(approved)
+        assert any(e.scope == "networkpolicy" for e in beyond)
+
+
+class TestNamespaceFromSerialisation:
+    def test_round_trip_preserves_namespace_from_and_namespace(self):
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER),
+            victim_namespace="prod-team-a",
+        )
+        assert entries_from_list(entries_to_list(materialized)) == materialized
+        rt = entries_from_list(entries_to_list(materialized))[0]
+        assert rt.namespace == "prod-team-a"
+        assert rt.namespace_from == NAMESPACE_FROM_VICTIM
+
+    def test_freeze_hydrates_materialized_entry(self):
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER),
+            victim_namespace="prod-team-a",
+        )
+        approved = _frozen_ns(materialized, namespace="prod-team-a")
+        assert approved.mechanism_entries == materialized
+
+    def test_payload_description_shows_derived_namespace(self):
+        materialized = materialize_derived_entries(
+            parse_mechanism_writes(_DERIVED_NETPOL_FRONTMATTER),
+            victim_namespace="prod-team-a",
+        )
+        payload = format_entries_for_payload(materialized)
+        assert payload[0]["namespace"] == "prod-team-a"
+        assert payload[0]["namespace_from"] == NAMESPACE_FROM_VICTIM
+        assert "derived from victim" in payload[0]["description"]

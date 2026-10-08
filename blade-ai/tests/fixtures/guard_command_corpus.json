@@ -5592,6 +5592,11 @@
    "cmd": "which is exempt from the solo-token check.",
    "src": "tests/test_tools/test_guard.py",
    "category": "tests"
+  },
+  {
+   "cmd": "sh -c 'E=\"/tmp/.wiz_err_$$\"; ( kubectl get pods -n default ) 2>\"$E\"; rc=$?; { [ $rc -ne 0 ] || [ -s \"$E\" ]; } && { printf \"\\n__WIZ_STDERR_BEGIN__\\n\"; cat \"$E\"; printf \"\\n__WIZ_STDERR_END__\"; }; rm -f \"$E\"; exit $rc'",
+   "src": "src/chaos_agent/transports/channels.py",
+   "category": "src"
   }
  ]
 }

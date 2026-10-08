@@ -496,10 +496,13 @@ class EffectiveTarget:
     # free-form flags string and the inline ``kubectl exec ... blade
     # create`` tokens — so the drift net can compare it against the frozen
     # contract duration (``ApprovedTarget.duration_seconds``). Zero when
-    # the call carries no ``--timeout`` (the executor then injects one
-    # from the contract / minimum floor). Deliberately NOT clamped to the
+    # the call carries no ``--timeout``: the issue-time pin
+    # (``FaultProviderRegistry.enforce_contract_duration``) writes the
+    # contract value into the call BEFORE dispatch, and only a call that
+    # reaches the executor with no flag at all falls back to the configured
+    # default. Deliberately NOT clamped to the
     # minimum-duration floor: the guard must see the verbatim value the
-    # executor would honour, so an over-large token stays visible as
+    # executor would honour, so any divergent token stays visible as
     # duration drift before execution.
     timeout_seconds: int = 0
 

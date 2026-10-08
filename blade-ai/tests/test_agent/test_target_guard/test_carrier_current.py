@@ -148,3 +148,80 @@ class TestRealSignatureIntegration:
         assert meta.get("uid") == "uid-1"
         assert meta.get("node") == "node-a"
         assert meta.get("privileged") is True
+
+
+class TestDerivedNodeCarrierAuthorization:
+    """W-56-1: a node-host mechanism under a namespaced (pod) victim writes the
+    node the victim runs on, which never appears in ``approved.names`` (that
+    holds the victim pod identity). The frozen ``mechanism_entries`` carry the
+    materialized victim-node name, so the chroot/host-exec carrier path must
+    consult it — the same authorization the drift guard's manifest branch uses
+    for the blade path. The two enforcement points must agree."""
+
+    @staticmethod
+    def _approved_pod(node_entry_names):
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
+        from chaos_agent.agent.target_guard import (
+            approved_from_dict, freeze_approved_target_from_spec,
+        )
+        from chaos_agent.agent.target_guard.mechanism_writes import (
+            MechanismWriteEntry,
+        )
+        spec = FaultSpec(
+            scope="pod", namespace="default", names=["victim-pod"],
+            fault_target="network", fault_action="loss",
+        )
+        entries = (
+            (MechanismWriteEntry(scope="node", namespace="", names=node_entry_names),)
+            if node_entry_names else ()
+        )
+        return approved_from_dict(
+            freeze_approved_target_from_spec(spec, mechanism_entries=entries),
+        )
+
+    @staticmethod
+    def _host_exec_args():
+        return {
+            "subcommand": "exec",
+            "v_args": "debug-pod-abc -n default -- chroot /host iptables -A "
+                      "OUTPUT -p tcp --dport 6443 -j DROP",
+        }
+
+    @pytest.mark.asyncio
+    async def test_derived_node_entry_authorises_the_carrier(self):
+        from chaos_agent.agent.target_guard.carriers import (
+            CarrierRejectReason, discover_unregistered_carrier,
+        )
+        approved = self._approved_pod(("node-x",))
+        with patch(_META, new=AsyncMock(return_value=(_meta(node="node-x"), None))):
+            res = await discover_unregistered_carrier(
+                "kubectl", self._host_exec_args(), _state(), approved,
+            )
+        # The node check must NOT fire — the derived entry authorises node-x.
+        assert res.reason != CarrierRejectReason.NODE_NOT_APPROVED
+
+    @pytest.mark.asyncio
+    async def test_node_outside_derived_entry_still_rejected(self):
+        from chaos_agent.agent.target_guard.carriers import (
+            CarrierRejectReason, discover_unregistered_carrier,
+        )
+        approved = self._approved_pod(("node-x",))
+        with patch(_META, new=AsyncMock(return_value=(_meta(node="node-evil"), None))):
+            res = await discover_unregistered_carrier(
+                "kubectl", self._host_exec_args(), _state(), approved,
+            )
+        assert res.reason == CarrierRejectReason.NODE_NOT_APPROVED
+
+    @pytest.mark.asyncio
+    async def test_no_entry_no_name_rejects_as_before(self):
+        # Regression: without a derived entry and with the node absent from
+        # approved.names, the pre-existing NODE_NOT_APPROVED still fires.
+        from chaos_agent.agent.target_guard.carriers import (
+            CarrierRejectReason, discover_unregistered_carrier,
+        )
+        approved = self._approved_pod(())
+        with patch(_META, new=AsyncMock(return_value=(_meta(node="node-x"), None))):
+            res = await discover_unregistered_carrier(
+                "kubectl", self._host_exec_args(), _state(), approved,
+            )
+        assert res.reason == CarrierRejectReason.NODE_NOT_APPROVED
