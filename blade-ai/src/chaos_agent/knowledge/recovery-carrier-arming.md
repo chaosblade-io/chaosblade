@@ -45,9 +45,16 @@ rejected the apply).
 
 ## Step 3 first — SA token pre-auth (BEFORE arming)
 
-Never arm on an unverified SA. `kubectl auth can-i --as=...` is FORBIDDEN
-(impersonation reflects the CALLER's view — it has produced false allows).
-Use the carrier SA's **real token** for a read-only GET, judged by HTTP code:
+Never arm on an unverified SA. `kubectl auth can-i --as=...` is FORBIDDEN:
+impersonation evaluates a SIMULATED identity, not the carrier's real
+request path. The SA's group memberships (`system:serviceaccounts`,
+`system:serviceaccounts:<ns>`) are not attached to an impersonated
+request unless the caller lists them via `--as-group`, so the evaluated
+surface is not the surface a real SA-token request carries; the probe
+also runs on the CALLER's channel and adds an impersonate-permission
+prerequisite the carrier does not need. Use the carrier SA's **real
+token** for a read-only GET, judged by HTTP code — same token, same URL,
+same in-cluster channel as the request that fires at TTL:
 
 ```bash
 kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \

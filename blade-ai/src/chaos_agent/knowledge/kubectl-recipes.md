@@ -150,3 +150,12 @@ outside the chaos scope.
 | Pod conditions | `{.status.conditions[*]}` |
 | Replica count | `{.spec.replicas}` |
 | Map output (labels) | `{.metadata.labels}` |
+
+**Keys containing dots MUST be escaped**: a ConfigMap `data` key like
+`check_docker_offline.sh` is `{.data.check_docker_offline\.sh}` — the
+unescaped dot splits the path into `.data.check_docker_offline` → `.sh`,
+and jsonpath then prints EMPTY output with exit code 0: silent, no error
+(verified 2026-09-21: unescaped → 0 bytes, escaped → full multi-line
+value; a probe built on the unescaped form reads "key missing" out of a
+present value — a false negative). Multi-line VALUES are not the problem
+— it is only the KEY's dot that breaks resolution.
