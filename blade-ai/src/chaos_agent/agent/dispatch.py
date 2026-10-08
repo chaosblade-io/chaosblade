@@ -205,6 +205,10 @@ def with_tool_span(node_name: str, tool_node):
       once, in ``with_phase_events._end_span``. ``end_span`` does not touch it.
     * **No phase events.** ``phase_started``/``phase_completed`` drive the TUI
       stepper; a tools node is an internal execution detail, not a step.
+
+    It is also where receipts get their evidence timestamp
+    (``agent.evidence_clock.stamp_tool_results``) — unrelated to spans, but
+    this is the one place every tool result in every phase passes through.
     """
     async def wrapped(state, config=None):
         task_id = state.get("task_id", "") if isinstance(state, dict) else ""
@@ -246,5 +250,12 @@ def with_tool_span(node_name: str, tool_node):
             raise
         else:
             await _end_span()
-            return result
+            # Stamp every receipt with its own wall clock before it lands in
+            # state. This wrapper is the single chokepoint every tool in every
+            # phase passes through (execute loop, verifier, recover verifier,
+            # clarification, plan builder), so one call here dates all of them
+            # — stamping per tool or per node would need re-enumerating each
+            # time either grows. See ``agent.evidence_clock``.
+            from chaos_agent.agent.evidence_clock import stamp_tool_results
+            return stamp_tool_results(result, state)
     return wrapped
