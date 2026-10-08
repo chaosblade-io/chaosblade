@@ -25,7 +25,6 @@ from langchain_core.messages import AIMessage
 from chaos_agent.agent.nodes.gates.confirmation_gate import confirmation_gate
 from chaos_agent.agent.nodes.planning.tool_screener import (
     SCREENER_ROUTE_FAIL,
-    SCREENER_ROUTE_RETRY,
     tool_screener,
 )
 from chaos_agent.agent.result.verdict import FailureCategory

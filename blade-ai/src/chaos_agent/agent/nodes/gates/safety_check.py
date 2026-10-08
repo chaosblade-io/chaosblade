@@ -26,6 +26,7 @@ from chaos_agent.agent.target_guard import (
     discover_owner_names,
     discover_pod_pvc_claims,
     discover_statefulset_pvc_claims,
+    discover_victim_nodes,
     discover_workload_pvc_claims,
     freeze_approved_target_from_spec,
     WORKLOAD_TEMPLATE_SCOPES,
@@ -33,8 +34,11 @@ from chaos_agent.agent.target_guard import (
 from chaos_agent.agent.target_guard.mechanism_writes import (
     derive_pvc_claims_from_writes,
     entries_beyond_victim,
+    entries_have_derived,
+    entries_needing_discovery,
     load_case_mechanism_writes,
     load_case_recovery_channel,
+    materialize_derived_entries,
 )
 from chaos_agent.agent.target_guard.freeze import approved_from_dict
 from chaos_agent.agent.result.verdict import FailureCategory
@@ -146,6 +150,35 @@ def _attach_safety_score(
             )
 
     return result
+
+
+async def _confirm_victim_pods_absent(
+    namespace: str, names: tuple[str, ...], kubeconfig: str,
+) -> tuple[str, ...]:
+    """Return the subset of ``names`` DEFINITIVELY absent from ``namespace``.
+
+    Fail-closed discriminator for the incoherent-victim check (inject-b6b02ebd
+    / memory f2ad82d2). A definitive ``NotFound`` — the pod does not exist in
+    the declared namespace — is authoritative and reported. A transient failure
+    (timeout, transport down, any non-NotFound error) is NOT: it returns as
+    "not confirmed absent", so a flaky cluster never triggers a spurious replan
+    (fail-open on infra, fail-closed only on a positive absence proof).
+    """
+    from chaos_agent.tools.kubectl_cli import query_kubectl
+
+    absent: list[str] = []
+    for name in names:
+        out = await query_kubectl(
+            ["pod", name, "-n", namespace, "-o", "name"],
+            kubeconfig,
+            log_name=f"victim-existence {name}",
+        )
+        if out.ok:
+            continue  # exists → not absent
+        if "notfound" in (out.error or "").lower():
+            absent.append(name)
+        # else: transient/other error → cannot confirm absence → fail-open
+    return tuple(absent)
 
 
 async def safety_check(state: AgentState) -> dict:
@@ -579,6 +612,116 @@ async def safety_check(state: AgentState) -> dict:
     mechanism_entries = load_case_mechanism_writes(
         skill_name, getattr(spec, "case_resource_path", "") or "",
     )
+    # W-56-1 / #65: materialize any DERIVED entry. Two orthogonal axes:
+    #   name_from: victim_node — the case legislates "write the node the victim
+    #     pod runs on"; code DERIVES the concrete node name from the live
+    #     cluster here (a query), never re-declared — the PVC-anchor discipline.
+    #   namespace_from: victim — the case legislates "write into the victim's
+    #     own namespace" (a victim-scoped NetworkPolicy must live there to
+    #     select it, and a portable case cannot hardcode the ns); code injects
+    #     ``spec.namespace`` — NO query, the victim's ns is already known.
+    # The materialized entry then freezes with concrete values, so the drift
+    # guard's manifest branch (and, for a node entry, the carriers node check)
+    # authorise the write, while the confirmation card renders the derived
+    # value for the human to approve. A derivation that resolves to nothing
+    # drops the entry (fail closed — see materialize_derived_entries). No-op
+    # for every manifest without a derived entry (freeze output byte-identical).
+    # Registry-driven trigger (root cause III): ``entries_have_derived`` /
+    # ``entries_needing_discovery`` consult the victim-runtime derivation
+    # registry, so a NEW axis is materialized (and, if discovery-backed,
+    # queried) with NO edit here — the old form hardcoded ``e.name_from or
+    # e.namespace_from`` and would have silently frozen a third axis
+    # unmaterialized. No-op for every manifest without a derived entry
+    # (freeze output byte-identical).
+    if entries_have_derived(mechanism_entries):
+        # Only a discovery-backed axis needs a live query; skip it when the
+        # manifest derives a namespace alone.
+        victim_nodes: tuple[str, ...] = ()
+        if entries_needing_discovery(mechanism_entries):
+            victim_nodes = await discover_victim_nodes(
+                spec.scope, spec.namespace, tuple(spec.names or ()),
+                dict(spec.labels or {}), kubeconfig,
+                resolved_names=resolved_names,
+            )
+            # Fail-closed on an incoherent victim (inject-b6b02ebd / memory
+            # f2ad82d2): a ``name_from: victim_node`` bridge needs a REAL
+            # victim pod. When the victim is a named pod/container but NO node
+            # resolved, confirm whether the named pod is definitively ABSENT
+            # from its declared namespace — the franken-target shape (a
+            # mechanism target's name frozen under the victim's namespace).
+            # Freezing it would silently drop the derived node entry, collapse
+            # the bridge, and every node/host write would then REJECT_DRIFT
+            # into a ~28-minute slow death. Fail FAST with a terminal reject
+            # instead — a retry is mechanically futile (see the block below).
+            # Transient query failures are NOT absence (fail-open on infra):
+            # only a definitive NotFound for EVERY named victim rejects.
+            if (
+                not victim_nodes
+                and (spec.scope or "").strip().lower() in ("pod", "container")
+                and spec.names
+                and spec.namespace
+            ):
+                _absent = await _confirm_victim_pods_absent(
+                    spec.namespace, tuple(spec.names), kubeconfig,
+                )
+                if _absent and len(_absent) == len(set(spec.names)):
+                    _names_s = ", ".join(_absent)
+                    # Reject, do NOT retry (inject-b6b02ebd cascade fix). The
+                    # retry this block used to emit is mechanically futile:
+                    # ``names`` is write-once locked (agent_loop ``if not
+                    # current``), the lazy-derivation block that could re-write
+                    # it is gated by ``is_complete`` (already True here), and a
+                    # safety retry never sets replan_context/replan_count so it
+                    # never triggers replan_reset_state(). A "re-declare the
+                    # victim" nudge therefore asks the LLM for something the
+                    # state machine cannot honour — even a perfectly obedient
+                    # re-probe has nowhere to write the corrected name, and the
+                    # loop spins to MAX_AGENT_LOOP -> PLANNING_TIMEOUT (~100
+                    # wasted cycles, verified by _probe_futile_loop.py). Fail
+                    # fast with an operator-facing diagnostic instead. The
+                    # reason deliberately avoids the "user"/"reject" substrings
+                    # so reject.py maps it to SAFETY_REJECTED, not USER_REJECTED.
+                    tracker.start(
+                        StatusCategory.NODE,
+                        "safety_check",
+                        "Victim identity unresolvable — halting (fail-fast)",
+                        {"reason": "victim_absent", "action": "rejected"},
+                    )
+                    sync_node_status_to_session(state, "safety_check",
+                        "Safety check: victim Pod(s) absent from declared "
+                        "namespace — halting (fail-fast)",
+                        detail={"safety_status": "rejected",
+                                "reason": "victim_absent"})
+                    messages = list(state.get("messages", []))
+                    result = {
+                        "safety_status": "rejected",
+                        "safety_reason": (
+                            f"Victim Pod(s) [{_names_s}] do NOT exist in the "
+                            f"drill namespace '{spec.namespace}'. This is the "
+                            "franken-target shape: the victim NAME was "
+                            "mis-derived from a probe of a DIFFERENT resource "
+                            "(e.g. a mechanism target such as kube-proxy in "
+                            "kube-system), so the victim_node authorization "
+                            "bridge cannot be derived and every node/host-level "
+                            "delivery would be blocked as target drift. The "
+                            "victim name is write-once locked, so planning "
+                            "cannot self-correct it and the drill is halted. "
+                            "Re-run with a real Pod that EXISTS in "
+                            f"'{spec.namespace}'."
+                        ),
+                        "messages": messages,
+                    }
+                    result = _attach_safety_score(result, spec, state)
+                    await sync_to_store(state, result)
+                    tracker.complete(
+                        "Halted (fail-fast): victim identity unresolvable "
+                        "in the declared namespace"
+                    )
+                    return result
+        mechanism_entries = materialize_derived_entries(
+            mechanism_entries, victim_nodes=victim_nodes,
+            victim_namespace=(spec.namespace or ""),
+        )
     # Case-file recovery-route legislation (D3 source 1, openspec
     # faultdrill-cr-channel): the SAME deterministic re-read discipline as
     # the manifest — code reads the settled case file, so neither the

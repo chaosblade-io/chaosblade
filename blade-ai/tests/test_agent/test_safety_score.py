@@ -2,13 +2,10 @@
 
 from datetime import datetime
 
-import pytest
 
 from chaos_agent.agent.spec.fault_spec import FaultSpec
 from chaos_agent.agent.spec.safety_score import (
     DEFAULT_WEIGHTS,
-    DimensionScore,
-    SafetyScore,
     _score_blast_radius,
     _score_frequency,
     _score_time,
@@ -160,7 +157,6 @@ class TestTime:
         Earlier version used bare ``datetime.now()`` which would have
         let the server's process TZ leak into the score.
         """
-        from chaos_agent.utils.time import BEIJING_TZ
         from datetime import timezone
 
         # Freeze "now" to a known instant: 2026-05-26T08:00:00Z = 16:00

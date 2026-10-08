@@ -111,7 +111,9 @@ async def _probe_operator(
         # maintain in lockstep.
         summary += (
             "; expected consequence: newly created experiment CRDs will not"
-            " be reconciled until the operator recovers"
+            " be reconciled until the operator recovers — the ChaosBlade"
+            " CRD injection channel is unavailable while the operator is"
+            " down"
         )
         # Best-effort fallback path discovery: when the operator cannot run
         # CRD injection, the cri/tool-pod path is the alternative — knowing

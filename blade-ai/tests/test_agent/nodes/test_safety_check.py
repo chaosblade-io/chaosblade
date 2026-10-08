@@ -533,3 +533,221 @@ class TestAnchorKindIntegrity:
         result = await safety_check(state)
         assert result["safety_status"] == "rejected"
         assert "kube-system" in result["safety_reason"]
+
+
+# ══ inject-b6b02ebd — fail-closed on an incoherent victim (维度2 + fail-closed) ══
+#
+# A ``name_from: victim_node`` mechanism needs a REAL victim pod to derive its
+# host node. When the victim name was mis-derived from a mechanism target's
+# probe (kube-proxy frozen under the drill-lb victim ns), discover_victim_nodes
+# resolves nothing, the bridge collapses, and every node/host write REJECT_DRIFTs
+# into a ~28-minute slow death. The fix fails FAST: if the named victim is
+# DEFINITIVELY absent (NotFound) from its declared namespace, route back to the
+# planner (retry) with an actionable re-declare nudge instead of freezing.
+#
+# The discriminator is fail-closed on a POSITIVE absence proof only: a
+# transient failure (timeout, transport down) is NOT absence, so a flaky
+# cluster never triggers a spurious replan.
+
+import contextlib  # noqa: E402
+from unittest.mock import AsyncMock, patch  # noqa: E402
+
+from chaos_agent.agent.nodes.gates.safety_check import (  # noqa: E402
+    _confirm_victim_pods_absent,
+)
+from chaos_agent.tools.kubectl_cli import QueryOutcome  # noqa: E402
+
+_NOT_FOUND = QueryOutcome(
+    ok=False,
+    error='exit=1: Error from server (NotFound): pods "kube-proxy-worker-r5mg9" not found',
+)
+_EXISTS = QueryOutcome(ok=True, stdout="pod/kube-proxy-worker-r5mg9")
+_TRANSIENT = QueryOutcome(ok=False, error="exception: connection timed out")
+
+
+class TestConfirmVictimPodsAbsent:
+    """Unit tests for the fail-closed/fail-open absence discriminator."""
+
+    @pytest.mark.asyncio
+    async def test_definitive_notfound_is_reported_absent(self):
+        with patch(
+            "chaos_agent.tools.kubectl_cli.query_kubectl",
+            new=AsyncMock(return_value=_NOT_FOUND),
+        ):
+            absent = await _confirm_victim_pods_absent(
+                "drill-lb", ("kube-proxy-worker-r5mg9",), "/fake",
+            )
+        assert absent == ("kube-proxy-worker-r5mg9",)
+
+    @pytest.mark.asyncio
+    async def test_existing_pod_is_not_absent(self):
+        with patch(
+            "chaos_agent.tools.kubectl_cli.query_kubectl",
+            new=AsyncMock(return_value=_EXISTS),
+        ):
+            absent = await _confirm_victim_pods_absent(
+                "drill-lb", ("drill-lb-target",), "/fake",
+            )
+        assert absent == ()
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_fails_open_not_absent(self):
+        # A timeout / transport-down is NOT proof of absence — reporting it as
+        # absent would fire a spurious replan on a flaky cluster.
+        with patch(
+            "chaos_agent.tools.kubectl_cli.query_kubectl",
+            new=AsyncMock(return_value=_TRANSIENT),
+        ):
+            absent = await _confirm_victim_pods_absent(
+                "drill-lb", ("some-pod",), "/fake",
+            )
+        assert absent == ()
+
+    @pytest.mark.asyncio
+    async def test_mixed_only_definitive_notfound_returned(self):
+        # One victim definitively absent, one merely unreachable: only the
+        # proven-absent one is reported, so the "EVERY named victim absent"
+        # caller condition is not met and no replan fires on partial evidence.
+        answers = {"gone-pod": _NOT_FOUND, "flaky-pod": _TRANSIENT}
+
+        async def fake_query(args, kubeconfig="", *, log_name=""):
+            return answers[args[1]]
+
+        with patch(
+            "chaos_agent.tools.kubectl_cli.query_kubectl", new=fake_query,
+        ):
+            absent = await _confirm_victim_pods_absent(
+                "drill-lb", ("gone-pod", "flaky-pod"), "/fake",
+            )
+        assert absent == ("gone-pod",)
+
+
+class TestVictimAbsentFailClosed:
+    """Node-level: safety_check must fail-fast REJECT an incoherent victim."""
+
+    @staticmethod
+    def _victim_node_entry():
+        # A mechanism manifest legislating ``name_from: victim_node`` — the
+        # derived node entry that collapses when the victim cannot be resolved.
+        from chaos_agent.agent.target_guard.mechanism_writes import (
+            MechanismWriteEntry,
+        )
+        return (MechanismWriteEntry(
+            scope="node", namespace="", name_from="victim_node",
+        ),)
+
+    def _franken_state(self, sample_agent_state):
+        from tests._helpers import replace_fault_spec
+        state = sample_agent_state
+        state["skill_name"] = "k8s-chaos-skills"
+        # The franken target: a mechanism pod's NAME frozen under the victim ns.
+        replace_fault_spec(
+            state, scope="pod", fault_target="process", fault_action="kill",
+            namespace="drill-lb", names=("kube-proxy-worker-r5mg9",),
+            labels={}, case_resource_path="cases/kube-proxy.md",
+        )
+        return state
+
+    def _patches(self, existence_outcome):
+        """Deterministic seam set: no cluster, disabled health/feasibility, a
+        victim_node manifest, empty node discovery, and a controlled victim
+        existence query."""
+        return [
+            patch("chaos_agent.agent.nodes.gates.safety_check.sync_to_store",
+                  new=AsyncMock()),
+            patch("chaos_agent.agent.nodes.gates.safety_check.load_case_mechanism_writes",
+                  new=lambda *a, **k: self._victim_node_entry()),
+            patch("chaos_agent.agent.nodes.gates.safety_check.discover_owner_names",
+                  new=AsyncMock(return_value=())),
+            patch("chaos_agent.agent.nodes.gates.safety_check.discover_names_by_labels",
+                  new=AsyncMock(return_value=())),
+            patch("chaos_agent.agent.nodes.gates.safety_check.discover_pod_pvc_claims",
+                  new=AsyncMock(return_value=())),
+            patch("chaos_agent.agent.nodes.gates.safety_check.discover_victim_nodes",
+                  new=AsyncMock(return_value=())),
+            patch("chaos_agent.tools.kubectl_cli.query_kubectl",
+                  new=AsyncMock(return_value=existence_outcome)),
+        ]
+
+    async def _run(self, state, monkeypatch, existence_outcome):
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
+        monkeypatch.setattr(settings, "safety_blacklist_namespaces", "")
+        monkeypatch.setattr(settings, "target_health_check_enabled", False)
+        monkeypatch.setattr(settings, "feasibility_check_enabled", False)
+        with contextlib.ExitStack() as stack:
+            for p in self._patches(existence_outcome):
+                stack.enter_context(p)
+            return await safety_check(state)
+
+    @pytest.mark.asyncio
+    async def test_absent_victim_rejects_fail_fast(self, sample_agent_state, monkeypatch):
+        # F1 (inject-b6b02ebd cascade fix): an incoherent victim is now a
+        # TERMINAL reject, not a retry. The retry was mechanically futile —
+        # ``names`` is write-once locked, so routing back to the planner spun
+        # to MAX_AGENT_LOOP without ever correcting the name (proven by
+        # _probe_futile_loop.py). The reason must carry an operator-facing
+        # diagnostic AND deliberately avoid the "user"/"reject" substrings so
+        # reject.py maps it to SAFETY_REJECTED (not USER_REJECTED).
+        state = self._franken_state(sample_agent_state)
+        result = await self._run(state, monkeypatch, _NOT_FOUND)
+        assert result["safety_status"] == "rejected"
+        reason = result["safety_reason"]
+        assert "do not exist" in reason.lower()
+        assert "drill-lb" in reason
+        assert "user" not in reason.lower()    # -> SAFETY_REJECTED, not USER_*
+        assert "reject" not in reason.lower()
+        # No LLM nudge is appended anymore (there is no further planner turn).
+        assert all(
+            "VICTIM IDENTITY UNRESOLVED" not in getattr(m, "content", "")
+            for m in result["messages"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejected_lands_on_safety_rejected_terminal(
+        self, sample_agent_state, monkeypatch,
+    ):
+        # F1 end-to-end: the fail-fast disposition must actually TERMINATE on
+        # SAFETY_REJECTED. Verified against the REAL consumer decision
+        # functions (router + reject._infer_failure_detail), not assumed:
+        #   - route_after_safety must send "rejected" to REJECT, never back to
+        #     agent_loop (looping back is what made the old retry futile);
+        #   - reject.py must attribute it to SAFETY_REJECTED and — because the
+        #     rejected branch is checked BEFORE agent_loop_count — must NOT
+        #     downgrade to PLANNING_TIMEOUT even after planning turns ran.
+        from chaos_agent.agent.router import route_after_safety, REJECT
+        from chaos_agent.agent.nodes.gates.reject import _infer_failure_detail
+        from chaos_agent.agent.result.verdict import FailureCategory
+
+        state = self._franken_state(sample_agent_state)
+        result = await self._run(state, monkeypatch, _NOT_FOUND)
+        assert result["safety_status"] == "rejected"
+
+        # Router terminates (never loops back to the planner).
+        assert route_after_safety(result) == REJECT
+
+        # Reject node attributes to SAFETY_REJECTED, the diagnostic survives,
+        # and agent_loop_count>0 does NOT downgrade it to PLANNING_TIMEOUT.
+        terminal_state = {**state, **result, "agent_loop_count": 3}
+        detail = _infer_failure_detail(terminal_state)
+        assert (
+            detail["failure_detail"]["category"]
+            == FailureCategory.SAFETY_REJECTED.value
+        )
+        assert "drill-lb" in detail["failure_detail"]["context"]
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_does_not_reject(self, sample_agent_state, monkeypatch):
+        # Fail-open on infra: an unreachable cluster must NOT be read as
+        # "victim absent" — that would spuriously reject a valid drill.
+        state = self._franken_state(sample_agent_state)
+        result = await self._run(state, monkeypatch, _TRANSIENT)
+        assert result["safety_status"] != "rejected"
+
+    @pytest.mark.asyncio
+    async def test_existing_victim_does_not_reject(self, sample_agent_state, monkeypatch):
+        # A victim that DOES exist (node discovery merely returned empty here)
+        # is not the franken shape — no fail-fast reject.
+        state = self._franken_state(sample_agent_state)
+        result = await self._run(state, monkeypatch, _EXISTS)
+        assert result["safety_status"] != "rejected"

@@ -834,7 +834,13 @@ REJECTED_WRITE_AUTHORITY: dict[str, int] = {
     "agent/nodes/execute/agent_loop.py": 2,
     "agent/nodes/gates/_write_set_boundary.py": 1,
     "agent/nodes/gates/confirmation_gate.py": 2,
-    "agent/nodes/gates/safety_check.py": 3,
+    # safety_check: 3 pre-existing safety verdicts + the victim_absent
+    # fail-fast (inject-b6b02ebd cascade fix). A franken victim that cannot
+    # exist in its declared namespace is a safety verdict, and the retry it
+    # replaced was mechanically futile (write-once ``names`` cannot be
+    # corrected on the retry path -> it spun to MAX_AGENT_LOOP), so it now
+    # terminates as a rejected safety verdict instead.
+    "agent/nodes/gates/safety_check.py": 4,
 }
 
 
