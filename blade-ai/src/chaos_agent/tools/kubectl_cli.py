@@ -1461,9 +1461,11 @@ async def _kubectl_impl(
         )
 
     if result.exit_code != 0:
-        # kubewiz 模式下错误信息在 stdout，直接模式在 stderr；两者都非空时
-        # （如 jsonpath 半截渲染占 stdout、真实报错在 stderr）必须合并，
-        # or 语义会把 kubectl 的实际错误解释丢掉，模型只能盲猜自修复。
+        # 通道层已根治（protocol.parse_wiz_output 哨兵展开，失败时远端
+        # stderr 回归 result.stderr），但合并双流仍是正确取值：直接模式
+        # 报错在 stderr；kubewiz 无哨兵的旧回执错误仍在 stdout；jsonpath
+        # 半截渲染占 stdout 而真实报错在 stderr 的双非空场景两者都要。
+        # or 语义会丢掉一侧证据，模型只能盲猜自修复。
         _err_parts = [s.strip() for s in (result.stdout, result.stderr) if s and s.strip()]
         error_detail = "\n".join(_err_parts) if _err_parts else "(no output)"
         # A node-debugger pod that completed mid-probing: its keep-alive sleep
@@ -1524,6 +1526,31 @@ async def _kubectl_impl(
                 "first: re-check the target's actual state with a read "
                 "command, then retry only what is genuinely missing."
             )
+        # A4: an exec'd probe with a non-zero exit code but REAL stdout —
+        # the command executed inside the container and produced output.
+        # Probe dialects speak in exit codes (grep no-match, nslookup
+        # NXDOMAIN, test false), so the output above is the probe's own
+        # negative ANSWER, not a channel failure; the bare "Error:"
+        # framing invited method-switches away from valid evidence.
+        # Kubectl client-side errors write stderr only, so non-empty
+        # stdout is the reliable "the command really ran" signal. Skipped
+        # when the timeout note fired (its outcome is genuinely unknown —
+        # "ran and produced" would overclaim). Same boundary as the notes
+        # above: advice appended to the raw error, never a gate.
+        if (
+            subcommand == "exec"
+            and result.stdout
+            and result.stdout.strip()
+            and "task timed out" not in error_detail
+        ):
+            error_detail += (
+                "\n\nProbe note: the exec'd command ran in the container "
+                "and produced output — a non-zero exit code here is often "
+                "the probe's own negative answer (grep no match, "
+                "NXDOMAIN, test false), not a channel failure. Read the "
+                "output above as valid probe evidence before retrying or "
+                "switching methods."
+            )
         # Report the exit code + raw output verbatim; no "failed" verdict word.
         # No routine truncation at the tool layer: governance is the
         # compactor's job (it caches oversized messages in full). The safety
@@ -1534,7 +1561,27 @@ async def _kubectl_impl(
             kind="error",
         )
 
-    output = apply_output_safety_valve(result.stdout, kind="success-output")
+    # Channel-contract symmetry (Case #63 inject-2ee3bdc7, verifier
+    # read-probe): the error branch above merges both streams precisely
+    # because "or 语义会丢掉一侧证据" — and exec'd container probes can
+    # carry their payload on stderr (dd's timing summary is the canonical
+    # form; POSIX convention puts progress/statistics on stderr for the
+    # whole dd/tar/curl/wget family). A stdout-only success receipt turns
+    # "ran fine" into "no output", which the #63 verifier had to burn a
+    # ReAct turn to diagnose and route around with `sh -c '... 2>&1'`.
+    # Merge BEFORE the safety valve so the 64KB budget sees the true
+    # total; the "--- STDERR ---" separator mirrors execute_skill_script's
+    # receipt form. When stderr is empty this is a byte-identical no-op;
+    # kubectl warnings emitted on stderr (e.g. deprecation notices) are
+    # now preserved instead of silently dropped.
+    _success_body = result.stdout
+    if (result.stderr or "").strip():
+        _success_body = (
+            f"{result.stdout}\n--- STDERR ---\n{result.stderr}"
+            if _success_body.strip()
+            else f"--- STDERR ---\n{result.stderr}"
+        )
+    output = apply_output_safety_valve(_success_body, kind="success-output")
 
     # Append large output hint for get subcommand with JSON output.
     # Skipped when the safety valve has already fired (original output
@@ -1547,7 +1594,12 @@ async def _kubectl_impl(
         subcommand == "get"
         and _is_json_output(v_args)
         and settings.kubectl_max_output_bytes > 0
-        and len(result.stdout.encode("utf-8", errors="replace"))
+        # Gate on the MERGED body length — the same input the valve just
+        # saw. Gating on result.stdout alone would desync from the valve
+        # once stderr joins the receipt (stdout under the ceiling but
+        # stdout+stderr over it ⇒ valve fired, yet this branch would
+        # still append ~300B past the budget the valve enforced).
+        and len(_success_body.encode("utf-8", errors="replace"))
         <= TOOL_OUTPUT_SAFETY_VALVE_BYTES
     ):
         output_bytes = len(output.encode("utf-8", errors="replace"))

@@ -2378,6 +2378,115 @@ class TestErrorOutputMergesBothStreams:
         assert "(no output)" in out
 
 
+class TestSuccessOutputMergesBothStreams:
+    """Success-path mirror of the error-branch stream-merge above.
+
+    Case #63 (inject-2ee3bdc7): the verifier's read-only dd probe
+    (`dd if=... of=/dev/null`) exited 0 with its timing summary on stderr —
+    the stdout-only receipt said "accepted, no output" and the verifier
+    burned a ReAct turn re-deriving a `sh -c '... 2>&1'` workaround.
+    Non-empty stderr must now ride along under the same "--- STDERR ---"
+    separator execute_skill_script uses."""
+
+    @pytest.mark.asyncio
+    async def test_stderr_only_probe_payload_survives(self, monkeypatch):
+        async def fake_run(cmd, *a, **kw):
+            return CommandResult(
+                0, "",
+                "10+0 records in\n10+0 records out\n"
+                "10485760 bytes (10 MB) copied, 0.0687 s, 153 MB/s",
+                1.0,
+            )
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+        out = await kubectl.ainvoke({
+            "subcommand": "exec",
+            "v_args": "pod p1 -- dd if=/d/f of=/dev/null bs=1M count=50",
+        })
+        assert "--- STDERR ---" in out
+        assert "0.0687 s" in out          # dd's summary reaches the model
+        assert not out.startswith("\n")  # no leading blank from empty stdout
+
+    @pytest.mark.asyncio
+    async def test_stdout_and_stderr_both_present(self, monkeypatch):
+        async def fake_run(cmd, *a, **kw):
+            return CommandResult(0, "probe-line", "deprecation warning", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+        out = await kubectl.ainvoke({"subcommand": "get", "v_args": "node n1"})
+        assert "probe-line" in out         # stdout kept, first
+        assert "--- STDERR ---" in out
+        assert "deprecation warning" in out  # stderr appended after
+
+    @pytest.mark.asyncio
+    async def test_clean_stdout_unchanged(self, monkeypatch):
+        """Routine reads (empty stderr) must be byte-identical to before."""
+        async def fake_run(cmd, *a, **kw):
+            return CommandResult(0, "NAME   AGE\nn1     1d", "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+        out = await kubectl.ainvoke({"subcommand": "get", "v_args": "nodes"})
+        assert out == "NAME   AGE\nn1     1d"
+
+    @pytest.mark.asyncio
+    async def test_merged_body_over_ceiling_suppresses_hint(self, monkeypatch):
+        """Valve/hint desync guard (Case #63 self-audit): stdout UNDER the
+        64KB ceiling but stdout+stderr OVER it. The valve fires on the
+        merged body, so the LARGE_OUTPUT hint gate — which used to read
+        result.stdout alone — must read the merged length too, or it would
+        append ~300B past the budget the valve just enforced."""
+        from chaos_agent.config.settings import settings as _settings
+        from chaos_agent.utils.truncation import TOOL_OUTPUT_SAFETY_VALVE_BYTES
+        monkeypatch.setattr(_settings, "kubectl_max_output_bytes", 32768)
+        big_stdout = '{"items": [' + ",".join(
+            ['{"pad":"' + "y" * 300 + '"}'] * 190
+        ) + "]}"
+        big_stderr = "warning: " + "z" * (10 * 1024)
+        assert len(big_stdout.encode()) <= TOOL_OUTPUT_SAFETY_VALVE_BYTES
+        assert len((big_stdout + big_stderr).encode()) > (
+            TOOL_OUTPUT_SAFETY_VALVE_BYTES
+        )
+
+        async def fake_run(cmd, *a, **kw):
+            return CommandResult(0, big_stdout, big_stderr, 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+        out = await kubectl.ainvoke({
+            "subcommand": "get", "v_args": "pods -n default -o json",
+        })
+        assert "⚠️ OUTPUT_TRUNCATED" in out   # valve fired on merged body
+        assert "LARGE_OUTPUT" not in out       # hint suppressed, no overrun
+        assert len(out.encode("utf-8", errors="replace")) <= (
+            TOOL_OUTPUT_SAFETY_VALVE_BYTES
+        )
+
+    @pytest.mark.asyncio
+    async def test_under_ceiling_hint_still_appends(self, monkeypatch):
+        """Control for the desync guard: merged body UNDER the ceiling ⇒
+        the valve does not fire and the JSON hint path behaves exactly as
+        before (60KB stdout > the 32KB default ⇒ hint appended)."""
+        from chaos_agent.config.settings import settings as _settings
+        monkeypatch.setattr(_settings, "kubectl_max_output_bytes", 32768)
+        big_stdout = '{"items": [' + ",".join(
+            ['{"pad":"' + "y" * 300 + '"}'] * 190
+        ) + "]}"
+
+        async def fake_run(cmd, *a, **kw):
+            return CommandResult(0, big_stdout, "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+        out = await kubectl.ainvoke({
+            "subcommand": "get", "v_args": "pods -n default -o json",
+        })
+        assert "LARGE_OUTPUT" in out           # hint path unchanged
+        assert "⚠️ OUTPUT_TRUNCATED" not in out  # valve did not fire
+
+
 def _pod_json(spec_ec_names: list[str], status_entries: dict[str, dict]) -> str:
     """Target pod JSON shape: spec order = creation order; status entries are
     name -> state dict (the API itself returns the status list alphabetically,
@@ -2761,6 +2870,69 @@ class TestOutputSafetyValve:
             monkeypatch, CommandResult(0, stdout, "", 0.1),
         )
         assert result == stdout
+
+
+class TestExecProbeExitCodeAnnotation:
+    """A4: a non-zero exit code from an exec'd probe that PRODUCED stdout
+    is the probe's own negative answer (grep no-match, NXDOMAIN), not a
+    channel failure — the raw output stays valid evidence, and the
+    appended note says so instead of leaving the bare "Error:" framing
+    to invite a method-switch away from it."""
+
+    @staticmethod
+    def _invoke_with_result(monkeypatch, command_result, v_args="my-pod -n default -- grep -c err /var/log/app.log"):
+        async def fake_run(cmd, *args, **kwargs):
+            return command_result
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+
+        async def _call():
+            return await kubectl.ainvoke({
+                "subcommand": "exec",
+                "v_args": v_args,
+                "kubeconfig": "",
+            })
+
+        return _call()
+
+    async def test_probe_stdout_with_exit1_gets_probe_note(self, monkeypatch):
+        # The nslookup NXDOMAIN shape: exit 1 and the answer text IS on
+        # stdout — the command ran, its negative answer is real evidence.
+        result = await self._invoke_with_result(
+            monkeypatch, CommandResult(
+                1, "Server:\t10.96.0.10\n** server can't find nx.svc.cluster.local: NXDOMAIN\n", "", 0.1,
+            ),
+        )
+        assert result.startswith("Error: kubectl exec (exit 1):")
+        assert "NXDOMAIN" in result                      # raw evidence intact
+        assert "Probe note" in result
+        assert "not a channel failure" in result
+        assert "valid probe evidence" in result
+
+    async def test_stderr_only_error_keeps_bare_framing(self, monkeypatch):
+        # Kubectl client-side errors write stderr only — no stdout means
+        # no "the command really ran" signal, so no probe note (the
+        # completed-pod / NotFound errors must keep their bare form).
+        result = await self._invoke_with_result(
+            monkeypatch, CommandResult(
+                1, "", 'Error from server (NotFound): pods "my-pod" not found', 0.1,
+            ),
+        )
+        assert result.startswith("Error: kubectl exec (exit 1):")
+        assert "Probe note" not in result
+
+    async def test_timeout_receipt_suppresses_probe_note(self, monkeypatch):
+        # The timeout note's outcome is genuinely UNKNOWN ("may STILL be
+        # running") — appending "ran and produced" would overclaim; the
+        # timeout advice wins and the probe note stays silent.
+        result = await self._invoke_with_result(
+            monkeypatch, CommandResult(
+                1, "partial probe output\n", "Error: task timed out after 60s", 0.1,
+            ),
+        )
+        assert "Outcome UNKNOWN" in result
+        assert "Probe note" not in result
 
 
 class TestQueryKubectl:
