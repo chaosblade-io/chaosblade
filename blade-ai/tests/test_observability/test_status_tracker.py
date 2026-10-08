@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from chaos_agent.observability.status_tracker import (
+    NullTracker,
     StatusCategory,
     StatusEvent,
     StatusPhase,
@@ -96,7 +97,7 @@ class TestStatusTracker:
 
     def test_emit_drops_on_full_queue(self):
         tracker = StatusTracker("t1")
-        q = tracker.subscribe(maxsize=1)
+        tracker.subscribe(maxsize=1)
         event = StatusEvent(
             task_id="t1",
             phase=StatusPhase.STARTED,
@@ -258,7 +259,7 @@ class TestTrackStatusContextManager:
         remove_tracker("task-ctx-test")
         q = subscribe("task-ctx-test")
 
-        async with track_status("task-ctx-test", "test_node", "Working...") as tracker:
+        async with track_status("task-ctx-test", "test_node", "Working..."):
             pass
 
         start_event = q.get_nowait()
@@ -337,3 +338,209 @@ class TestStatusCategories:
             category=StatusCategory.SYSTEM, source="init", message="test",
         )
         assert event.category == StatusCategory.SYSTEM
+
+
+class TestInterventionChannel:
+    """The framework-intervention fact must reach a surface an auditor reads.
+
+    Case #64: the contract pin rewrote the plan's 300s into the approved
+    420s and recorded it on the logger and the session ledger. The run was
+    launched through ``inject --stream``, which renders tracker events only
+    — so the rewrite was invisible, and a CORRECT pin was audited as an
+    unexplained drift. ``SYSTEM`` had been legislated as the one category
+    that survives non-debug rendering (see ``cli.status_display``) but had
+    no producer at all until ``intervention`` existed. These tests pin both
+    the channel and the two drop rules that make it necessary.
+    """
+
+    @staticmethod
+    def _render(event, monkeypatch, *, debug: bool):
+        from chaos_agent.cli.status_display import format_status_event
+        from chaos_agent.config.settings import settings
+        # ``is_debug`` is a derived property (log_level == "DEBUG") with no
+        # setter, so the underlying field is what gets patched. The suite runs
+        # at DEBUG by default — without this the drop rules under test would
+        # never fire and every assertion below would pass vacuously.
+        monkeypatch.setattr(settings, "log_level", "DEBUG" if debug else "INFO")
+        assert settings.is_debug is debug
+        return format_status_event(event)
+
+    def _one(self):
+        tracker = StatusTracker(task_id="t1")
+        tracker.intervention(
+            "pin",
+            "[contract] blade_create: blade --timeout 300 -> 420s",
+            {"tool": "blade_create", "before": "blade --timeout 300",
+             "after": 420, "window": 300},
+        )
+        assert len(tracker._history) == 1
+        return tracker._history[0]
+
+    def test_lands_on_the_system_channel_with_the_facts(self):
+        event = self._one()
+        assert event.category == StatusCategory.SYSTEM
+        assert event.phase == StatusPhase.RUNNING
+        assert event.detail["intervention"] == "pin"
+        assert event.detail["before"] == "blade --timeout 300"
+        assert event.detail["after"] == 420
+
+    def test_survives_non_debug_rendering(self, monkeypatch):
+        event = self._one()
+        assert self._render(event, monkeypatch, debug=False) != ""
+
+    def test_update_would_have_been_dropped(self, monkeypatch):
+        # The counterfactual that makes SYSTEM load-bearing: the identical
+        # message sent through ``update`` (category NODE — the route the
+        # ``[FCAT P0]`` precedent uses) renders to nothing outside debug
+        # mode. Copying that precedent would have reproduced the gap.
+        tracker = StatusTracker(task_id="t1")
+        tracker.update("[contract] blade_create: 300 -> 420s")
+        assert self._render(tracker._history[0], monkeypatch, debug=False) == ""
+
+    def test_debug_marker_would_have_been_dropped(self, monkeypatch):
+        # The second drop rule: ``detail["debug"]`` is discarded non-debug
+        # regardless of category. An audit fact is not a debug aid, so
+        # ``intervention`` must not set the marker.
+        event = self._one()
+        assert "debug" not in event.detail
+        event.detail["debug"] = True
+        assert self._render(event, monkeypatch, debug=False) == ""
+
+    def test_is_a_point_event_with_its_own_timestamp(self):
+        event = self._one()
+        # A rewrite is instantaneous: no span, so the renderer omits a
+        # duration. The wall-clock stamp is the fact's own time.
+        assert event.duration_ms == 0
+        assert event.timestamp > 0
+
+    def test_null_tracker_swallows_it(self):
+        # Dialogue turns run the same nodes with no task identity; an
+        # intervention there must not fabricate a history entry.
+        tracker = NullTracker()
+        tracker.intervention("pin", "rewritten", {"after": 420})
+        assert len(tracker._history) == 0
+
+
+class TestSpanSegmentation:
+    """``mark`` — sub-span breakdown inside one node span.
+
+    A node emits ONE cumulative number while its message names one phase, so
+    ``Iteration 1 LLM response: (71751ms)`` reads as "the model took 71.7s".
+    inject-6ebf341c turn 1 was audited exactly that way and the 67s could be
+    neither confirmed nor refuted: no layer held a breakdown. These tests pin
+    the three properties that make the number falsifiable — labels in call
+    order, parts that sum to the whole, and a renderer that says what it is
+    showing.
+    """
+
+    def _tracker(self):
+        tracker = StatusTracker("t1")
+        tracker.start(StatusCategory.NODE, "agent_loop", "iteration 1")
+        return tracker
+
+    @staticmethod
+    def _labels(event):
+        return [s["label"] for s in event.detail["segments"]]
+
+    def test_mark_records_labels_in_call_order(self):
+        tracker = self._tracker()
+        tracker.mark("hook")
+        tracker.mark("prompt-build")
+        tracker.mark("llm-call")
+        tracker.update("Iteration 1 LLM response:")
+        assert self._labels(tracker._history[-1]) == [
+            "hook", "prompt-build", "llm-call", "other",
+        ]
+
+    def test_segments_measure_their_own_intervals(self):
+        import time
+
+        tracker = self._tracker()
+        time.sleep(0.02)
+        tracker.mark("hook")
+        tracker.mark("llm-call")
+        tracker.update("x")
+        segs = {s["label"]: s["ms"] for s in tracker._history[-1].detail["segments"]}
+        # The slept interval is attributed to the phase it was slept in, not
+        # smeared across the span.
+        assert segs["hook"] >= 15
+        assert segs["llm-call"] < 15
+
+    def test_parts_sum_to_the_whole(self):
+        import time
+
+        tracker = self._tracker()
+        time.sleep(0.02)
+        tracker.mark("hook")
+        tracker.update("x")
+        event = tracker._history[-1]
+        total = sum(s["ms"] for s in event.detail["segments"])
+        # ``other`` exists so an un-instrumented remainder can never be
+        # silently dropped from the breakdown — a sum that looks complete but
+        # is not would re-create the mis-attribution this closes.
+        assert abs(total - event.duration_ms) < 5
+
+    def test_no_segments_until_something_is_marked(self):
+        tracker = self._tracker()
+        tracker.update("x")
+        tracker.complete("done")
+        # Un-instrumented producers keep their exact previous payload.
+        assert all("segments" not in e.detail for e in tracker._history)
+
+    def test_start_resets_previous_segments(self):
+        tracker = self._tracker()
+        tracker.mark("hook")
+        tracker.start(StatusCategory.NODE, "agent_loop", "iteration 2")
+        tracker.mark("llm-call")
+        tracker.update("x")
+        # A new span must not inherit the previous one's breakdown.
+        assert self._labels(tracker._history[-1]) == ["llm-call", "other"]
+
+    def test_complete_logs_the_breakdown(self, caplog):
+        import logging
+
+        tracker = self._tracker()
+        tracker.mark("hook")
+        tracker.mark("llm-call")
+        with caplog.at_level(logging.INFO, logger="chaos_agent.observability.status_tracker"):
+            tracker.complete("iteration 1 done")
+        # Events reach a live subscriber or nothing; the log line is what makes
+        # a slow turn in an unwatched run answerable afterwards.
+        assert "span breakdown" in caplog.text
+        assert "hook=" in caplog.text and "llm-call=" in caplog.text
+
+    def test_save_restore_keeps_the_parents_segments(self):
+        tracker = self._tracker()
+        tracker.mark("hook")
+        saved = tracker.save_state()
+        # A sub-operation takes over the tracker and clears its bookkeeping.
+        tracker.start(StatusCategory.NODE, "conflict_check", "checking")
+        tracker.mark("kubectl")
+        tracker.restore_state(saved)
+        tracker.complete("iteration 1 done")
+        assert self._labels(tracker._history[-1]) == ["hook", "other"]
+
+    def test_renderer_states_what_the_number_measures(self, monkeypatch):
+        from chaos_agent.cli.status_display import format_status_event
+        from chaos_agent.config.settings import settings
+
+        tracker = self._tracker()
+        tracker.mark("hook")
+        tracker.mark("llm-call")
+        tracker.update("Iteration 1 LLM response:")
+        monkeypatch.setattr(settings, "log_level", "DEBUG")
+        line = format_status_event(tracker._history[-1])
+        # The cumulative figure is labelled as the NODE's, and the phase split
+        # sits beside it — the reading "LLM response took <node total>" is no
+        # longer the only one available.
+        assert "(node " in line
+        assert "llm-call=" in line
+        assert "segments" not in line.split("→ detail:")[-1]
+
+    def test_null_tracker_mark_is_inert(self):
+        tracker = NullTracker()
+        tracker.mark("hook")
+        tracker.update("x")
+        assert tracker._segments == []
+        assert len(tracker._history) == 0
+

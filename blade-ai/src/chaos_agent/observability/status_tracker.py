@@ -102,6 +102,9 @@ class StatusTracker:
         self._history: deque[StatusEvent] = deque(maxlen=_HISTORY_MAXLEN)
         self._current_source: str = ""
         self._start_time: float = 0.0
+        # Sub-span bookkeeping, see :meth:`mark`.
+        self._segments: list[tuple[str, float]] = []
+        self._segment_start: float = 0.0
 
     def subscribe(self, maxsize: int = 100) -> asyncio.Queue[StatusEvent]:
         """Subscribe to status events for this task. Returns a Queue."""
@@ -129,6 +132,8 @@ class StatusTracker:
         """Emit a STARTED event and track timing."""
         self._current_source = source
         self._start_time = time.monotonic()
+        self._segments = []
+        self._segment_start = self._start_time
         self.emit(StatusEvent(
             task_id=self.task_id,
             phase=StatusPhase.STARTED,
@@ -137,6 +142,82 @@ class StatusTracker:
             message=message,
             detail=detail or {},
         ))
+
+    def mark(self, label: str) -> None:
+        """Close the sub-span that just ended and name it.
+
+        A node's COMPLETED event carries ONE number: everything from
+        ``start()`` to ``complete()``. That number is honest, but the
+        message it is rendered next to usually names a single phase —
+        ``Iteration 5 LLM:`` — so a reader concludes the LLM call took
+        that long. inject-6ebf341c turn 1 printed ``(71751ms)`` beside
+        ``LLM:`` and the 67s was duly audited as model latency; the
+        breakdown that would have shown where it actually went did not
+        exist at any layer, so the mis-attribution was unfalsifiable
+        rather than merely wrong.
+
+        ``mark`` is the missing layer: call it right AFTER a phase's work
+        returns and the elapsed interval since the previous mark is
+        recorded under *label*. Call sites are one line each and need no
+        knowledge of the tracker's internals.
+
+        Segments ride in ``detail["segments"]`` of subsequent events and
+        are logged on completion. They deliberately do NOT get their own
+        rows in ``task_spans``: that table has a fixed column set across
+        three backends, and a migration to answer one attribution
+        question is not a proportionate cost while the log line answers
+        it. Revisit only if segment-level SQL aggregation is needed.
+        """
+        now = time.monotonic()
+        if self._segment_start:
+            self._segments.append((label, (now - self._segment_start) * 1000))
+        self._segment_start = now
+
+    def _segments_snapshot(self) -> list[dict]:
+        """Closed segments plus the still-open tail, labelled ``other``.
+
+        The open tail is included so the parts always sum to the whole.
+        A breakdown that quietly omitted the un-instrumented remainder
+        would invite the same mis-attribution it exists to prevent —
+        readers add up what is listed and assume it is everything.
+        """
+        segs = [{"label": lb, "ms": round(ms, 1)} for lb, ms in self._segments]
+        if self._segment_start:
+            segs.append({
+                "label": "other",
+                "ms": round((time.monotonic() - self._segment_start) * 1000, 1),
+            })
+        return segs
+
+    def _detail_with_segments(self, detail: dict = None) -> dict:
+        """Caller detail plus ``segments`` once this span has been marked.
+
+        Gated on at least one ``mark`` having happened: every node in the graph
+        runs through ``start``/``complete``, and attaching a lone ``other``
+        segment to all of them would add a field that says nothing to every
+        event the tracker already emits.
+        """
+        out = dict(detail or {})
+        if self._segments and "segments" not in out:
+            out["segments"] = self._segments_snapshot()
+        return out
+
+    def _log_segments(self, duration: float) -> None:
+        """One log line per span close: the post-hoc attribution channel.
+
+        Events reach a live subscriber or nothing; a slow turn in a run
+        nobody was watching has to be answerable afterwards, and the
+        logger is the only durable channel that needs no schema.
+        """
+        if not self._segments:
+            return
+        breakdown = " ".join(
+            f"{s['label']}={s['ms']:.0f}ms" for s in self._segments_snapshot()
+        )
+        logger.info(
+            f"span breakdown task={self.task_id} source={self._current_source} "
+            f"total={duration:.0f}ms {breakdown}"
+        )
 
     def update(self, message: str, detail: dict = None) -> None:
         """Emit a RUNNING update event."""
@@ -147,12 +228,13 @@ class StatusTracker:
             source=self._current_source,
             message=message,
             duration_ms=(time.monotonic() - self._start_time) * 1000 if self._start_time else 0,
-            detail=detail or {},
+            detail=self._detail_with_segments(detail),
         ))
 
     def complete(self, message: str = "", detail: dict = None) -> None:
         """Emit a COMPLETED event."""
         duration = (time.monotonic() - self._start_time) * 1000 if self._start_time else 0
+        self._log_segments(duration)
         self.emit(StatusEvent(
             task_id=self.task_id,
             phase=StatusPhase.COMPLETED,
@@ -160,12 +242,13 @@ class StatusTracker:
             source=self._current_source,
             message=message or f"{self._current_source} completed",
             duration_ms=duration,
-            detail=detail or {},
+            detail=self._detail_with_segments(detail),
         ))
 
     def fail(self, error: str, detail: dict = None) -> None:
         """Emit a FAILED event."""
         duration = (time.monotonic() - self._start_time) * 1000 if self._start_time else 0
+        self._log_segments(duration)
         self.emit(StatusEvent(
             task_id=self.task_id,
             phase=StatusPhase.FAILED,
@@ -173,7 +256,57 @@ class StatusTracker:
             source=self._current_source,
             message=error,
             duration_ms=duration,
-            detail=detail or {},
+            detail=self._detail_with_segments(detail),
+        ))
+
+    def intervention(
+        self,
+        kind: str,
+        message: str,
+        detail: dict = None,
+    ) -> None:
+        """Emit a FRAMEWORK-INTERVENTION fact on the SYSTEM channel.
+
+        An intervention is the framework overriding what the model asked
+        for: pinning a carrier's duration to the approved contract,
+        clamping a parameter, rejecting a call at a guard. The rewrite
+        itself is a guardrail action and must stay programmatic — but an
+        action nobody can see is indistinguishable from the model having
+        chosen the value itself, which is exactly how a CORRECT pin got
+        audited as an unexplained drift (Case #64: the plan said 300, the
+        dispatched call said 420, and the rewrite that bridged them was
+        recorded only on the logger and the session ledger — neither of
+        which the ``inject --stream`` surface renders).
+
+        Two deliberate differences from :meth:`update`:
+
+        * ``StatusCategory.SYSTEM``, not NODE. ``cli.status_display``
+          drops NODE and TOOL events unless debug is on, so an
+          intervention emitted through ``update`` would stay invisible in
+          a normal run — reproducing the very gap this closes. SYSTEM is
+          the one category that survives, and until this method existed
+          it had no producer at all.
+        * No ``debug`` marker in ``detail``. ``status_display`` also drops
+          ``detail["debug"]`` events outside debug mode; an audit fact is
+          not a debug aid.
+
+        ``kind`` is the intervention family (``"pin"`` / ``"clamp"`` /
+        ``"reject"`` …) and lands in ``detail["intervention"]`` so
+        consumers can filter without parsing the message. ``detail``
+        should carry the objective facts — ``before`` / ``after`` /
+        ``authority`` — never a judgement about them.
+        """
+        self.emit(StatusEvent(
+            task_id=self.task_id,
+            phase=StatusPhase.RUNNING,
+            category=StatusCategory.SYSTEM,
+            source=self._current_source,
+            message=message,
+            # A point event, not a span: leave duration at 0 so the
+            # renderer omits it. ``StatusEvent.__post_init__`` stamps
+            # ``timestamp`` with the wall clock, which is the fact's own
+            # time and the only timing an intervention needs.
+            detail={"intervention": kind, **(detail or {})},
         ))
 
     def get_history(self) -> list[dict]:
@@ -184,24 +317,41 @@ class StatusTracker:
     def current_source(self) -> str:
         return self._current_source
 
-    def save_state(self) -> tuple[str, float]:
-        """Save current source and start_time for later restoration.
+    def save_state(self) -> tuple[str, float, list, float]:
+        """Save current source, start_time and segment state for restoration.
 
         Used by sub-operations (e.g. conflict check) that need their own
         tracker lifecycle without corrupting the parent operation's state.
 
-        Returns:
-            Tuple of (current_source, start_time) to pass to restore_state().
-        """
-        return self._current_source, self._start_time
+        The segment fields travel with the pair: a sub-op that calls
+        ``start()`` clears them, and restoring only source/start_time
+        would leave the parent's COMPLETED event reporting a breakdown
+        that silently lost its first half — the same incomplete-sum trap
+        :meth:`mark` documents.
 
-    def restore_state(self, saved: tuple[str, float]) -> None:
-        """Restore previously saved source and start_time.
+        Returns:
+            Opaque tuple to pass to restore_state().
+        """
+        return (
+            self._current_source,
+            self._start_time,
+            list(self._segments),
+            self._segment_start,
+        )
+
+    def restore_state(self, saved: tuple[str, float, list, float]) -> None:
+        """Restore previously saved source, start_time and segment state.
 
         Args:
             saved: Tuple from save_state() to restore.
         """
-        self._current_source, self._start_time = saved
+        (
+            self._current_source,
+            self._start_time,
+            _segments,
+            self._segment_start,
+        ) = saved
+        self._segments = list(_segments)
 
 
 # ---- Null tracker (no task → no state, no events, no growth) ----
@@ -247,6 +397,11 @@ class NullTracker(StatusTracker):
         self._current_source = source
 
     def update(self, message: str, detail: dict = None) -> None:
+        return None
+
+    def mark(self, label: str) -> None:
+        # No event will ever carry these segments, so recording them
+        # would only grow a list nobody reads.
         return None
 
     def complete(self, message: str = "", detail: dict = None) -> None:
