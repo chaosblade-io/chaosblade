@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Callable
 
 # The raw-string public surfaces (``host_command_rejection_reason`` /
 # ``contains_shell_metachar`` / ``kubectl_exec_rejection_reason`` /
@@ -223,8 +224,15 @@ _READONLY_BINARIES = frozenset(
     }
 )
 # Binaries that ARE the injection in an exec context even though their names
-# are not fault verbs: load generators, device-mapper, port-occupying
-# listeners. Their presence alone marks a mutation.
+# are not fault verbs: load generators, port-occupying listeners. Their
+# presence alone marks a mutation.
+#
+# ``dmsetup`` sat in this set too. That refused its table-editing verbs as
+# intended, but it ALSO refused every query verb (``ls``/``info``/``status``)
+# — leaving no read-only way to confirm a device-mapper mapping, which is the
+# skill case's own recovery-verification step. It is judged by a verb split
+# instead (the ``dmsetup`` branch below), the same treatment iptables/nft got
+# for their read subcommands.
 _MUTATING_BINARIES = frozenset(
     {
         "stress",
@@ -232,7 +240,6 @@ _MUTATING_BINARIES = frozenset(
         "dd",
         "fallocate",
         "fio",
-        "dmsetup",
         "nc",
         "ncat",
         "socat",
@@ -751,6 +758,23 @@ _RESOLVECTL_MUTATING_VERBS = frozenset(
 # spelling is judged by getopt_long's prefix rule (``--lis`` — R42).
 _DISK_READONLY_SHORT = frozenset({"-l"})
 _DISK_READONLY_LONG = ("--list",)
+# dmsetup edits the device-mapper mapping table only through its verb
+# subcommands; the query verbs below are pure reads (``ls`` lists mappings,
+# ``info``/``table``/``status`` describe one). Every other verb —
+# create/remove/reload/suspend/resume/wipe_table/message/rename/clear —
+# rewrites live block-device plumbing and stays refused.
+_DMSETUP_READONLY_VERBS = frozenset(
+    {
+        "ls",
+        "info",
+        "table",
+        "status",
+        "deps",
+        "targets",
+        "version",
+        "help",
+    }
+)
 # openssl is a crypto toolkit — only the ``version`` subcommand is a probe;
 # every other subcommand computes / writes / connects. java RUNS bytecode by
 # default; only its version banner is a safe probe (note the single-dash
@@ -1020,6 +1044,79 @@ _DISCARD_SINKS = frozenset({"/dev/null"})
 #: worth allowing. Anything that is not a pure read parameter is refused so a
 #: discard sink cannot be used to smuggle a write form past the check.
 _DD_MUTATING_OPERANDS = ("seek", "conv", "oflag")
+#: Ceiling for a dd PIPE source (the no-``of=`` form, where bytes stream to
+#: stdout and on into a pipe). A throughput probe must stay bounded so it cannot
+#: become a second injection: ``bs * count`` is compared against this, and an
+#: unparseable size fails closed (the bound cannot be confirmed). 256 MiB
+#: comfortably covers a ``dd bs=1M count=100`` bandwidth measurement.
+_MAX_PROBE_BYTES = 256 * 1024 * 1024
+#: dd ``bs``/``count`` multiplier suffixes (GNU dd's K/M/G, 1024-based).
+_DD_BS_SUFFIX = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}
+
+#: nc/ncat — a connectivity/throughput probe by default: ``nc HOST PORT`` sends
+#: stdin to the target and prints the reply (send packets, mutate nothing — the
+#: same class as ping/traceroute, see the ``_READONLY_BINARIES`` note). It sits
+#: in ``_MUTATING_BINARIES`` only because a SMALL, KNOWN set of mode-switch flags
+#: turns it into a mutation. Per the B76 "the mode switch IS the write surface"
+#: principle (arping ``-U``/``-A``), those flags are refused and the plain
+#: connect-and-send probe stays read-only. Output REDIRECTION (``> file``) is not
+#: judged here — the shell-level redirect scan already refuses any landing write.
+_NC_DANGER_LONG_FLAGS = frozenset(
+    {"--listen", "--exec", "--sh-exec", "--output", "--keep-open", "--broadcast"}
+)
+#: Short-flag chars carrying the same mutating meaning: ``-l`` listen, ``-e``
+#: exec, ``-c`` sh-exec, ``-o`` output-file, ``-k`` keep-open, ``-b`` broadcast.
+#: Scanned across a whole bundled cluster so ``-le`` is caught as surely as
+#: ``-l -e``; a value-taking flag's attached value can only ADD chars, never hide
+#: one, so an over-broad scan fails CLOSED (the safe direction).
+_NC_DANGER_SHORT_CHARS = frozenset("lecokb")
+#: Reason text keyed by the danger char; ``_NC_LONG_TO_CHAR`` maps a canonical
+#: long flag back to the same key so both spellings share one description.
+_NC_DANGER_REASON = {
+    "l": "listens on a socket (binds a server port)",
+    "e": "executes a program (reverse shell / container escape)",
+    "c": "executes a program via sh (reverse shell / escape)",
+    "o": "lands the reply in a file (residual write)",
+    "k": "keeps a listening socket open (persistent server)",
+    "b": "broadcasts to the subnet",
+}
+_NC_LONG_TO_CHAR = {
+    "--listen": "l",
+    "--exec": "e",
+    "--sh-exec": "c",
+    "--output": "o",
+    "--keep-open": "k",
+    "--broadcast": "b",
+}
+
+#: socat — a bidirectional stream connector: ``socat ADDR1 ADDR2``. Unlike nc,
+#: whose dual-use danger is a small set of mode-switch FLAGS, socat's danger is
+#: carried ENTIRELY by the two ADDRESS TYPES — ``TCP-LISTEN``/``UNIX-LISTEN``
+#: bind a server socket, ``EXEC``/``SYSTEM`` run a program (reverse shell /
+#: container escape), ``CREATE``/``GOPEN`` write files, ``TUN``/``INTERFACE``
+#: touch the network stack. The plain connect-and-send probe (``socat -
+#: TCP:HOST:PORT``, or ``dd ... | socat - TCP:HOST:PORT`` timing injected egress)
+#: mutates nothing — the same class as nc's connect probe above. CNI / minimal
+#: images (terway/calico/cilium) routinely ship socat but NOT nc, so without this
+#: carve-out a bandwidth drill on such an image could inject yet never verify.
+#: Address ALLOWLIST (fail-closed): socat is read-only ONLY when BOTH addresses
+#: are outbound-connect or stdio endpoints. The head token before the first ``:``
+#: is matched EXACTLY, so ``TCP-LISTEN`` (head ``TCP-LISTEN``) never matches the
+#: ``TCP`` connect entry and stays refused, as does every unrecognised type.
+_SOCAT_SAFE_ADDRESS_TYPES = frozenset(
+    {"TCP", "TCP4", "TCP6", "UDP", "UDP4", "UDP6"}
+)
+#: Pure-stdio address tokens: socat's ``-`` (stdin/stdout) and its spelled
+#: equivalents move bytes to/from the process's own streams, touching neither a
+#: socket bind nor the filesystem.
+_SOCAT_SAFE_STDIO_ADDRESSES = frozenset({"-", "STDIN", "STDOUT", "STDIO"})
+#: socat GLOBAL OPTION prefixes that write a log: ``-lf FILE`` lands a logfile
+#: (residual write), ``-lm`` routes to syslog, ``-lu`` mirrors to stderr+file.
+#: These are the option-level write surface; every other option only shapes the
+#: transfer (``-u``/``-U`` direction, ``-b`` buffer, ``-t``/``-T`` timeouts,
+#: ``-d`` debug, ``-v``/``-x`` verbosity) and cannot bind/exec/write. Matched by
+#: prefix because socat accepts an attached value (``-lf/tmp/log``).
+_SOCAT_WRITE_OPTION_PREFIXES = ("-lf", "-lm", "-lu")
 
 # wget — its DEFAULT is to write the response into a cwd file, so the verdict
 # is inverted: read-only only for ``--spider`` or output explicitly redirected
@@ -1685,56 +1782,77 @@ def _awk_program_arg_mutation(args: list[str]) -> str | None:
     return None
 
 
-def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None]:
-    """Classify a single command (one pipeline stage). Returns (ok, reason)."""
-    if not tokens:
-        return True, None
-    binary = tokens[0].rsplit("/", 1)[-1]
-    args = tokens[1:]
+def _dd_pipe_bytes(operands: dict[str, str]) -> int | None:
+    """Byte size of a dd pipe source (``bs * count``), or ``None`` if unparseable.
 
-    # Wrappers (``timeout 5 <cmd>``, ``nice -n 5 <cmd>``, ``env A=1 <cmd>``):
-    # the wrapped command decides the verdict.
-    if binary in _COMMAND_WRAPPERS and _depth < 3:
-        unwrapped = _strip_wrappers(tokens)
-        if unwrapped is not tokens and unwrapped != tokens:
-            return _classify_argv(unwrapped, _depth + 1)
-        # No wrapped command: ``env`` alone dumps the environment (read-only);
-        # a bare metadata probe (``timeout -V`` / ``nice --help``) prints and
-        # exits; a bare wrapper otherwise does nothing observable.
-        if binary in _READONLY_BINARIES or (
-            args and all(a in _METADATA_FLAGS for a in args)
-        ):
-            return True, None
-        return (
-            False,
-            f"'{binary}' wraps no command, so read-only status cannot be determined",
-        )
+    Used only for the no-``of=`` form, where the stream must be PROVABLY bounded
+    to stay a probe rather than a flood. ``bs`` defaults to 512 and ``count`` to
+    1 (the GNU dd defaults); an unrecognised suffix or a non-integer returns
+    ``None`` so the caller fails closed rather than admitting an unknown size.
+    """
 
-    # Escape primitives reach the host. A ``/host/...`` absolute path needs NO
-    # special handling here: ``binary`` above is the BASENAME, so
-    # ``/host/usr/bin/cat`` classifies as ``cat`` (a legitimate debug-pod probe
-    # path) while ``/host/usr/bin/iptables -A`` still lands in the iptables
-    # guard below, and an unknown ``/host`` binary fails closed at the end.
-    if binary in _ESCAPE_PRIMITIVES:
-        return (
-            False,
-            f"'{binary}' reaches the host / escapes the container, not a read-only probe",
-        )
+    def _num(value: str) -> int | None:
+        m = re.fullmatch(r"(\d+)\s*([KMG]?)B?", value.strip().upper())
+        if not m:
+            return None
+        return int(m.group(1)) * _DD_BS_SUFFIX[m.group(2)]
 
-    # Pure metadata probe (``--version`` / ``-h`` / ... and nothing else): every
-    # CLI prints and exits before any action, whatever the binary otherwise
-    # does — covers dd/timeout/nice/systemctl/docker/crictl/stress-ng/... in
-    # one rule instead of per-binary exemptions.
-    if args and all(a in _METADATA_FLAGS for a in args):
-        return True, None
+    bs = _num(operands.get("bs", "512"))
+    count = _num(operands.get("count", "1"))
+    if bs is None or count is None:
+        return None
+    return bs * count
 
+
+def _socat_address_is_probe(addr: str) -> bool:
+    """True if a socat ADDRESS is a connect/stdio endpoint that mutates nothing.
+
+    ALLOWLIST polarity (fail-closed): socat's write surfaces live in the address
+    TYPE, and the space of mutating types (``*-LISTEN``, ``EXEC``, ``SYSTEM``,
+    ``CREATE``, ``GOPEN``, ``TUN``, ``UNIX`` …) is open-ended, so only the KNOWN
+    connect/stdio types are admitted and everything else is refused. The head
+    before the first ``:`` is matched EXACTLY (upper-cased), which keeps
+    ``TCP-LISTEN`` out of the ``TCP`` connect entry automatically. A bare token
+    with no ``:`` is admitted only if it is a stdio address — a bare path
+    (``/etc/passwd``) or an unknown type is refused.
+    """
+    if addr.upper() in _SOCAT_SAFE_STDIO_ADDRESSES:
+        return True
+    head, sep, _rest = addr.partition(":")
+    if not sep:
+        return False
+    return head.upper() in _SOCAT_SAFE_ADDRESS_TYPES
+
+
+_HandlerFn = Callable[[str, list[str], int], tuple[bool, str | None]]
+
+
+def _build_binary_handlers() -> dict[str, "_HandlerFn"]:
+    """Table-driven dispatch for per-binary read-only classification (I-c).
+
+    Each ``_h_<binary>`` handler is one binary's argument-level verdict logic,
+    lifted VERBATIM from the former ``if binary == ...`` chain that lived inline
+    in ``_classify_argv`` (bodies are byte-identical; only the branch heads
+    became ``def`` lines). ``_BINARY_HANDLERS`` below is the SINGLE enumeration
+    tying every specially-handled binary to its handler, so:
+
+      * adding read-only handling for a binary is ONE dict entry, not a
+        lock-step edit buried in a 1400-line if-chain;
+      * the completeness invariant derives the handled-binary set from the
+        dict's keys (by-construction) instead of scanning ``binary ==`` string
+        literals that a refactor could silently drop.
+
+    Handlers are consulted BEFORE the terminal ``_MUTATING_BINARIES`` reject so
+    dual-use binaries (dd/nc/ncat/socat) keep their argument-level exemptions —
+    the ordering the old inline chain relied on.
+    """
     # Netfilter tooling — read-only only in list/version forms. The command verb
     # may be preceded by global options (``iptables -t nat -L -n``), so skip
     # them before locating the verb rather than reading args[0].
     # Evidence: even ``-L`` creates /run/xtables.lock (O_CREAT) — the iptables
     # 1.8+ lock protocol taken for ANY netlink op; the ruleset itself is not
     # touched (strace shows no other write).
-    if binary in ("iptables", "ip6tables"):
+    def _h_iptables(binary, args, _depth):
         i = 0
         while i < len(args):
             a = args[i]
@@ -1777,7 +1895,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
                     "-Z...) with the read-only one, which mutates"
                 )
         return True, None
-    if binary == "nft":
+    def _h_nft(binary, args, _depth):
         ok = bool(args) and (
             args[0] in _NFT_READONLY_SHORT
             or _long_flag_hit(args[0], _NFT_READONLY_LONG) is not None
@@ -1792,7 +1910,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # notes): the object decides which verb chain applies and is itself
     # reached by prefix, so ``tc q a`` IS ``tc qdisc add``. ``exec`` is
     # refused whatever follows it — do_exec runs an arbitrary command.
-    if binary == "tc":
+    def _h_tc(binary, args, _depth):
         positionals = _iproute2_positionals(args, _TC_GLOBAL_VALUE_TOKENS)
         obj_token = positionals[0] if positionals else ""
         obj = _keyword_prefix_hit(obj_token, _TC_OBJECTS)
@@ -1821,7 +1939,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # Evidence: even these verbs open chaosblade.dat (BoltDB bookkeeping) and
     # touch its mtime, but content stays byte-identical (md5 before/after on a
     # live node) — an open-for-mapping side effect, not a mutation.
-    if binary == "blade":
+    def _h_blade(binary, args, _depth):
         if args and args[0] in _BLADE_READONLY_VERBS:
             return True, None
         # A help flag ANYWHERE short-circuits the mutation: blade is a
@@ -1848,7 +1966,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # letter ``s`` is resolved by the OBJECT's own chain: it IS ``set`` for
     # link, and a display for address/route/rule/neighbor (see
     # _IP_S_DISPLAY_OBJECTS for the evidence).
-    if binary == "ip":
+    def _h_ip(binary, args, _depth):
         positionals = _iproute2_positionals(args, _IP_GLOBAL_VALUE_TOKENS)
         obj_token = positionals[0] if positionals else ""
         obj = _keyword_prefix_hit(obj_token, _IP_OBJECTS)
@@ -1880,7 +1998,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         return True, None
 
     # systemctl — read-only only for its status/show verbs.
-    if binary == "systemctl":
+    def _h_systemctl(binary, args, _depth):
         verb = next((a for a in args if not a.startswith("-")), "")
         if verb in _SYSTEMCTL_READONLY_VERBS:
             return True, None
@@ -1890,7 +2008,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
 
     # mount — read-only only when listing (no target device/dir, no remount).
-    if binary == "mount":
+    def _h_mount(binary, args, _depth):
         # ``-`` is an OPERAND to getopt, not an option (same rule as uniq/xxd
         # above — R43); counting it keeps the positional judgement honest.
         positionals = [a for a in args if a == "-" or not a.startswith("-")]
@@ -1913,7 +2031,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # dmesg — read-only unless clearing the ring buffer. The long flags are
     # matched by getopt_long's prefix rule (``--cl`` IS ``--clear``) and the
     # short ones ride the cluster scan.
-    if binary == "dmesg":
+    def _h_dmesg(binary, args, _depth):
         if any(
             _long_flag_hit(a, _DMESG_MUTATING_LONG_FLAGS) is not None
             or any(
@@ -1931,7 +2049,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # journalctl — reading the journal is read-only; maintenance verbs are
     # not. The long flags are matched by getopt_long's prefix rule (``--rot``
     # IS ``--rotate``).
-    if binary == "journalctl":
+    def _h_journalctl(binary, args, _depth):
         bad = next(
             (
                 a
@@ -1952,7 +2070,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # the cluster scan, so ``-p/etc/sysctl.conf`` and ``-qw k=v`` are judged,
     # and the long flags are matched by getopt_long's prefix rule (``--sys``
     # IS ``--system``).
-    if binary == "sysctl":
+    def _h_sysctl(binary, args, _depth):
         bad = next(
             (
                 a
@@ -1979,7 +2097,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # node breaks kubelet identity/registration (R39: the exact-token check
     # only caught a standalone ``-F``). ``-`` counts too: getopt treats it as
     # a non-option OPERAND and net-tools calls sethname on it (R43).
-    if binary == "hostname":
+    def _h_hostname(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2007,7 +2125,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # it calls clock_settime directly (verified live). ``+FORMAT`` is the
     # display operand; ``--set=...`` is caught by prefix so the value cannot
     # hide it (R39: only ``-s``/``--set`` were checked before).
-    if binary == "date":
+    def _h_date(binary, args, _depth):
         i = 0
         while i < len(args):
             a = args[i]
@@ -2040,7 +2158,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         return True, None
 
     # route — printing the table is read-only; add/del/flush edit it.
-    if binary == "route":
+    def _h_route(binary, args, _depth):
         bad = next((a for a in args if a in _ROUTE_MUTATING_VERBS), None)
         if bad is not None:
             return (
@@ -2054,7 +2172,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # the short flags ride the cluster scan. ``-d``/``-w`` READ registers
     # unless their optional sink keyword is present, which is judged on the
     # keyword (``ethtool -d eth0 file`` writes that file).
-    if binary == "ethtool":
+    def _h_ethtool(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2089,7 +2207,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # cluster scan (``-DF`` is conntrack's own documented bundle spelling);
     # the long ones are matched by getopt_long's prefix rule (``--fl`` IS
     # ``--flush``).
-    if binary == "conntrack":
+    def _h_conntrack(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2109,7 +2227,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         return True, None
 
     # swapon — ENABLES swap by default; only the listing flags are read-only.
-    if binary == "swapon":
+    def _h_swapon(binary, args, _depth):
         if any(
             a in _SWAPON_READONLY_SHORT
             or _long_flag_hit(a, _SWAPON_READONLY_LONG) is not None
@@ -2125,7 +2243,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # (batch-load from a file) edit it. The short writers ride the cluster
     # scan (``-Ds``/``-nd`` bundles) and the long ones are matched by
     # getopt_long's prefix rule (``--del`` IS ``--delete``).
-    if binary == "arp":
+    def _h_arp(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2148,7 +2266,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # numactl — ``-H``/``--hardware`` / ``-s``/``--show`` inspect; any other form
     # RUNS a wrapped command (``numactl --physcpubind=0 stress ...``), so the
     # wrapped command must decide. Delegate exactly like the env/timeout path.
-    if binary == "numactl":
+    def _h_numactl(binary, args, _depth):
         _RO_SHORT = ("-H", "-s")
         _RO_LONG = ("--hardware", "--show")
         non_opt = [a for a in args if not a.startswith("-")]
@@ -2174,7 +2292,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         return _classify_argv(args[args.index(non_opt[0]) :], _depth + 1)
 
     # Container-runtime CLIs — only leaf inspection verbs (ps/inspect/logs/...).
-    if binary in _RUNTIME_CLIS:
+    def _h_runtime_clis(binary, args, _depth):
         verb = ""
         i = 0
         while i < len(args):
@@ -2195,7 +2313,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # run an arbitrary command per match (the ``+`` terminator carries no
     # shell metacharacter, so the string-level screens cannot see it),
     # ``-delete`` removes whole trees, ``-fprint*``/``-fls`` write files.
-    if binary == "find":
+    def _h_find(binary, args, _depth):
         bad = next((a for a in args if a in _FIND_MUTATING_FLAGS), None)
         if bad is not None:
             return False, (
@@ -2214,7 +2332,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # judges by construct, not by character (see _awk_program_mutation), so
     # the read-only forms those screens used to refuse (``NR>1`` comparisons,
     # regex alternation, ``getline < file`` reads) stay allowed.
-    if binary == "awk":
+    def _h_awk(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2254,7 +2372,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # scan, and only for those flags — an upload or a config read stays
     # refused however its own value is spelled. The long table is matched
     # EXACTLY (``abbreviate=False``): curl does not abbreviate.
-    if binary == "curl":
+    def _h_curl(binary, args, _depth):
         args = _drop_discard_output(
             args, ("-o", "--output", "--stderr"), cluster_of=_CURL_VALUELESS_SHORT
         )
@@ -2306,7 +2424,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # sink separate from the document, so they are dropped here on the same
     # discard rule: ``wget -o /dev/null -qO- <url>`` keeps both sinks off
     # disk. The document check below is untouched and still decides on its own.
-    if binary == "wget":
+    def _h_wget(binary, args, _depth):
         args = _drop_discard_output(
             args,
             ("-o", "-a", "--output-file", "--append-output"),
@@ -2406,7 +2524,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # command — ``command -v X`` resolves a path and runs nothing (the probe
     # form the prompts recommend). Without ``-v``/``-V`` it EXECUTES X, so the
     # wrapped command decides, exactly as for env/timeout/nice.
-    if binary == "command":
+    def _h_command(binary, args, _depth):
         if any(a in ("-v", "-V") for a in args):
             return True, None
         # ``command [-p] CMD [ARGS...]``: skip only ``command``'s OWN leading
@@ -2438,7 +2556,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # compressor (find -exec grade); the long match is the split-head one
     # (``=`` cannot hide it) WITH getopt_long's prefix rule, so ``--comp`` /
     # ``--out`` are the same options (R42).
-    if binary == "sort":
+    def _h_sort(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2454,7 +2572,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
                 f"'sort' {bad} writes a file or runs a compressor, not a read-only diagnostic",
             )
         return True, None
-    if binary == "sar":
+    def _h_sar(binary, args, _depth):
         bad = next(
             (a for a in args if "o" in _reachable_cluster(a, _SAR_VALUELESS_SHORT)),
             None,
@@ -2466,7 +2584,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # ss — ``-K``/``--kill`` force-closes every matching socket. That is a
     # fault injection, not an observation. The long spelling is matched by
     # getopt_long's prefix rule (``--kil`` IS ``--kill``, R42).
-    if binary == "ss":
+    def _h_ss(binary, args, _depth):
         # ``-D FILE`` / ``--diag=FILE`` writes the raw table to FILE — the
         # VALUE decides the verdict, and the regular discard targets stay
         # allowed (``-`` names stdout in the iproute2 dump convention).
@@ -2512,7 +2630,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # (``-fq``) is judged; the value walk pairs standalone, attached
     # (``-i0``) and ``=``-joined (``--interval=0``) values with their flag,
     # so the plain connectivity probe (``ping -c 4 host``) is untouched.
-    if binary in ("ping", "ping6"):
+    def _h_ping(binary, args, _depth):
         i = 0
         while i < len(args):
             a = args[i]
@@ -2618,7 +2736,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # arping — spoof/announce primitives (see the _ARPING_* tables). The
     # valueless table drives ``_reachable_cluster`` so a bundled ``-qU`` is
     # judged; -S/-s are refused on sight, their value never matters.
-    if binary == "arping":
+    def _h_arping(binary, args, _depth):
         i = 0
         while i < len(args):
             a = args[i]
@@ -2652,7 +2770,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
 
     # dig — ``-f`` bulk-query exfil (see _DIG_BULK_SHORT_CHARS); ``+``query
     # options and ``@servers`` never reach this walk (no leading dash).
-    if binary == "dig":
+    def _h_dig(binary, args, _depth):
         i = 0
         while i < len(args):
             a = args[i]
@@ -2679,7 +2797,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         return True, None
 
     # uniq — ``uniq INPUT OUTPUT``: the second positional is an output file.
-    if binary == "uniq":
+    def _h_uniq(binary, args, _depth):
         positionals: list[str] = []
         i = 0
         while i < len(args):
@@ -2711,7 +2829,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # ``xxd - out`` writes too. Long options are refused fail-closed: their
     # value-taking shapes are not enumerated, and a value token mistaken for
     # an operand would let ``--foo X`` hide the OUTFILE.
-    if binary == "xxd":
+    def _h_xxd(binary, args, _depth):
         positionals = []
         i = 0
         while i < len(args):
@@ -2750,20 +2868,118 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # no-op or half of a pipeline, so it earns no exemption. Bare ``dd`` and any
     # real output path stay refused, as do the conversion operands that change
     # what is written even when the sink is discarded.
-    if binary == "dd":
+    def _h_dd(binary, args, _depth):
         operands = {k: v for k, _, v in (a.partition("=") for a in args) if _}
-        if operands.get("of") in _DISCARD_SINKS and operands.get("if"):
+        src = operands.get("if")
+        sink = operands.get("of")
+        # A discard sink (``of=/dev/null``) OR no ``of=`` at all keeps dd a pure
+        # reader. With no ``of=`` the bytes go to stdout, which for a probe means
+        # a pipe — ``dd if=/dev/zero bs=1M count=100 | nc HOST PORT`` is how a
+        # bandwidth case measures injected throughput. Either way dd lands
+        # nothing on a filesystem or device, so it is the same read a discard
+        # sink already is.
+        if src and (sink in _DISCARD_SINKS or sink is None):
             bad = next((f for f in _DD_MUTATING_OPERANDS if f in operands), None)
-            if bad is None:
-                return True, None
-            return False, (
-                f"'dd' reading into a discard sink is read-only, but {bad}= changes what is written"
+            if bad is not None:
+                return False, (
+                    f"'dd' reading into a discard sink is read-only, but {bad}= changes what is written"
+                )
+            # No ``of=`` streams to stdout — bounded only when ``count=`` caps it.
+            # ``dd if=/dev/zero`` with no count runs forever: traffic
+            # amplification, the same category as ``ping -f`` (see the ping flood
+            # guard). An unparseable or oversized ``bs * count`` fails closed,
+            # since the bound cannot be confirmed.
+            if sink is None:
+                if "count" not in operands:
+                    return False, (
+                        "'dd' piping to stdout with no count= is an unbounded "
+                        "stream (a flood), not a read-only probe"
+                    )
+                nbytes = _dd_pipe_bytes(operands)
+                if nbytes is None or nbytes > _MAX_PROBE_BYTES:
+                    return False, (
+                        "'dd' pipe source is not provably within the "
+                        f"{_MAX_PROBE_BYTES}-byte bounded-probe budget"
+                    )
+            return True, None
+        # ``of=<real path/device>`` (not a discard sink) is a write: fall through
+        # to the ``_MUTATING_BINARIES`` refusal below. Writing a block device
+        # (``of=/dev/mapper/...``) would corrupt the source — never exempt.
+
+    # nc/ncat — connect-and-send probe (mutate nothing, same class as ping); the
+    # only danger is a small known set of mode-switch flags. See
+    # ``_NC_DANGER_LONG_FLAGS`` for the rationale.
+    def _h_nc(binary, args, _depth):
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                break  # everything after it is a positional (host / port)
+            if a.startswith("--"):
+                hit = _long_flag_hit(a, _NC_DANGER_LONG_FLAGS)
+                if hit is not None:
+                    ch = _NC_LONG_TO_CHAR.get(hit, "l")
+                    return (
+                        False,
+                        f"'{binary}' {hit} {_NC_DANGER_REASON[ch]}, not a read-only probe",
+                    )
+                i += 1
+                continue
+            if not a.startswith("-"):
+                i += 1  # positional: host or port
+                continue
+            # Short cluster (``-vz``, ``-le``, attached ``-e/bin/sh``): any danger
+            # char anywhere in it is refused — an over-broad scan fails closed.
+            bad = next(
+                (c for c in a.lstrip("-") if c in _NC_DANGER_SHORT_CHARS), None
             )
+            if bad is not None:
+                return (
+                    False,
+                    f"'{binary}' -{bad} {_NC_DANGER_REASON[bad]}, not a read-only probe",
+                )
+            i += 1
+        return True, None
+
+    # socat — connect-and-send probe vs. mode-switch ADDRESS. See
+    # ``_SOCAT_SAFE_ADDRESS_TYPES``: the danger is the address TYPE (a ``*-LISTEN``
+    # bind, an ``EXEC``/``SYSTEM`` program run, a file write), not a flag, so BOTH
+    # addresses must be known connect/stdio endpoints and no log-writing option
+    # may ride along. The plain probe (``socat - TCP:HOST:PORT``, and the bounded
+    # ``dd ... | socat - TCP:HOST:PORT`` throughput feeder) mutates nothing — the
+    # same class nc earned a carve-out for.
+    def _h_socat(binary, args, _depth):
+        addresses: list[str] = []
+        for a in args:
+            if a == "-":
+                addresses.append(a)  # the bare ``-`` IS the stdio address
+                continue
+            if a.startswith("-"):
+                if a.startswith(_SOCAT_WRITE_OPTION_PREFIXES):
+                    return False, (
+                        f"'socat' option {a} writes a log (residual write), "
+                        "not a read-only probe"
+                    )
+                continue  # a transfer-shaping option; cannot bind/exec/write
+            addresses.append(a)
+        if len(addresses) != 2:
+            return False, (
+                "'socat' joins exactly two addresses; with "
+                f"{len(addresses)} the endpoints cannot be confirmed read-only"
+            )
+        bad = next((a for a in addresses if not _socat_address_is_probe(a)), None)
+        if bad is not None:
+            return False, (
+                f"'socat' address '{bad}' is not a known connect/stdio probe "
+                "endpoint (a *-LISTEN socket bind, an EXEC/SYSTEM program run, "
+                "or a file-write address mutates), not a read-only probe"
+            )
+        return True, None
 
     # --- Extended dual-use probe guards (audit follow-up) -----------------
     # ifconfig — display unless an action keyword or a value positional (the
     # thing being SET) is present. Two+ positionals means ``iface VALUE``.
-    if binary == "ifconfig":
+    def _h_ifconfig(binary, args, _depth):
         positionals = [a for a in args if a == "-" or not a.startswith("-")]
         kw = next(
             (p for p in positionals if p.lower() in _IFCONFIG_MUTATING_KEYWORDS), None
@@ -2777,7 +2993,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
 
     # ipvsadm — lists with -L/--list (bare lists too); every other verb
     # adds/edits/deletes a virtual service or real server.
-    if binary == "ipvsadm":
+    def _h_ipvsadm(binary, args, _depth):
         if not args or any(
             a == "-L"
             or (a.startswith("-L") and not a.startswith("--"))
@@ -2791,7 +3007,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
 
     # crontab — installs/edits/removes by default; only -l/--list reads.
-    if binary == "crontab":
+    def _h_crontab(binary, args, _depth):
         if any(
             a in _CRONTAB_READONLY_SHORT
             or _long_flag_hit(a, _CRONTAB_READONLY_LONG) is not None
@@ -2804,7 +3020,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
 
     # timedatectl — reads unless it SETS the clock.
-    if binary == "timedatectl":
+    def _h_timedatectl(binary, args, _depth):
         verb = next((a for a in args if not a.startswith("-")), "")
         if verb in _TIMEDATECTL_MUTATING_VERBS:
             return (
@@ -2814,7 +3030,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         return True, None
 
     # resolvectl / systemd-resolve — read with status; set-*/revert/flush mutate.
-    if binary in ("resolvectl", "systemd-resolve"):
+    def _h_resolvectl(binary, args, _depth):
         verb = next((a for a in args if not a.startswith("-")), "")
         if verb in _RESOLVECTL_MUTATING_VERBS:
             return (
@@ -2825,7 +3041,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
 
     # taskset / chrt — query one pid with -p; a second positional is the value
     # being SET, and without -p they RUN a command. chrt -m lists limits.
-    if binary in ("taskset", "chrt"):
+    def _h_taskset(binary, args, _depth):
         if binary == "chrt" and any(
             (a.startswith("-m") and not a.startswith("--"))
             or _long_flag_hit(a, ("--max",)) is not None
@@ -2849,7 +3065,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # strace). parted is deliberately NOT admitted even for -l: strace shows it
     # opens every block device O_RDWR in list mode, and an RW fd on a raw
     # device is a write channel — fail closed.
-    if binary == "fdisk":
+    def _h_fdisk(binary, args, _depth):
         if any(
             a in _DISK_READONLY_SHORT
             or _long_flag_hit(a, _DISK_READONLY_LONG) is not None
@@ -2860,17 +3076,34 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             False,
             "'fdisk' is read-only only with -l/--list (a bare device opens the mutating partition editor)",
         )
-    if binary == "parted":
+    def _h_parted(binary, args, _depth):
         return False, (
             "'parted' opens block devices O_RDWR even in list mode (verified by strace),"
             " so no form is admitted as a read-only probe — use 'fdisk -l'"
+        )
+
+    # dmsetup — the device-mapper control command. ``echo '0 1024 error' |
+    # dmsetup create <name>`` is the skill case's IO-error injection and MUST
+    # stay refused (its mutation verbs rewrite the mapping table); the query
+    # verbs are the only legal way to READ a mapping. A bare ``dmsetup``
+    # (no command word) prints usage and mutates nothing.
+    def _h_dmsetup(binary, args, _depth):
+        if any(_long_flag_hit(a, ("--version", "--help")) is not None for a in args):
+            return True, None
+        verb = next((a for a in args if not a.startswith("-")), "")
+        if not verb or verb in _DMSETUP_READONLY_VERBS:
+            return True, None
+        return (
+            False,
+            f"'dmsetup' {verb} mutates the device-mapper mapping table (only the query "
+            "verbs ls/info/table/status/deps/targets/version/help are read-only)",
         )
 
     # Three allowlist binaries whose ONLY argument-level write face the
     # name-only rule could not see (see the table notes above). Their read
     # forms remain allowed: dmidecode --dump/-u and --from-dump, file
     # -m/-f/--mime-*, blkid -i/-o/-L/-U.
-    if binary == "dmidecode":
+    def _h_dmidecode(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2886,7 +3119,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
                 " not a read-only probe (--dump prints to STDOUT)"
             )
         return True, None
-    if binary == "file":
+    def _h_file(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2908,7 +3141,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
                 " which writes (only the query forms are read-only)"
             )
         return True, None
-    if binary == "blkid":
+    def _h_blkid(binary, args, _depth):
         bad = next(
             (
                 a
@@ -2928,7 +3161,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         return True, None
 
     # openssl — only the 'version' subcommand is a probe.
-    if binary == "openssl":
+    def _h_openssl(binary, args, _depth):
         verb = next((a for a in args if not a.startswith("-")), "")
         if verb == "version":
             return True, None
@@ -2942,7 +3175,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # memory-mapped READ-ONLY at startup; archive WRITES happen only with the
     # explicit -Xshare:dump / -XX:ArchiveClassesAtExit flags, and crash logs
     # only on abnormal exit. The banner forms below never reach bytecode.
-    if binary == "java":
+    def _h_java(binary, args, _depth):
         if args and all(a in _JAVA_READONLY_PROBES for a in args):
             return True, None
         return (
@@ -2955,7 +3188,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # (/var/lib/rpm/__db.*) O_RDWR as part of BDB env recovery, but the real
     # database (Packages/...) is opened O_RDONLY only and no DB file mtime
     # changes — query stays query.
-    if binary == "rpm":
+    def _h_rpm(binary, args, _depth):
         if any(
             _long_flag_hit(a, ("--query",)) is not None
             or (a.startswith("-q") and not a.startswith("--"))
@@ -2969,7 +3202,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # dpkg query forms are classified as dpkg-query actions in the Debian man
     # page (dpkg-query reads /var/lib/dpkg without the mutating lock); no
     # Debian host exists in the test cluster, so this is doc-level evidence.
-    if binary == "dpkg":
+    def _h_dpkg(binary, args, _depth):
         if any(
             a.split("=", 1)[0] in _DPKG_READONLY_SHORT
             or _long_flag_hit(a, _DPKG_READONLY_LONG) is not None
@@ -2980,7 +3213,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             False,
             "'dpkg' is read-only only for query forms (-l/-s/-S/-L/-W); install/remove/purge mutate",
         )
-    if binary == "apk":
+    def _h_apk(binary, args, _depth):
         verb = next((a for a in args if not a.startswith("-")), "")
         if verb in _APK_READONLY_VERBS:
             return True, None
@@ -2988,6 +3221,129 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             False,
             "'apk' is read-only only for info/search/list/policy/version (add/del/upgrade mutate)",
         )
+
+    return {
+        "iptables": _h_iptables,
+        "ip6tables": _h_iptables,
+        "nft": _h_nft,
+        "tc": _h_tc,
+        "blade": _h_blade,
+        "ip": _h_ip,
+        "systemctl": _h_systemctl,
+        "mount": _h_mount,
+        "dmesg": _h_dmesg,
+        "journalctl": _h_journalctl,
+        "sysctl": _h_sysctl,
+        "hostname": _h_hostname,
+        "date": _h_date,
+        "route": _h_route,
+        "ethtool": _h_ethtool,
+        "conntrack": _h_conntrack,
+        "swapon": _h_swapon,
+        "arp": _h_arp,
+        "numactl": _h_numactl,
+        "crictl": _h_runtime_clis,
+        "docker": _h_runtime_clis,
+        "nerdctl": _h_runtime_clis,
+        "podman": _h_runtime_clis,
+        "ctr": _h_runtime_clis,
+        "find": _h_find,
+        "awk": _h_awk,
+        "curl": _h_curl,
+        "wget": _h_wget,
+        "command": _h_command,
+        "sort": _h_sort,
+        "sar": _h_sar,
+        "ss": _h_ss,
+        "ping": _h_ping,
+        "ping6": _h_ping,
+        "arping": _h_arping,
+        "dig": _h_dig,
+        "uniq": _h_uniq,
+        "xxd": _h_xxd,
+        "dd": _h_dd,
+        "nc": _h_nc,
+        "ncat": _h_nc,
+        "socat": _h_socat,
+        "ifconfig": _h_ifconfig,
+        "ipvsadm": _h_ipvsadm,
+        "crontab": _h_crontab,
+        "timedatectl": _h_timedatectl,
+        "resolvectl": _h_resolvectl,
+        "systemd-resolve": _h_resolvectl,
+        "taskset": _h_taskset,
+        "chrt": _h_taskset,
+        "fdisk": _h_fdisk,
+        "parted": _h_parted,
+        "dmsetup": _h_dmsetup,
+        "dmidecode": _h_dmidecode,
+        "file": _h_file,
+        "blkid": _h_blkid,
+        "openssl": _h_openssl,
+        "java": _h_java,
+        "rpm": _h_rpm,
+        "dpkg": _h_dpkg,
+        "apk": _h_apk,
+    }
+
+
+_BINARY_HANDLERS = _build_binary_handlers()
+
+
+def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None]:
+    """Classify a single command (one pipeline stage). Returns (ok, reason)."""
+    if not tokens:
+        return True, None
+    binary = tokens[0].rsplit("/", 1)[-1]
+    args = tokens[1:]
+
+    # Wrappers (``timeout 5 <cmd>``, ``nice -n 5 <cmd>``, ``env A=1 <cmd>``):
+    # the wrapped command decides the verdict.
+    if binary in _COMMAND_WRAPPERS and _depth < 3:
+        unwrapped = _strip_wrappers(tokens)
+        if unwrapped is not tokens and unwrapped != tokens:
+            return _classify_argv(unwrapped, _depth + 1)
+        # No wrapped command: ``env`` alone dumps the environment (read-only);
+        # a bare metadata probe (``timeout -V`` / ``nice --help``) prints and
+        # exits; a bare wrapper otherwise does nothing observable.
+        if binary in _READONLY_BINARIES or (
+            args and all(a in _METADATA_FLAGS for a in args)
+        ):
+            return True, None
+        return (
+            False,
+            f"'{binary}' wraps no command, so read-only status cannot be determined",
+        )
+
+    # Escape primitives reach the host. A ``/host/...`` absolute path needs NO
+    # special handling here: ``binary`` above is the BASENAME, so
+    # ``/host/usr/bin/cat`` classifies as ``cat`` (a legitimate debug-pod probe
+    # path) while ``/host/usr/bin/iptables -A`` still lands in the iptables
+    # guard below, and an unknown ``/host`` binary fails closed at the end.
+    if binary in _ESCAPE_PRIMITIVES:
+        return (
+            False,
+            f"'{binary}' reaches the host / escapes the container, not a read-only probe",
+        )
+
+    # Pure metadata probe (``--version`` / ``-h`` / ... and nothing else): every
+    # CLI prints and exits before any action, whatever the binary otherwise
+    # does — covers dd/timeout/nice/systemctl/docker/crictl/stress-ng/... in
+    # one rule instead of per-binary exemptions.
+    if args and all(a in _METADATA_FLAGS for a in args):
+        return True, None
+
+    # Per-binary argument-level verdicts (root-cause I-c table). A handler
+    # returns ``None`` to FALL THROUGH to the terminal refusal below — the
+    # exact behaviour the former inline ``if binary == ...`` chain had when a
+    # branch body ended without a ``return`` (e.g. ``dd of=<real path>`` defers
+    # to ``_MUTATING_BINARIES``). Because every binary maps to one handler,
+    # falling through can only reach the terminal, never another branch.
+    handler = _BINARY_HANDLERS.get(binary)
+    if handler is not None:
+        result = handler(binary, args, _depth)
+        if result is not None:
+            return result
 
     if binary in _MUTATING_BINARIES:
         return (
@@ -3149,9 +3505,12 @@ def readonly_inner_tokens_reason(inner: list[str]) -> str | None:
 # identical fix path it would have got from the tool (and vice versa).
 READONLY_PROBE_FIX_HINT = (
     "A read-only probe is one command after `--`, or a `;`/`&&`/`||`-chained "
-    "list where EVERY segment is a read-only probe. Redirects, substitution, "
-    "background and heredocs still fail closed. "
+    "list where EVERY segment is a read-only probe. File-writing redirects "
+    "(> or >> to a path, e.g. >/tmp/x or 2>/tmp/x), substitution, background "
+    "and heredocs still fail closed; the two stream-only shapes ARE allowed: "
+    "fd duplication (2>&1) and discarding to /dev/null (2>/dev/null). "
     "Examples: `-- which stress-ng`, `-- cat /proc/diskstats | grep vda`, "
+    "`-- nslookup kubernetes.default 2>&1 | grep -i nxdomain`, "
     "`-- echo ===T===; nsenter -t 1 -m -- df -h; nsenter -t 1 -m -- "
     "iostat -xd 1 2` (chained probes: one debug pod instead of several). "
     "If the command is genuinely a fault INJECTION, it belongs to Phase 2 "
@@ -3164,8 +3523,10 @@ def is_readonly_kubectl_exec(v_args: str) -> bool:
 
     Parses ``POD [-n NS] [-c C] -- INNER``, unwraps one ``sh -c`` layer, and
     treats the command as read-only only when every pipeline stage is a known
-    inspection command. Any shell control operator fails closed to mutating; a
-    bare exec with no inner command is read-only.
+    inspection command. Shell control operators fail closed to mutating,
+    EXCEPT the two stream-only redirect shapes (A1: fd duplication such as
+    ``2>&1`` and the ``/dev/null`` discard) — a bare exec with no inner
+    command is read-only.
     """
     return kubectl_exec_rejection_reason(v_args) is None
 
@@ -3177,6 +3538,170 @@ def kubectl_exec_rejection_reason(v_args: str) -> str | None:
         lambda: _facts_engine().kubectl_exec_rejection_reason_facts(v_args),
         on_error=_INTERNAL_ERROR_REASON,
     )
+
+
+# ---------------------------------------------------------------------------
+# kubectl exec TARGET-ZONE form gate (Case #61 / W-61-1)
+#
+# Structural companion to ``kubectl_exec_rejection_reason`` (which judges the
+# INNER command after ``--`` for read-only-ness — its judgement deliberately
+# starts at the ``--`` boundary, prefix inert). This predicate closes that
+# prefix blind spot: it decides whether the tokens between ``exec`` and
+# ``--`` form a valid exec target.
+#
+# Case #61 (Pod_文件权限异常) empirically demonstrated the LLM generalizing
+# ``-l`` from ``get``/``top`` (where it is legitimate) to ``exec`` (where it
+# is not), producing commands like ``kubectl exec -l app=drill-perms-target
+# -- id`` that failed with ``unknown shorthand flag: 'l'`` at runtime and
+# were then laundered as ``expected_absence`` by the retry LLM's half-way
+# replacement — receipt said ``7/7 succeeded`` while four container-internal
+# dimensions were never actually measured.
+#
+# Design: closed-syntax form check (not vocabulary judgement, not existence
+# check). The domain is small and stable — ``kubectl exec`` accepts exactly
+# three target forms: a bare pod name, ``<kind>/<name>`` with a resource
+# prefix, or (baseline-side extension) the ``{target_pod}`` placeholder that
+# ``_templates.py`` resolves to a literal pod name at execution time.
+# Selector flags are the only class of prefix tokens we actively reject;
+# other unknown flags fall through (kubectl will error at runtime with an
+# honest exit code).
+#
+# Single-source discipline (memory a2f0cce7): the predicate lives HERE, not
+# in a private baseline-side copy — both ``validate_command_with_reason``
+# (initial derive) and the retry-replacement double-gate consume this one
+# implementation. Any new readonly裁决 point MUST reuse this surface.
+# ---------------------------------------------------------------------------
+
+_EXEC_SELECTOR_FLAGS = frozenset({"-l", "--selector", "--field-selector"})
+
+# Resource prefixes ``kubectl exec`` accepts for the ``<kind>/<name>`` form.
+# Includes the short aliases kubectl itself recognizes (po/deploy/sts/ds/svc).
+_EXEC_RESOURCE_PREFIXES = frozenset({
+    "pod", "pods", "po",
+    "deployment", "deployments", "deploy",
+    "statefulset", "statefulsets", "sts",
+    "daemonset", "daemonsets", "ds",
+    "service", "services", "svc",
+})
+
+# Baseline-side placeholder resolved to a literal pod name at execution time
+# by ``_templates._resolve_one_baseline`` (mechanism同款 with ``{debug_pod}``).
+_TARGET_POD_PLACEHOLDER = "{target_pod}"
+
+# Flags in the exec prefix zone that consume the next token as their value
+# (so the token after them is not a positional target).
+_EXEC_VALUE_FLAGS = frozenset({
+    "-n", "--namespace",
+    "-c", "--container",
+})
+
+
+def kubectl_exec_target_form_reason(command: str) -> str | None:
+    """Reason a ``kubectl exec`` command's TARGET ZONE (tokens between
+    ``exec`` and ``--``) is malformed for baseline use, or ``None`` when the
+    form is permitted.
+
+    Permitted target forms (closed set):
+
+    * the ``{target_pod}`` placeholder (baseline-side; resolved to a literal
+      pod name at execution time — see ``_templates._resolve_one_baseline``)
+    * a bare literal pod name (single non-flag token, no ``/``)
+    * an explicit resource prefix ``<kind>/<name>`` where ``<kind>`` is one
+      of ``pod``/``deployment``/``deploy``/``statefulset``/``sts``/
+      ``daemonset``/``ds``/``service``/``svc`` (and their plurals)
+
+    Rejected: selector flags (``-l`` / ``--selector`` / ``--field-selector``)
+    anywhere in the target zone; also a missing positional target entirely.
+    Rejection reasons follow the reason-fix pairing discipline (memory
+    04dfe25d): they name what was wrong and what to emit instead, so the
+    retry LLM's ReAct feedback loop can converge in one round.
+
+    Orthogonal to ``kubectl_exec_rejection_reason`` (which judges the INNER
+    command after ``--``): a command can pass this gate (target form valid)
+    and still fail the inner gate (``-- rm -rf /`` is not read-only), or
+    vice versa. Both must pass. The predicate is self-consistent on its own
+    input domain — calling it in isolation returns the same verdict as
+    calling it via ``validate_command_with_reason`` (no reliance on caller
+    if/elif ordering to be correct).
+
+    Out of domain (returns ``None``, no judgement): non-``kubectl exec``
+    commands, ``exec`` without a ``--`` separator (handled by the caller's
+    canonical-separator check).
+    """
+    def _judge() -> str | None:
+        import shlex as _shlex
+        try:
+            tokens = _shlex.split(command)
+        except ValueError:
+            return "not parseable as a single command"
+        if len(tokens) < 2 or tokens[0] != "kubectl" or tokens[1] != "exec":
+            return None  # not a kubectl exec — outside this predicate's domain
+        if "--" not in tokens:
+            return None  # missing separator handled by caller (canonical-form check)
+
+        prefix = tokens[2:tokens.index("--")]
+
+        # 1. Selector flags are the empirical Case #61 failure mode: reject
+        #    them explicitly with a reason-fix pair pointing at {target_pod}.
+        for tok in prefix:
+            if tok in _EXEC_SELECTOR_FLAGS:
+                return (
+                    f"kubectl exec target zone must not use selector flag "
+                    f"'{tok}' — exec targets ONE specific pod, not a label "
+                    f"query. Emit '{_TARGET_POD_PLACEHOLDER}' (resolved to "
+                    f"a literal pod name at execution time) or a literal "
+                    f"pod name / 'deploy/<name>' form."
+                )
+
+        # 2. Locate the positional target: walk prefix, skipping value-taking
+        #    flags (``-n cms-demo`` consumes both tokens) and other flags.
+        positional: list[str] = []
+        i = 0
+        while i < len(prefix):
+            tok = prefix[i]
+            if tok in _EXEC_VALUE_FLAGS:
+                i += 2  # skip flag and its value
+                continue
+            if tok.startswith("-"):
+                i += 1  # unknown flag: pass through, kubectl will judge at runtime
+                continue
+            positional.append(tok)
+            i += 1
+
+        if not positional:
+            return (
+                f"kubectl exec is missing a positional target — emit "
+                f"'{_TARGET_POD_PLACEHOLDER}' (resolved at execution time) "
+                f"or a literal pod name / 'deploy/<name>' form."
+            )
+
+        target = positional[0]
+        if target == _TARGET_POD_PLACEHOLDER:
+            return None
+
+        # 3. Resource-prefix form: ``<kind>/<name>``.
+        if "/" in target:
+            kind, _, name = target.partition("/")
+            if kind not in _EXEC_RESOURCE_PREFIXES:
+                return (
+                    f"kubectl exec target '{target}' uses unsupported "
+                    f"resource prefix '{kind}/' — allowed kinds: "
+                    f"pod/deployment(deploy)/statefulset(sts)/"
+                    f"daemonset(ds)/service(svc). Or emit "
+                    f"'{_TARGET_POD_PLACEHOLDER}' for baseline use."
+                )
+            if not name:
+                return (
+                    f"kubectl exec target '{target}' has empty name after "
+                    f"'{kind}/' — provide a concrete resource name."
+                )
+            return None
+
+        # 4. Bare literal pod name — accept. Existence check is out of scope
+        #    (runtime kubectl will error with an honest exit code if missing).
+        return None
+
+    return _facts_verdict(_judge, on_error=_INTERNAL_ERROR_REASON)
 
 
 def is_readonly_host_command(command: str) -> bool:
@@ -3225,6 +3750,7 @@ __all__ = [
     "READONLY_PROBE_FIX_HINT",
     "is_readonly_kubectl_exec",
     "kubectl_exec_rejection_reason",
+    "kubectl_exec_target_form_reason",
     "is_readonly_host_command",
     "contains_shell_metachar",
     "host_command_rejection_reason",

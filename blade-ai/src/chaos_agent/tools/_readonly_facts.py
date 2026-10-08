@@ -55,6 +55,7 @@ from chaos_agent.bashfacts import (
     CommandFacts,
     IssueKind,
     PartKind,
+    RedirectFacts,
     ScriptFacts,
     WordFacts,
     has_shell_structure,
@@ -65,6 +66,7 @@ from chaos_agent.bashfacts import (
 )
 from chaos_agent.tools.readonly import (
     _COMMAND_WRAPPERS,
+    _DISCARD_SINKS,
     _DURATION_RE,
     _ESCAPE_PRIMITIVES,
     _WRAPPER_VALUE_FLAGS,
@@ -211,6 +213,50 @@ def _watch_payload(tokens: list[str]) -> list[str] | None:
 # --- structural scan --------------------------------------------------------
 
 
+def _benign_stream_redirect_reason(red: RedirectFacts) -> str | None:
+    """Why this redirect is NOT a benign stream operation, or None if it is.
+
+    A1 legislation (2026-09-21, inject-76f5f317): the exec-probe dialect
+    admits exactly two stream-only shapes — the shell-level twins of the
+    argument-level ``_DISCARD_SINKS`` carve-out (curl ``-o /dev/null``):
+
+      - fd duplication ``>&``/``<&`` with a PLAIN NUMERIC literal target
+        (``2>&1``, ``1>&2``, ``>&2``) — copies a descriptor, opens nothing.
+        The case teaching documented probes in this exact shape
+        (NXDOMAIN L375/381/387: ``nslookup <domain> 2>&1 | grep``) while
+        the screen refused it — the guard and the knowledge base spoke
+        different dialects.
+      - the discard sink ``> /dev/null`` (any fd, e.g. ``2>/dev/null``) —
+        throws a stream away, writes nothing.
+
+    Everything else stays refused, each for a registered reason: file
+    writes (``>``/``>>`` to a path; ``>&file`` is old-POSIX ``>file 2>&1``
+    and writes, hence the numeric-literal requirement); the write-group
+    operators ``<>``/``&>``/``&>>``/``>|`` (grouped by
+    ``bashfacts.facts``'s legislated table); input and heredoc operators
+    (out of scope — the carve-out is stream-shaping, not input); close-on-
+    exec ``2>&-``; ``>>/dev/null`` (semantically a discard but unused by
+    any real probe — legislate when a case asks); and any target that is
+    not a plain literal (``2>&$(...)``) — the 4.6 value discipline: only
+    a literal target proves the descriptor arithmetic.
+    """
+    target_value = red.target.value if red.target is not None else None
+    if red.operator in (">&", "<&"):
+        if target_value is not None and target_value.isdigit():
+            return None
+        return (
+            "fd duplication whose target is not a plain numeric literal "
+            "(a file-shaped target means the legacy `>file 2>&1` write form)"
+        )
+    if red.operator == ">" and target_value in _DISCARD_SINKS:
+        return None
+    return (
+        f"'{red.operator}' writes or shapes a stream a read-only probe "
+        "may not shape (allowed: fd duplication like 2>&1, discard to "
+        "/dev/null)"
+    )
+
+
 def _issue_reason(issue_kind: IssueKind, pos: int) -> str:
     if issue_kind is IssueKind.BUDGET_EXCEEDED:
         return (
@@ -223,7 +269,9 @@ def _issue_reason(issue_kind: IssueKind, pos: int) -> str:
 
 
 def _structure_reason(
-    script: ScriptFacts, *, allow_pipes: bool, tail: str, allow_chains: bool = False
+    script: ScriptFacts, *, allow_pipes: bool, tail: str,
+    allow_chains: bool = False,
+    allow_benign_redirects: bool = False,
 ) -> str | None:
     """First structural element a read-only probe may not carry, or None.
 
@@ -236,8 +284,18 @@ def _structure_reason(
     vocabulary as target_guard's ``_PROBE_SEPARATOR_OPS`` — the execute-phase
     guard already admits all-readonly compound chains, and the read-only
     exec channel now speaks the same dialect instead of refusing a shape the
-    other guard accepts). Redirects, substitutions, background and newlines
-    stay refused on every surface.
+    other guard accepts).
+
+    ``allow_benign_redirects`` (A1) admits the two stream-only redirect
+    shapes — fd duplication (``2>&1``) and the ``/dev/null`` discard — on
+    the exec-probe dialect ONLY. The host surface and the
+    ``contains_shell_metachar`` screen keep passing the default False:
+    the host contract is a SINGLE diagnostic (pipes are refused there, so
+    a stream merge would be inconsistent), and the metachar screen's
+    question ("does this command carry structure AT ALL?") is orthogonal
+    to read-only-ness — both must keep refusing every redirect. File-
+    writing redirects, substitutions, background and newlines stay
+    refused on every surface.
     """
     for issue in script.errors:
         return _issue_reason(issue.kind, issue.pos)
@@ -257,14 +315,28 @@ def _structure_reason(
             return f"contains a subshell '(...)'{tail}"
         cmd = seg.command
         if cmd.redirects:
-            red = cmd.redirects[0]
-            return (
-                f"contains a shell redirect ('{red.operator}') at pos "
-                f"{red.pos}{tail}"
-            )
+            if not allow_benign_redirects:
+                red = cmd.redirects[0]
+                return (
+                    f"contains a shell redirect ('{red.operator}') at pos "
+                    f"{red.pos}{tail}"
+                )
+            # A1 carve-out: every redirect must be a benign stream op —
+            # the verdict is all-or-nothing, so ``cmd 2>&1 > /etc/x``
+            # still refuses on its file-writing member.
+            for red in cmd.redirects:
+                why = _benign_stream_redirect_reason(red)
+                if why is not None:
+                    return (
+                        f"contains a shell redirect ('{red.operator}') at pos "
+                        f"{red.pos}{tail}: {why}"
+                    )
         words = _segment_words(cmd)
-        for red in cmd.redirects:  # unreachable today (rejected above) —
-            # kept so a future allow-list still scans redirect words
+        for red in cmd.redirects:
+            # Reachable only under the A1 carve-out (benign stream ops —
+            # their targets are plain literals by construction, so this
+            # scan is belt-and-suspenders): admitted redirect targets and
+            # heredoc bodies still walk the substitution screen.
             if red.target is not None:
                 words.append(red.target)
             if red.body is not None:
@@ -459,6 +531,7 @@ def _judge_exec_script(
 ) -> tuple[bool, str | None]:
     bad = _structure_reason(
         script, allow_pipes=True, tail=_TAIL_PROBE, allow_chains=allow_chains,
+        allow_benign_redirects=True,
     )
     if bad is not None:
         return False, bad
@@ -927,8 +1000,11 @@ def kubectl_exec_rejection_reason_facts(v_args: str) -> str | None:
     root = parse_script(inner_raw, budget=budget)
     # B46: segment-chained all-readonly probes are admitted — the same
     # dialect target_guard's execute-phase readonly bypass already speaks
-    # (its ``_PROBE_SEPARATOR_OPS``). Redirects / substitutions / background
-    # / newlines still fail closed (``_structure_reason``).
+    # (its ``_PROBE_SEPARATOR_OPS``). A1: the two stream-only redirect
+    # shapes (fd duplication ``2>&1`` and the ``/dev/null`` discard) are
+    # admitted on this exec dialect only. File-writing redirects /
+    # substitutions / background / newlines still fail closed
+    # (``_structure_reason``).
     ok, reason = _judge_exec_script(root, budget=budget, depth=0, allow_chains=True)
     return None if ok else reason
 

