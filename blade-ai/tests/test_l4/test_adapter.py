@@ -85,26 +85,70 @@ class TestTestTaskToInitialState:
         state = _to_initial_state(task)
         assert state["fault_spec"]["duration_seconds"] == 180
 
+    def test_string_duration_is_parsed_to_int(self):
+        """The only shape that survives verbatim is a parseable positive
+        integer — a numeric string included. The spec field is an int on
+        every path, never the caller's spelling."""
+        task = L4TestTask(
+            task_id="t-durstr",
+            intent="x",
+            payload=self._payload_with_duration(duration_seconds="600"),
+        )
+        state = _to_initial_state(task)
+        assert state["fault_spec"]["duration_seconds"] == 600
+
+    def test_explicit_zero_is_treated_as_unspecified(self):
+        """Pins the absent-value semantics, because they are UNSETTLED and
+        the two candidate readings differ observably: here 0 joins a missing
+        key in resolving to the operator default, which makes the resolved
+        contract a POSITIVE value and so leaves B14's "a declaration only
+        fills an empty contract" rule with nothing to fill — the planner's
+        finish_planning(duration_seconds=N) is not adopted on this channel.
+        CLI-NL instead keeps 0 and lets the declaration fill it. If the SDK
+        channel is ever ruled to follow CLI-NL, this test is the one to
+        flip."""
+        from chaos_agent.config.settings import blade_ai_context
+
+        task = L4TestTask(
+            task_id="t-durzero",
+            intent="x",
+            payload=self._payload_with_duration(duration_seconds=0),
+        )
+        with blade_ai_context(experiment_timeout=450):
+            state = _to_initial_state(task)
+        assert state["fault_spec"]["duration_seconds"] == 450
+
     def test_retired_duration_alias_not_honored(self):
         """The retired `duration` alias has no reader: a payload carrying
-        only it falls to the default (l4-contract-faithfulness ruling —
-        no compatibility layer for old keys)."""
+        only it falls to the operator default (l4-contract-faithfulness
+        ruling — no compatibility layer for old keys)."""
+        from chaos_agent.config.settings import blade_ai_context
+
         task = L4TestTask(
             task_id="t-dura",
             intent="x",
             payload=self._payload_with_duration(duration=240),
         )
-        state = _to_initial_state(task)
+        with blade_ai_context(experiment_timeout=300):
+            state = _to_initial_state(task)
         assert state["fault_spec"]["duration_seconds"] == 300
 
-    def test_duration_absent_falls_to_default(self):
+    def test_duration_absent_follows_operator_config(self):
+        """An unsupplied duration resolves through the single policy point
+        (``ensure_min_duration`` → ``experiment_timeout``) instead of a
+        literal. Moving the operator knob must move this value: a literal
+        default leaves the setting dead on this channel — the same defect
+        class as the retired CLI pre-fill."""
+        from chaos_agent.config.settings import blade_ai_context
+
         task = L4TestTask(
             task_id="t-durx",
             intent="x",
             payload=self._payload_with_duration(),
         )
-        state = _to_initial_state(task)
-        assert state["fault_spec"]["duration_seconds"] == 300
+        with blade_ai_context(experiment_timeout=777):
+            state = _to_initial_state(task)
+        assert state["fault_spec"]["duration_seconds"] == 777
 
     def test_transport_fields_forwarded(self):
         """L4 payload transport fields (channel override + kubewiz + ssh/host)

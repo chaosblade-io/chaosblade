@@ -10,7 +10,6 @@ from chaos_agent.l4.adapter import state_to_task_result
 from chaos_agent.l4.error_mapping import map_to_agent_error
 from chaos_agent.l4.events import (
     _conn_to_state_patch,
-    _forward_progress_event,
     _last_ai_message_text,
 )
 from chaos_agent.l4.pool import _ChaosAgentPool

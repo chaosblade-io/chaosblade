@@ -13,18 +13,20 @@ import threading
 from logging.handlers import RotatingFileHandler
 from typing import TYPE_CHECKING
 
-logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-from chaos_agent.l4.constants import DEFAULT_CARD_DECISION_TIMEOUT_S
+# Re-exported for tests: ``tests/test_l4/test_agent_cards.py`` imports this
+# name FROM this module, so it is not dead code despite the local non-use
+# (ruff cannot see cross-module re-export consumers — hence the noqa).
+from chaos_agent.l4.constants import DEFAULT_CARD_DECISION_TIMEOUT_S  # noqa: F401
 from chaos_agent.l4.execution import _L4ExecutionMixin
 from chaos_agent.l4.interaction import _L4InteractionMixin
 from chaos_agent.l4.pool import _ChaosAgentPool
 from chaos_agent.l4.recovery import _L4RecoveryMixin
 from chaos_agent.l4.schemas import L4TaskResult
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _logging_configured = False
 _log_dir: "Path | None" = None

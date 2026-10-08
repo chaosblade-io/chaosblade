@@ -18,6 +18,7 @@ from chaos_agent.agent.intent_handoff import (
 from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.l4.error_mapping import _extract_error
 from chaos_agent.l4.schemas import L4TaskResult, L4TestTask
+from chaos_agent.utils.fault_type import ensure_min_duration
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +164,28 @@ def test_task_to_initial_state(task: L4TestTask) -> dict:
         # ``duration_seconds`` — the key emitted by to_intent_dict() and
         # the only legal duration channel. The retired ``duration``
         # alias has no reader here.
-        "duration_seconds": fi.get("duration_seconds", 300),
+        #
+        # An unsupplied value (missing key / 0 / None) resolves through the
+        # single policy point (``ensure_min_duration`` → operator-configured
+        # ``experiment_timeout``) rather than a literal 300, so the operator
+        # knob moves this channel. What verbatim means here is narrow: only a
+        # parseable positive integer passes through untouched. A non-integer
+        # spelling (``"600.0"``, ``600.0``) is unparsable to
+        # ensure_min_duration and lands on the configured default, and a
+        # below-floor value passes through verbatim with a warning.
+        #
+        # Known, still-open seam — not a property this write fixes: the
+        # resolved default is a POSITIVE value, so B14's "a declaration only
+        # fills an empty contract" rule (spec.duration_seconds or
+        # declared_duration) never adopts the planner's
+        # finish_planning(duration_seconds=N) on this channel when the caller
+        # sent nothing. CLI-NL instead leaves 0 and lets the declaration
+        # fill it. Which of the two the SDK channel should do is an unsettled
+        # semantic (see the l4-contract-faithfulness spec, which never
+        # defined the absent-value arm), not an oversight in this line.
+        "duration_seconds": ensure_min_duration(
+            fi.get("duration_seconds"), scope, fault_target, fault_action,
+        ),
         "source": "l4_sdk",
         "user_description": fi.get("user_description") or task.intent,
     }
