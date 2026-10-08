@@ -1,6 +1,7 @@
 **用例名称** 磁盘IO读写负载 导致 Pod_磁盘IO过高
 
-**故障定位**：负载型故障——IO 压测进程存活即故障存活，进程终止（实验销毁/定时器
+## 故障定位
+负载型故障——IO 压测进程存活即故障存活，进程终止（实验销毁/定时器
 kill）即 IO 吞吐回落、自动恢复。手段1（ChaosBlade `pod-disk burn`）与手段2
 （kubectl-native：容器内 `dd conv=fsync` 循环）是**并列的注入手段**，底层效果
 等价（blade 内部同样是容器内 dd 循环），按环境能力选用。**本用例的两个核心
@@ -14,13 +15,13 @@ kill）即 IO 吞吐回落、自动恢复。手段1（ChaosBlade `pod-disk burn`
    可靠形态是 `conv=fsync` 持续落盘（739KB/s vs 底噪 1KB/s）。
 `duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. 目标盘 IO 吞吐异常升高（容器内 `/proc/diskstats` 双采样差分显著超底噪）
 2. 应用读写延迟明显增加，请求处理变慢
 3. 同节点其他 Pod 受 IO 带宽争抢影响，延迟上升（爆炸半径内预期现象）
 4. （有应用访问入口时）应用出现读写超时或性能退化
 
-**资源准备**：
+## 资源准备
 1. 确认目标 Pod 的标签选择器、命名空间、实际容器名，以及根文件系统可写：
    ```bash
    kubectl exec <pod> -n <namespace> -c <container> -- sh -c 'touch /.iobench.tmp && rm -f /.iobench.tmp'
@@ -59,7 +60,7 @@ kill）即 IO 吞吐回落、自动恢复。手段1（ChaosBlade `pod-disk burn`
    记录各行计数，注入后差分看哪行增量爆发（该行即容器 overlay 的 backing
    设备；可由节点侧 `lsblk` 或 `df` 交叉核对设备名）
 
-**演练步骤**：
+## 演练步骤
 1. 记录注入前基线：资源准备第 3/5 条的节点条件、同节点 Pod 清单、diskstats
    快照；`kubectl get pods -n <namespace> -l <label-selector> -o wide` 记录
    目标 Pod RESTARTS
@@ -89,7 +90,7 @@ kill）即 IO 吞吐回落、自动恢复。手段1（ChaosBlade `pod-disk burn`
 回收；IO 负载启动与定时器武装在同一 sh -c 载荷内原子紧邻，无侵蚀间隙）：
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
-  ( sleep <duration>; kill $(cat /tmp/iobench-writer.pid) 2>/dev/null; rm -f /tmp/iobench-writer.pid /.iobench.write.dat; echo IOBENCH_RESTORED >> /tmp/iobench.evd ) >/dev/null 2>&1 &
+  ( sleep <recovery-seconds>; kill $(cat /tmp/iobench-writer.pid) 2>/dev/null; rm -f /tmp/iobench-writer.pid /.iobench.write.dat; echo IOBENCH_RESTORED >> /tmp/iobench.evd ) >/dev/null 2>&1 &
   ( while :; do dd if=/dev/zero of=/.iobench.write.dat bs=1M count=50 conv=fsync 2>/dev/null; done ) >/dev/null 2>&1 &
   echo $! > /tmp/iobench-writer.pid
   echo IOBENCH_INJECTED >> /tmp/iobench.evd
@@ -112,7 +113,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
     dd if=/dev/zero of=/.iobench.read.dat bs=1M count=500 2>/dev/null
     ( while :; do dd if=/.iobench.read.dat of=/dev/null bs=1M count=100 2>/dev/null; done ) >/dev/null 2>&1 &
     echo $! > /tmp/iobench-reader.pid
-    ( sleep <duration>; kill $(cat /tmp/iobench-reader.pid) 2>/dev/null; rm -f /tmp/iobench-reader.pid /.iobench.read.dat ) >/dev/null 2>&1 &
+    ( sleep <recovery-seconds>; kill $(cat /tmp/iobench-reader.pid) 2>/dev/null; rm -f /tmp/iobench-reader.pid /.iobench.read.dat ) >/dev/null 2>&1 &
   '
   ```
   读热文件全命中页缓存，diskstats 增量近乎为零——读方向只在与写方向叠加时
@@ -128,7 +129,13 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 grep "[d]d if" | awk "{print \$1}" | xargs -r kill -9`——注意 awk 的 `$1`
 在双引号载荷内须转义为 `\$1`）
 
-**注入验证**（两种手段共用；diskstats/cat/ps 判据全部只读，verify 阶段
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——写/读压力两处 sleep 定时器以它
+武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；手段1 的 `--timeout` 由
+引擎在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
+
+## 注入验证
+（两种手段共用；diskstats/cat/ps 判据全部只读，verify 阶段
 read-only 纪律天然放行）：
 1. **效果主证——diskstats 增量**：间隔 3-5 秒采样两次差分：
    ```bash
@@ -159,7 +166,7 @@ read-only 纪律天然放行）：
 5. **持续性检查（必做）**——负载型故障，进程在即故障在：45s 后复查
    diskstats 增量仍在高位、`ps` 佐证 dd 进程仍存活
 
-**注入恢复**：
+## 注入恢复
 1. 手段1：`blade destroy <experiment_uid>`，burn 进程随实验销毁终止，临时
    文件自动清理
 2. 手段2：定时器到期自动 kill + 清理 + 写 `IOBENCH_RESTORED`（主恢复路径）；
@@ -173,7 +180,7 @@ read-only 纪律天然放行）：
    50MB 最长约 70s），本轮落盘完成即自行退出——恢复验证的 dd 进程判据须在
    定时器触发 90s 后观察，或以 diskstats 回落为准
 
-**恢复验证**：
+## 恢复验证
 1. **效果主证——IO 吞吐回落基线**：diskstats 双采样差分回落到底噪水平
    （与资源准备第 5 条基线对照）
 2. 压测进程已终止：`ps -o pid,args | grep "[d]d if"` 无输出（残余单轮滞后
@@ -184,7 +191,7 @@ read-only 纪律天然放行）：
 4. Pod 状态 Running、RESTARTS 与基线一致；（有访问入口时）应用读写延迟
    恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：Pod 内产生大量磁盘读写负载，模拟应用异常 IO 操作或日志洪峰，
   磁盘 IO 带宽被占满，影响同节点正常业务读写
 - **必现现象**：节点根盘 IO 吞吐异常升高（diskstats 增量显著超底噪）；

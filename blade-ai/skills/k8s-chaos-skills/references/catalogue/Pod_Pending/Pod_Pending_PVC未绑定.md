@@ -21,7 +21,8 @@ mechanism_writes:
 
 **用例名称** PVC未绑定 导致 Pod_Pending
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载并还原 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载并还原 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -54,12 +55,12 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - 道具 PVC（引用不存在 StorageClass、永远 Pending 的瞬态对象）为 execute 计划 manifest 步骤（走 front matter mechanism_writes 立法条目）；收尾清理步删除。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Pod 状态为 Pending，无法启动
 2. Pod Events 中显示 `pod has unbound immediate PersistentVolumeClaims`
 3. PVC 状态为 Pending，无法绑定到 PV
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认集群中 StorageClass 和 CSI 插件正常工作
 3. ⚠️ **靶形态硬性要求**：靶必须是 **Deployment 管辖的应用**（意图以
@@ -73,7 +74,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    `delete persistentvolumeclaims -n <ns>`，三权皆 yes 即可行。受阻时
    **严禁降级改机制**（如删除重建 Pod 等破坏性替代）
 
-**演练步骤**（主路径 = 载体配方经 `faultdrill_assemble_carrier` 一次调用执行；手动序列仅当装配器 fail-closed 报告不可用时作降级兜底。注意：本用例需要临时修改 Deployment 添加 volume 引用，这是故障注入的必要操作，不违反安全红线。目标应用无需预先配置 PVC——注入的目的就是添加一个无法绑定的 PVC 依赖。恢复步骤会还原所有修改）：
+## 演练步骤
+（主路径 = 载体配方经 `faultdrill_assemble_carrier` 一次调用执行；手动序列仅当装配器 fail-closed 报告不可用时作降级兜底。注意：本用例需要临时修改 Deployment 添加 volume 引用，这是故障注入的必要操作，不违反安全红线。目标应用无需预先配置 PVC——注入的目的就是添加一个无法绑定的 PVC 依赖。恢复步骤会还原所有修改）：
 1. 使用 `kubectl apply -f` 创建一个引用不存在的 StorageClass 的 PVC（通过 `stdin_data` 传入 YAML；走 frontmatter mechanism_writes 道具立法条目）：
    ```yaml
    apiVersion: v1
@@ -142,7 +144,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 3. 使用 `kubectl patch` 修改应用 A 的 Deployment，添加引用该 PVC 的 volume 和 volumeMount；等待 Pod 滚动更新完成，观察新 Pod 的状态
 4. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段——主路径下此项随 restorePatches 由载体 TTL 还原，无需手动执行）
 
-**注入验证**：
+## 注入验证
 1. 确认所有旧 Pod 已被替换（滚动更新完成）：**用 RS 视角判据，不要用 `kubectl rollout status`**——注入期新 Pod 永不被调度（PVC 未绑定，故障本身），`rollout status` 等待 available 副本必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」；正确判据是 `kubectl get rs -n <namespace> -l <label>`：旧 RS DESIRED=0、新 RS DESIRED=目标副本数（或旧 Pod 名消失、新 Pod 处于 Pending）
 2. 执行 `kubectl get pvc`，确认 PVC 状态为 Pending
 3. 执行 `kubectl get pods`，确认**所有**目标 Pod 状态为 Pending（不是仅一个新 Pod，而是全部副本）
@@ -165,7 +167,8 @@ Pod Pending + FailedScheduling unbound PVC 事件 + PVC Pending」即效果确�
 （EVIDENCE SEMANTICS：效果裁决不等恢复窗口）。恢复由载体 TTL 带外完成，恢复确认
 （Pod Running + PVC 清理）走演练结束后的带外核验
 
-**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治 fire）：
+## 注入恢复
+（主路径下恢复无需 Agent 执行动作——载体 TTL 自治 fire）：
 1. 等待 `<duration>` 到期，载体自治执行基线还原（fire 证据落载体 `/tmp/restore.log` +
    任务台账 recovery_handle，可查不静默）；演练提前结束时执行 `blade-ai recover`
    从台账重放同源配方提前收敛（幂等，与载体双执行——先到先收敛、后到读回 no-op。
@@ -181,10 +184,10 @@ Pod Pending + FailedScheduling unbound PVC 事件 + PVC Pending」即效果确�
    不会误删其他数组项）
 2. 等待 Pod 滚动更新完成
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods`，确认 Pod 状态恢复为 Running
 2. 确认注入时创建的 PVC 已被清理
 
-**基准事实**：
+## 基准事实
 - **根因**：Pod 引用的 PVC 无法绑定，原因为 StorageClass 不存在或 Provisioner 异常，导致 Pod 无法挂载所需存储卷而 Pending
 - **必现现象**：Pod Pending；PVC Pending；Events 显示 unbound PersistentVolumeClaims

@@ -1,6 +1,7 @@
 **用例名称** 网络隔离 导致 Pod_网络故障
 
-**故障定位**：持续型故障——Pod 网络命名空间内的 iptables DROP 规则是状态型故障，
+## 故障定位
+持续型故障——Pod 网络命名空间内的 iptables DROP 规则是状态型故障，
 规则存活即故障存活，贯穿整个故障窗口；窗口到期自删链/实验销毁即自动恢复。
 手段1（ChaosBlade）与手段2（kubectl-native）是**并列的注入手段**，底层效果完全
 等价（blade 内部也是在目标 Pod netns 下发 iptables DROP 规则），按环境能力选用：
@@ -8,7 +9,7 @@
 （实验 UID 统一生命周期管理）；否则用手段2。`duration_seconds` 是必填的故障窗口
 契约，未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. 目标 Pod 的网络流量被丢弃，受影响的方向取决于注入时的方向参数（手段1 `--network-traffic`、手段2 规则选择）：
    - 双向（默认）：所有出入流量被丢弃，Pod 完全无法通信
    - `out`（仅出向）：Pod 发起的调用全部超时；**外部仍能访问该 Pod**
@@ -16,7 +17,7 @@
 2. 入向被阻断时（双向或 `in`），httpGet/tcpSocket 探针无响应 → Pod 被重启或标记 NotReady → Service Endpoints 移除该 Pod
 3. 同节点其他 Pod 不受影响（非 hostNetwork 模式下各 Pod 有独立网络命名空间）
 
-**资源准备**：
+## 资源准备
 1. 确认目标应用已正常运行，且有对外网络调用
 2. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（手段2 路径B 临时容器
    `--target` 必须填容器名，填 Pod 名/服务名会被 API server 拒绝：`targetContainerName: Not found`）
@@ -38,7 +39,7 @@
      通常自带；用 `kubectl get pods -A -o jsonpath='{{..image}}'` 找集群已在用的，
      探测该镜像内 `iptables --version` 可用后再使用）
 
-**演练步骤**：
+## 演练步骤
 1. 记录注入前基线：
    ```bash
    kubectl get pods -n <namespace> -l <label-selector> -o wide
@@ -78,7 +79,7 @@ kubectl exec <pod-name> -n <namespace> -- iptables --version
 第二段 kubectl 会沦为第一条 exec 载荷（sh -c）的死参数，注入静默丢失）：
 ```bash
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  '( sleep <duration>; iptables -D OUTPUT -j DROP; iptables -D INPUT -j DROP ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; iptables -D OUTPUT -j DROP; iptables -D INPUT -j DROP ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -- sh -c \
   'iptables -A OUTPUT -j DROP && iptables -A INPUT -j DROP && iptables -S'
 ```
@@ -93,12 +94,12 @@ kubectl exec <pod-name> -n <namespace> -- sh -c \
 # 0) 前置安全检查：确认目标 Pod 不是 hostNetwork（资源准备第 3 条）。
 #    hostNetwork=true 时禁止此路径，临时容器里的 iptables 会打穿整个节点。
 
-# 1) 注入 + 内置定时自删（一条命令完成：注入成功后 sleep <duration> 到期自动删除规则）。
+# 1) 注入 + 内置定时自删（一条命令完成：注入成功后 sleep <recovery-seconds> 到期自动删除规则）。
 #    --target 必须填实际容器名；--quiet 不进入交互附着，不要加 -it。
 kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
   --target=<container-name> --profile=netadmin --quiet -- sh -c \
   'iptables -A OUTPUT -j DROP && iptables -A INPUT -j DROP \
-   && iptables -S && echo INJECTED && sleep <duration> \
+   && iptables -S && echo INJECTED && sleep <recovery-seconds> \
    && iptables -D OUTPUT -j DROP && iptables -D INPUT -j DROP \
    && iptables -S && echo RECOVERED'
 ```
@@ -109,8 +110,13 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
 不得为缩短命令而省略（注意 wiz 等通道 sh -c 载荷有 1024 字节上限，本链含占位符约 360 字节，安全）。
 倒计时从注入成功时刻起算：`INJECTED` 回显与倒计时起点在同一条命令链内严格串行，无侵蚀间隙；
 武装后发生任何修复需重新注入时，先用下方提前恢复命令另起临时容器删规则（旧链到期后的重复删除是幂等空触发、无害），再重跑注入命令（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径A 的 sleep 定时器与路径B 的
+链内 sleep 自删链以它武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；
+手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
 - 方向适配：仅出向隔离去掉两处 INPUT 规则（`-A INPUT -j DROP` / `-D INPUT -j DROP`）；仅入向同理去掉 OUTPUT
-- 该命令整体阻塞 `<duration>` 秒（命令自身就是保活载体，自恢复随命令完成而闭环）；
+- 该命令整体阻塞 `<recovery-seconds>` 秒（命令自身就是保活载体，自恢复随命令完成而闭环）；
   如需后台执行，将整条 kubectl debug 置于后台并轮询其输出/临时容器日志
 - 输出未直接回流时，从临时容器日志读取（`INJECTED`/`RECOVERED` 标记即注入/自恢复的确证；
   标记之间的 `iptables -S` 输出即白盒主证原文）：
@@ -129,7 +135,8 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
 - **注入报 `Permission denied` / `Operation not permitted`**：载体缺 NET_ADMIN——路径A 说明
   目标容器无该 capability，转路径B；路径B 说明 `--profile=netadmin` 未生效或镜像异常，如实报告
 
-**注入验证**（两种手段共用——底层是同一组 iptables DROP 规则）：
+## 注入验证
+（两种手段共用——底层是同一组 iptables DROP 规则）：
 1. 白盒确认 DROP 规则已生效（主证，必做）：
    - 手段1：`blade status --uid <experiment_uid>` 状态为 Success/Running 即表示丢包规则已下到目标 Pod netns
    - 手段2 路径B：**首选证据是注入容器日志**——`kubectl logs <pod-name> -n <namespace> -c <ephemeral-container-name>`，
@@ -172,7 +179,7 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
 3. 手段2 路径B：以日志为准——`INJECTED` 已现而 `RECOVERED` 未现即窗口仍开、规则仍活
 4. 窗口内连通性探测与白盒复查至少各一次（方向匹配的那一侧）
 
-**注入恢复**：
+## 注入恢复
 
 手段1（ChaosBlade）：
 1. 提前恢复：销毁实验（移除 DROP 规则）`blade destroy <experiment_uid>`
@@ -196,7 +203,8 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
      ```
    （方向过滤注入时只删对应方向的规则；`-D` 对不存在的规则报错无害但需预期）
 
-**恢复验证**（两种手段共用）：
+## 恢复验证
+（两种手段共用）：
 1. 白盒确认 DROP 规则已移除：手段2 路径B 首选注入容器日志（`RECOVERED` 之前的 `iptables -S`
    不再含对应 DROP 规则）；到期自动恢复场景或需当前状态时，按提前恢复形态另起载体复验
    `iptables -S`；手段1 可辅以 `blade status <uid>` 但以其不可靠著称，最终以规则表/连通性为准
@@ -207,7 +215,7 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
 3. **（仅当入向曾被阻断）** 确认 Pod 恢复 Ready 状态、Service Endpoints 重新包含该 Pod
 4. 确认目标 Pod 无重启（`RESTARTS` 与基线一致）
 
-**基准事实**：
+## 基准事实
 - **根因**：Pod 网络命名空间内 iptables 链被设置 DROP 规则，匹配的数据包被丢弃（`out` 作用于 OUTPUT、`in` 作用于 INPUT、双向则两者都下）
 - **必现现象（与方向无关）**：白盒规则表可见 DROP 规则（手段1 以 blade status 为辅证）；被阻断方向的流量全部超时
 - **随方向变化的现象**：
@@ -221,5 +229,5 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
 - 两条路径操作的都是目标 Pod 的网络命名空间（路径A 容器内直接操作；路径B 临时容器 `--target` 共享同一 netns），作用范围仅目标 Pod
 - 目标 netns 内 `iptables -S` 用的是**载体镜像**的二进制（路径B 是调试镜像，非目标镜像），无需目标镜像自带 iptables
 - 若目标 Pod 容器重启，网络命名空间重建，规则自然消失（故障自愈，如实报告即可）
-- 自恢复基于路径A 武装的后台定时删除或路径B 注入命令内置的 `sleep <duration>` 自删链；
+- 自恢复基于路径A 武装的后台定时删除或路径B 注入命令内置的 `sleep <recovery-seconds>` 自删链；
   二者都不依赖宿主机 systemd/timer，也不产生需要额外管理的临时单元

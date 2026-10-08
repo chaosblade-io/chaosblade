@@ -1,15 +1,15 @@
 **用例名称** 日志或临时文件堆积 导致 Node_磁盘空间不足
 
-**故障现象**：
+## 故障现象
 1. 节点磁盘使用率告警（大于85%）
 2. 容器无法写入数据
 3. `/var/log`、`/tmp` 目录占用空间大
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A/B 已正常运行
 2. 确认节点磁盘空间充足
 
-**演练步骤**：
+## 演练步骤
 1. 定位运行应用 A Pod 的节点
 2. 使用 chaosblade 或其他故障注入工具向节点 `/var/log` 或 `/tmp` 目录持续写入数据，模拟日志或临时文件堆积
    - **手段1 可用性判据（以当次探测为准）**：chaosblade operator 无可用副本（无 ready 的 operator Pod）或 chaosblade-tool Pod 全员 ImagePullBackOff/CrashLoopBackOff 时，手段1 判死，直接走手段2 kubectl-native（勿再投探测 Pod 复验已判死结论——单命令轻探 chaosblade ns 下 operator ready 数即可）
@@ -31,7 +31,7 @@
 | `/etc`, `/root`, `/home` | nodefs（根文件系统） | `/dev/vda3` 等根分区 | `df -h /host` 显示根分区使用率 | 同上 |
 | 其他路径 | 需 `df -h` 列出全部后判定 | 不确定 | `df -h`（无路径参数）识别哪个分区使用率变化 | 仅检查单一分区 |
 
-**注入验证**：
+## 注入验证
 0. **基线完整性检查**（验证阶段第一步，必须先于其他验证步骤执行）：
    - **首条命令必须**是 `df -h`（无路径参数），列出所有分区使用率，标注与注入 `--path` 对应的分区（根据上方路径→分区映射表）。禁止先执行 `df -h /host` 或 `df -h /host/<path>` — 这些命令只显示 nodefs，会在 imagefs 场景下产生错误基线（**注意场景区分**：本条适用于**注入后验证期**（需全分区对比防假阴性）；**注入前基线预探测**相反——用带路径形态 `chroot /host df -h /var/log` 单行精确定位（见手段2 命令 0 注释：无路径全列回执截断会丢根分区行，勿泛化混用两场景））
    - 后续验证中，只对比**同一分区**的使用率变化。禁止将 nodefs 基线与 imagefs 注入后数据做对比
@@ -58,24 +58,24 @@
 
 **持续性判据语义（与 IO 类故障的根本差异）**：磁盘空间堆积是**静态故障**——填充文件落地后使用率持续保持，无需像 IO 类那样依赖连续写负载。verify 的「持续性」体现为**两次观察**（间隔 ≥30s）使用率/填充文件大小稳定不回落（确认非瞬时缓存效应），一次观察即可证明「在位」；不需要观察「活动」（无持续写入过程）。fallocate 填充的字节直证（ls -l 精确字节）比使用率百分比更早可判（metrics 采样滞后不影响文件大小）。
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 chaosblade 实验
 2. 停止数据写入或删除创建的大文件
 3. 清理日志文件
 
-**恢复验证**：
+## 恢复验证
 1. 查看节点磁盘使用率，确认恢复到正常水平。使用 kubectl debug 两步法（同注入验证），执行 `df -h`（无路径参数）检查所有磁盘分区均恢复
-   - **宿主 df 通道边界**：`df` 读的是宿主文件系统**非 host-global**（与 /proc/diskstats 不同）——`kubectl exec <任意 DaemonSet Pod> -- df -h` 看到的是容器 overlay，**不能**复用「exec 平台 DaemonSet Pod 免 debug pod」通道。宿主 df/du 取证必须走 debug pod（chroot /host 或 --profile=sysadmin 挂 /host）。若 verify 只读阶段拒建 debug pod，用逻辑等价论证补：填充文件不存在（`ls /host/tmp/app-archive.log` 或宿主侧 stat）+ 使用率回基线 ⇒ 磁盘空间必然已释放
+   - **宿主 df 通道边界**：`df` 读的是宿主文件系统**非 host-global**（与 /proc/diskstats 不同）——`kubectl exec <任意 DaemonSet Pod> -- df -h` 看到的是容器 overlay，**不能**复用「exec 平台 DaemonSet Pod 免 debug pod」通道。宿主 df/du 取证必须走 debug pod（chroot /host 或 --profile=sysadmin 挂 /host）。若 verify 只读阶段拒建 debug pod，用逻辑等价论证补：填充文件已被 truncate 清空为 0 字节（`ls -l /host/tmp/app-archive.log` 显示 size=0，或宿主侧 stat）+ 使用率回基线 ⇒ 磁盘空间必然已释放（truncate -s 0 释放数据块但保留 inode，故判据是「0 字节」而非「文件不存在」）
 2. 确认应用 A/B 可正常写入数据
 3. 确认 `/var/log`、`/tmp` 目录大小恢复正常（需通过宿主机文件系统访问方式验证）
-4. **恢复期 Agent 侧禁止宿主 rm/systemctl**（mutation 与 host-escape 门禁）：timer 到期自动 rm 是设计内主恢复路径；Agent 侧只做只读核实。若 timer 落空（fire 后文件仍在），走守卫兼容四路径（逻辑等价证明 / 人工带外兜底），不得伪造证据形态绕过
-5. **DiskPressure/taint 翻回的 ~5min transition period**：timer fire 删除填充文件**即时生效**（df 使用率立即可见回落），但 DiskPressure=False 翻转与 taint 清除**非即时**——kubelet 压力状态翻转有过渡期（防抖动设计），常见形态为 fire 后约 5min 才翻回 False。恢复验证时窗内 taint 仍在 / DiskPressure 仍 True **不是恢复失败**：主恢复证据 = 填充文件不存在 + 使用率回基线；DiskPressure 翻回作为最终一致项（带外终验等 ~5min 或异步注明预期延迟，勿在翻回前反复轮询）
+4. **恢复期 Agent 侧禁止宿主 rm/systemctl**（mutation 与 host-escape 门禁）：timer 到期自动 `truncate -s 0` 清空是设计内主恢复路径；Agent 侧只做只读核实。若 timer 落空（fire 后文件仍在），走守卫兼容四路径（逻辑等价证明 / 人工带外兜底），不得伪造证据形态绕过
+5. **DiskPressure/taint 翻回的 ~5min transition period**：timer fire `truncate -s 0` 清空填充文件**即时生效**（df 使用率立即可见回落），但 DiskPressure=False 翻转与 taint 清除**非即时**——kubelet 压力状态翻转有过渡期（防抖动设计），常见形态为 fire 后约 5min 才翻回 False。恢复验证时窗内 taint 仍在 / DiskPressure 仍 True **不是恢复失败**：主恢复证据 = 填充文件 0 字节 + 使用率回基线；DiskPressure 翻回作为最终一致项（带外终验等 ~5min 或异步注明预期延迟，勿在翻回前反复轮询）
 6. **Evicted husks 分诊（与第 5 条同一过渡窗）**：DiskPressure=True 窗口内被 kubelet 准入拒绝的 Pod（含 DS 控制器的重建尝试）留下 Evicted 终态壳，分诊两问：
    - **谁拥有？** DaemonSet-owned Evicted husks（node-exporter / chaosblade-tool / drill-ds-target / NPD 等）**勿删**——DS 控制器在 DiskPressure 翻回后会自动重建健康副本，过渡窗内强删是徒劳 churn（替代 Pod 同样被准入拒绝、变成新 husk）；它们随 DiskPressure=False 自愈，属第 5 条过渡窗的滞后项而非未恢复残留。**ownerless Evicted husks**（无控制器、如 kubectl debug 留下的 node-debugger-*）**必须显式 delete**——无主 Pod 永不自愈，是终验残留（唯一合法的 K8s 层 mutation）
    - **判别法**：`kubectl get pods -A --field-selector spec.nodeName=<node>` 列名对 DS 名册（DS 名下 = 等；不在名册 = 删）。判别不清时看 AGE 是否随观察窗推进变 churn（churn = 控制器仍在尝试 = 等）
    - 预期成本收益：recover 免去常见 3-4 轮现场分诊推理（每轮 30-67s 反复推演「删还是等」）
 
-**基准事实**：
+## 基准事实
 - **根因**：容器日志或临时文件未清理，导致磁盘空间被占满
 - **必现现象**：节点磁盘使用率大于85%，`/var/log` 或 `/tmp` 目录占用空间大
 
@@ -101,21 +101,22 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-imag
 #    例：分区 100G、已用 50G、目标 85% → 100×0.85 − 50 = 35G
 
 # 2) 通过 kubectl debug node 在 /var/log 或 /tmp 目录填充数据。
-#    **先武装定时清理，再填充**：timer 由宿主机 systemd(PID 1) 管理，到期自动删除填充文件；
+#    **先武装定时清理，再填充**：timer 由宿主机 systemd(PID 1) 管理，到期自动 `truncate -s 0` 清空填充文件（释放数据块、留 0 字节空文件）；
 #    `&&` 串联保证武装失败时不会执行填充
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill rm -f /var/log/app-archive.log &&
+  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill truncate -s 0 /var/log/app-archive.log &&
    dd if=/dev/zero of=/var/log/app-archive.log bs=1M count=<算出的填充量换算的MB数>'
 # 或使用 fallocate（更快）：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill rm -f /tmp/app-archive.log &&
+  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill truncate -s 0 /tmp/app-archive.log &&
    fallocate -l <算出的填充量>G /tmp/app-archive.log'
 ```
 
-**引号形态红线（假武装风险，三形态边界）**：上述命令外层单引号内嵌**零嵌套引号、零 `;`、零 `$()`** 的简单载荷可以原样使用；一旦载荷复杂化（循环/算术/多语句 `;`），外层单引号内的**双引号 + `\$` 转义**是唯一经验证安全的形态（外层单引号包住 `sh -c "..."`，内层 `$(date +%s)`、`$e` 等变量写成 `\$(date +%s)`、`\$e` 传递给宿主 shell 展开），`'\''` 多层嵌套会被传输层打碎（dash exit 2），**零引号 `;` 被外层容器 sh 分割致假武装**（systemd-run 只收到首段瞬即退出，回执照常含 Running as unit 行但故障从未注入——比引号打碎更危险，静默无故障）。本 case 的填充+timer 复合载荷推荐拆两条命令分别传输（先武装 timer、后填充），每条保持零引号 `&&` 串联——比嵌套引号更稳。
+**引号形态红线（假武装风险，三形态边界）**：上述命令外层单引号内嵌**零嵌套引号、零 `;`、零 `$()`** 的简单载荷可以原样使用；一旦载荷复杂化（循环/算术/多语句 `;`），外层单引号内的**双引号 + `\$` 转义**是唯一经验证安全的形态（外层单引号包住 `sh -c "..."`，内层 `$(date +%s)`、`$e` 等变量写成 `\$(date +%s)`、`\$e` 传递给宿主 shell 展开），`'\''` 多层嵌套会被传输层打碎（dash exit 2），**零引号 `;` 被外层容器 sh 分割致假武装**（systemd-run 只收到首段瞬即退出，回执照常含 Running as unit 行但故障从未注入——比引号打碎更危险，静默无故障）。本 case 的填充+timer 复合载荷**必须写在同一条 `sh -c` 内**（`systemd-run --on-active=Ns --unit=U truncate -s 0 <path> && <fill> <path>`），**不可拆成「先武装 timer、后填充」两条命令**——one-shot `kubectl debug` 载体是 ephemeral、不登记为 carrier，守卫只能**逐条命令孤立判定自恢复**：拆开后武装命令无填充（判不出故障家族）、填充命令无同命令逆转（判不出有界恢复），两条都会被 host-escape 门禁拒（`__escape__`）。combined 单命令的简单载荷（零嵌套引号、零 `;`、零 `$()`）本身就是传输安全形态，无需为传输稳健而拆分（拆分反而被守卫拒）。
 
 **武装回执核验红线**：timer 武装回执须含 `Running as unit blade-restore-diskfill.timer`（或 service 名）且**无 `sh: N:` 报错行**；回执为空或含报错行时，须另发确认检查（`systemctl list-timers blade-restore-diskfill*` 经 debug pod）核验 timer 落位，勿直接进入填充步骤。
-恢复命令（timer 到期前可提前手动恢复——**Agent 在场时此命令会被 host-escape 门禁拦截 systemctl**，提前恢复走 LLM 只读核实 + timer 自然到期，或人工带外执行；人工带外时用）：
+恢复命令（timer 到期前可提前手动恢复——**Agent 经 one-shot debug 侧的任何裸回收都会被 host-escape 门禁拒**：裸 `systemctl`/`rm`/`truncate` 命令既无故障家族、one-shot debug 又不登记 carrier 账本（`armed_fill_paths` 只由 exec 通道填充），守卫认不出它是已武装填充的逆操作；提前恢复走 LLM 只读核实 + timer 自然到期，或人工带外执行。人工带外时用下方命令——人直接在自己 shell 跑、不经 Agent 守卫，rm 可彻底删文件）：
 ```bash
 # 提前恢复：删除填充文件（同时停掉已武装的 timer）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
@@ -130,7 +131,7 @@ kubectl delete pod <debug-pod-name> --force --grace-period=0
 - **填充量安全上界**：目标使用率 85% 是告警线而非饱和线——填充后分区剩余空间须 >10%（避触碰 DiskPressure 硬阈值）；增量计算若为负（已用 >85%）说明分区本已告警，先换节点或清理
 - 填充路径对应的分区取决于节点配置，需参考上方「CRD 模式路径→分区映射表」
 - 与 ChaosBlade `--percent` 不同，此方式需按**增量**手动计算填充字节数（填充量 = 分区总容量 × 目标使用率 − 当前已用量）；量太小达不到 85% 告警阈值，量太大把分区填满会触发非预期的 DiskPressure/驱逐
-- 自恢复基于 systemd-run transient timer 到期自动删除填充文件，补齐了 ChaosBlade `--timeout` 的自恢复能力；timer 载荷里的文件路径必须与填充路径逐字一致
+- 自恢复基于 systemd-run transient timer 到期自动 `truncate -s 0` 清空填充文件，补齐了 ChaosBlade `--timeout` 的自恢复能力；timer 载荷里的 truncate 目标路径必须与填充路径逐字一致（守卫按路径逐字匹配认逆操作——`_disk_inverse` 从 `dd of=<path>` / `fallocate -l <size> <path>` 提取填充路径，要求同命令内有 `truncate -s 0 <同路径>` / `fallocate -d <同路径>` 才判自恢复；路径不一致或用 `rm` 都判不出逆操作，整条注入被拒。`rm` 是宿主面刻意封禁词——对活跃日志文件 `truncate -s 0` 也更优：rm 一个被进程持有的 fd 要到 fd 关闭才释放空间，truncate 立即释放且保持 fd 有效）
 - 同名 transient timer 重复武装会报 `Unit blade-restore-diskfill.service was already loaded`（上次武装命令执行失败时 unit 以 failed 状态残留所致）；重武装前先按本文件注入命令的同等 chroot /host 通道形态清理残留：`systemctl stop blade-restore-diskfill.service; systemctl reset-failed blade-restore-diskfill.service`（武装命令成功执行过的 unit 无残留，可直接重武装）
 - **残留预检（ls 形态）回执判读**：planning 期冲突预检 `chroot /host ls -l /var/log/app-archive.log` 在**无残留**时回执是 error 通道——`one-shot debug command failed with exit_code=2` + stderr `ls: cannot access '/var/log/app-archive.log': No such file or directory`。**这恰恰是预检通过的预期形态**（文件不存在 = 无冲突 = 可武装）：ls 的非零 exit 是 POSIX 语义（目标不存在）而非注入/探测失败，勿当异常处理、勿重试、勿换探测通道——读 stderr 即得结论。同理适用于所有「确认不存在」类预检（timer unit 残留、旧填充文件等）；预检**有**残留时 exit 0 + 文件行输出，按上条清理流程处置。（改 ls 命令形态塞 `|| echo ABSENT` 走正常通道不可取——引入引号嵌套违反传输层红线，读回执才是零成本路径）
 - **timer 残留预检优先列表形态**：timer unit 存在性预检有比 `systemctl status <unit>`（无残留时 exit 4 error 通道）**更优的形态**——`systemctl list-units '<unit>'`：无残留时回执 exit 0 + `0 loaded units listed`，**自然落成功通道**（错误管线与 RUNTIME EVIDENCE reminder 根本不触发，连上一条的回执判读都免）；有残留时输出该 unit 行直读。此形态规划期可直接套用零浪费——「确认不存在」类预检凡有列表查询等价形态（systemd units / kubectl get）一律优先列表形态，把缺席结论留在 exit 0 里而不是靠非零 exit 语义判读。

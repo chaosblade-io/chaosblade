@@ -15,7 +15,8 @@ recovery_channel: apiserver-write
 
 **用例名称** 关键配置被篡改 导致 ConfigMap_内容错误
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 ConfigMap 配置值；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 ConfigMap 配置值；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -36,12 +37,12 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - 配置生效触发（Pod 重启或应用 reload——注入侧与恢复侧均需要，见注意事项「只 patch 不 rollout 故障不显形」）保留为 execute 计划普通步骤。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（rollout restart）保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. 应用滚动更新后读取到错误的配置值（环境变量或挂载文件内容异常）
 2. 依赖该配置的功能出错：日志级别失控、连接串指向错误地址、开关被误翻转等
 3. Pod 本身 Running 不崩溃——这是配置类故障与资源类故障的关键区别：故障藏在配置语义里，不在 Pod 状态上
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 的 Deployment/StatefulSet 正常运行
 2. 确认应用确实消费目标 ConfigMap（env from / volume mount）；若不消费，先完成接线并等待滚动完成：
    ```bash
@@ -70,7 +71,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl delete sa drill-rc-<hash> -n <namespace> --ignore-not-found
    ```
 
-**演练步骤**（主路径 = 基线捕获（步骤 1）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=ConfigMap、patches=data 键篡改、restorePatches=基线还原、duration_seconds=<duration>），CM 注入+武装+readback 工具内同步完成 → rollout restart 使新值生效（步骤 3 后半，execute 计划普通步骤，两条路径共用）；步骤 2-3 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+## 演练步骤
+（主路径 = 基线捕获（步骤 1）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=ConfigMap、patches=data 键篡改、restorePatches=基线还原、duration_seconds=<duration>），CM 注入+武装+readback 工具内同步完成 → rollout restart 使新值生效（步骤 3 后半，execute 计划普通步骤，两条路径共用）；步骤 2-3 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 
 > **爆炸半径分类（定案）**：`target-only`——被修改的既有资源仅靶 ConfigMap 自身（env 接线、载体四件套均为演练新建资产，不触及任何既有非靶资源；新建资产不构成"影响其他资源"，与既有节点 taint 的 cluster-wide 场景不同），勿纠结是否升格。
 
@@ -88,7 +90,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl rollout status <workload-kind>/<name> -n <namespace> --timeout=120s
    ```
 
-**注入验证**：
+## 注入验证
 1. 确认 ConfigMap 已被篡改：
    ```bash
    kubectl get cm <cm-name> -n <namespace> -o jsonpath={.data.<KEY>}
@@ -105,7 +107,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 2. 行为复查：Pod 内 `printenv <KEY>` 仍为错误值（env 在 Pod 启动时固化，存量 Pod 不会自行重载）
 3. 稳定性复查：目标 Pod RESTARTS 计数无增长（排除应用侧 crash 自愈路径；本故障为配置型，无调度类周期事件可查——白盒字段在位即故障在位，事件探针不适用）
 
-**注入恢复**（主路径下 CM 还原无需 Agent 执行动作——载体 TTL 自治还原 ConfigMap data（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。配置生效触发（rollout restart）为非 patch 域动作，走 execute 计划普通步骤在载体 fire 后执行。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下 CM 还原无需 Agent 执行动作——载体 TTL 自治还原 ConfigMap data（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。配置生效触发（rollout restart）为非 patch 域动作，走 execute 计划普通步骤在载体 fire 后执行。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动还原 ConfigMap 并触发滚动（两条 merge-patch curl：configmap data 还原基线值 + deployment restartedAt 注解触发第二次滚动）；演练提前结束时由 Agent 主动执行同一组恢复命令（幂等，定时器迟到再执行一次无副作用）：
    ```bash
    kubectl patch cm <cm-name> -n <namespace> --type merge -p '{"data":{"<KEY>":"<baseline-value>"}}'
@@ -114,7 +117,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
    恢复效果核实注意 restore.log 取证（`kubectl exec drill-rc-<hash> -n <namespace> -- cat /tmp/restore.log`——定时器 fire 的直接证据，两条 PATCH 响应回显）与状态转移证据（CM 回基线 + 新 Pod 加载基线值）互为补充。演练全清（载体四件套四连删除）按标准件第六节，首选 `blade-ai recover --task-id` 带外收尾
 
-**恢复验证**：
+## 恢复验证
 1. 确认 ConfigMap 键值已回到基线：
    ```bash
    kubectl get cm <cm-name> -n <namespace> -o jsonpath={.data.<KEY>}
@@ -125,11 +128,11 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
 3. 确认 workload READY = DESIRED，无重启风暴
 
-**基准事实**：
+## 基准事实
 - **根因**：ConfigMap 内容被错误修改（人为误操作/流水线错误），应用滚动后加载了错误配置
 - **必现现象**：ConfigMap data 与基线不一致；新 Pod 内生效配置为错误值；Pod 状态本身正常
 
-**注意事项**：
+## 注意事项
 - chaosblade 无 ConfigMap/配置类故障靶点，本用例为 kubectl-native 专属注入
 - env 形式的 ConfigMap 消费只在 Pod 启动时解析：只 patch ConfigMap 不 rollout，故障不会显形；同理恢复也必须 patch + rollout 两步，缺一不可
 - volume mount 形式的 ConfigMap 消费会被 kubelet 自动同步（分钟级延迟），但多数应用不会热加载挂载文件，是否触发故障取决于应用自身；演练前确认消费形式决定验证方式

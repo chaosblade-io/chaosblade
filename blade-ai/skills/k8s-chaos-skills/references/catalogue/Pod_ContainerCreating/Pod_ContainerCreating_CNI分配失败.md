@@ -13,12 +13,12 @@ mechanism_writes:
 
 **用例名称** CNI分配失败 导致 Pod_ContainerCreating
 
-**故障现象**：
+## 故障现象
 1. Pod 长时间停留在 ContainerCreating 状态
 2. Pod Events 中显示 `failed to allocate for ENI` 或 `no available IP in subnet` 或 CNI 相关错误
 3. 节点上的 IP 资源池耗尽或 ENI 数量达到上限
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认集群使用 ENI 或 vSwitch 分配 Pod IP 的 CNI 插件（如 Terway）
 3. **余量核查（必做，命中则改道或停）**：对比目标节点 `status.allocatable.pods`（pod 容量 C）与
@@ -66,7 +66,7 @@ mechanism_writes:
    带内 kubectl 工具复刻脚本序列（create deployment → patch 绑 nodeName+replicas 两步），
    载具登记行缺失的补偿 = 恢复动作显式编入意图（timer 载体兜底 + recover 主动删）
 
-**演练步骤**：
+## 演练步骤
 1. 查看目标节点的 ENI 和 IP 分配情况，确认目标应用 Pod 所在节点（记为 `<目标节点>`）
 2. **先武装定时恢复，再注入**（恢复命令幂等：定时器到期自动删除耗尽 Deployment、还原
    nodeSelector、移除节点标签；Agent 在演练结束时主动执行同一条命令兜底，定时器迟到重复执行无副作用。定时器 shell 逻辑必须作为 `kubectl exec` 载体载荷派发——直接以
@@ -115,7 +115,7 @@ mechanism_writes:
 5. 删除应用 A 在目标节点上的 Pod，触发重建。调度器路径下新 Pod 只能调度到已耗尽的目标节点，将进入 ContainerCreating 状态；**直绑形态下应用 A 的 Deployment template 须带 nodeName**（重建 Pod 直达 kubelet 撞 CNI 失败——否则走调度器撞 pods fit 呈 Pending/OutOfpods，非目标判据形态。前提 H ≤ C − P − 1 已满足，否则重建 Pod 因自删腾位 admit 通过而正常运行，故障形态不出现——见资源准备 3）
 6. 观察新 Pod 的 ContainerCreating 状态
 
-**注入验证**：
+## 注入验证
 1. 执行 `kubectl get pods`，确认应用 A 新 Pod 状态为 ContainerCreating
 2. 执行 `kubectl describe pod <pod-name>`，确认 Events 显示 CNI/IP 分配失败相关错误
 3. 查看节点 ENI/IP 使用情况，确认资源已耗尽
@@ -123,7 +123,7 @@ mechanism_writes:
    的是 pod 容量而非 IP 池（见资源准备第 3 条余量核查），本用例判据不可达，转入恢复并上报
    形态退化，禁止继续加压
 
-**注入恢复**：
+## 注入恢复
 1. 等待 `<duration>` 到期后武装的定时器自动删除耗尽 Deployment、还原 nodeSelector、移除节点标签；如需提前恢复，Agent 直接执行下列第 2–4 步恢复命令（幂等，定时器迟到再执行一次无副作用；载体 Pod 为多副本时无法可靠终止容器内的定时器进程，不依赖 pidfile）
 2. 删除批量创建的 Deployment：`kubectl delete deployment chaos-ip-exhaust -n <namespace>`（该 Deployment 已由脚本登记行注册为演练载具，此删除会被守卫豁免）
 3. 移除应用 A 的 Deployment 上添加的 nodeSelector（还原为原始值，若原本无 nodeSelector 则移除整个 nodeSelector）：
@@ -134,11 +134,11 @@ mechanism_writes:
 4. 移除目标节点上添加的标签：`kubectl label node <目标节点> net.ops/ipam-audit-`
 5. 等待 IP/ENI 资源释放和 Pod 滚动更新完成
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods`，确认应用 A 的 Pod 状态恢复为 Running
 2. 确认节点 IP/ENI 资源恢复可用
 3. 确认应用 A 网络连通正常
 
-**基准事实**：
+## 基准事实
 - **根因**：节点可用 IP 池耗尽或 ENI 数量达到上限或 vSwitch IP 不足，CNI 插件无法为新 Pod 分配网络资源
 - **必现现象**：Pod ContainerCreating；Events 显示 CNI/IP/ENI 分配失败；节点网络资源耗尽

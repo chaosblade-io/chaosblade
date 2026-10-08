@@ -1,17 +1,18 @@
 **用例名称** 后端不可达 导致 Service_负载均衡异常
 
-**故障定位**：持续型故障——故障窗口内后端 Pod 网络持续中断，Service 负载均衡
+## 故障定位
+持续型故障——故障窗口内后端 Pod 网络持续中断，Service 负载均衡
 持续无法转发请求。**本用例不提供一次性注入**：单次杀进程/单次删 Pod 随 kubelet/
 控制器重建一次即自愈（15-90s），不构成有效演练窗口；一次性 kill/delete 形态已被
 废除（上游取证：ChaosBlade kill 类 action 仅在实验创建时发送一次信号）。
 `duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. Service 的 Endpoints 列表为空或部分后端不可用
 2. 请求到 Service 出现 5xx 错误或连接超时
 3. Ingress 后端健康检查失败
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，对外暴露 Service 和 Ingress
 2. 确认监控系统可观测 Service 请求指标和 Endpoints 状态
 3. 确认 `duration_seconds`（故障窗口）已明确
@@ -23,7 +24,7 @@
    类型时，本用例的网络形态判据不可达，改走 Pod_进程被杀死 用例（节点侧持续停容器
    循环）制造后端重启风暴，如实报告并请用户确认
 
-**演练步骤**：
+## 演练步骤
 1. 定位应用 A 的 Service 和后端 Pod
 2. 注入 —— `pod-network drop` 断开 Pod 网络（**唯一形态**：tc/netem 规则是状态型
    故障，规则本身贯穿整个故障窗口，`--timeout` 到期 destroy 即恢复）：
@@ -40,7 +41,7 @@
    - 记录返回的 experiment_uid，用于恢复
 3. 观察 Service 访问与 Endpoints 变化
 
-**注入验证**：
+## 注入验证
 1. 执行 `kubectl get endpoints <service-name>`，确认部分后端被移除或全不可用
    （exec 型 Probe 的 Pod 不会被移除，见资源准备第 4 条的判据约束）
 2. 向 Service 发送请求，确认出现 5xx 错误或连接超时
@@ -49,16 +50,16 @@
 5. **持续性检查（必做）**——网络 drop 是状态型故障，tc 规则存活即故障存活。本步证明的是持续性，不是效果存在——效果已由第 1-4 步证明；对持续性命题，机制状态就是直接证据：
    **白盒主证（即时，单独充分）**：实验仍在（未 destroy 且未到 `--timeout`）——机制存活即"持续 drop"由构造成立，本步即完成，无需佐证窗口；**有界佐证（仅当实验状态不可查时的回退）**：静观短窗口后向 Service 发请求仍超时/5xx。若窗口内提前恢复，说明故障窗口契约未达成，必须如实报告实际持续时长
 
-**注入恢复**：
+## 注入恢复
 1. 等待 `--timeout` 到期实验自动销毁（主保险）
 2. 提前恢复：销毁 chaosblade 实验 `blade destroy <experiment_uid>`
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get endpoints <service-name>`，确认所有后端恢复可用
 2. 向 Service 发送请求，确认恢复正常
 3. （仅当服务经 Ingress 暴露时）查看 Ingress 状态，确认后端健康检查通过
 
-**基准事实**：
+## 基准事实
 - **根因**：Service 后端 Pod 网络在窗口内持续中断，负载均衡无法将请求转发到健康的后端，服务可用性下降
 - **必现现象**：请求出现 5xx 或超时贯穿窗口；httpGet/tcpSocket Probe 的后端从 Endpoints 移除；窗口结束 destroy 后恢复
 
@@ -81,7 +82,7 @@
 #         先武装定时 -D 再 -A，到期自动恢复。两条命令分两次独立执行——不能用 && 串联：
 #         第二段 kubectl 会沦为第一条 exec 载荷（sh -c）的死参数，注入静默丢失
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  '( sleep <duration>; iptables -D OUTPUT -j DROP ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; iptables -D OUTPUT -j DROP ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -j DROP
 # 方式B'：容器内无 iptables 时，用临时容器 + tc。
 #    临时容器与目标容器共享同一个网络命名空间，工具来自调试镜像，
@@ -95,20 +96,26 @@ kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.hostNetwork}'
 # 期望输出为空或 false；输出 true 则停止。
 
 kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
-  --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
+  --target=<container-name> --profile=netadmin --quiet -- sleep <recovery-seconds>
 
 # 取载体名，等它进入 running
 kubectl get pod <pod-name> -n <namespace> \
   -o jsonpath='{range .status.ephemeralContainerStatuses[*]}{.name}{"="}{.state}{"\n"}{end}'
 
 # 经载体注入：载体与目标容器共享网络命名空间，操作 eth0 即操作目标 Pod 的网卡。
-# 同样先武装定时自删（在载体内后台运行；载体保活 sleep 必须 ≥ <duration>）。
+# 同样先武装定时自删（在载体内后台运行；载体保活 sleep 必须 ≥ <recovery-seconds>）。
 # 两条命令分两次独立执行——不能用 && 串联（第二段会沦为第一条 exec 载荷的死参数）
 kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- sh -c \
-  '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev eth0 root netem loss 100%
 ```
 方式B/B' 倒计时均从武装时刻起算：武装与注入两条命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先停旧定时器再全额重武装：`kubectl exec <pod-name> -n <namespace> [-c <debugger-name>] -- sh -c 'pkill -f "iptables -[D]|qdisc de[l]"; true'`（exec 目标必须与武装时同一容器）；精简镜像无 pkill 时旧定时器无法停止，到期会提前恢复侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——方式B/B' 的 sleep 定时器以它
+武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；方式B' 载体保活 sleep
+同须 ≥ 它（保活承载定时器，随定时器升窗）；手段1 的 `--timeout` 由引擎在派发前
+按同一单源钉定，文档占位符保持 `<duration>` 不动
 
 恢复命令：
 ```bash

@@ -17,7 +17,8 @@ recovery_channel: apiserver-write
 
 **用例名称** CoreDNS异常 导致 Pod_网络故障
 
-**故障定位**：持续型故障——CoreDNS Deployment 副本数缩零是状态型故障，
+## 故障定位
+持续型故障——CoreDNS Deployment 副本数缩零是状态型故障，
 副本为零即集群 DNS 服务中断，贯穿整个故障窗口；窗口到期定时器恢复副本数即自动恢复。
 本用例为**单手段用例（kubectl-native）**：ChaosBlade 无 deployment 缩容的等价
 action——`pod-process kill` 杀掉 CoreDNS 进程后 Deployment 控制器秒级重建，
@@ -25,7 +26,8 @@ action——`pod-process kill` 杀掉 CoreDNS 进程后 Deployment 控制器秒�
 CoreDNS 是**集群级依赖**（缩零期间全集群 DNS 解析瘫痪），窗口应取小值（如 120 秒）。
 ⚠️ **通道依赖死锁（硬性前置）**：若控制通道本身依赖集群 DNS（如有的执行链路在命令执行前就要解析外部域名上传工件，解析走的正是集群 DNS），CoreDNS 缩零后**一切经该通道的命令——包括定时器武装与所有恢复命令——都不可达**，形成拓扑死锁。因此：定时器必须在注入前武装完毕，**且**必须存在不依赖集群 DNS 的带外恢复手段（直连 kubeconfig/控制台手动）；无带外手段时不得注入本用例。
 
-**恢复动作配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数。**装配器主路径对本 case 结构性死锁**——装配器载体 TTL 恢复载荷经 `https://kubernetes.default.svc` 域名直连 apiserver，Pod 内该域名解析走 kube-dns service → CoreDNS，正是本故障摧毁的链路：注入前时段验权 GET/武装/注入全部可达且成功（装配器如实报告 success），窗口到期载体内恢复 curl 必解析失败——**表面自治、实际死锁**，比 fail-closed 拒绝更隐蔽。本配方不经装配器，作为正文降级 SOP（先武装后注入硬序）与 Agent 主动兜底/恢复验证的权威动作清单：
+## 恢复动作配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数。**装配器主路径对本 case 结构性死锁**——装配器载体 TTL 恢复载荷经 `https://kubernetes.default.svc` 域名直连 apiserver，Pod 内该域名解析走 kube-dns service → CoreDNS，正是本故障摧毁的链路：注入前时段验权 GET/武装/注入全部可达且成功（装配器如实报告 success），窗口到期载体内恢复 curl 必解析失败——**表面自治、实际死锁**，比 fail-closed 拒绝更隐蔽。本配方不经装配器，作为正文降级 SOP（先武装后注入硬序）与 Agent 主动兜底/恢复验证的权威动作清单：
 
 ```yaml
 targetRef:                                # 靶（kube-system 基础设施对象）
@@ -47,13 +49,13 @@ durationSeconds: <duration>               # 演练窗口（正文定时器 sleep
 - 目标是 kube-system 基础设施对象：targetRef.namespace 写 kube-system；降级 SOP 定时器宿主复用集群既有工具 Pod（不新建 k8s 对象），宿主探测见资源准备第 4/5 条。
 - 恢复由正文定时器承载（`kubectl scale` 幂等）：定时器到期自动恢复为主，演练提前结束时 Agent 主动执行同一条恢复命令兜底，Agent 死亡后 `blade-ai recover` 从任务台账重放（恢复命令幂等）——不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Pod 内 DNS 解析失败，应用报 `Name or service not known` 或 `NXDOMAIN` 错误
 2. CoreDNS Pod 全部消失（副本数为 0）
 3. 集群内服务间调用因 DNS 解析失败而中断
 4. 不受影响的：kubelet/API server 通信（走 IP 不依赖 DNS）、已建立的连接与已缓存的解析结果
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，且依赖集群 DNS 进行服务发现（验证探针用；其 Pod 名记为 `<app-pod>`）
 2. 确认 CoreDNS Deployment 正常运行，记录其名称（不同发行版叫 `coredns` 或 `kube-dns`）与副本数
 3. 获取 CoreDNS Pod 选择器标签：
@@ -81,7 +83,8 @@ durationSeconds: <duration>               # 演练窗口（正文定时器 sleep
    返回 no 则定时器方案不可用——按资源准备第 4 条不得注入，任务如实失败收尾；故障已落地则靠带外 `blade-ai recover --task-id` 或控制台手动 scale（仅限控制通道不依赖集群 DNS 的环境）
 6. ⚠️ **带外恢复手段确认（无则不得注入）**：确认存在一条不依赖集群 DNS 的恢复路径——如直连集群的 kubeconfig（`kubectl scale` 走 API server IP，不依赖集群 DNS）或控制台手动改副本数。控制通道若依赖集群 DNS（如任务封装需在命令执行前解析外部域名），故障一旦落地，经该通道的任何恢复命令（含定时器武装、盲发重放）都会在执行前失败——无带外手段时本用例**禁止注入**。反之，若控制通道是直连 kubeconfig（不经依赖集群 DNS 的任务封装），本条件天然满足：集群内定时器的 kubectl 走 in-cluster 配置的 IP 字面量（KUBERNETES_SERVICE_HOST），带外恢复走本机 resolver，两者均不经集群 DNS，故障期间照常可达，定时器+带外恢复双通道有效
 
-**演练步骤**（本 case 无装配器主路径——装配器载体 TTL 恢复对本 case 结构性死锁（见恢复动作配方标题），正文降级 SOP 即主路径；时序硬律不变：步骤 1 基线捕获（restorePatches 基线值来源）→ 资源准备第 4/5 条载体探测与 RBAC 前置 + 第 6 条带外恢复确认 → 步骤 2 先武装定时器、再缩零注入，武装与注入紧邻下发）：
+## 演练步骤
+（本 case 无装配器主路径——装配器载体 TTL 恢复对本 case 结构性死锁（见恢复动作配方标题），正文降级 SOP 即主路径；时序硬律不变：步骤 1 基线捕获（restorePatches 基线值来源）→ 资源准备第 4/5 条载体探测与 RBAC 前置 + 第 6 条带外恢复确认 → 步骤 2 先武装定时器、再缩零注入，武装与注入紧邻下发）：
 1. 记录注入前基线：
    ```bash
    kubectl get deployment <coredns-deployment> -n kube-system -o jsonpath='{.spec.replicas}'
@@ -100,7 +103,7 @@ durationSeconds: <duration>               # 演练窗口（正文定时器 sleep
    原子操作，要么整体生效要么整体报错——报错时直接执行恢复命令（幂等）还原副本数后
    replan，不存在需要窗口中段重武装的中间态
 
-**注入验证**：
+## 注入验证
 1. 白盒确认副本已缩零（机制主证）：
    ```bash
    kubectl get deployment <coredns-deployment> -n kube-system -o jsonpath='{.spec.replicas},{.status.replicas}'
@@ -127,7 +130,8 @@ durationSeconds: <duration>               # 演练窗口（正文定时器 sleep
    的 replicas 与事件后如实报告
 2. 窗口中段在应用 Pod 内复查一次 DNS 解析仍失败（同注入验证第 2 条形态）
 
-**注入恢复**（自治承载 = 正文工具 Pod 定时器——kubectl in-cluster 走 KUBERNETES_SERVICE_HOST IP 字面量，不经集群 DNS，CoreDNS 全瘫期间照常可达；Agent 在线兜底 = 主动执行同一条 scale 命令（幂等）；Agent 死亡 = 带外 `blade-ai recover` / 控制台手动。⚠️ 装配器载体 TTL 形态对本 case 死锁（域名解析依赖被本故障摧毁的集群 DNS），严禁以装配器承载本 case 恢复）：
+## 注入恢复
+（自治承载 = 正文工具 Pod 定时器——kubectl in-cluster 走 KUBERNETES_SERVICE_HOST IP 字面量，不经集群 DNS，CoreDNS 全瘫期间照常可达；Agent 在线兜底 = 主动执行同一条 scale 命令（幂等）；Agent 死亡 = 带外 `blade-ai recover` / 控制台手动。⚠️ 装配器载体 TTL 形态对本 case 死锁（域名解析依赖被本故障摧毁的集群 DNS），严禁以装配器承载本 case 恢复）：
 1. 等待 `<duration>` 到期，定时器自动将副本数恢复为基线；演练提前结束时由 Agent 主动执行
    同一条恢复命令（幂等，定时器迟到再执行一次无副作用）：
    ```bash
@@ -135,7 +139,7 @@ durationSeconds: <duration>               # 演练窗口（正文定时器 sleep
    ```
 2. 等待 CoreDNS Pod 启动并就绪（新建副本数与基线一致且全部 Ready）
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods -n kube-system -l <coredns-label>`（使用演练步骤 1 中获取的实际标签），确认 CoreDNS Pod 全部 Running 且 Ready，副本数回到基线
 2. 在应用 A 的 Pod 内重新执行 DNS 解析，确认恢复正常（CoreDNS 刚拉起时 kubernetes 插件
    同步 Service 记录需数秒到数十秒，Ready 后立即查询可能仍空应答，稍候重试；部分发行版多副本
@@ -145,7 +149,7 @@ durationSeconds: <duration>               # 演练窗口（正文定时器 sleep
    ```
 3. 确认应用 A 的服务间调用恢复（可观察项）
 
-**基准事实**：
+## 基准事实
 - **根因**：CoreDNS Pod 全部不可用（副本缩零），导致集群内 DNS 解析服务中断，依赖 DNS 的服务发现和调用全部失败
 - **必现现象**：Pod 内 DNS 解析超时或返回 NXDOMAIN/空应答；CoreDNS Pod 不可用；新发起的依赖 DNS 的调用失败
 - **不误报现象**：存量已建立连接与已缓存解析不受影响；kubelet/API server 心跳正常（走 IP）

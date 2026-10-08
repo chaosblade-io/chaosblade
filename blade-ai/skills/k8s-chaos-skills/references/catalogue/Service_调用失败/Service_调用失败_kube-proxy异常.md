@@ -1,42 +1,79 @@
+---
+# 机制写入集立法（write-set approval contract）：
+# 本用例受害者是应用 Pod（Service 调用方），但故障机制必须写两个受害者域外对象：
+#   ① 目标节点（cluster-scoped）——方式A 用标签把该节点排除出 kube-proxy 调度。
+#      节点名由调度运行时决定，可移植 case 无法硬编码（换集群即失效），故用派生
+#      选择器 name_from: victim_node：意图定案时由 discover_victim_nodes 解析真实
+#      节点名、materialize_derived_entries 物化进本条目，冻结后节点审批与 drift
+#      守卫据此放行；派生失败（受害 Pod 未调度/不存在）则丢弃条目、node 写被拒
+#      （fail closed）。
+#   ② kube-proxy DaemonSet（跨命名空间写）——方式A 的另一半机制写入。用
+#      name_prefix: kube-proxy 而非 names：不同发行形态下 DS 实名不同（如
+#      kube-proxy / kube-proxy-worker），托管形态（OpenKruise）为同 CR 名、不同
+#      API group，前缀形态对三者皆覆盖（实名以当次探测为准）。
+# 两处均超出 pod 受害靶的 scope 与 secondary_scopes（node 为 cluster-scoped、
+# kube-system 为跨命名空间），drift 守卫对该写判 scope/namespace drift 直接拒绝——
+# 缺本条声明时注入到不了 execute 阶段的 armed 门。LLM 无权扩写。
+mechanism_writes:
+  - scope: node
+    name_from: victim_node
+  - scope: daemonset
+    namespace: kube-system
+    name_prefix: kube-proxy
+---
+
 **用例名称** kube-proxy异常 导致 Service_调用失败
 
-**故障现象**：
-1. 通过 ClusterIP/NodePort 访问 Service 失败，连接超时
+## 故障现象
+1. 通过 ClusterIP/NodePort 访问 Service 失败，连接超时（**条件性现象**：须规则指向已失效
+   后端，见下方「注入验证」步骤 3；后端存活时存量内核态规则继续转发，不能以「未超时」
+   否定注入生效）
 2. 节点上 iptables/ipvs 规则未更新或被清空
 3. kube-proxy Pod 异常，无法维护 Service 转发规则
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，对外暴露 Service
 2. 确认 kube-proxy DaemonSet 正常运行
 3. 确认监控系统可观测 Service 请求指标
 
-**演练步骤**：
+## 演练步骤
 1. 记录 kube-proxy DaemonSet 当前状态
-2. 选择目标节点，删除该节点上的 kube-proxy Pod 并临时阻止重建（通过 cordon 节点或修改 DaemonSet nodeSelector）：
+2. 选择目标节点，令该节点的 kube-proxy 停止维护转发规则并临时阻止其重建（方式A 按下方命令把该节点排除出 kube-proxy 调度，Pod 由 DaemonSet 控制器回收；方式B 直接挂起 kube-proxy 进程）：
    ```bash
    # 方式A：给目标节点添加标签排除 kube-proxy 调度
    kubectl label node <目标节点> net.ops/proxy-degraded=true
    kubectl patch ds kube-proxy -n kube-system \
      -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"net.ops/proxy-degraded","operator":"DoesNotExist"}]}]}}}}}}}'
+   # 注入前必须探测 template patch 是否真能收走 Pod：patch 只改期望模板，目标节点上的 Pod
+   # 是否被回收取决于 DaemonSet 的 updateStrategy——OnDelete 形态下模板变更不触发已运行
+   # Pod 的替换，须先确认该形态下的回收语义，必要时补一步删除目标节点上的 kube-proxy Pod
+   # （写 kube-system 的 Pod 属跨命名空间写，须在机制写入集中声明后才投递得动）：
+   kubectl get ds kube-proxy -n kube-system -o jsonpath='{.spec.updateStrategy.type}{"\n"}'
    ```
    ChaosBlade `node-process kill` 不提供：经上游源码取证（chaosblade-exec-os
    `exec/process/process_kill.go`）它仅在实验创建时发送**一次**信号，`--timeout` 只
    销毁实验记录，kube-proxy 被 systemd/kubelet 拉起后故障即消失——一次性形态没有
    演练价值。持续形态用上方方式A（状态持续整个窗口）或下方方式B（STOP 状态持续，
-   受 liveness 阈值约束）
+   受容器 liveness probe 约束——无探针形态不受此限，以当次探测为准）
 3. 在目标节点上的 Pod 内通过 ClusterIP 访问 Service
 4. 观察 Service 访问结果
 
-**注入验证**：
+## 注入验证
 1. 确认目标节点上 kube-proxy 进程不存在或 Pod 处于异常状态
-2. 检查节点 iptables/ipvs 规则（ipvs 模式用 `ipvsadm -Ln`），确认 Service 相关转发规则缺失或
-   过期——kube-proxy 挂起/被杀时**存量内核态规则不清除**，规则停滞的分离判据是 apiserver
-   Endpoints 已更新而节点规则仍指向旧后端 IP（复现）
+2. 检查节点 iptables/ipvs 规则——**判据住址在宿主网络命名空间**（内核规则表与 ipvs 装置属
+   宿主 netns，在 Pod netns 内查询恒为阴性、不构成有效判据），须经 `kubectl debug` 两步法
+   读宿主视角：先建**长驻 debug 载体**（`kubectl debug node/<node> --profile=sysadmin
+   --image=<verified-cluster-image> -- sleep 3600`），再在该载体内 exec 宿主视角探针——
+   只读面必须用 `nsenter -t 1 -m -- <命令>` 形态，**禁 `chroot`**（宿主逃逸原语，只读探针
+   阶段被守卫拒）与 `$(…)` 命令替换（同样被拒）；勿用 one-shot `kubectl debug node` 直查
+   （部分通道对 one-shot 输出不回流，静默失败会被误读为规则不存在）。ipvs 模式用
+   `ipvsadm -Ln`：确认 Service 相关转发规则缺失或过期——kube-proxy 挂起/被杀时**存量内核
+   态规则不清除**，规则停滞的分离判据是 apiserver Endpoints 已更新而节点规则仍指向旧后端 IP
 3. 在目标节点的 Pod 内访问 Service ClusterIP：规则过期指向**已死后端**时连接超时
    （`download timed out`）；存量后端仍存活时访问可能仍通（内核态规则继续转发），不能以
    「未超时」否定注入生效
 
-**注入恢复**：
+## 注入恢复
 1. 方式A：移除节点标签并按注入前取证的基线还原 affinity（定时器到期自动执行，或提前主动执行；若原 DaemonSet 本就有 affinity，
    须用注入前记录的原值还原，而非直接 remove）：
    ```bash
@@ -47,16 +84,19 @@
 2. 方式B：按下方手段2 方式B 的恢复命令停 timer 并 SIGCONT
 3. 等待 kube-proxy Pod 在目标节点重建
 
-**恢复验证**：
+## 恢复验证
 1. 确认目标节点上 kube-proxy Pod 恢复 Running 且 Ready
 2. 在目标节点的 Pod 内重新访问 Service，确认恢复正常
-3. 检查 iptables/ipvs 规则已重新同步
+3. 检查 iptables/ipvs 规则已重新同步（判据住址同注入验证步骤 2：宿主 netns 视角，长驻 debug 载体 + `nsenter -t 1 -m --` 只读探针）
 
-**基准事实**：
+## 基准事实
 - **根因**：kube-proxy Pod 异常或进程被杀，无法维护节点上的 iptables/ipvs 转发规则，导致 Service ClusterIP 流量无法被正确转发
 - **必现现象**：kube-proxy 不可用；节点 iptables/ipvs 规则停滞（不随 Endpoints 更新，存量
-  内核态规则不清除）；Service ClusterIP 访问超时——须规则过期指向已死后端（后端存活时
-  存量规则仍转发，访问可维持）
+  内核态规则不清除）
+- **条件性现象**：Service ClusterIP 访问超时——须规则过期指向已死后端（后端存活时
+  存量规则仍转发，访问可维持）。该现象需要「后端更替」这一额外条件（如演练期间删除或
+  迁移后端 Pod），**本演练步骤不制造该条件**，故通常不出现、不构成验证判据；验证判据取
+  上述两项必现现象
 
 ---
 
@@ -84,6 +124,7 @@ kubectl patch ds kube-proxy -n kube-system \
   -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"net.ops/proxy-degraded","operator":"DoesNotExist"}]}]}}}}}}}'
 # 方式B：通过 kubectl debug node 挂起 kube-proxy 进程。
 # 先武装定时 CONT（timer 由宿主机 systemd(PID 1) 管理），再 STOP；`&&` 串联保证武装失败不冻结
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
   'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-proxy sh -c "kill -CONT \$(pidof kube-proxy)" && kill -STOP $(pidof kube-proxy)'
 ```
@@ -96,30 +137,51 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-imag
 kubectl label node <目标节点> net.ops/proxy-degraded-
 kubectl patch ds kube-proxy -n kube-system --type=json \
   -p='[{"op":"remove","path":"/spec/template/spec/affinity"}]'
-# 方式B：停掉 timer，恢复 kube-proxy 进程
-kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'systemctl stop blade-restore-proxy.timer 2>/dev/null; kill -CONT $(pidof kube-proxy)'
+# 基线非空时**不要用上面的 remove**（会删丢原有 affinity），改用 replace 原值——
+# <baseline-affinity-json> 为注入前 `kubectl get ds <ds> -n kube-system -o
+# jsonpath='{.spec.template.spec.affinity}'` 的原始输出；nodeSelectorTerms 是原子替换
+# 列表，原有排除项须整体保留在载荷内：
+# kubectl patch ds <ds> -n kube-system --type=json -p='[{"op":"replace",
+#   "path":"/spec/template/spec/affinity","value":<baseline-affinity-json>}]'
+# 方式B：恢复 kube-proxy 进程。**无需停 timer**——`systemctl` 是宿主命令守卫的 host-escape
+#        禁词，计划扫描（plan 扫描）与执行门双层拒，携带即被拒；transient unit 到期 fire 后
+#        自毁，残留与否用只读探针核验（长驻 debug 载体内 `nsenter -t 1 -m -- ls /run/systemd/transient/`，
+#        无 `blade-restore-proxy*` 即净）。宿主写走已批准载体的 exec 通道：
+kubectl exec <载体Pod> -n <载体命名空间> -- chroot /host sh -c \
+  'kill -CONT $(pidof kube-proxy)'
 ```
 
 注意事项：
-- 方式A 效果更彻底（kube-proxy Pod 被完全移除），但修改了 DaemonSet 配置，需注意恢复
+- 方式A 效果更彻底（目标节点上的 kube-proxy Pod 被移除，是否自完成取决于 updateStrategy，
+  见下条），但修改了 DaemonSet 配置，需注意恢复
 - **方式A 的 `patch ds` 仅适用于原生 apps/v1 DaemonSet 管理的 kube-proxy**：部分云托管/自研
   集群的 kube-proxy 由 OpenKruise DaemonSet 管理（Pod ownerReferences 为
   `apps.kruise.io/v1alpha1 DaemonSet`），`kubectl patch ds kube-proxy` 直接 NotFound——须改用
-  `kubectl patch daemonsets.apps.kruise.io kube-proxy -n kube-system ...` 同款载荷（该集群
-  确证：kruise DS 基线 affinity 非空且含多条业务排除约束，恢复必须走 replace 原值分支；
-  修改管控面 DS 会引发全集群 kube-proxy 滚动，注入前评估爆炸半径）
-- **方式B 更轻量，但 kube-proxy 带 liveness probe 时注入窗口有硬上限**（确证，典型配置
+  `kubectl patch daemonsets.apps.kruise.io kube-proxy -n kube-system ...` 同款载荷。
+  **基线 affinity 常非空**（例：排除 `type=virtual-kubelet` 的节点，或附带业务排除约束），
+  恢复须按基线分支走 replace 原值而非 remove（以当次探测为准）；
+  修改管控面 DS 会引发全集群 kube-proxy 滚动，注入前评估爆炸半径
+- **方式B 更轻量，但注入窗口上限取决于容器是否带 liveness probe——注入前必须探测**：
+  `kubectl get ds <ds> -n kube-system -o jsonpath='{.spec.template.spec.containers[*]
+  .livenessProbe}'`，为空即无探针。
+  **带 liveness probe 时窗口有硬上限**（典型配置如
   failureThreshold=5 × periodSeconds=10s + terminationGracePeriodSeconds=30s）：STOP 后
   ~50s liveness 判死发 SIGTERM（STOP 进程对捕获型信号 pending 不退出）→ +30s grace 期满
   SIGKILL → kubelet 重建容器自愈——**挂起最长持续 ≈ 80s**，超出后故障被 kubelet 自动消除。
-  timer 建议设在 liveness 阈值内（如 30s）以获得同 PID 干净恢复（restartCount 不变）；
+  timer 建议设在 liveness 阈值内（如 30s）以获得同 PID 干净恢复（restartCount 与注入前取证值一致）；
   timer 超过阈值时 kubelet 先行重启，到期 CONT 作用于新 PID、幂等无害（兜底语义）
-- **手动 CONT 存在时序分叉**：SIGTERM 已 pending 后（约 STOP 后 50–80s 窗口）执行 CONT 会
+  - **无 liveness probe 时无此上限**（部分托管形态的 kube-proxy 容器不声明任何探针）：
+    kubelet 无检测机制，SIGSTOP 可稳定持续整个窗口。代价是**故障在 K8s API 层不可见**——
+    Pod 仍显示 Running/Ready、restartCount 不变，控制面无从发现；此时白盒判据必须走宿主
+    视角（判据住址与取法同「注入验证」步骤 2，读 `/proc/<pid>/status` 的 State），行为判据
+    可用 kube-proxy 自身的健康端口 `<node-ip>:10256/healthz`（在受害 Pod 内即可访问，无需
+    宿主视角）：SIGSTOP 后内核仍接受 TCP 连接但无 HTTP 响应，`curl --max-time` 以 exit 28
+    超时（注意 `:10249` metrics 端口常仅绑 localhost，在 Pod 内不可达、不构成判据）
+- **手动 CONT 存在时序分叉**（仅带 liveness probe 时成立）：SIGTERM 已 pending 后（约 STOP 后 50–80s 窗口）执行 CONT 会
   唤醒进程并立即处理积压 SIGTERM → graceful 退出（exitCode 143）→ 经容器重启完成恢复；
   liveness 失败前（约 50s 内）CONT 才是原进程直接恢复。最终态均为恢复，仅路径不同
 - 自恢复机制：方式B 依赖宿主机 systemd-run transient timer（到期自动 SIGCONT）；
   方式A 为载体 sh -c 载荷内定时器（到期自动去标签+按基线还原 affinity，为空 remove、
   非空 replace 原值，不会删丢原有 affinity；定时器存活于载体 Pod，Pod 重建会丢失定时器，
   届时仍需 Agent 主动执行或人工恢复兜底）
-- 方式B 的同名 transient timer 重复武装会报 `Unit blade-restore-proxy.service was already loaded`（上次武装命令执行失败时 unit 以 failed 状态残留所致）；重武装前先按本文件方式B 的同等 chroot /host 通道形态清理残留：`systemctl stop blade-restore-proxy.service; systemctl reset-failed blade-restore-proxy.service`（武装命令成功执行过的 unit 无残留，可直接重武装）
+- 方式B 的同名 transient timer 重复武装会报 `Unit blade-restore-proxy.service was already loaded`（上次武装命令执行失败时 unit 以 failed 状态残留所致）；**重武装换一个唯一 unit 名即可**（如 `blade-restore-proxy-2`），**不得用 `systemctl stop/reset-failed` 清理**——`systemctl` 是宿主命令守卫的 host-escape 禁词，计划扫描与执行门双层拒，携带即被拒。武装命令成功执行过的 unit 无残留，可直接重武装；武装时加 `--collect` 可保证 fire 后零残留（残留核验见方式B 恢复命令注释）

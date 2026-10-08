@@ -22,7 +22,8 @@ mechanism_writes:
 
 **用例名称** PVC未绑定（StatefulSet 靶） 导致 Pod_Pending
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -50,17 +51,17 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - 删除卡住的错误 revision Pod（revision-hash 不等标签选择器——正文 OrderedReady 立法：控制器对 Pending 错误 revision Pod 零动作）保留为 execute 计划收尾步骤。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（删卡住 Pod、删演练 PVC）保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. StatefulSet 最高序号 Pod 状态为 Pending，READY < DESIRED 持续不收敛
 2. 新 Pod Events 中显示 `pod has unbound immediate PersistentVolumeClaims`
 3. 演练用 PVC 状态为 Pending，无法绑定到 PV
 
-**RCA症状**：
+## RCA症状
 1. 最高序号 Pod Pending（滚动更新重建后新 Pod 不被调度）
 2. Events 显示 unbound PersistentVolumeClaims；演练用 PVC Pending
 （以上为 kubectl 直接可观测的现象，不包含诊断结论）
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A（StatefulSet 管辖）已正常运行，全部副本 Ready
 2. 确认集群中 StorageClass 和 CSI 插件正常工作；确认本用例引用的 StorageClass
    `ssd-retain-zone-c` 在集群中**不存在**（若已存在则另选一个不存在的名字并全文
@@ -89,7 +90,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    （volumeClaimTemplates 派生的数据卷零触碰），对齐 SKILL.md「无备份对
    StatefulSet 做破坏性实验」红线（本用例非破坏性）
 
-**演练步骤**（主路径 = 基线捕获（步骤 1）→ 创建道具 PVC（步骤 2，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=StatefulSet、patches=模板卷挂载注入、restorePatches=模板还原、duration_seconds=<duration>），模板注入+武装+readback 工具内同步完成；步骤 3-4 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底。updateStrategy 为 `OnDelete` 时主路径同样须在装配器注入后手动删除最高序号 Pod 触发重建，见步骤 1 注）：
+## 演练步骤
+（主路径 = 基线捕获（步骤 1）→ 创建道具 PVC（步骤 2，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=StatefulSet、patches=模板卷挂载注入、restorePatches=模板还原、duration_seconds=<duration>），模板注入+武装+readback 工具内同步完成；步骤 3-4 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底。updateStrategy 为 `OnDelete` 时主路径同样须在装配器注入后手动删除最高序号 Pod 触发重建，见步骤 1 注）：
 1. **基线捕获**（恢复对照基准；restorePatches 的基线值来源，两条路径共用。Agent 读取输出并记录原始 JSON。updateStrategy
    输出为空即默认 `RollingUpdate`；`rollingUpdate.partition` 非零时仅序号 ≥
    partition 的副本参与更新，最高序号仍会更新、故障照常成立，但需在方案中知悉）：
@@ -211,7 +213,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    不是异常）
 6. 观察新 Pod 的状态
 
-**注入验证**：
+## 注入验证
 1. 确认滚动停在高序号：**用 revision/Pod 状态判据，不要用 `kubectl rollout
    status`**——注入期新 Pod 永不被调度（PVC 未绑定，故障本身），`rollout
    status` 等待必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」。
@@ -259,7 +261,8 @@ unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完
    原地变老），此时本条判据结构性不可达，如实记 partial，持续性证明由第 1/2 条
    承载（配置即状态 + 行为不收敛）；勿把事件不前进误判为故障已恢复
 
-**注入恢复**（主路径下模板还原无需 Agent 执行动作——载体 TTL 自治按 restorePatches 还原 Pod 模板（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。非 patch 域动作——删卡住错误 revision Pod（**不可省略**）与删演练 PVC——保留为 execute 计划收尾步骤，在模板还原后执行（先模板、次卡住 Pod、后 PVC，顺序即安全顺序，见步骤 3）。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下模板还原无需 Agent 执行动作——载体 TTL 自治按 restorePatches 还原 Pod 模板（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。非 patch 域动作——删卡住错误 revision Pod（**不可省略**）与删演练 PVC——保留为 execute 计划收尾步骤，在模板还原后执行（先模板、次卡住 Pod、后 PVC，顺序即安全顺序，见步骤 3）。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期执行基线还原：定时器宿主形态由定时器自动执行；演练
    提前结束时由 Agent 主动执行同一组恢复命令（幂等，定时器迟到再执行一次无
    副作用。**数组整体 replace 回基线而非按索引 remove**——remove 按位置删除，
@@ -281,7 +284,7 @@ unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完
 2. 等待滚动更新完成（被卡序号的 Pod 由步骤 ②触发重建为基线 Pod 并调度运行；
    判据见恢复验证第 1 条，勿用 rollout status）
 
-**恢复验证**：
+## 恢复验证
 1. `kubectl get statefulset <sts-name> -n <namespace>`：READY == DESIRED，
    全部副本 Running/Ready，`currentRevision == updateRevision`（滚动完成；
    模板还原回基线 hash，不产生新代——cur/up 均等于步骤 1 基线 revision 名）
@@ -296,7 +299,7 @@ unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完
    FailedScheduling 的 LAST SEEN 停在恢复时刻之前即确证「不再新增」
    （新式事件形态下以 eventTime 与 series.lastObservedTime 为准）
 
-**基准事实**：
+## 基准事实
 - **根因**：StatefulSet Pod 模板被挂载引用了无法绑定的 PVC（StorageClass 不
   存在），滚动更新重建的最高序号 Pod 因 PVC 未绑定无法调度，OrderedReady 使
   更新停在该序号
@@ -304,7 +307,7 @@ unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完
   PersistentVolumeClaims；READY < DESIRED 持续不收敛；currentRevision !=
   updateRevision
 
-**注意事项**：
+## 注意事项
 - `spec.volumeClaimTemplates` 是不可变字段（API 直接拒绝 patch）——本用例机制
   走 `spec.template.spec.volumes` 外部卷引用，与 STS 原生 PVC 通路正交
 - 本用例对 STS 存储**零触碰**：不创建/删除/篡改任何 volumeClaimTemplates 派生

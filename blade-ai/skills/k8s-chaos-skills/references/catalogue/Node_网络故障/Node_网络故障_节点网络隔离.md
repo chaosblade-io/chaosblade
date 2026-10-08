@@ -1,17 +1,17 @@
 **用例名称** 节点网络隔离 导致 Node_网络故障
 
-**故障现象**：
+## 故障现象
 1. 节点上 hostNetwork Pod（及宿主机进程）的网络通信中断（或指定方向/端口的流量被屏蔽）；非 hostNetwork Pod 是否受影响取决于注入手段（见基准事实与注意事项）
 2. 该节点上的 Pod 健康检查失败，可能触发驱逐和重新调度
 3. kubelet 与 API Server 通信中断时，节点状态变为 NotReady
 4. 作用点为整个节点宿主机网络栈，不限于单个 Pod
 
-**资源准备**：
+## 资源准备
 1. 确认目标节点名称及其上运行的关键工作负载
 2. 确认集群有足够冗余节点承载被驱逐的 Pod
 3. 确认 ChaosBlade Operator 已部署（DaemonSet 通道）或具备节点 SSH 访问权限（SSH 通道）
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标节点名称和当前状态：
    ```bash
    kubectl get nodes
@@ -44,7 +44,7 @@
    - `--timeout`：必须指定，超时后自动恢复
 3. 记录返回的 experiment_uid，用于后续恢复
 
-**注入验证**：
+## 注入验证
 
 > ⚠️ **自断链路故障的判读规范（务必先读）**：**当屏蔽范围覆盖 6443/10250 时**（不指定端口的全量屏蔽必然覆盖），被切断的正是 `kubectl exec` 等带内命令下发依赖的通道。因此**注入用的那条 exec 命令自身会超时或断连（如 `task timed out after 10s`），这是预期的成功信号，不是失败**。收到超时后：
 > 1. **不要重试同一条 exec，也不要归因为"镜像没 shell / 通道坏了"**——通道正是被你成功切断的；
@@ -84,7 +84,7 @@
 > - 连通性测试必须落在**被屏蔽的端口与方向**上；换端口或换方向重试只会得到"连通"，纯属浪费。
 > - 同一事实（如节点是否 NotReady）确认一次即可，不要重复查询。
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 ChaosBlade 实验：
    ```bash
    blade destroy <experiment_uid>
@@ -92,7 +92,7 @@
    若使用 DaemonSet 通道且网络已中断无法通过 API 恢复，等待 `--timeout` 自动恢复
 2. SSH 通道可直接通过 SSH 登录节点执行恢复
 
-**恢复验证**：
+## 恢复验证
 1. 确认节点状态恢复为 Ready：
    ```bash
    kubectl get nodes <node-name>
@@ -100,7 +100,7 @@
 2. 确认节点上 Pod 网络连通性恢复
 3. 确认被驱逐的 Pod 已重新调度并 Running
 
-**基准事实**：
+## 基准事实
 - **根因**：节点宿主机网络栈被注入 iptables DROP 规则，指定方向/端口的所有流量被丢弃，模拟网络分区或节点隔离场景
 - **必现现象**：宿主机进程与 hostNetwork Pod 网络中断；节点可能变为 NotReady（全量屏蔽时）；Pod 健康检查失败触发驱逐
 - **传导边界（CNI 相关，terway-eniip）**：非 hostNetwork Pod 的流量在宿主机网络栈走 FORWARD 链转发，不经 OUTPUT/INPUT 链——宿主机 iptables OUTPUT/INPUT DROP 对其零传导（出站方向：同一注入下 hostNetwork Pod 探测被拦、非 hostNetwork Pod 恒连通）。手段1（ChaosBlade，tc/网卡级注入）作用于网卡队列，对该类 Pod 同样有效；手段2（iptables 链路级）与手段1存在此保真度差异
@@ -135,6 +135,7 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-imag
 #    不依赖 debug Pod 存活——debug Pod 被删除后恢复仍然生效。
 #    ✅ 注入后本条 exec 会因 6443/10250 被切断而超时（如 task timed out after 10s）——
 #    这是预期的成功信号，**不要重试该 exec、不要换镜像**；立即改用集群侧 `kubectl get nodes <node-name>`（应 NotReady）验证。
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c '
   systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-netiso sh -c "
     iptables -D OUTPUT -p tcp --dport 6443 -j DROP;

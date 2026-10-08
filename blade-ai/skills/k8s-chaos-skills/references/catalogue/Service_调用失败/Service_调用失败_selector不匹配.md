@@ -15,7 +15,8 @@ recovery_channel: apiserver-write
 
 **用例名称** selector不匹配 导致 Service_调用失败
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Service selector；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Service selector；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -35,16 +36,17 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Service 的 Endpoints 列表为空
 2. 通过 Service 访问应用返回 connection refused 或无响应
 3. Pod 正常运行但未被 Service 选中
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，对外暴露 Service
 2. 确认监控系统可观测 Service 请求指标和 Endpoints 状态
 
-**演练步骤**（主路径 = 载体配方经 `faultdrill_assemble_carrier` 一次调用执行；手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+## 演练步骤
+（主路径 = 载体配方经 `faultdrill_assemble_carrier` 一次调用执行；手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 基线捕获：记录应用 A 的 Service 当前 selector 配置（restorePatches 的基线值来源，两条路径共用）：
    ```bash
    kubectl get svc <service-name> -n <namespace> -o jsonpath='{.spec.selector}'
@@ -74,7 +76,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
    倒计时从武装时刻起算：先校验后武装、与注入紧邻（≤60s）；武装后发生任何修复须先 `kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'pkill -f blade-restore-selecto[r]; true'` 停旧定时器再全额重武装（见 SKILL.md 安全红线「故障窗口完整」）
 
-**注入验证**：
+## 注入验证
 1. 执行 `kubectl get endpoints <service-name>`，确认 Endpoints 列表为空（无子集）。patch 后
    endpoints 清空有 endpoints controller 同步的秒级传播滞后（实测 ~5-15s 量级），采样前短等收敛；
    恢复后 endpoints 回填同理
@@ -82,7 +84,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 3. 执行 `kubectl get pods -l app=<原标签>`，确认 Pod 实际正常运行
 4. 对比 Service selector 与 Pod labels，确认不匹配
 
-**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治 fire）：
+## 注入恢复
+（主路径下恢复无需 Agent 执行动作——载体 TTL 自治 fire）：
 1. 等待 `<duration>` 到期，载体自治将 selector 整体替换回基线（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle，可查不静默）；演练提前结束时执行 `blade-ai recover` 从台账重放同源配方提前收敛（幂等，与载体双执行——先到先收敛、后到读回 no-op）。恢复语义注意用 json patch 的 `replace`
    而非 strategic merge patch——后者对 map 是键级合并，若注入期间键集变化会残留多余键导致
    selector 永久不匹配（装配器与载体 REST 载荷均按 replace 构造，此陷阱仅手动降级路径需自防）：
@@ -93,11 +96,11 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
 2. 等待 Endpoints 自动更新
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get endpoints <service-name>`，确认 Endpoints 列表恢复，包含后端 Pod IP
 2. 向 Service 发送请求，确认恢复正常
 3. 确认服务可用性恢复
 
-**基准事实**：
+## 基准事实
 - **根因**：Service 的 selector 与后端 Pod 的 label 不匹配，导致 Endpoints 控制器无法关联任何 Pod，Service 无后端可转发
 - **必现现象**：Endpoints 为空；Service 请求失败（connection refused/超时）；Pod 正常但未被选中

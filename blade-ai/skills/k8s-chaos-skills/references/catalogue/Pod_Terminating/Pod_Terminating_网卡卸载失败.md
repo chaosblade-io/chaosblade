@@ -1,16 +1,16 @@
 **用例名称** 网卡卸载失败 导致 Pod_Terminating
 
-**故障现象**：
+## 故障现象
 1. Pod 状态长时间停留在 Terminating
 2. 容器已停止，但 Pod sandbox 清理失败
 3. Events 或 kubelet 日志中显示 CNI DEL 调用失败或网络资源释放异常
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认集群使用 ENI/Terway 等需要显式清理网络资源的 CNI 插件
 3. 确认监控系统可观测 Pod 状态和 CNI 插件日志
 
-**演练步骤**：
+## 演练步骤
 1. 定位应用 A 的 Pod 所在节点
 2. 使用 chaosblade 挂起节点上的 CNI 插件进程（如 terway-daemon），模拟 CNI 响应异常：
    ```bash
@@ -28,7 +28,7 @@
 3. 删除应用 A 的 Pod，触发 Terminating 流程
 4. 观察 Pod Terminating 状态
 
-**注入验证**：
+## 注入验证
 1. ⚠️ **按注入形态判读，两种形态判据相反**：
    - **daemon 被杀形态**（kill/crash）：unix socket 关闭 → terway CNI binary connect
      立即失败（快速失败路径）→ kubelet 仍能完成 Pod 删除（不卡 Terminating）——此形态
@@ -47,18 +47,18 @@
    才发生 <60s 重启自愈（窗口坍缩）。判定在规划期一次探测完成（进程树 + 端口归属），
    勿照抄「<60s 坍缩」预判
 
-**注入恢复**：
+## 注入恢复
 1. 恢复 CNI 插件进程：等待 chaosblade 超时或执行 `blade destroy <UID>`
 2. 若删除了 CNI Pod：uncordon 节点，等待 CNI DaemonSet Pod 重建
 3. kubelet 将自动重试 sandbox 清理
 
-**恢复验证**：
+## 恢复验证
 1. 确认 CNI 插件进程恢复正常
 2. 执行 `kubectl get pods`，确认 Pod 删除正常完成（实际形态下删除本来就不被阻塞，此条为不退化检查而非恢复信号）
 3. 确认节点网络资源（ENI/IP）已释放（CNI DEL 失败期间可能产生泄漏残留，daemon 恢复后的回收存在异步性，以 terwayd 日志/节点 ENI 实际状态核对为准）
 4. 确认新 Pod 可以正常创建和分配网络
 
-**基准事实**：
+## 基准事实
 - **根因**：CNI 插件异常或不可用，导致 Pod 删除时网卡/ENI 资源无法正常释放，sandbox 清理失败，Pod 卡在 Terminating
 - **必现现象**：kubelet 日志显示 CNI DEL 失败；CNI 插件进程 stopped/不可用（形态分叉见注入验证第 1 条：daemon 被杀→不卡 Terminating；SIGSTOP 挂起→卡 Terminating + FailedKillPod 周期重试；潜在 ENI/IP 泄漏）
 
@@ -86,6 +86,7 @@
 #    会被 target_guard 拒绝；且提前恢复会使 verify 失去故障态采样（T 态进程、
 #    FailedKillPod 累积都在窗口内取得）——窗口尾部与 verify 报告生成天然重叠，
 #    全窗设计即零浪费
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
   'systemd-run --on-active=<recovery-seconds>s --unit=blade-cont-cni \
      sh -c "kill -CONT \$(pidof terwayd)" && \

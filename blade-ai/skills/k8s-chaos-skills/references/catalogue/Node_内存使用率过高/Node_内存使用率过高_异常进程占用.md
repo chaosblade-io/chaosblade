@@ -1,6 +1,6 @@
 **用例名称** 异常进程占用 导致 Node_内存使用率过高
 
-**故障现象**：
+## 故障现象
 1. 节点内存使用率持续超过注入的目标百分比（`kubectl top` 口径）
 2. （仅深水区形态，见下方「两种注入深度」）节点 Status 出现 MemoryPressure 条件为 True
 3. （仅深水区形态）节点上 Pod 出现 OOMKilled 或被驱逐
@@ -13,7 +13,7 @@
   物理口径另行估算（见注意事项口径条款），接受驱逐波及面与 OOM killer 风险，判据含
   MemoryPressure True 与 Pod 驱逐；本形态对生产节点破坏性大，非显式要求不启用
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行（保守形态下应用不受影响，可作「无波及」旁证）
 2. 确认监控系统（如 Prometheus）已配置，可观测节点内存指标
 3. **镜像选择（节点缓存约束）**：debug Pod 镜像须为节点已缓存镜像（外网 registry 不可达
@@ -30,25 +30,25 @@
    同语义分块）。禁止依赖镜像内 stress-ng——外网镜像不可达 + 节点缓存镜像/宿主机通常均
    不含该二进制
 
-**演练步骤**：
+## 演练步骤
 1. 定位目标节点并测基线：`kubectl top node <node-name>`（记当前用量）
 2. 计算分配量（保守形态增量口径）：分配量 ≈ 节点总内存 × 目标百分比 − 当前用量
    （例：64G 节点、当前 3.2G、目标 80% → 64×0.8 − 3.2 ≈ 48G；top 口径按 allocatable
    归一时目标值可略高，读数落在目标附近即成立，不必精确卡线）
 3. 经 `kubectl debug node/<node-name>` 的一次性命令在**宿主机上武装 systemd 瞬态服务**，
-   以宿主 python3 分块分配匿名内存并驻留至窗口结束（`RuntimeMaxSec` 到期自停）
+   以宿主 python3 分块分配匿名内存并驻留至到期自停（`RuntimeMaxSec` 武装值见下方参数说明）
 
 **注入命令**（保守形态，一次性武装，命令立即返回）：
 ```bash
 # 经 sysadmin debug Pod 进入宿主机 PID namespace，武装 systemd 瞬态服务承载内存载荷
 # <CHUNK> 为单块字节数（默认 200MB），<SLEEP> 为块间隔秒（默认 0.2）——分块防一次性
 # 峰值约 2 倍越过余量被 OOM killer 杀；<BYTES> 为分配总量（按步骤 2 增量算）
-# <duration> 秒后 systemd 终止整个 cgroup（自停，权威停止时刻）
+# <recovery-seconds> 秒后 systemd 终止整个 cgroup（自停，权威停止时刻；武装值见下方）
 kubectl debug node/<node-name> --profile=sysadmin --image=<cached-image-with-sh-nsenter> -- sh -c \
   'nsenter -t 1 -m -u -i -n -p -- systemd-run --unit=drill-node-mem-load --collect \
-   --property=RuntimeMaxSec=<duration> -- python3 -c "
+   --property=RuntimeMaxSec=<recovery-seconds> -- python3 -c "
 import time
-deadline = time.time() + <duration>
+deadline = time.time() + <recovery-seconds>
 blocks = []
 target, chunk, gap = <BYTES>, <CHUNK>, <SLEEP>
 done = 0
@@ -65,13 +65,17 @@ while time.time() < deadline:
 > `b\"x\"` 为 bytes 乘法（匿名内存，不落盘）——shell 引号转义按所在层级自行处理。
 > 分配阶段失败（如余量不足 MemoryError）进程 fast-fail 退出，服务转 failed，内存即
 > 释放——此时无驻留无窗口，按「分配失败处置」重算尺寸重武装，勿在原单元上等待
+>
+> `<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+> （= duration + grace，见 SKILL.md 双数窗口契约）——`RuntimeMaxSec` 与载荷 `deadline`
+> 同以它武装，让框架在观察窗终点主动派发的恢复先于自治到期落地
 
 倒计时从武装时刻起算：注入与到期自停定时（RuntimeMaxSec 与载荷 sleep）在同一条命令内
 原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `systemctl stop <unit>`
 （旧载荷终止与定时器取消同步完成），再重跑上方注入命令重武装+重注入（见 SKILL.md 安全
 红线「故障窗口完整」与「武装载荷单次性」）
 
-**注入验证**：
+## 注入验证
 1. `kubectl top node <node-name>` 确认节点内存使用率升至注入目标附近——读数高于注入前
    基线并接近目标百分比即占用已发生（top 读数来自 metrics-server 采样窗口，注入后立即
    查询可能仍读到旧值，出现低于目标的读数时可稍后复查一次）；「持续保持」由机制存活
@@ -84,7 +88,7 @@ while time.time() < deadline:
    分配量同量级；`systemctl show drill-node-mem-load.service --property=MainPID` 有主
    进程即载荷在驻留
 
-**注入恢复**：
+## 注入恢复
 1. 等待 `RuntimeMaxSec` 到期（systemd 终止整个 cgroup——内存即时释放，故障自动停止，
    无需手动 kill；载荷内 sleep 是第二道自停保险）
 2. 若需提前停止：`systemctl stop <unit>`（`--collect` 使瞬态单元停止即被 GC，无残留
@@ -101,7 +105,7 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<cached-image> -- sh -
 #   --property=LoadState,ActiveState,SubState → not-found / inactive / dead
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `kubectl top node <node-name>` 确认内存使用率恢复到注入前基线量级（metrics-server
    采样有延迟，给一次复查窗口）
 2. 宿主 MemAvailable 恢复至基线量级（白盒即时主证，不受 metrics-server 采样滞后影响）
@@ -111,7 +115,7 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<cached-image> -- sh -
    --property=LoadState,ActiveState,SubState` 确认）；`kubectl get pods -A | grep
    node-debugger` 为空（一次性武装/探针 Pod 均已被自动清理）
 
-**基准事实**：
+## 基准事实
 - **根因**：节点上存在异常进程大量占用内存，导致节点内存使用率过高；深水区形态下压穿
   available 引发 MemoryPressure 与驱逐
 - **必现现象**：保守形态 = 节点内存使用率持续超过注入目标（top 口径）；深水区形态另加

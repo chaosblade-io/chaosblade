@@ -15,7 +15,8 @@ recovery_channel: apiserver-write
 
 **用例名称** StartupProbe配置不足 导致 Pod_CrashLoopBackOff
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 startupProbe 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 startupProbe 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:
@@ -48,22 +49,23 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - **MU 100% 的承载分工**：主路径下步骤 2 的手动置 100% 由配方注入域承载（一次 patch 面内原子并入，无需单独执行），其还原随 restorePatches 由载体 TTL 还原——窗口内维持 100%（故障态本身，无其他滚动触发源时无增量风险），不再泄漏到恢复期之后；降级路径下步骤 2/7 的手动序列照常执行。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Pod 反复重启，状态为 CrashLoopBackOff
 2. Pod Events 中显示 `Startup probe failed` 后容器被杀
 3. 慢启动应用尚未完成初始化就被 StartupProbe 判定为失败
 
-**RCA症状**：
+## RCA症状
 1. Pod 反复重启，状态为 CrashLoopBackOff
 2. Pod Events 中显示 `Startup probe failed`，容器在初始化完成前被反复杀死
 3. 容器日志显示应用启动过程被中断（无应用自身异常退出记录）
 （以上为kubectl直接可观测的现象，不包含诊断结论）
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行（应用启动时间较长，如 Java 应用）
 2. 确认应用 A 启动过程中健康检查接口不可用
 
-**演练步骤**（主路径 = 步骤 1 基线捕获（startupProbe 配置 JSON——restorePatches 基线值来源，两条路径共用）→ 调 faultdrill_assemble_carrier（参数取自载体配方：target_kind=deployment、target_name=<deployment-name>、target_namespace=<namespace>、patches=…（startupProbe replace + MU 100% 注入域）、restorePatches=…、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 MU 100% 由配方注入域承载，无需单独执行 → 步骤 6 等待滚动更新完成（两路径共用）→ 步骤 7 的 MU 还原随 restorePatches 由载体 TTL 承载，无需手动执行。步骤 3 的手动定时器序列与步骤 4 的手动 patch 仅当装配器 fail-closed 报告不可用时作降级兜底——降级路径下步骤 2/4/7 手动序列照常）：
+## 演练步骤
+（主路径 = 步骤 1 基线捕获（startupProbe 配置 JSON——restorePatches 基线值来源，两条路径共用）→ 调 faultdrill_assemble_carrier（参数取自载体配方：target_kind=deployment、target_name=<deployment-name>、target_namespace=<namespace>、patches=…（startupProbe replace + MU 100% 注入域）、restorePatches=…、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 MU 100% 由配方注入域承载，无需单独执行 → 步骤 6 等待滚动更新完成（两路径共用）→ 步骤 7 的 MU 还原随 restorePatches 由载体 TTL 承载，无需手动执行。步骤 3 的手动定时器序列与步骤 4 的手动 patch 仅当装配器 fail-closed 报告不可用时作降级兜底——降级路径下步骤 2/4/7 手动序列照常）：
 1. 记录应用 A 当前的探针配置（基线捕获：Agent 读取输出并记录 JSON，恢复时使用；
    原本无 startupProbe 时输出为空）：
    ```bash
@@ -111,13 +113,14 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 7. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段）——**降级路径形态；主路径下此项随载体配方 restorePatches 由载体 TTL 还原，无需手动执行**
 8. 观察 Pod 启动行为
 
-**注入验证**：
+## 注入验证
 1. 确认所有旧 Pod 已被替换（滚动更新完成）：**用 RS 视角判据，不要用 `kubectl rollout status`**——注入期新 Pod 永不 Ready（startup 探针超时，故障本身），`rollout status` 等待 available 副本必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」；正确判据是 `kubectl get rs -n <namespace> -l <label>`：旧 RS DESIRED=0、新 RS DESIRED=目标副本数（或旧 Pod 名消失、新 Pod 已 CrashLoopBackOff）
 2. 执行 `kubectl get pods`，确认**所有**目标 Pod 的 RESTARTS 已高于注入前读数（单调递增计数器，高于基线即重启已发生，无需等待持续增长），状态为 CrashLoopBackOff——状态标签是重启的渲染，不等其稳定出现（不是仅一个新 Pod，而是全部副本）
 3. 执行 `kubectl describe pod <pod-name>`，确认 Events 显示 `Startup probe failed`
 4. 查看容器日志，确认应用正在启动但未完成初始化就被杀
 
-**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原（restorePatches 的探针 replace/remove + MU 基线 replace 由载体内 timer 到点执行，恢复自动触发回滚滚动；fire 证据落载体 /tmp/restore.log + 任务台账 recovery_handle）；演练提前结束时 blade-ai recover 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原（restorePatches 的探针 replace/remove + MU 基线 replace 由载体内 timer 到点执行，恢复自动触发回滚滚动；fire 证据落载体 /tmp/restore.log + 任务台账 recovery_handle）；演练提前结束时 blade-ai recover 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动将 startupProbe 还原为步骤 1 基线；演练提前结束时由
    Agent 主动执行同一条恢复命令（幂等，定时器迟到再执行一次无副作用——基线非空时 json patch
    replace 回原值 JSON，原本无探针时 remove。json patch 按字段精确替换，天然规避
@@ -139,7 +142,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 2. 等待 Pod 滚动更新完成（RS 视角判据同注入验证第 1 条：注入代 RS DESIRED=0；恢复代 RS
    hash 回基线值——hash 不回即 template 有残留，零漂移归还未达成）
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods`，确认 Pod 状态为 Running 且不再重启（慢启动应用的恢复代新 Pod
    在启动期内 RESTARTS 冻结即为「不再重启」——不等应用完成初始化）
 2. 确认 StartupProbe 和 LivenessProbe 检查均正常通过
@@ -154,6 +157,6 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    属常态（效果证据在窗口存活期采集），本条判据由带外终验兑现（timer fire 后读子树 +
    RS hash；Agent 收尾报告须注明恢复正确性待带外终验确认）
 
-**基准事实**：
+## 基准事实
 - **根因**：StartupProbe 未配置或 failureThreshold × periodSeconds 总窗口不足以覆盖应用启动时间，慢启动应用在初始化完成前被判定为启动失败，反复被杀重启
 - **必现现象**：Pod CrashLoopBackOff；Events 显示 Startup probe failed；容器日志显示应用启动中被中断

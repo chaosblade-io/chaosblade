@@ -1,11 +1,11 @@
 **用例名称** 资源饱和 导致 HPA_副本达到上限
 
-**故障现象**：
+## 故障现象
 1. HPA 的当前副本数达到 maxReplicas 上限，无法继续扩容
 2. 应用 CPU 或内存使用率仍持续高于 HPA 目标阈值
 3. 应用响应延迟增大，出现超时
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，且已配置 HPA。**集群内无可破坏 HPA 时，由运维带外
    预置常驻演练靶**（drill-hpa-target Deployment + 同名 HPA，同 drill-pvc-target /
    drill-ds-target 常驻靶模式——HPA 与 Deployment 都是 workload 系 kind，manifest
@@ -25,7 +25,8 @@
    显示实时百分比即就绪
 3. 确认监控系统可观测 HPA 状态和 Pod CPU/内存指标
 
-**演练步骤**（kubectl-native 主路径；chaosblade operator 不可用的集群走此路径，
+## 演练步骤
+（kubectl-native 主路径；chaosblade operator 不可用的集群走此路径，
 可用时 blade pod-cpu fullload 等效）：
 1. 定位演练靶 HPA，记录 maxReplicas 配置与基线 REPLICAS
 2. 对应用 A 的**全部存量 Pod** 注入 CPU 压力（单核 shell 循环即足够——见资源准备
@@ -33,27 +34,27 @@
 3. 观察 HPA 扩容行为（15s/轮同步逐步逼近，1→3 约 3 轮 ≈ 45-60s），等待副本数
    达到 maxReplicas 上限
 
-**注入验证**：
+## 注入验证
 1. 执行 `kubectl get hpa`，确认 REPLICAS 已达到 MAXPODS 上限——扩到上限需多轮同步周期逐步逼近（HPA 同步默认 15s/轮，1→3 约 45-60s），首查未达上限不构成反证，无需反复轮询等它到顶
 2. `kubectl describe hpa <hpa-name> -n <namespace>` 确认 Conditions 中 `ScalingLimited: True`（reason: TooManyReplicas，message: the desired replica count is more than the maximum replica count）——这是达到上限的权威信号。**不要在 Events 里找告警**：desiredReplicas 超过 max 时直接被 clamp 到上限、扩容静默跳过，不会发出告警 Event；`FailedGetScale` 是获取 scale 子资源失败的错误（scaleTargetRef 问题），与达到上限无关，勿作为判据。Events 中可见的是逐级扩容的 `SuccessfulRescale` 记录
 3. `kubectl top pod -n <namespace> -l <label-selector>` 确认 CPU 使用率仍高于目标阈值（小 requests 形态下注入 Pod 应接近满核、TARGETS 平均百分比远超目标——平均数值本身即反稀释定案成立的直接回显）
 4. （可选，仅当演练方提供了应用访问入口时）确认请求延迟增大或超时；无入口时上述 HPA 与 CPU 证据成立即可判定
 
-**注入恢复**：
+## 注入恢复
 1. 停掉全部 Pod 的 CPU 负载（按手段 2 恢复命令——kill PID 文件内进程）
 2. 等待 HPA 自动缩容（**缩容时序预算**：behavior scaleDown 稳定窗 60s + 同步周期
    ≈ 90-150s 内回落；期间 CPU 已归零而 REPLICAS 尚未回落不构成恢复失败——HPA
    缩容按设计滞后于负载消失）
 3. **常驻靶不删除**（跨 case 复用资产，无拆线动作；HPA 与 Deployment 均保留）
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get hpa`，确认 REPLICAS 回落至基线（minReplicas 或注入前值——
    给足缩容稳定窗时序预算，见注入恢复第 2 条）
 2. `kubectl top pod -n <namespace> -l <label-selector>` 确认 CPU 使用率恢复到基线（无负载即 ~0m）
 3. （可选，有访问入口时）确认请求延迟恢复正常
 4. 常驻靶形态验证独立性：HPA 与 Deployment 跨演练存续，判据恢复完成后随时可独立复核
 
-**基准事实**：
+## 基准事实
 - **根因**：应用负载超过 HPA 的 maxReplicas 能覆盖的处理能力，HPA 达到扩容上限后无法继续扩容，导致服务资源饱和
 - **必现现象**：HPA REPLICAS 达到 MAXPODS；Conditions 显示 ScalingLimited=True（TooManyReplicas）；CPU 使用率持续超过目标阈值；应用性能下降
 - **扩容稀释算术**：HPA desired = ceil(当前副本 × 平均利用率 / 目标)——扩容出的新 Pod 不带注入负载会稀释平均；小 requests 设计使注入 Pod 利用率达 100×requests，稀释后平均仍数倍于目标，desired 恒超 max 被 clamp（扩容停止但 ScalingLimited 置位——「上限」与「停止」的机制区分）
@@ -73,7 +74,7 @@
 kubectl get pods -n <namespace> -l <label-selector> -o name
 
 # 方式一：容器内有 stress-ng（后台+重定向让 exec 立即返回，--timeout 自带自动恢复）
-kubectl exec <pod-name> -n <namespace> -- sh -c 'stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s >/dev/null 2>&1 &'
+kubectl exec <pod-name> -n <namespace> -- sh -c 'stress-ng --cpu 0 --cpu-load <percent> --timeout <recovery-seconds>s >/dev/null 2>&1 &'
 
 # 方式二：容器无 stress-ng，用 shell 循环。
 # 关键点：① 每个循环重定向到 /dev/null（否则 exec 会挂到 10s 超时）；
@@ -82,9 +83,13 @@ kubectl exec <pod-name> -n <namespace> -- sh -c 'stress-ng --cpu 0 --cpu-load <p
 #    $(seq 1 N) 展开为空会使 for 空转零注入（静默失败）。
 # 同样对每个 Pod 各执行一次。sh -c 的载荷整体是一个参数，内部的 for/while/&
 # 由容器内的 sh 解释，不需要外层 shell。
-kubectl exec <pod-name> -n <namespace> -- sh -c ': > /tmp/loadgen-worker.pids; i=1; while [ $i -le <N> ]; do ( while :; do :; done ) >/dev/null 2>&1 & echo $! >> /tmp/loadgen-worker.pids; i=$((i+1)); done; ( sleep <duration>; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids ) >/dev/null 2>&1 &'
+kubectl exec <pod-name> -n <namespace> -- sh -c ': > /tmp/loadgen-worker.pids; i=1; while [ $i -le <N> ]; do ( while :; do :; done ) >/dev/null 2>&1 & echo $! >> /tmp/loadgen-worker.pids; i=$((i+1)); done; ( sleep <recovery-seconds>; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids ) >/dev/null 2>&1 &'
 ```
 倒计时从武装时刻起算：负载发生器启动与定时器武装在同一 sh -c 载荷内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f "loadgen-worker.pid[s]"; true'` 一并停掉故障与旧定时器（后台 subshell 共享载荷 cmdline，此杀同时命中定时器与负载循环，即全停语义），再重跑上方注入命令原子重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——方式一 stress-ng 的 `--timeout` 与
+方式二的 sleep 定时器以它武装，让框架在观察窗终点主动派发的恢复先于自治到期落地
 
 恢复命令（从精确到兜底）：
 ```bash

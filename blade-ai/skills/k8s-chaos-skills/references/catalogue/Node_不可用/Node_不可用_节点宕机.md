@@ -1,12 +1,12 @@
 **用例名称** 节点宕机 导致 Node_不可用
 
-**故障现象**：
+## 故障现象
 1. 节点状态变为 NotReady
 2. 节点上所有 Pod 无法访问
 3. kubelet 停止上报节点状态，NodeStatus 中 LastHeartbeatTime 停止更新
 4. Pod 在其他节点上被重建
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，且有多个副本分布在不同节点
 2. 确认监控系统可观测节点状态和 Pod 状态
 3. 探测确认目标应用 Pod 的 NoExecute tolerationSeconds（ACK 默认 300s）——该值决定驱逐时序，是 duration 窗口下限推导的输入；与 kubelet 停摆类 case 相反，本 case 的窗口语义是**必须大于** tolerationSeconds（要观察驱逐/重建判据），不得为缩短演练而选自定义长容忍的应用
@@ -18,12 +18,12 @@
    ```
    甄别锚点：只看 `tol` 中 effect=NoExecute 的项——tolerationSeconds 缺省（nil）= 永久免疫（owner=DaemonSet 的 Pod 由控制器自动注入此类容忍）；有数值 = 驱逐倒计时秒数；key 限定且不匹配 node.kubernetes.io/not-ready / unreachable 标准键的容忍项等同无此项；NoSchedule/PreferNoSchedule 项不参与驱逐判定。消费口径：目标应用与同节点全部负载一并入表，预期驱逐名单与免疫名单一次定案（勿逐 Pod 查询），是窗口下限推导与爆炸半径声明的直接输入
 
-**演练步骤**：
+## 演练步骤
 1. 定位运行应用 A 的节点
 2. 使用 chaosblade 对该节点注入网络完全丢包（node-network drop 即全量丢包，不需要 --percent），并设置 `--timeout <duration>`（到期自动恢复），模拟节点与集群失联的宕机场景
 3. 观察节点状态和 Pod 调度行为变化
 
-**注入验证**：
+## 注入验证
 
 > ⚠️ **自断链路判读**：若通过 exec/kubectl-native 方式断网注入，注入命令自身会超时（如 task timed out after 10s）——这是预期成功信号，不要重试/换镜像；立即改从集群侧 `kubectl get nodes` 验证，拿到 NotReady + 心跳停止即可判定并收敛，勿反复探入被隔离节点。blade 方式（operator/CRD 链路）同理有回执形态风险：全量丢包后 tool Pod 与 operator 失联，实验状态上报中断——create 可能挂起/超时或停在中间态；**回执异常 + 下方效果判据成立 = 注入已成功**（效果即证据），勿据回执重发。
 1. 轮询 Lease 心跳（即时主证，秒级可见冻结——kubelet 断网后 ~10s 即不再续约）：
@@ -37,17 +37,17 @@
 
 > **verify 负证据事实来源（预写核对清单——只列证据来源，驳回与否由 verifier 独立裁决）**：verify 采样时点晚于设计内自恢复时刻，以下「看似反证」按来源逐项核对而非重新推导——①节点已回 Ready / Lease 正在推进：核对注入窗口期时间戳工件（NodeNotReady 事件 + Lease 冻结期的两次以上采样记录 + 驱逐事件链）是否证明 freeze→resume 转变发生过；②注入回执超时/Error：见上方自断链路判读条款（预期成功信号，非反证）；③lastHeartbeatTime 观感过期：见判据 2 的 nodeStatusReportFrequency 语义（只作互证不作时序判据）；④同节点其他 Pod（如常驻 DS 类）未驱逐：核对其 tolerations 形态（永久容忍 nil tolerationSeconds 与演练靶 0 容忍的对照）——未驱逐可为各自容忍度的预期行为；⑤NodeRepair* 事件存在（平台修复替代解释）：核对 NodeRepairStart 与 NodeNotReady 的时间先后（介入严格晚于故障发生 = 果非因）+ 基线期事件快照是否为空（注入前无既有修复轮次）；⑥timer fire 无直接回执：核对 Lease 恢复推进时刻与武装时刻 + 窗口值的吻合度（fire 即网络恢复，Lease 推进是其间接直证）。
 
-**注入恢复**：
+## 注入恢复
 1. 主恢复路径（且全量丢包形态下**唯一** Agent 可依赖路径）：等待 chaosblade 实验自动超时恢复（`--timeout <duration>`）——超时定时器由节点本地 chaosblade 进程持有，不依赖网络、不受宿主 daemon-reload 重置（相对手段 2 的 systemd timer 的决定性抗干扰优势）
 2. ⚠️ **`blade destroy` 兜底在全量丢包形态下不可达**：destroy 命令虽经 operator/CRD 链路秒回（operator 接受请求），但销毁指令须下发到目标节点上的 tool Pod 才执行——全量丢包下该下发链路正是被切断的对象，指令永远到不了执行方。destroy 兜底仅对部分丢包/其他 node 级故障（如 kubelet 停摆、网络正常）有效
 3. 全量丢包下若定时自恢复失效（超时后节点仍未恢复），Agent 无集群内恢复手段——须 SSH/控制台/IPMI 人工带外恢复（见注意事项）；因此 `--timeout` 的设定本身是安全红线，必须确保定时器武装成功（blade create 回执 Success 或效果判据成立）后才算窗口受控
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get nodes`，确认目标节点恢复 Ready
 2. 确认 LastHeartbeatTime 恢复更新
 3. 确认应用 A 的 Pod 恢复正常运行
 
-**基准事实**：
+## 基准事实
 - **根因**：节点网络完全中断，导致 kubelet 无法与 API server 通信，停止上报节点状态
 - **必现现象**：节点 NotReady；LastHeartbeatTime 停止更新；Pod 在其他节点被重建
 - **环境事实（外部节点自愈对断网形态的适配）**：部分集群存在平台侧节点自愈通道（见同目录 kubelet停止 case）。断网形态：NotReady 后 **约 217s** NodeRepairStart/NodePoolRepairStart 介入（与 kubelet 停摆形态的 257-292s 同量级）——诊断是**症状级**而非根因级（「Kubelet stopped posting node status + healthz connection refused」，修复不了网络层根因）；若演练窗口足够短（timer fire 早于修复介入），修复动作落地时故障已清除，事件链收尾为 NodeRepairSucceed（no-op 修复，fire 后约 20s 介入即此形态）；另 300s 默认容忍的 Pod 在驱逐倒计时中遇节点恢复会被 `TaintManagerEviction Cancelling deletion` 取消驱逐。风险推演不变：多轮修复或升级动作（drain/重置）的具体策略仍未知，窗口设计须按「自愈介入前完成恢复」校准（见下方短容忍加速形态）
@@ -70,6 +70,7 @@
 # ⚠️ <api-server-ip> 必须按集群实际 endpoint 全量展开：apiserver 前有 SLB/
 #    多副本时是多个 VIP/IP（`kubectl get endpoints kubernetes` 可查）——每个 IP
 #    各需 INPUT/OUTPUT 两条规则；漏掉任一 IP 节点仍可达 apiserver，注入不生效。
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 # ⚠️ <recovery-seconds> 窗口下限 ≈ 420s：完整判据链需要 NotReady 判定
 #    （~40–50s）+ tolerationSeconds 默认 300s（Pod 开始驱逐）+ 驱逐/重建
 #    观察与验证调用余量；窗口不足会在看到 Pod 重建前自恢复，判据链被打断。

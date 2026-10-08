@@ -1,17 +1,17 @@
 **用例名称** 服务依赖中断 导致 Pod_网络丢包
 
-**故障现象**：
+## 故障现象
 1. Pod 对外部服务或上下游依赖的网络请求超时或无响应
 2. 应用健康检查可能失败（如依赖外部探活）
 3. 服务间调用链路出现断裂，影响业务可用性
 
-**资源准备**：
+## 资源准备
 1. 确认目标应用已正常运行，且有对外网络调用（数据库、缓存、上下游服务等）
 2. 确认监控系统可观测网络请求成功率和延迟指标
 3. 确认目标 Pod 的标签选择器和命名空间
 4. 若走 手段2（kubectl-native）的 tc netem 路径：确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）。netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`——有输出说明已加载；无输出时可用更强的前置确证：经 node debug 载体执行 `chroot /host modprobe sch_netem` 试载，报 `FATAL: Module sch_netem not found` 即模块文件本身缺失（内核自动加载不可能成功），**注入前即可定案不可行**；部分 ACK/ASI al8 内核（5.10.134-13.1.al8）即为此形态——同一节点 netem 全家（loss/delay/corrupt）全部不可行，而 sch_tbf 存在（带宽受限场景可用，见 `Pod_网络带宽不足_带宽受限`）。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`（后者为节点上 sch_netem 模块文件本身缺失、内核自动加载失败）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一种报错形态）即为内核不支持 netem 的确证
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标 Pod 的标签选择器和命名空间：
    ```bash
    kubectl get pods -n <namespace> -l <label-selector> -o wide
@@ -30,7 +30,7 @@
    - 不指定端口时为全量丢包（慎用，影响所有流量包括监控和健康检查）
 3. 记录返回的 experiment_uid，用于后续恢复
 
-**注入验证**：
+## 注入验证
 1. 在目标 Pod 内验证网络连通性丧失：
    ```bash
    kubectl exec <pod-name> -n <namespace> -- wget -qO- --timeout=5 <依赖服务地址>
@@ -42,14 +42,14 @@
    ```
 3. （可选，仅当有监控平台访问能力时）确认目标端口流量中断；无平台时上述连通性探针与日志证据成立即可判定
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 ChaosBlade 实验：
    ```bash
    blade destroy <experiment_uid>
    ```
 2. 如 Pod 因丢包导致健康检查失败被重启，等待新 Pod Ready
 
-**恢复验证**：
+## 恢复验证
 1. 在目标 Pod 内重新验证网络连通性恢复：
    ```bash
    kubectl exec <pod-name> -n <namespace> -- wget -qO- --timeout=5 <依赖服务地址>
@@ -57,7 +57,7 @@
 2. 确认应用日志不再出现连接超时错误
 3. （可选，有监控平台访问能力时）确认调用链路指标恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：Pod 出方向网络流量被 iptables DROP 规则丢弃，导致对指定端口/地址的所有请求无响应
 - **必现现象**：目标端口的 TCP/UDP 请求超时；应用日志出现 connection timed out；依赖该连接的业务功能不可用
 
@@ -87,7 +87,7 @@ kubectl exec <pod-name> -n <namespace> -- tc -Version
 # 两条命令分两次独立执行——不能用 && 串联：第二段 kubectl 会沦为第一条 exec
 # 载荷（sh -c）的死参数，注入静默丢失
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -- tc qdisc add dev eth0 root netem loss <percent>%
 
 # ── 路径 B：容器内无可用 tc（精简镜像的常态）。临时容器与目标容器共享网络命名空间，
@@ -103,20 +103,26 @@ kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.hostNetwork}'
 # 期望输出为空或 false；输出 true 则停止。
 
 kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
-  --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
+  --target=<container-name> --profile=netadmin --quiet -- sleep <recovery-seconds>
 
 # 取载体名，等它进入 running
 kubectl get pod <pod-name> -n <namespace> \
   -o jsonpath='{range .status.ephemeralContainerStatuses[*]}{.name}{"="}{.state}{"\n"}{end}'
 
 # 经载体注入：载体与目标容器共享网络命名空间，操作 eth0 即操作目标 Pod 的网卡。
-# 同样先武装定时自删（在载体内后台运行；载体保活 sleep 必须 ≥ <duration>）。
+# 同样先武装定时自删（在载体内后台运行；载体保活 sleep 必须 ≥ <recovery-seconds>）。
 # 两条命令分两次独立执行——不能用 && 串联（第二段会沦为第一条 exec 载荷的死参数）
 kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- sh -c \
-  '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev eth0 root netem loss <percent>%
 ```
 各路径倒计时均从武装时刻起算：武装与注入两条命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先停旧定时器再全额重武装：`kubectl exec <pod-name> -n <namespace> [-c <debugger-name>] -- sh -c 'pkill -f "qdisc de[l]"; true'`（exec 目标必须与武装时同一容器）；精简镜像无 pkill 时旧定时器无法停止，到期会提前恢复侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——各路径的 sleep 定时器（tc/iptables
+两形态）以它武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；路径 B 的载体
+保活 sleep 同须 ≥ 它（保活承载定时器，随定时器升窗）；手段1 的 `--timeout` 由引擎
+在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
 - `<verified-cluster-image>`：当前集群**已验证可拉取**且含 iproute2 的镜像。先看集群在用哪些仓库
   （`kubectl get pods -A -o jsonpath='{..image}'`）并从同仓库取；拉不动时 Pod 事件里会出现
   `ErrImagePull` / `ImagePullBackOff`
@@ -134,7 +140,7 @@ kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev et
 ```bash
 # 两条命令分两次独立执行（&& 串联会使第二段沦为第一条 exec 载荷的死参数）：
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  '( sleep <duration>; iptables -D OUTPUT -p tcp --dport <port> -j DROP ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; iptables -D OUTPUT -p tcp --dport <port> -j DROP ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -p tcp --dport <port> -j DROP
 ```
 倒计时从武装时刻起算：武装与注入两条命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f "iptables -[D]"; true'` 停旧定时器再全额重武装；容器无 pkill 时旧定时器无法停止，到期会提前恢复侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
@@ -159,7 +165,7 @@ kubectl exec <pod-name> -n <namespace> -- iptables -D OUTPUT -p tcp --dport <por
 - 按百分比丢包只有 `tc netem loss` 能做，`iptables -j DROP` 是二元的，两者不可互相替代
 - 全量丢包（`iptables -A OUTPUT -j DROP` 或 `netem loss 100%`）会切断监控和健康检查，
   可能触发 Pod 重启，建议用端口级或较低百分比
-- 自恢复基于注入前武装的后台定时器（`sleep <duration>` + 逆操作），到期自动删除规则；
+- 自恢复基于注入前武装的后台定时器（`sleep <recovery-seconds>` + 逆操作），到期自动删除规则；
   提前恢复仍用下方手动命令。Pod 重启也会让 tc 规则自动消失（不持久化）
 - 恢复 iptables 用 `-D` 逐字对应删除，不要用 `iptables -F`——那会清掉容器原有的其他规则
 - 走过路径 B 的话：**临时容器无法从运行中的 Pod 移除**（Kubernetes 既定行为），只能随 Pod 重建消失。

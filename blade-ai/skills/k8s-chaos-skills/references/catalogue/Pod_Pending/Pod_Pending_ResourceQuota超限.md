@@ -15,7 +15,8 @@ recovery_channel: apiserver-write
 
 **用例名称** ResourceQuota超限 导致 Pod_Pending
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -36,12 +37,12 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - 道具 quota（`kubectl create quota --hard=pods=<不超过当前Pod数>`——上限低于存量 Pod 数的瞬态约束对象）为 execute 计划 manifest/kubectl 步骤；收尾清理步删除；故障解除判据 = 副本回基线且全部 Running。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. 应用扩容后新副本迟迟不就绪，DESIRED > READY
 2. ReplicaSet 持续报 FailedCreate 事件：`Error creating: pods "<pod>" is forbidden: exceeded quota: <quota-name>, requested: pods=1, used: pods=<N>, limited: pods=<M>`
 3. 注意真实签名：Pod 被准入控制（admission）直接拒绝，**Pod 对象根本不会被创建**，因此观察不到 Pending 状态的 Pod——"扩容卡住 + FailedCreate 事件"才是本故障的必现现象
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 的 Deployment/StatefulSet 正常运行，记录当前副本数为基线
 2. 确认目标命名空间当前没有已存在的 ResourceQuota（有则记录并在恢复时保留原状）
 3. 确认集群内存在带 kubectl 且有该命名空间 RBAC 权限的常驻载体 Pod（用于武装定时自恢复）。**若集群无此类载体**（chaosblade-tool/operator 镜像均无 kubectl，chaosblade SA 对业务命名空间无 scale/delete quota 权限），按**恢复载体标准件**（`references/carrier/recovery-carrier.md`）自建载体栈——四对象同名 `drill-rc-<hash>`、全部建在被批准的靶点命名空间内（漂移守卫以二级范围+命名空间锚定放行，建在其他命名空间会被判 scope/namespace drift 拦截）、SA/Role/RoleBinding 必须用 `kubectl create` 命令构造（`apply -f` 因清单内容对守卫不可见被设计性拦截）：
@@ -69,7 +70,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl delete sa drill-rc-<hash> -n <namespace> --ignore-not-found
    ```
 
-**演练步骤**（主路径 = 基线捕获 → 创建道具 quota（步骤 3 前半，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方），副本扩容注入+武装+readback 工具内同步完成；以下手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+## 演练步骤
+（主路径 = 基线捕获 → 创建道具 quota（步骤 3 前半，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方），副本扩容注入+武装+readback 工具内同步完成；以下手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. **基线捕获**：记录 Pod 总数与 workload 副本数（restorePatches 的基线值来源，两条路径共用）
    ```bash
    kubectl get pods -n <namespace> --no-headers
@@ -87,7 +89,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl scale <workload-kind> <name> -n <namespace> --replicas=<基线副本数+增量>
    ```
 
-**注入验证**：
+## 注入验证
 1. 执行 `kubectl get <workload-kind> <name> -n <namespace>`，确认 READY < DESIRED 且持续不收敛
 2. 确认 FailedCreate 事件（根因证据，消息中含 `exceeded quota`）：
    ```bash
@@ -104,7 +106,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 2. 行为复查：READY 仍 < DESIRED 持续不收敛（同注入验证第 1 条形态）
 3. 事件复查：FailedCreate 事件 LAST SEEN 相比注入时有新增（仍在被准入拒绝）
 
-**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原 replicas（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行；quota 删除为非 patch 域动作，走 execute 计划收尾清理步（恢复验证第 3 条）。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原 replicas（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行；quota 删除为非 patch 域动作，走 execute 计划收尾清理步（恢复验证第 3 条）。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动缩回基线副本并删除配额；演练提前结束时由 Agent 主动执行同一组恢复命令（幂等，定时器迟到再执行一次无副作用。降级兜底路径专用——主路径下载体只还原 replicas，quota 由收尾清理步删除）：
    ```bash
    kubectl scale <workload-kind> <name> -n <namespace> --replicas=<基线捕获的原始副本数>
@@ -112,7 +115,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
 2. 等待新副本自动创建并 Running
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods -n <namespace> -l <app-label>`，确认 Pod 数与副本数回到基线且全部 Running/Ready
 2. 确认 FailedCreate 事件不再新增——事件列表是 append-only 的（历史事件不会消失），判据是 **LAST SEEN 时戳不再前进**：恢复后复查一次，最后一条 FailedCreate 的 LAST SEEN 停在恢复时刻之前即确证「不再新增」：
    ```bash
@@ -123,11 +126,11 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl get resourcequotas.v1. -n <namespace>
    ```
 
-**基准事实**：
+## 基准事实
 - **根因**：命名空间 ResourceQuota 上限低于 workload 期望副本所需，新 Pod 在准入控制阶段被拒绝创建
 - **必现现象**：READY < DESIRED 持续不收敛；ReplicaSet FailedCreate 事件含 `exceeded quota`；无 Pending Pod 对象产生
 
-**注意事项**：
+## 注意事项
 - chaosblade 无 ResourceQuota/准入类故障靶点，本用例为 kubectl-native 专属注入
 - 优先选择无 HPA 的 workload 作靶点：存在 HPA 时其会在约 15s 内收回手动扩出的副本，抢占故障窗口与定时器动作
 - 部分托管集群安装了抢占短名的 CRD（如 `quotas.quotas.alibabacloud.com`），`kubectl get/delete quota` 会命中 CRD 并报 NotFound——必须使用组限定写法 `resourcequotas.v1.`

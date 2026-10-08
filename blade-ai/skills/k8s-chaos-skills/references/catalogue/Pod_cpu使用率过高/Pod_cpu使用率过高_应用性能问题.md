@@ -1,34 +1,34 @@
 **用例名称** 应用性能问题 导致 Pod_CPU使用率过高
 
-**故障现象**：
+## 故障现象
 1. Pod 的 CPU 使用率持续超过阈值
 2. CPU 使用率过高影响其他服务
 3. 应用响应变慢或发生超时
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A/B 已正常运行
 2. 确认监控系统（如 Prometheus）已配置，可观测 Pod CPU 指标
 
-**演练步骤**：
+## 演练步骤
 1. 定位应用 A 的 Pod 作为故障注入目标
 2. 使用 chaosblade 对目标 Pod 注入 CPU 压力（模拟死循环或高并发计算场景）
 3. 观察 Pod CPU 使用率变化
 
-**注入验证**：
+## 注入验证
 1. `kubectl top pod <pod-name> -n <namespace>` 确认 CPU 使用率高于注入目标——单次采样读数高于目标即压力已发生；「持续保持」由机制存活保证（fullload 实验在册即持续满载由构造成立），无需反复采样验证持续
 2. 进入容器查看 CPU 占用进程
 3. （可选，仅当环境部署了 APM 时）借助 APM 分析 CPU 热点分布；无 APM 不影响判定
 4. （可选，仅当演练方提供了应用访问入口时）确认对其他服务的调用出现延迟或超时；无入口时上述 CPU 级证据成立即可判定
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 chaosblade CPU 压力实验
 2. 如 Pod 仍异常，可删除 Pod 触发重建
 
-**恢复验证**：
+## 恢复验证
 1. `kubectl top pod <pod-name> -n <namespace>` 确认 CPU 使用率恢复到正常水平
 2. （可选，有访问入口时）确认对其他服务的调用恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：应用存在死循环、高并发计算或资源泄漏等性能问题，导致 CPU 使用率持续过高
 - **必现现象**：Pod CPU 使用率持续超过阈值，应用响应变慢或超时
 
@@ -44,7 +44,7 @@
 ```bash
 # 方式一：容器内有 stress-ng（后台+重定向让 exec 立即返回，--timeout 自带自动恢复）
 kubectl exec <pod-name> -n <namespace> -c <container> -- \
-  sh -c 'stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s >/dev/null 2>&1 &'
+  sh -c 'stress-ng --cpu 0 --cpu-load <percent> --timeout <recovery-seconds>s >/dev/null 2>&1 &'
 
 # 方式二：容器无 stress-ng，用 shell 循环。
 # 关键点：① 先读 CPU 上限算循环数；② 每个循环重定向到 /dev/null（否则
@@ -57,7 +57,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- \
 kubectl get pod <pod-name> -n <namespace> \
   -o jsonpath='{.spec.containers[0].resources.limits.cpu}'
 
-# ② 注入：起 N 个循环，PID 落盘，<duration> 秒后按 PID 文件自动 kill
+# ② 注入：起 N 个循环，PID 落盘，<recovery-seconds> 秒后按 PID 文件自动 kill
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
   : > /tmp/loadgen-worker.pids
   i=1
@@ -66,11 +66,15 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
     echo $! >> /tmp/loadgen-worker.pids
     i=$((i+1))
   done
-  ( sleep <duration>; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids ) >/dev/null 2>&1 &
-  echo "started <N> loops, auto-stop after <duration>s"
+  ( sleep <recovery-seconds>; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids ) >/dev/null 2>&1 &
+  echo "started <N> loops, auto-stop after <recovery-seconds>s"
 '
 ```
 倒计时从武装时刻起算：负载发生器启动与定时器武装在同一 sh -c 载荷内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c 'pkill -f "loadgen-worker.pid[s]"; true'` 一并停掉故障与旧定时器（后台 subshell 共享载荷 cmdline，此杀同时命中定时器与负载循环，即全停语义），再重跑上方注入命令原子重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——方式一 stress-ng 的 `--timeout` 与
+方式二的 sleep 定时器以它武装，让框架在观察窗终点主动派发的恢复先于自治到期落地
 
 恢复命令（从精确到兜底，任选其一）：
 ```bash

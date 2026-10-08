@@ -1,6 +1,7 @@
 **用例名称** 端口被占用 导致 Pod_网络故障
 
-**故障定位**：持续型故障——端口被占用进程持有即故障存活，监听 socket 存在即故障
+## 故障定位
+持续型故障——端口被占用进程持有即故障存活，监听 socket 存在即故障
 存在，贯穿整个故障窗口；占用进程终止（实验销毁/定时器 kill）即端口释放、自动恢复。
 手段1（ChaosBlade `pod-network occupy`）与手段2（kubectl-native：容器内 nc/socat 抢占
 端口）是**并列的注入手段**，底层效果等价（blade 内部也是向目标 Pod 注入端口占用进程），
@@ -12,13 +13,13 @@ bind 该端口」（`Address already in use`），不是「连接被拒」——
 （如 sleep 型裸负载）时该项为预期阴性，效果主证一律用 **bind 探针失败**。
 `duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. Pod 内服务端口被强制占用，应用无法监听预期端口（重启/重发布报 `Address already in use`）
 2. 已有监听应用被强制杀死时（手段1 `--force` / 手段2 pkill 分支），现有连接中断
 3. 健康检查可能失败（如探针使用被占端口），导致 Pod 被重启
 4. Service 端点无法正常接收流量（仅原有监听应用被杀时）
 
-**资源准备**：
+## 资源准备
 1. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（多容器/临时容器混存时
    `kubectl exec` 必须显式 `-c <容器名>`）
 2. **能力探测（决定手段选择）**——确认 ChaosBlade 的 `pod-network` 是否提供 occupy
@@ -57,7 +58,7 @@ bind 该端口」（`Address already in use`），不是「连接被拒」——
 6. 确认容器内 `/tmp` 可写（PID 文件与证据文件落盘；root 不受权限位约束，探测
    `ls -ld /tmp` 即可）
 
-**演练步骤**：
+## 演练步骤
 1. 记录注入前基线：
    ```bash
    kubectl get pods -n <namespace> -l <label-selector> -o wide
@@ -98,7 +99,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'pkill -x <原应用进程名> 2>/dev/null; \
    socat TCP-LISTEN:<port>,fork,reuseaddr /dev/null >/dev/null 2>&1 & echo $! > /tmp/portbind-agent.pid; \
    echo PORTBIND_INJECTED >> /tmp/portbind-agent.evd; \
-   ( sleep <duration>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid; echo PORTBIND_RESTORED >> /tmp/portbind-agent.evd ) >/dev/null 2>&1 &'
+   ( sleep <recovery-seconds>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid; echo PORTBIND_RESTORED >> /tmp/portbind-agent.evd ) >/dev/null 2>&1 &'
 ```
 结构说明：
 - `pkill -x <原应用进程名>`：仅当资源准备第 4 条探测到原应用监听时保留（实现手段1
@@ -116,6 +117,11 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   （载荷约 320 字节，wiz 通道 sh -c 1024 字节上限内安全）
 
 路径A 倒计时从武装时刻起算：抢占→落盘→标记→武装在同一载荷内严格串行（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c 'pkill -f portbind-agent.pi[d]; true'` 停旧定时器（socat 占用进程不受影响，如需重注入先按恢复命令释放端口），再重跑上方注入命令原子重抢占+重武装（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径A/B 的 sleep 定时器以它武装，
+让框架在观察窗终点主动派发的恢复先于自治到期落地；手段1 的 `--timeout` 由引擎在
+派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
 
 **执行期效果自证探针（强烈推荐，注入载荷后、进入验证前执行）**——bind 探针是
 变异形态操作（后台起进程再 kill），**verify 阶段的 read-only 纪律会结构性拒绝它**
@@ -154,11 +160,12 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'pkill -x <原应用进程名> 2>/dev/null; \
    ( nc -l -l -p <port> -e cat ) >/dev/null 2>&1 & echo $! > /tmp/portbind-agent.pid; \
    echo PORTBIND_INJECTED >> /tmp/portbind-agent.evd; \
-   ( sleep <duration>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid; echo PORTBIND_RESTORED >> /tmp/portbind-agent.evd ) >/dev/null 2>&1 &'
+   ( sleep <recovery-seconds>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid; echo PORTBIND_RESTORED >> /tmp/portbind-agent.evd ) >/dev/null 2>&1 &'
 ```
 （自证链、重武装纪律、执行期效果自证探针与路径 A 完全一致）
 
-**注入验证**（两种手段共用——底层都是端口被占用进程持有；⚠️ verify 阶段
+## 注入验证
+（两种手段共用——底层都是端口被占用进程持有；⚠️ verify 阶段
 read-only 纪律约束：探针类变异形态操作（后台起进程+kill 的 bind 探针）会被拒绝，
 效果主证依赖执行期探针标记（见手段2 执行期效果自证）或下列白盒观测）：
 1. 白盒确认端口已被占用进程监听（主证）：
@@ -191,7 +198,7 @@ read-only 纪律约束：探针类变异形态操作（后台起进程+kill 的 
    `PORTBIND_RESTORED` 未现即窗口仍开。若窗口内提前恢复，说明故障窗口契约未达成，
    必须如实报告实际持续时长
 
-**注入恢复**：
+## 注入恢复
 
 手段1（ChaosBlade）：
 1. 提前恢复：销毁实验（释放端口）`blade destroy <experiment_uid>`
@@ -213,7 +220,8 @@ read-only 纪律约束：探针类变异形态操作（后台起进程+kill 的 
 4. 原应用进程恢复：由容器 init 系统或 K8s 探针重启机制自动恢复；若未恢复，重启
    Pod：`kubectl delete pod <pod-name> -n <namespace>`
 
-**恢复验证**（两种手段共用；自动化主证用白盒，bind 探针为变异形态仅限执行期/
+## 恢复验证
+（两种手段共用；自动化主证用白盒，bind 探针为变异形态仅限执行期/
 带外人工——verify 阶段会被 readonly 纪律拒绝，不要重试）：
 1. 白盒确认端口已释放（自动化主证）：`ss -tlnp`（或 `netstat -tlnp`）不再有 `<port>`
    的 LISTEN 行（与基线快照一致）；手段2 证据文件应新增 `PORTBIND_RESTORED`、
@@ -231,7 +239,7 @@ read-only 纪律约束：探针类变异形态操作（后台起进程+kill 的 
 4. 确认 Pod RESTARTS 与基线一致（无注入引发的额外重启；自然重启周期工作负载按
    基线预期剔除）
 
-**基准事实**：
+## 基准事实
 - **根因**：Pod 内目标端口被占用进程强制持有（手段1 blade 注入进程 / 手段2 socat/nc），
   其他进程 bind 该端口报 `Address already in use`；原监听进程被杀时（`--force`/pkill）
   叠加服务中断现象

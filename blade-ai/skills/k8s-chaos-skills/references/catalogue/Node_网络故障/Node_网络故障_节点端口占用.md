@@ -1,12 +1,12 @@
 **用例名称** 节点端口占用 导致 Node_网络故障
 
-**故障现象**：
+## 故障现象
 1. 节点上的关键端口被占用（如 kubelet 10250、NodePort 范围 30000-32767、应用 HostPort）
 2. 使用该端口的系统组件或应用无法正常工作
 3. NodePort 类型 Service 无法在该节点接收流量
 4. 模拟节点端口资源冲突或恶意进程占用场景
 
-**资源准备**：
+## 资源准备
 1. 确认目标节点名称
 2. 确认需要占用的端口号（NodePort、HostPort 或系统组件端口）
 3. 确认 ChaosBlade Operator 已部署（DaemonSet 通道）或具备节点 SSH 访问权限（SSH 通道）
@@ -15,7 +15,7 @@
    - **NodePort 形态须先确认 kube-proxy 非 IPVS 模式**（`kubectl get pods -n kube-system -l k8s-app=kube-proxy -o yaml | grep mode`，mode: ipvs 即中招）——IPVS 模式下 NodePort 流量由虚拟服务 DNAT 直达后端 Pod，宿主机上的 nc/socat 监听收不到任何 NodePort 流量（socat 实占 NodePort 端口后，外部访问仍直达后端 Service），注入"成功"但「NodePort 不可达」判据**恒假阴性**；且集群可能无任何 NodePort Service（无现成靶）
    - **kubelet 10250 不建议作靶**：占用后节点 NotReady 会触发节点级外部自愈通道介入（约 217-292s），故障窗口被外部恢复机制截断，duration 契约失效
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标节点和端口使用情况：
    ```bash
    kubectl get nodes <node-name>
@@ -47,7 +47,7 @@
    - `--force`：强制杀死当前使用该端口的进程后占用
 3. 记录返回的 experiment_uid，用于后续恢复
 
-**注入验证**：
+## 注入验证
 1. 确认端口已被占用（通过 SSH 或 debug Pod 检查节点）：
    ```bash
    kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host ss -tlnp | grep <port>
@@ -68,7 +68,7 @@
    - **组件 crashloop（传导证据）**：原组件 Pod `RESTARTS` 计数增长——被杀重启后因端口被占 bind 失败反复 crash，`RESTARTS` 持续增长是注入生效的预期主证而非副作用，勿当作误伤
 5. 检查相关事件和系统组件日志
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 ChaosBlade 实验：
    ```bash
    blade destroy <experiment_uid>
@@ -76,7 +76,7 @@
 2. 或等待 `--timeout` 到期自动恢复
 3. 被杀的系统组件（如 kubelet）通常由 systemd 自动重启
 
-**恢复验证**：
+## 恢复验证
 1. 确认端口恢复正常使用：
    ```bash
    kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host ss -tlnp | grep <port>
@@ -86,7 +86,7 @@
 3. 确认 NodePort Service 恢复可达（仅 iptables 模式下此判据成立，见注入验证第 2 条）
 4. 确认系统组件运行正常：hostNetwork 守护进程端口形态下补三项零残留判据——原组件 Pod `RESTARTS` 停止增长且容器稳定 Running；服务响应形态回基线（curl code 回到注入前采集值）；`pgrep -af socat`（或 nc）无残留进程
 
-**基准事实**：
+## 基准事实
 - **根因**：节点宿主机上的指定端口被 ChaosBlade 强制占用，原使用该端口的进程被杀死（`--force`），模拟端口资源冲突或关键组件端口被抢占场景
 - **必现现象**：目标端口被占用；原监听进程中断；依赖该端口的服务/组件不可用
 
@@ -115,29 +115,33 @@ kubectl exec <probe-pod> -n <ns> -c debugger -- chroot /host curl -sk --max-time
 # nc 形态（宿主机有 nc 时）：通过 kubectl debug node 在宿主机网络空间占用端口（nc 作为 debug Pod 主进程常驻；
 # timeout 到期自动终止 nc，恢复=到期自停或提前删除该 debug Pod）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host \
-  timeout <duration> nc -l -p <port> -k
+  timeout <recovery-seconds> nc -l -p <port> -k
 # socat 形态（宿主机无 nc 时等效替代；OPEN:/dev/null = 接受连接不回数据）：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host \
-  timeout <duration> socat TCP-LISTEN:<port>,reuseaddr,fork OPEN:/dev/null
+  timeout <recovery-seconds> socat TCP-LISTEN:<port>,reuseaddr,fork OPEN:/dev/null
 # 如需强制占用（先杀原进程再监听，exec 让 timeout+占用进程取代 shell 成为主进程）——nc 形态：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'fuser -k <port>/tcp; exec timeout <duration> nc -l -p <port> -k'
+  'fuser -k <port>/tcp; exec timeout <recovery-seconds> nc -l -p <port> -k'
 # 强制占用 socat 形态（宿主机无 nc 时；fuser -k 杀原持有进程后 socat 抢占，宿主机须有 fuser）：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'fuser -k <port>/tcp; exec timeout <duration> socat TCP-LISTEN:<port>,reuseaddr,fork OPEN:/dev/null'
+  'fuser -k <port>/tcp; exec timeout <recovery-seconds> socat TCP-LISTEN:<port>,reuseaddr,fork OPEN:/dev/null'
 # 容器内直接执行形态（守卫兼容路径）：当 `chroot /host sh -c` 复合载荷被守卫以
 # host-escape 原语/fault family 不匹配拦截时，改在 privileged+hostNetwork+hostPID 载体容器内直接执行
 # （容器内 bind = 宿主端口被占，网络栈共享；镜像钦定须自带 socat/timeout，terway 镜像已验证自带）；
 # 杀原持有进程用 kill <pid>（从基线探测动态解析持有者 pid，守卫 process family 认可；fuser 在
 # 只读探查阶段即被全形态拦截，勿在载荷中使用），kill 与 socat 间加 sleep 1 竞态缓冲：
 kubectl exec <debug-pod> -n <debug-namespace> -c debugger -- sh -c \
-  'kill <holder-pid>; sleep 1; nohup timeout <duration> socat TCP-LISTEN:<port>,reuseaddr,fork OPEN:/dev/null >/dev/null 2>&1 & echo armed'
+  'kill <holder-pid>; sleep 1; nohup timeout <recovery-seconds> socat TCP-LISTEN:<port>,reuseaddr,fork OPEN:/dev/null >/dev/null 2>&1 & echo armed'
 # （nohup 后台化使 exec 秒回——规避 harness 30s task ceiling 截断；socat 生命周期由 timeout 独立管理）
 ```
 
 **机制定案免推导（勿再推演此机理）**：exec 载荷秒回后 socat 为何存活——nohup 忽略 SIGHUP；`&` 后台化的 socat 在 exec 会话的 shell 退出后被 reparent 到容器 PID 1（载体 `sleep 3600` 常驻，PID 1 存活故容器不被收割——runtime 仅在 PID 1 退出时收割容器，exec 会话结束不触发），故 socat 由 timeout 独立管理存活至到期。**载体的唯一使命 = 保持 PID 1 存活**：观察窗口内（含 verify 阶段——exec 进载体观察 socat/端口持有者是本 case 的验证形态）勿删载体；「删除载体不影响 socat」的推论未经验证（exec 出的 socat 仍在容器 cgroup 内，删载体大概率连带收割 = 窗口截断），勿采信勿再推导；确需强制提前恢复时可删载体兜底，代价是窗口截断（提前恢复方向，无害）。
 
 倒计时从武装时刻起算：timeout 包裹与 nc 监听在同一条命令内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先删除旧 debug Pod（`kubectl delete pod <debug-pod-name> --force --grace-period=0`，端口释放与定时器取消同步完成），再重跑上方注入命令重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——timeout 自停包裹（及下方无 timeout
+环境的等效 sleep 定时器）以它武装，让框架在观察窗终点主动派发的恢复先于自治到期落地
 
 恢复命令（到期前可提前手动恢复）：
 ```bash
@@ -155,5 +159,5 @@ kubectl delete pod <debug-pod-name> --force --grace-period=0
 - socat `OPEN:/dev/null` 形态的响应特征：接受 TCP 连接但不回任何数据（读 /dev/null 立即 EOF）——对 TLS 服务（如 kube-rbac-proxy）表现为 TLS 握手无响应（curl `code=000`、exit 35 SSL connect error），对明文 HTTP 表现为连接成功但空响应/立即断开；这是「效果主证」的判读形态，勿误判为注入未生效
 - 强制占用 hostNetwork 守护进程端口后，原组件会进入 crashloop（bind 失败反复退出），`RESTARTS` 增长是注入生效的传导证据；占用释放后 kubelet 在下一个重启周期内重绑成功（约 10s，backoff 10s 量级不显著拖延），恢复验证以此为准勿提前判负
 - **IPVS 遮蔽对本手段2同样生效**：kube-proxy IPVS 模式下占用 NodePort 端口，NodePort 流量仍被虚拟服务 DNAT 直达后端 Pod，宿主机监听零承接——「NodePort 不可达」判据恒假阴性（判型见资源准备第 4 条），本场景应改用 hostNetwork 守护进程端口形态
-- 自恢复基于 `timeout <duration>` 包裹：到期 nc/socat 退出后 debug Pod 主进程结束、端口释放；
-  若宿主机无 `timeout`（coreutils 缺失的极端环境），改用 `sh -c 'nc ... & sleep <duration>; kill $!'` 等效实现
+- 自恢复基于 `timeout <recovery-seconds>` 包裹：到期 nc/socat 退出后 debug Pod 主进程结束、端口释放；
+  若宿主机无 `timeout`（coreutils 缺失的极端环境），改用 `sh -c 'nc ... & sleep <recovery-seconds>; kill $!'` 等效实现

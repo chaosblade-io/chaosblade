@@ -1,16 +1,16 @@
 **用例名称** DiskPressure 导致 Pod_被驱逐重建
 
-**故障现象**：
+## 故障现象
 1. Pod 被 kubelet 驱逐（Evicted），状态为 Failed，reason 为 Evicted
 2. 节点 Conditions 中 DiskPressure 为 True
 3. 容器运行时目录（如 /var/lib/docker 或 /var/lib/containerd）磁盘使用超过 kubelet 驱逐阈值
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，有多个副本分布在不同节点
 2. 确认目标节点的容器运行时磁盘当前使用率距离驱逐阈值有一定空间
 3. 确认监控系统可观测节点磁盘使用率和 Pod 驱逐事件
 
-**演练步骤**：
+## 演练步骤
 1. 前置确证（两项，直接决定填充量计算与本场景可行性）：
    ```bash
    # a) 分区拓扑：容器运行时目录与根分区是否同一分区（决定适用阈值）
@@ -34,24 +34,24 @@
 3. 等待 kubelet 检测到 DiskPressure 并触发 Pod 驱逐
 4. 观察应用 A 的 Pod 驱逐和重建行为
 
-**注入验证**：
+## 注入验证
 1. **（即时主证据，必做）** 经 debug pod 确认填充已越过驱逐阈值：`kubectl debug node/<节点名> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host df -h <容器运行时数据目录>`，使用率超过演练步骤 1 探测的阈值（同分区 nodefs>90% 或独立 imagefs>85%）——填充是同步操作，df 即时可见，用于区分「填充未达阈值」与「驱逐传播延迟」两个失败层
 2. 执行 `kubectl describe node <节点名>`，确认 Conditions 中 DiskPressure 为 True——该条件由 kubelet 周期检测同步，存在滞后，首查仍为 False 不构成反证（前置确证命中 `DisablePodEviction=true` 时此项不可达，按演练步骤第 1 步判读改验磁盘使用率与节点定制事件）
 3. 执行 `kubectl get pods --field-selector=status.phase=Failed`，确认有 Pod 被 Evicted——驱逐由 kubelet 周期决策，同样存在滞后；第 1 条的 df 阈值确认成立而驱逐未出现时，属传播延迟而非注入失败，无需反复轮询
 4. 查看被驱逐 Pod 的详情，确认 reason 为 `The node was low on resource: ephemeral-storage`
 5. 确认应用 A 在其他节点重建 Pod
 
-**注入恢复**：
+## 注入恢复
 1. 等待 chaosblade 实验自动超时恢复（`<duration>` 内），或执行 `blade destroy <UID>`
 2. 等待节点磁盘空间释放
 3. 清理 Evicted Pod：`kubectl delete pods --field-selector=status.phase=Failed`
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl describe node <节点名>`，确认 DiskPressure 恢复为 False
 2. 确认应用 A 的 Pod 在正常节点上运行
 3. 确认节点磁盘使用率恢复到安全水位
 
-**基准事实**：
+## 基准事实
 - **根因**：容器运行时目录磁盘使用超过 kubelet 驱逐阈值（DiskPressure），kubelet 按优先级驱逐 Pod 以释放磁盘空间
 - **必现现象**：节点 DiskPressure=True；Pod 被 Evicted；reason 为 ephemeral-storage 不足
 
@@ -68,25 +68,38 @@
 # 0) 先测容器运行时目录所在分区的基线
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host df -h /var/lib/containerd
 
-# 1) 填充量 = 分区总容量 × 目标使用率（对齐 blade --percent 注入值） − 当前已用量
+# 0b) 【弹药实测，必做】只读求和节点现有镜像层总量：DiskPressure 触发后
+#     kubelet 会回收未使用镜像层（实测可回收 ~4GiB），填充量若只略超阈值，
+#     GC 回收后使用率回落到阈值以下，DiskPressure 反复翻转、驱逐链路不稳定
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host crictl images
+
+# 1) 填充量 = 分区总容量 × 目标使用率（对齐 blade --percent 注入值） − 当前已用量 + 可回收镜像层总量（按 0b 求和估算）
 
 # 2) 通过 kubectl debug node 在容器运行时目录填充数据。
-#    **先武装定时清理，再填充**：timer 由宿主机 systemd(PID 1) 管理，到期自动删除填充文件；
+#    **先武装定时清理，再填充**：timer 由宿主机 systemd(PID 1) 管理，到期自动
+#    回收填充文件——且不依赖本 debug pod 存活（本场景的 DiskPressure 恰恰可能
+#    驱逐 debug pod 自身，timer 由 PID 1 持有，载体死了照常触发）；
+#    timer payload 必须用家族逆 `truncate -s 0`（幂等，可静态验证配对），
+#    **严禁 rm / systemctl**（宿主命令守卫的 banned verbs，携带即被拒）；
 #    `&&` 串联保证武装失败时不会执行填充
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill rm -f /var/lib/containerd/app-archive.log &&
+  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill truncate -s 0 /var/lib/containerd/app-archive.log &&
    dd if=/dev/zero of=/var/lib/containerd/app-archive.log bs=1M count=<算出的填充量换算的MB数>'
 # 或使用 fallocate（更快）：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill rm -f /var/lib/containerd/app-archive.log &&
+  'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-diskfill truncate -s 0 /var/lib/containerd/app-archive.log &&
    fallocate -l <算出的填充量>G /var/lib/containerd/app-archive.log'
 ```
 
 恢复命令（timer 到期前可提前手动恢复）：
 ```bash
-# 提前恢复：删除填充文件（同时停掉已武装的 timer）
-kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'systemctl stop blade-restore-diskfill.timer 2>/dev/null; rm -f /var/lib/containerd/app-archive.log'
+# 提前恢复：经同一 debug pod（或同节点任一在册 debug pod）执行与 timer payload
+# 等同的纯逆操作。truncate 幂等——提前执行后 timer 到期再执行一次是无害空操作，
+# 无需（也无法）用 systemctl 停 timer
+kubectl exec <debug-pod-name> -n default -- chroot /host truncate -s 0 /var/lib/containerd/app-archive.log
+# 或 fallocate -d：
+kubectl exec <debug-pod-name> -n default -- chroot /host fallocate -d /var/lib/containerd/app-archive.log
 # 删除 debug Pod
 kubectl delete pod <debug-pod-name> --force --grace-period=0
 # 清理 Evicted Pod
@@ -94,8 +107,10 @@ kubectl delete pods --field-selector=status.phase=Failed
 ```
 
 注意事项：
-- 填充大小需按**增量**计算（填充量 = 分区总容量 × 目标使用率 − 当前已用量），确保超过驱逐阈值——阈值随分区拓扑变化：容器运行时目录与根分区同分区时默认 `nodefs.available < 10%`，独立 imagefs 分区时默认 `imagefs.available < 15%`（显式 --eviction-hard 优先）；量太小不越阈值不触发驱逐，量太大把分区填满会影响恢复阶段写入
+- 填充大小需按**增量**计算（填充量 = 分区总容量 × 目标使用率 − 当前已用量 + 可回收镜像层总量），确保超过驱逐阈值——阈值随分区拓扑变化：容器运行时目录与根分区同分区时默认 `nodefs.available < 10%`，独立 imagefs 分区时默认 `imagefs.available < 15%`（显式 --eviction-hard 优先）；量太小不越阈值不触发驱逐，量太大把分区填满会影响恢复阶段写入
 - 演练前先按手段1（演练步骤）第 1 步做前置确证：feature-gates 含 `DisablePodEviction=true` 的集群驱逐链路被禁用，填充可注入可自恢复但不会出现 DiskPressure=True 与 Pod Evicted，须按「填充可验证 + 驱逐不可达」定案
 - 与 ChaosBlade `--percent` 不同，此方式需手动计算填充字节数
-- 自恢复基于 systemd-run transient timer 到期自动删除填充文件，补齐了 ChaosBlade `--timeout` 的自恢复能力；被驱逐的 Pod 由上层控制器自动重建，Evicted 残留记录需手动清理
-- 同名 transient timer 重复武装会报 `Unit blade-restore-diskfill.service was already loaded`（上次武装命令执行失败时 unit 以 failed 状态残留所致）；重武装前先按本文件注入命令的同等 chroot /host 通道形态清理残留：`systemctl stop blade-restore-diskfill.service; systemctl reset-failed blade-restore-diskfill.service`（武装命令成功执行过的 unit 无残留，可直接重武装）
+- 自恢复基于 systemd-run transient timer 到期自动回收填充文件（payload 为幂等家族逆 `truncate -s 0`），补齐了 ChaosBlade `--timeout` 的自恢复能力；timer 由宿主 PID 1 管理，debug pod 被 DiskPressure 驱逐也不影响到期触发；被驱逐的 Pod 由上层控制器自动重建，Evicted 残留记录需手动清理
+- 同名 transient timer 重复武装会报 `Unit blade-restore-diskfill.service was already loaded`（上次武装命令执行失败时 unit 以 failed 状态残留所致）；重武装**换一个唯一 unit 名**（如 `blade-restore-diskfill-2`）即可，不得用 systemctl stop/reset-failed 清理（banned verb，会被宿主命令守卫拒绝）；武装命令成功执行过的 unit 到期后自动卸载，可直接重武装同名
+- **驱逐豁免的实测判据是 Pod priority，不是 toleration**：kubelet 驱逐按 QoS/优先级排序，system-node-critical 类高优先级 Pod（多数系统 DaemonSet）实测幸存；toleration 只影响准入调度，不影响驱逐排序——验证时不要把"带 toleration"当作豁免证据
+- **DiskPressure 存续期会产生两类 Evicted 记录**：资源驱逐型（message 含 `low on resource: ephemeral-storage`，驱逐已有 Pod）与准入拒绝型（message 含 `The node had condition: [DiskPressure]`，调度期拒绝新建 Pod）。统计爆炸半径时须按 message 区分代际，不得混计；压力解除后两类记录均会停止产生

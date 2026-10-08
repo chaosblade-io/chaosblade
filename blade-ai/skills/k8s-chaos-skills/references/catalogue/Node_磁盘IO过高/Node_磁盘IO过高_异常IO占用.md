@@ -1,11 +1,11 @@
 **用例名称** 异常IO占用 导致 Node_磁盘IO过高
 
-**故障现象**：
+## 故障现象
 1. 节点磁盘 IO 使用率持续过高（iostat 显示 %util 接近 100%）
 2. 节点上 Pod 的磁盘读写延迟增大，应用响应变慢
 3. iowait 占比升高
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认监控系统可观测节点磁盘 IO 指标
 3. **镜像选择（节点缓存约束）**：debug Pod 镜像须为节点已缓存镜像（外网 registry 不可达
@@ -27,7 +27,7 @@
 5. **宿主工具链探测**：载荷依赖宿主机 `dd`；验证判据依赖宿主 `iostat`（sysstat）。
    探测宿主无 iostat 时验证降级 `/proc/diskstats` 两采样差分（免工具依赖，见注入验证）
 
-**演练步骤**：
+## 演练步骤
 1. 定位目标节点并测基线（注入前必采，供恢复对比）：
    - 宿主 `iostat -xd 1 2`（记目标盘 %util、r/s、w/s、MB/s 基线）
    - 宿主 `iostat -c 1 2`（记 %iowait 基线）
@@ -51,22 +51,22 @@
 # 载荷设计要点：
 #   - oflag=direct 绕过页缓存，产生真实 IO 压力（稳态约 130-137MB/s）
 #   - wall-clock deadline 循环（date +%s 比较）：迭代时长不确定（burst ~0.5s/稳态 ~3.7s），
-#     固定迭代数会跑偏窗口；deadline = duration-50（600→550），为回收 tail 留清理余量
+#     固定迭代数会跑偏窗口；deadline = recovery-seconds-50（例观察窗 600 + grace 120 → 720−50=670），为回收 tail 留清理余量
 #   - 每轮 timeout -k 5 20：防单轮 dd 卡死卡住整个循环，同时是守卫可见的 timeout 时间界原语
 #   - truncate 归零 + unlink 删除 burn_test 回收 tail（先于 RuntimeMaxSec 强杀完成，
-#     否则 512MB 文件滞留）；RuntimeMaxSec=<duration> 为 systemd 兜底（unit 到期自 GC）
+#     否则 512MB 文件滞留）；RuntimeMaxSec=<recovery-seconds> 为 systemd 兑底（unit 到期自 GC）
 #   - 守卫时间界认可清单：--on-* timer / timeout N / background sleep N + 显式回收——
 #     RuntimeMaxSec 单独出现不被认可为时间界；timeout 原语 + 显式回收满足执法
 #   - 载荷体（systemd-run 之后的部分）必须整体被内层双引号包裹成一个参数，宿主侧变量用
-#     \$ 转义（外层算好的字面量如 e=<epoch>+<duration-50> 不转义）：
+#     \$ 转义（外层算好的字面量如 e=<epoch>+<recovery-seconds>-50 不转义）：
 #     `'\''` 多层嵌套引号会被命令传输层打碎（dash exit 2「Unterminated quoted
 #     string」）；而零引号形态有更隐蔽的致命缺陷：脚本中的 `;` 被外层
 #     容器 sh 解析为命令分隔符，systemd-run 只收到首段 `sh -c e=<字面量>`（瞬即退出），
 #     while/dd 循环从未进入宿主 unit——回执照常含 Running as unit 行但故障未注入（假武装）
 kubectl debug node/<node-name> --profile=sysadmin --image=<cached-image> -- sh -c \
   'nsenter -t 1 -m -u -i -n -p -- systemd-run --unit=drill-node-disk-burn --collect \
-   --property=RuntimeMaxSec=<duration> -- /bin/sh -c \
-   "e=$(( $(date +%s) + <duration-50> )); while [ \$(date +%s) -lt \$e ]; do timeout -k 5 20 dd if=/dev/zero of=<path>/burn_test bs=1M count=512 oflag=direct; done; truncate -s 0 <path>/burn_test; unlink <path>/burn_test"'
+   --property=RuntimeMaxSec=<recovery-seconds> -- /bin/sh -c \
+   "e=$(( $(date +%s) + <recovery-seconds>-50 )); while [ \$(date +%s) -lt \$e ]; do timeout -k 5 20 dd if=/dev/zero of=<path>/burn_test bs=1M count=512 oflag=direct; done; truncate -s 0 <path>/burn_test; unlink <path>/burn_test"'
 ```
 
 武装回执核验红线：回执须含 `Running as unit drill-node-disk-burn.service` 且**不伴随任何
@@ -93,11 +93,11 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<cached-image> -- sh -
 # 回收 tail 用 deadline 后显式 truncate，与主命令同构）
 kubectl debug node/<node-name> --profile=sysadmin --image=<cached-image> -- sh -c \
   'nsenter -t 1 -m -u -i -n -p -- systemd-run --unit=drill-node-disk-burn-r --collect \
-   --property=RuntimeMaxSec=<duration> -- sh -c \
-   e=$(( $(date +%s) + <duration-50> )); while [ $(date +%s) -lt $e ]; do timeout -k 5 20 dd if=<path>/burn_test of=/dev/null bs=1M count=512 iflag=direct; done'
+   --property=RuntimeMaxSec=<recovery-seconds> -- sh -c \
+   e=$(( $(date +%s) + <recovery-seconds>-50 )); while [ $(date +%s) -lt $e ]; do timeout -k 5 20 dd if=<path>/burn_test of=/dev/null bs=1M count=512 iflag=direct; done'
 ```
 
-**注入验证**：
+## 注入验证
 1. **主证（/proc/diskstats 两采样差分，免工具依赖）**：宿主侧 `cat /proc/diskstats` 两次
    采样（间隔 3-5s），目标整盘（如 `vda`，跳过分区条目 `vda1/vda3`）的
    delta(sectors_written) × 512 / 间隔秒数 / 1048576 = MB/s；**任何整盘持续写入 >10MB/s
@@ -132,17 +132,22 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<cached-image> -- sh -
 - 方法 3（容器无 dd 时）：`kubectl get events -n <ns> --field-selector
   involvedObject.name=<pod>` 观察是否有 IO 相关事件
 
-**注入恢复**：
+## 注入恢复
 1. 标准恢复路径 = **到期自停**（三层时序，零外部干预）：
-   - t≈duration-50s：wall-clock deadline 到点 → dd 循环退出（单轮卡死由 per-dd
+   - t≈<recovery-seconds>-50s：wall-clock deadline 到点 → dd 循环退出（单轮卡死由 per-dd
      `timeout -k 5 20` 兜底）
    - deadline 后立即：`truncate -s 0` + `unlink` 回收 burn_test（在 systemd 强杀 unit
-     之前完成——deadline = duration-50 为清理留出 ≥14s 余量，这是零残留的关键时序）
-   - t=duration：RuntimeMaxSec 到期 → systemd 停 unit → `--collect` 即时 GC
+     之前完成——deadline = <recovery-seconds>-50 为清理留出 ≥14s 余量，这是零残留的关键时序）
+   - t=<recovery-seconds>：RuntimeMaxSec 到期 → systemd 停 unit → `--collect` 即时 GC
 2. 提前终止（应急）：人工带外 `nsenter -t 1 -m -- systemctl stop drill-node-disk-burn`
    （Agent 恢复阶段该命令会撞禁词拦截，走带外或等到期）
+3. `<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+   （= duration + grace，见 SKILL.md 双数窗口契约）——wall-clock deadline 与
+   RuntimeMaxSec 同以它武装（-50 为回收 tail 的结构性余量，保留）。**本 case 特例**：
+   提前终止命令在 Agent 恢复阶段撞门禁禁词（见上），自恢复链是 Agent 在线段唯一
+   可依赖的恢复路径——安全网窗即实际故障窗
 
-**恢复验证**：
+## 恢复验证
 1. **主证（吞吐回落）**：宿主 `/proc/diskstats` 两采样差分，目标整盘持续写入回落至
    <10MB/s（对照基线）
 2. **iostat 口径**：宿主 `iostat -xd 1 3` 目标盘 %util 与 w/s 回落至基线水平
@@ -161,7 +166,7 @@ kube-proxy 等）`cat /proc/diskstats` 拿到与宿主完全一致的整盘计�
 iostat 自身算法等价）。但宿主文件路径（/tmp、/run）无法经此通道核实——依赖 Layer 1
 或注入期已采证据 + 当前吞吐的排他性论证（活 dd 循环与 0.4MB/s 吞吐不可共存）。
 
-**基准事实**：
+## 基准事实
 - **根因**：节点上存在异常进程大量占用磁盘 IO，导致磁盘 IO 使用率过高，影响同节点上所有
   Pod 的磁盘读写性能
 - **必现现象**：目标整盘持续写入吞吐远超基线（diskstats 差分 >10MB/s）；iowait 相对基线

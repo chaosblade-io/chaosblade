@@ -1,6 +1,6 @@
 **用例名称** 带宽受限 导致 Pod_网络带宽不足
 
-**故障现象**：
+## 故障现象
 1. Pod 出方向网络吞吐被限制到设定速率（如 1mbit），大数据量传输显著变慢
 2. 小请求仍能正常返回（限速不影响单包时延），但批量拉取/上传耗时成倍增加
 3. 应用出现「慢而不断」的症状：健康检查通过、但数据同步/镜像拉取/日志上报堆积
@@ -11,7 +11,7 @@
 > ChaosBlade 的 `pod-network` 无带宽限速 action（以 `blade create k8s pod-network --help`
 > 探测为准），本用例只有 kubectl-native 一条路径。
 
-**资源准备**：
+## 资源准备
 1. 确认目标 Pod 正常运行，且有可用的 **iproute2** `tc`（见演练步骤 1 —— 精简镜像里常有同名的
    BusyBox applet，它不支持 tbf；若无可用 tc，走演练步骤 2 的路径 B）
 2. 确认目标 Pod 有持续的出方向数据传输（对象存储上传、日志外发、数据同步等），
@@ -19,7 +19,7 @@
 3. 记录限速前的吞吐基线（见注入验证步骤 2 的测速方法），否则无法判断限速是否生效
 4. 确认目标 Pod 名称和命名空间
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标 Pod 运行状态，并判定容器内的 `tc` 是不是真的能用 —— **`which tc` / `command -v tc`
    会误判**，精简镜像里 `/bin/tc` 常与 `/bin/sh` 是同一个 BusyBox 二进制，名字在但不支持 tbf：
    ```bash
@@ -38,11 +38,17 @@
    载荷（sh -c）的死参数，注入静默丢失：
    ```bash
    kubectl exec <pod-name> -n <namespace> -- sh -c \
-     '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
+     '( sleep <recovery-seconds>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
    kubectl exec <pod-name> -n <namespace> -- \
      tc qdisc add dev eth0 root tbf rate <rate> burst <burst> latency <latency>
    ```
    各路径倒计时均从武装时刻起算：武装与注入两条命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先 `kubectl exec <pod-name> -n <namespace> [-c <debugger-name>] -- sh -c 'pkill -f "qdisc de[l]"; true'` 停旧定时器再全额重武装（exec 目标必须与武装时同一容器）；精简镜像无 pkill 时旧定时器无法停止，到期会提前恢复侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
+
+   `<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+   （= duration + grace，见 SKILL.md 双数窗口契约）——各路径的 sleep 定时器以它武装，
+   让框架在观察窗终点主动派发的恢复先于自治到期落地；路径 B 的载体保活 sleep 同须
+   ≥ 它（保活承载定时器，随定时器升窗）；手段1 的 `--timeout` 由引擎在派发前按同一
+   单源钉定，文档占位符保持 `<duration>` 不动
 
    **路径 B —— 容器内没有可用 tc（精简镜像的常态）**：用临时容器注入。临时容器与目标容器
    **共享同一个网络命名空间**，对 `eth0` 操作等价于操作目标 Pod 的网卡；`tc` 来自调试镜像，
@@ -58,16 +64,16 @@
    #    若直接把 tc 命令交给 kubectl debug，命令跑完容器立即终止，
    #    后续 `kubectl exec -c <debugger>` 会报 `container not found`，故障就没法恢复了。
    kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
-     --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
+     --target=<container-name> --profile=netadmin --quiet -- sleep <recovery-seconds>
 
    # 2) 取载体名（等它进入 running 再继续）
    kubectl get pod <pod-name> -n <namespace> \
      -o jsonpath='{range .status.ephemeralContainerStatuses[*]}{.name}{"="}{.state}{"\n"}{end}'
 
-   # 3) 经载体注入。同样先武装定时自删（在载体内后台运行；载体保活 sleep 必须 ≥ <duration>）。
+   # 3) 经载体注入。同样先武装定时自删（在载体内后台运行；载体保活 sleep 必须 ≥ <recovery-seconds>）。
    #    两条命令分两次独立执行——不能用 && 串联（第二段会沦为第一条 exec 载荷的死参数）
    kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- sh -c \
-     '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
+     '( sleep <recovery-seconds>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
    kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- \
      tc qdisc add dev eth0 root tbf rate <rate> burst <burst> latency <latency>
    ```
@@ -88,7 +94,7 @@
 
 3. 观察应用的数据传输耗时与吞吐变化
 
-**注入验证**：
+## 注入验证
 1. （诊断，仅当下述吞吐效果未出现时执行）确认 tbf 规则已生效（**用注入时同一条路径查**）——规则快照为机制代言不为结果代言，用于定位失败层（规则未挂载 vs 挂载未生效）：
    ```bash
    # 路径 A
@@ -101,9 +107,22 @@
 2. **（主证据，必做）** 测吞吐，用「注入前 vs 注入后」的速率差作为判据。**tbf 只限出方向（确证：
    1mbit 挂载中入向下载仍可达 1365KB/s 不受限）—— 判据必须测出向上传，不能测下载**。
    若业务是下载型流量，tbf 无法产生可观测现象，须换 ifb 重定向（不在本用例范围）
-   或改选其他方案。测法：在目标 Pod 内往外发大流量（如 `dd if=/dev/zero bs=1M count=N | nc <接收端> <port>`
-   计时，接收端用另一台可达主机的 `nc -l` / `socat TCP-LISTEN` 落盘），
-   比较注入前后耗时。**不要用小请求测** —— 限速不影响单个小包的时延，
+   或改选其他方案。测法：在目标 Pod 内往外发大流量（发送端
+   `dd if=/dev/zero bs=1M count=N | nc <接收端> <port>` 计时），比较注入前后耗时。
+   **CNI / 精简镜像（terway、calico、cilium 等）常只有 `socat` 没有 `nc`**，此时发送端改用
+   `dd if=/dev/zero bs=1M count=N | socat - TCP:<接收端>:<port>` —— 与 `dd|nc` 同属「有界发流量
+   探测」，只读守卫按参数级豁免放行（socat 两地址须为出向 TCP/UDP 连接或 stdio；`*-LISTEN`/
+   `EXEC`/`SYSTEM`/文件写地址等一律拒）。接收端 sink 相应改用 `socat TCP-LISTEN:<port> ...`。
+   - **接收端 sink 须在注入前预置**（资源准备阶段，在另一台可达主机起
+     `nc -l <port> >/dev/null` 或 `socat TCP-LISTEN:<port> ...`）——它是演练脚手架，不是
+     verify 观测项。**verify 阶段只在发送端跑上面的 `dd|nc` 计时**（这条已被只读守卫按
+     「有界发流量探测」放行）；**不要在 verify 里临时起 `nc -l` 接收端**——listen 属
+     「模式开关即写」（绑端口起服务端），会被守卫正确拒绝。
+   - **`count=N` 受守卫有界预算约束**：必须显式带 `count=`（无 count 的 `dd if=/dev/zero`
+     是无界流，按 flood 拒），且 `bs×count ≤ 256MiB`（超出按「无法确认有界」拒）——
+     `bs=1M` 时 `count ≤ 256`。取值还须兼顾单次 exec 超时：低速率档（如 1mbit）下大 count
+     会跑很久，在能测出速率差的前提下取小值（如 `count=20~50`）。
+   **不要用小请求测** —— 限速不影响单个小包的时延，
    几 KB 的请求在 1mbit 下仍是毫秒级返回，看起来「没生效」
    判据：出向上传速率应落在 `rate` 附近（如 `1mbit` ≈ 125KB/s，1mbit 下上传约
    227KB/s、基线 ≥ 8MB/s，约 35 倍差；允许 ±30% 偏差）。
@@ -117,8 +136,8 @@
 
 4. 检查应用日志是否出现传输超时、上传失败、同步滞后等慢速症状
 
-**注入恢复**：
-1. 等待 `<duration>` 到期后注入前武装的定时器自动删除规则；如需提前恢复，手动删除 tc tbf 规则
+## 注入恢复
+1. 等待 `<recovery-seconds>` 到期后注入前武装的定时器自动删除规则；如需提前恢复，手动删除 tc tbf 规则
    （不使用 blade destroy，这是 kubectl-native 方案）——
    **必须用注入时那条路径**：
    ```bash
@@ -135,16 +154,24 @@
    `tc qdisc del` 成功即代表故障已恢复，残留的临时容器不影响业务容器。如需立即清理须删除该 Pod
    让上层控制器重建 —— 这是额外的变更动作，须经确认后再做。
 
-**恢复验证**：
+## 恢复验证
 1. 确认 tbf 规则已清除（**与注入/恢复同一条路径**）：
    ```bash
    kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc show dev eth0
    ```
    输出应回到默认 qdisc（如 `pfifo_fast` / `noqueue` / `mq`），不再包含 tbf
-2. 重测出向上传速率，确认恢复到基线水平（测法同注入验证步骤 2）
+2. 重测出向上传速率，确认恢复到基线水平（测法同注入验证步骤 2）。
+   **注意固有排序张力**：接收端 sink（`nc -l` / `socat TCP-LISTEN`）是注入前预置的演练脚手架、
+   属写入集组件，恢复时会被一并拆除；而 verify/recover 是只读阶段，重新起 listen 属「模式开关
+   即写」被守卫正确拒绝 —— 因此 sink 拆除后**字面的 `dd|nc`（或 `dd|socat`）重测不可执行**。
+   此时**认可「机制缺失等价论证」为吞吐类恢复验证的合法降级形态**：无需重测出绝对 MB/s 数字，
+   三条腿成立即可判恢复到基线 —— (a) 机制不存在：`tc qdisc show dev eth0` 回到 `noqueue`/默认
+   qdisc、全网 ns 内 tbf 计数为 0（网卡上没挂任何限速装置 → 出向物理上不可能再被整形）；
+   (b) 同资源基线逐字节匹配（qdisc 状态 = 注入前基线）；(c) 旁证计数干净（TX errors/dropped 为 0、
+   小请求延迟回基线）。裁决如实标注为「通过（方法偏差：未重测绝对速率）」，不得捏造 MB/s 数字。
 3. 确认应用日志不再出现传输慢/超时错误
 
-**基准事实**：
+## 基准事实
 - **根因**：通过 tc tbf（令牌桶过滤器）在 Pod 网卡限制出方向速率，模拟带宽受限/专线拥塞环境
 - **必现现象**：出方向大流量传输速率被压到 `rate` 附近（入向不受限）；`tc qdisc show` 显示 tbf 规则；
   小请求仍正常返回（区别于网络不通）；应用出现数据同步滞后、上传超时等慢速症状

@@ -1,11 +1,11 @@
 **用例名称** 内存压力过大 导致 Pod_OOM内存异常
 
-**故障现象**：
+## 故障现象
 1. Pod 内存使用率接近 Limit 上限
 2. 应用响应变慢，出现延迟
 3. 存在被 OOMKill 的风险
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认应用 A 的 Pod 已配置 resources.limits.memory
 3. 确认容器内有注入载体：`stress-ng`（首选）；否则 `python`/`perl`（多数业务容器自带）；最低保底 `dd`（见方案 3 的驻留陷阱）
@@ -14,7 +14,7 @@
 > 最大的内存占用者，内存逼近 Limit 时会被 OOM killer 优先杀掉——进程一死内存立即释放，
 > 故障无法真正持续生效。内存压力注入一律走下方 kubectl-native 方案。
 
-**演练步骤**：
+## 演练步骤
 1. 定位应用 A 的 Pod
 2. 测量内存基线并计算分配量（必须，防超量 OOMKill）
 3. 在 Pod 内注入驻留式内存压力（kubectl exec），模拟内存占用增长接近 Limit 的场景
@@ -36,7 +36,7 @@ kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[0].reso
 ```bash
 # 方案1：指定绝对大小（推荐，精确控制；后台+重定向让 exec 立即返回，--timeout 自带自动恢复）
 kubectl exec <pod-name> -n <namespace> -- \
-  sh -c 'stress-ng --vm 1 --vm-bytes <按上式算出的分配量，如 3G> --timeout <duration>s >/dev/null 2>&1 &'
+  sh -c 'stress-ng --vm 1 --vm-bytes <按上式算出的分配量，如 3G> --timeout <recovery-seconds>s >/dev/null 2>&1 &'
 # 方案2：无 stress-ng 时用分块分配（推荐，python/perl 容器普遍自带）。
 # 关键：必须分块逐段分配——一次性构造全量（如 bytearray(N) 或 perl "x"xN）有 ~2 倍瞬时峰值，
 # 会越过余量直接 OOMKill。分块后瞬时峰值只有一个块，且 python 不可用时可换 perl 同构写法：
@@ -48,7 +48,7 @@ for _ in range(<MB> // 100):        # 每块 100MB，块数 = 分配量(MB)/100
     time.sleep(0.2)
 with open("/tmp/memcache-warmup.pid", "w") as f:
     f.write(str(__import__("os").getpid()))
-time.sleep(<duration>)              # 到期进程退出即自动释放
+time.sleep(<recovery-seconds>)              # 到期进程退出即自动释放
 EOF
 nohup python /tmp/mem_stress.py >/dev/null 2>&1 &'
 # 方案2'（闭环 cgroup 计数，perl；#47 实测后立法的首选形态）：固定分配量估算对解释器开销的
@@ -58,7 +58,7 @@ nohup python /tmp/mem_stress.py >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -- sh -c 'cat > /tmp/mem_stress.pl << "EOF"
 use strict;
 my $tgt = $ARGV[0] || <目标字节数，如 429496729>;   # = limit × 目标百分比
-my $dur = $ARGV[1] || <duration>;
+my $dur = $ARGV[1] || <recovery-seconds>;
 my @c;
 open(my $p, ">", "/tmp/memcache-warmup.pid") or die $!;
 print $p $$; close($p);
@@ -69,27 +69,33 @@ while (1) { my $x = u(); last if $x < 0 || $x >= $tgt;
 sleep($dur);
 exit 0;
 EOF
-setsid nohup perl /tmp/mem_stress.pl <目标字节数> <duration> >/dev/null 2>&1 &'
+setsid nohup perl /tmp/mem_stress.pl <目标字节数> <recovery-seconds> >/dev/null 2>&1 &'
 # （cgroup v1 路径；v2 环境读 /sys/fs/cgroup/memory.current。脚本含双引号字符，外层
 # 用 quoted heredoc << "EOF" 保真落盘——分词器修复后双引号转义形态可用，单引号形态仍首推）
 # 方案3：仅有 dd 时，必须用 sleep 挂住管道保持驻留——`( dd … | tail )` 单独用有驻留缺陷：
 # dd 拷贝一结束 tail 即退出、内存立即释放，内存冲高后 30 秒内塌回基线；
-# sleep 让管道 EOF 延迟到 <duration> 后，tail 的缓冲才能撑住全程。
+# sleep 让管道 EOF 延迟到 <recovery-seconds> 后，tail 的缓冲才能撑住全程。
 # 另注意：dd 是逐块拷贝，速度慢于方案 2 的匿名内存直接分配：
 kubectl exec <pod-name> -n <namespace> -- sh -c '
-  ( ( dd if=/dev/zero bs=1M count=<MB> 2>/dev/null; sleep <duration> ) | tail ) >/dev/null 2>&1 &
+  ( ( dd if=/dev/zero bs=1M count=<MB> 2>/dev/null; sleep <recovery-seconds> ) | tail ) >/dev/null 2>&1 &
   echo $! > /tmp/memcache-warmup.pid
 '
 ```
 倒计时从武装时刻起算：内存驻留与到期释放定时在同一载荷内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'kill $(cat /tmp/memcache-warmup.pid) 2>/dev/null; pkill -f mem_stress.p[y]; true'` 停掉旧驻留进程（方案2/3 通吃），再重跑对应方案的注入命令原子重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）。#47 实测：注入成功后 Agent 框架层崩溃且自动回滚失败（无人清理的最坏情形），正是载荷内原子 timer 到期自释放收的尾（600s 精确自清，memory 压力残留归零）——窗口自持设计不依赖任何上层存活
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——方案1 stress-ng 的 `--timeout`、
+方案2/2' 的 python/perl 到期释放定时、方案3 的 dd 管道 sleep 以它武装，让框架在
+观察窗终点主动派发的恢复先于自治到期落地
+
 > **不要走 tmpfs 文件写路线**（`dd of=/dev/shm/…`）：部分环境对页缓存写入路径限速，可低至 ~0.5MB/s（3.5G 需 1 小时以上）；匿名内存分配（方案 2）同环境 <30 秒可完成同量级分配。
 
-**注入验证**：
+## 注入验证
 1. 首选零滞后直查：`kubectl exec <pod-name> -n <namespace> -- cat /proc/<注入进程PID>/status`（注入时已落盘 PID 的用 `cat /tmp/memcache-warmup.pid` 取；未落盘的用 `ps` 找 stress/mem_stress 进程）看 VmRSS 确认接近目标量——`kubectl top` 滞后一个 metrics 窗口（同集群不同 Pod 可差 11s~60s，且部分 adapter 不暴露快照时间戳），注入后短期内 top 无变化**不构成效果否定证据**，仅作聚合确认
 2. 仅当已触发 OOMKill 时，`kubectl describe pod` 才会在 Events 中见到 OOMKilled；只接近 Limit 而未 OOM 时**没有任何内存相关 Event，查不到是必然，不要反复找**
 3. （可选，仅当演练方提供了应用访问入口时）向入口发请求确认延迟增大；无入口时上述内存级证据成立即可判定
 
-**注入恢复**：
+## 注入恢复
 1. 杀掉 Pod 内注入进程释放内存（按注入时实际使用的方案择一）：
 ```bash
 # stress-ng：kill 进程
@@ -103,11 +109,11 @@ kubectl exec <pod-name> -n <namespace> -- \
   sh -c "ps -o pid,args 2>/dev/null | grep -E '[s]tress-ng|[m]em_stress|[d]d if=/dev/zero' | awk '{print \$1}' | xargs -r kill -9"
 ```
 
-**恢复验证**：
+## 恢复验证
 1. 直查注入进程 PID 是否已退出（`cat /proc/<pid>/status` 报 No such file 即已释放）；`kubectl top pod` 回落仅作聚合确认（同样滞后一个窗口，恢复初期 top 仍高**不构成恢复失败证据**）
 2. （可选，有访问入口时）确认应用响应恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：应用内存使用增长或注入内存压力，导致 Pod 内存使用率接近 Limit，存在被 OOMKill 的风险
 - **必现现象**：Pod 内存使用率接近 Limit；应用响应变慢；存在 OOMKill 风险
 

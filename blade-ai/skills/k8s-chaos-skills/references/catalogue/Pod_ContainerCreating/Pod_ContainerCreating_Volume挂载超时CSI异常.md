@@ -24,7 +24,8 @@ mechanism_writes:
 
 **用例名称** Volume挂载超时CSI异常 导致 Pod_ContainerCreating
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载并还原 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载并还原 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:
@@ -62,7 +63,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - **MU 100% 的承载分工**：主路径下步骤 1 的手动置 100% 由配方注入域承载（一次 patch 面内原子并入，无需单独执行），其还原随 restorePatches 由载体 TTL 还原；降级路径下步骤 1/7 的手动序列照常执行。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作（PV/PVC 道具创建与清理）保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Pod 长时间停留在 ContainerCreating 状态
 2. Pod Events 中显示 `FailedMount` 或 `FailedAttachVolume`，提示 CSI driver 超时或 attach 失败
 3. PV 指向的云盘不存在或不可用，CSI 驱动无法完成 attach/mount
@@ -71,14 +72,15 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - **严禁给 PV 添加 nodeAffinity**：一旦 PV 带 `nodeAffinity`，调度器的 VolumeBinding 过滤器会在**调度阶段**前置过滤节点（Events 显示 `volume node affinity conflict`，Pod 呈 `Pending` + `FailedScheduling`）。CSI 驱动根本不会被调用，本用例承诺的 ContainerCreating 现象永远无法复现
 - 正确机制：PV **不带任何拓扑约束**让调度正常通过，`volumeHandle` 指向不存在/不可用的云盘，使 CSI 驱动在 **attach 阶段**失败，Pod 才会卡在 ContainerCreating
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认集群 CSI 驱动（如 `diskplugin.csi.alibabacloud.com`）在位且正常工作：`kubectl get csidriver` 列出驱动对象、`kubectl get pod -n kube-system -l app=csi-plugin` 确认组件 Running（反证条件：集群无磁盘型 CSI 驱动时本用例不可达，勿强行注入）
 3. **靶选型（guard 契约约束，定案免推导）**：注入对象是已存在的 workload 或专用靶——**专用靶可带内自建**：单文档 Deployment manifest 过 drill-target 契约门即放行（`spec.template.spec` 恰一个容器且无 initContainers、无 hostNetwork/hostPID/hostIPC/privileged/capabilities/hostPath 特权面、镜像 ∈ 载体镜像允许集、卷仅 persistentVolumeClaim/configMap/secret；注意容器/卷/host 标志在 `spec.template.spec` 内层非 spec 直层），且 manifest 名字必须等于 FaultSpec 批准靶名、命名空间一致（名字锚定，相似名/前缀变体拒）；违约是可重塑的 form issue（修清单重 apply 同一 manifest 即过，非机制禁令）。合规模板与选型指引见 `references/target/drill-target.md` 标准件。靶形态要求：单副本、无既有卷挂载（注入的假卷是唯一变量）、镜像节点缓存可靠。带外预建仍为合法备选（复杂靶形态或意图不动时）；其他 workload kind（StatefulSet/DaemonSet/Job 等）仍是机制级禁令——对已存在的此类 workload 注入是合法路径
 4. **守卫 scope 判型（同域已验立法直接引用）**：本用例写入集含 PV（cluster-scoped）创建——意图须按目标 Deployment 叙述使 scope 判为 workload（workload 网含 pv/persistentvolume，cluster-scoped 豁免 ns 检查后放行）；执行身份须有 `create persistentvolumes` 权限（`kubectl auth can-i create persistentvolumes` 预检）
 5. **靶可调度性免推导（#38 四测实测立法，资源探测段动作指引）**：专用靶（裸靶——无 nodeSelector/affinity，本用例 PV 明确不带 nodeAffinity）的可调度性**无需探测节点 taint 拓扑**——常驻靶名册 Running（drill-hpa-target / drill-pvc-target 等）即集群可调度的存在性证明，默认调度器自动避开污点节点。**勿在 planning 段拉全量节点 taint 列表做拓扑推演**（四测证据：立法落在通用件 drill-target.md 时 taint 探测仍被发出——调用决策先于立法到达上下文的时序击穿；本条立法落在本 case 首读位置后先于任何探测调用决策生效）；计划产物中的调度定案照写一句「无 taint 约束、多节点集群可调度」即可
 
-**演练步骤**（主路径 = 步骤 1 的基线读取（maxUnavailable 值——restorePatches 基线值来源，两条路径共用）→ 步骤 2 创建 PV/PVC 道具（两路径共用，execute 计划 manifest 步骤）→ 调 faultdrill_assemble_carrier（参数取自载体配方：target_kind=deployment、target_name=<deployment-name>、target_namespace=<namespace>、patches=…（add volumes/volumeMounts + MU 100% 注入域）、restorePatches=…（remove volumes/volumeMounts + MU 基线 replace）、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 1 的写入部分与步骤 5 的手动模板 patch 均由配方承载，无需单独执行 → 步骤 6 等待滚动更新完成（两路径共用）→ 步骤 8 观察现象（两路径共用）。步骤 3-4 的五件套载体序列与步骤 1 写入部分/步骤 5/7 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+## 演练步骤
+（主路径 = 步骤 1 的基线读取（maxUnavailable 值——restorePatches 基线值来源，两条路径共用）→ 步骤 2 创建 PV/PVC 道具（两路径共用，execute 计划 manifest 步骤）→ 调 faultdrill_assemble_carrier（参数取自载体配方：target_kind=deployment、target_name=<deployment-name>、target_namespace=<namespace>、patches=…（add volumes/volumeMounts + MU 100% 注入域）、restorePatches=…（remove volumes/volumeMounts + MU 基线 replace）、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 1 的写入部分与步骤 5 的手动模板 patch 均由配方承载，无需单独执行 → 步骤 6 等待滚动更新完成（两路径共用）→ 步骤 8 观察现象（两路径共用）。步骤 3-4 的五件套载体序列与步骤 1 写入部分/步骤 5/7 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. （仅 Deployment 目标）记录 Deployment 当前 maxUnavailable 值，并临时设为 100%（确保滚动更新能完成，故障注入的新 Pod 不会 Ready，默认策略下 K8s 不会终止旧 Pod，导致滚动更新死锁）——**降级路径形态；主路径下读取部分（restorePatches 基线值来源）两条路径共用，写入 100% 由载体配方注入域承载，无需单独执行**：
    ```bash
    kubectl get deployment <deployment-name> -n <namespace> \
@@ -143,7 +145,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - 爆炸半径声明必须按实际受影响的 ordinal 区间如实告知用户，严禁声称 target-only
 - 新 Pod 永不 Ready 时 StatefulSet 滚动更新同样会卡住（控制器等待新 Pod Ready 才继续），这是本故障的预期现象，无需也不可用 maxUnavailable 类技巧绕过
 
-**注入验证**：
+## 注入验证
 1. （Deployment）确认所有旧 Pod 已被替换（滚动更新完成）：**用 RS 视角判据，不要用 `kubectl rollout status`**——注入期新 Pod 永不 Ready（卡在 ContainerCreating 卷挂载失败，故障本身），`rollout status` 等待 available 副本必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」；正确判据是 `kubectl get rs -n <namespace> -l <label>`：旧 RS DESIRED=0、新 RS DESIRED=目标副本数（或旧 Pod 名消失、新 Pod 处于 ContainerCreating）
 2. 执行 `kubectl get pods`，确认目标 Pod 状态为 ContainerCreating
 3. 执行 `kubectl describe pod <pod-name>`，确认 Events 显示 FailedMount 或 FailedAttachVolume 或 CSI attach 超时
@@ -151,7 +153,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    （**sustained 判据一次采样等价形态（#38 三测实测立法）**：「Pod 实时 ContainerCreating（现在时证据）+ FailedMount count ≥ 5（过去时证据——count 是重试次数的积分，实测 2m31s 时 count 已达 9，重试退避从密到疏）」一次采样即等价「两次采样证持续」，无需等待窗口后二次采样——本故障机制为确定性失败（假盘 ID 恒 NotFound，不存在间歇性成功的物理路径），count 高即已编码「持续失败 ≥1 分钟」；两次采样能提供的唯一增量信息「采样后未恢复」属 recover 阶段职责，不是 verify 义务）
 4. **如果观察到 Pending + FailedScheduling（事件含 `volume node affinity conflict`），说明 PV 带了 nodeAffinity，机制错误——不可判定为 verified，必须删除 PV/PVC 并按本用例模板（无 nodeAffinity）重新注入**
 
-**注入恢复**（主路径下模板还原无需 Agent 执行动作——载体 TTL 自治还原（restorePatches 的 remove volumes/volumeMounts + MU 基线 replace 由载体内 timer 到点执行，恢复自动触发回滚滚动；fire 证据落载体 /tmp/restore.log + 任务台账 recovery_handle）；演练提前结束时 blade-ai recover 从台账重放同源配方提前收敛，与载体幂等双执行。道具 PVC/PV 清理为收尾步（非 patch 域动作，两路径共用——第 5-6 步）；降级路径下载体 timer 三动作载荷兼清理 PVC/PV。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下模板还原无需 Agent 执行动作——载体 TTL 自治还原（restorePatches 的 remove volumes/volumeMounts + MU 基线 replace 由载体内 timer 到点执行，恢复自动触发回滚滚动；fire 证据落载体 /tmp/restore.log + 任务台账 recovery_handle）；演练提前结束时 blade-ai recover 从台账重放同源配方提前收敛，与载体幂等双执行。道具 PVC/PV 清理为收尾步（非 patch 域动作，两路径共用——第 5-6 步）；降级路径下载体 timer 三动作载荷兼清理 PVC/PV。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动移除注入的 volumes/volumeMounts 并清理 PV/PVC（主路径下载体 TTL 只还原 patch 域，PVC/PV 清理交收尾步第 5-6 步）；如需提前恢复，Agent 直接执行下列第 2–6 步恢复命令（幂等，定时器迟到再执行一次无副作用）
 2. 恢复应用 A 的工作负载模板，移除注入时添加的 volumes 和 volumeMounts（两者都需移除，只移除其中一个会导致配置错误）
 3. 等待 Pod 滚动更新/重建完成，确认 Pod 恢复 Running
@@ -159,12 +162,12 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 5. 清理测试 PVC：`kubectl delete pvc archive-vol-claim -n <namespace>`（**先于 PV**——PVC 存在时 PV 删除被绑定关系阻塞）——**收尾步（两路径共用，非 patch 域动作）**
 6. 清理测试 PV：`kubectl delete pv archive-vol-chaos`；**若 PV 卡 Terminating**（CSI external-attacher 的 finalizer 因假盘 detach 无法正常释放），json patch 移除 finalizers 是标准兑底：`kubectl patch pv archive-vol-chaos --type='json' -p '[{"op":"remove","path":"/metadata/finalizers"}]'`（此时底层盘本就不存在，无真实数据风险）——**收尾步（两路径共用，非 patch 域动作）**
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods`，确认 Pod 状态恢复为 Running
 2. 确认测试资源已清理
 3. 确认应用 A 存储功能正常
 
-**基准事实**：
+## 基准事实
 - **根因**：CSI 驱动 attach/mount 失败（云盘不存在或不可用），Pod 无法完成存储卷挂载
 - **必现现象**：Pod ContainerCreating；Events 显示 FailedMount/FailedAttachVolume/CSI 超时
 - **必不出现**：若 PV 带 nodeAffinity，现象退化为 Pending + FailedScheduling（调度器前置过滤），CSI 流程未被触发——这不是本用例的合格形态

@@ -1,6 +1,7 @@
 **用例名称** 进程被挂起 导致 Pod_进程异常
 
-**故障定位**：状态型故障（信号驱动）——目标进程收到 SIGSTOP 即故障存活（内核挂起，
+## 故障定位
+状态型故障（信号驱动）——目标进程收到 SIGSTOP 即故障存活（内核挂起，
 不退出、不消耗 CPU，但完全停止执行、无法处理任何请求），SIGCONT 或容器重启即恢复。
 手段1（ChaosBlade `pod-process stop`）与手段2（kubectl-native）是**并列的注入手段**，
 底层效果等价（blade 内部也是发送 SIGSTOP/SIGCONT），按环境能力选用。
@@ -21,7 +22,7 @@ kubelet 周期探测累积失败（需连续失败达 failureThreshold，存在�
 写入集在节点命名空间，规划期就必须确认批准包含 node scope（见路径 B 边界警示）。
 `duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. 应用完全无响应但进程仍存在（与 kill 不同，进程不会退出），进程状态变为 T（Stopped）
 2. Pod 状态仍为 Running（进程 PID 存在，容器未退出）
 3. 所有入站请求超时，服务完全不可用（模拟应用死锁场景）
@@ -29,7 +30,7 @@ kubelet 周期探测累积失败（需连续失败达 failureThreshold，存在�
    出现即 Liveness 触发，按故障定位约束②记录为「故障导致重启」并核对窗口缩短量）
 5. 同节点其他 Pod 零影响、节点 Conditions 无漂移（预期阴性——出现即爆炸半径失控）
 
-**资源准备**：
+## 资源准备
 1. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（多容器混存时
    `kubectl exec` 必须显式 `-c <容器名>`）
 2. **能力探测（决定手段与路径选择）**：
@@ -76,7 +77,7 @@ kubelet 周期探测累积失败（需连续失败达 failureThreshold，存在�
    记录：进程正常状态 `S (sleeping)`（恢复对照）、Pod RESTARTS 基线、同节点
    Pod 清单（爆炸半径对照）
 
-**演练步骤**：
+## 演练步骤
 1. 记录注入前基线（资源准备第 5 条全部输出）
 
 **手段1（ChaosBlade）** —— 前提：资源准备第 2a 条探测通过（operator 健康）
@@ -102,9 +103,16 @@ kubelet 周期探测累积失败（需连续失败达 failureThreshold，存在�
 `pgrep -x` 不会命中它——这正是必须用 `-x` 的原因，见下方陷阱说明）：
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
-  '( sleep <duration>; kill -CONT $(pgrep -x <process-name>); echo PROCSTOP_RESTORED >> /tmp/procstop.evd ) >/dev/null 2>&1 & \
+  '( sleep <recovery-seconds>; kill -CONT $(pgrep -x <process-name>); echo PROCSTOP_RESTORED >> /tmp/procstop.evd ) >/dev/null 2>&1 & \
    kill -STOP $(pgrep -x <process-name>) && echo PROCSTOP_INJECTED >> /tmp/procstop.evd'
 ```
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径 A 的 sleep 定时器（与路径 B
+的 systemd-run 定时器同源）以它武装，让框架在观察窗终点主动派发的恢复先于
+自治到期落地；手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持
+`<duration>` 不动
+
 - 链条是**自证的**：`PROCSTOP_INJECTED`（kill -STOP 成功后写入）、
   `PROCSTOP_RESTORED`（定时器 SIGCONT 后写入）落盘证据文件 `/tmp/procstop.evd`，
   验证阶段 `cat` 取证，不受故障窗口是否已关闭的时序约束
@@ -205,7 +213,8 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
      '
    ```
 
-**注入验证**（手段1/手段2 路径 A 共用；路径 B 差异单列。本用例判据全部是只读
+## 注入验证
+（手段1/手段2 路径 A 共用；路径 B 差异单列。本用例判据全部是只读
 操作——ps/grep/wget/describe，verify 阶段 read-only 纪律天然放行）：
 1. **效果主证——进程 T 状态**（**仅适用手段1/手段2 路径 A**；procps 镜像看 STAT 列；
    **busybox 镜像 ps 无 STAT 列**——输出仅 PID/USER/TIME/COMMAND（busybox:1.33）——改用 /proc 判据）：
@@ -255,7 +264,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 7. 路径 A 补自证链：`cat /tmp/procstop.evd` 含 `PROCSTOP_INJECTED`（含
    `PROCSTOP_RESTORED` 即窗口已关，如实报告实际时长）
 
-**注入恢复**：
+## 注入恢复
 1. 手段1：`blade destroy <experiment_uid>`（向进程发送 SIGCONT 恢复执行）
 2. 手段2 路径 A：定时器到期自动 SIGCONT + 写 `PROCSTOP_RESTORED`（主恢复路径）；
    提前恢复用演练步骤的恢复命令（幂等）
@@ -266,7 +275,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    ```
 4. 若 Liveness 探针已触发容器重启，等待新 Pod Ready 即可（重启即恢复）
 
-**恢复验证**：
+## 恢复验证
 1. **进程恢复运行（主证，路径 A）**：/proc State 回到 `S (sleeping)`（或 procps STAT 列
    不再显示 T）
 1a. **路径 B 恢复主证**：`freezer.state` 读回 `THAWED` + **exec 恢复响应**
@@ -278,7 +287,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 5. 爆炸半径最终对照：节点 Conditions 与同节点 Pod 清单与基线一致——进程级故障
    全程未外溢的最终证据
 
-**基准事实**：
+## 基准事实
 - **根因**：容器内应用主进程收到 SIGSTOP 信号被内核挂起，进程不退出但完全停止
   执行，无法处理任何请求
 - **必现现象**：进程状态变为 T（Stopped）；应用端口请求全部超时；Pod 状态保持

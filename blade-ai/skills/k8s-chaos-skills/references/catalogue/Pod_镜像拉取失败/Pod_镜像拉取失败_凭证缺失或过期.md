@@ -25,7 +25,8 @@ mechanism_writes:
 
 **用例名称** 凭证缺失或过期 导致 Pod_镜像拉取失败
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（凭证道具 Secret 的创建/删除为非 patch 域动作，走 execute 计划步骤+frontmatter 立法条目）；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（凭证道具 Secret 的创建/删除为非 patch 域动作，走 execute 计划步骤+frontmatter 立法条目）；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -66,16 +67,17 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - **host 匹配律警示（实验第二坑）**：`--docker-server`（原 registryHostOverride 同位参数）必须与镜像地址中的 registry host 逐字匹配——dockerconfigjson 的 auths 键 host 不匹配时拉取不引用该凭证，故障静默失效（Secret 已落地、现象不出现）。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（Secret 创建/删除）保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Pod 状态为 ImagePullBackOff 或 ErrImagePull
 2. Pod Events 中显示 `unauthorized` 或 `authentication required`
 3. 镜像仓库返回 401/403 认证错误
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，且使用私有镜像仓库
 2. 确认应用 A 的 Pod 配置了 imagePullSecrets
 
-**演练步骤**（主路径 = 基线捕获（步骤 1 的 imagePullSecrets/policy 记录 + 步骤 2 的 MU 读取，restorePatches 的基线值来源，两条路径共用）→ 创建失效凭证 Secret（步骤 4，道具，走 frontmatter mechanism_writes 立法条目，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、patches=imagePullSecrets 指向道具+policy Always+maxUnavailable 100%、restorePatches=三字段基线还原、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 100% 在主路径下由配方注入域承载；步骤 1 的基线 JSON 导出（剥离 resourceVersion）仅为降级兜底的 replace 形态所需，主路径配方为 json-patch 三字段无需整体替换；步骤 2-3、5 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+## 演练步骤
+（主路径 = 基线捕获（步骤 1 的 imagePullSecrets/policy 记录 + 步骤 2 的 MU 读取，restorePatches 的基线值来源，两条路径共用）→ 创建失效凭证 Secret（步骤 4，道具，走 frontmatter mechanism_writes 立法条目，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、patches=imagePullSecrets 指向道具+policy Always+maxUnavailable 100%、restorePatches=三字段基线还原、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 100% 在主路径下由配方注入域承载；步骤 1 的基线 JSON 导出（剥离 resourceVersion）仅为降级兜底的 replace 形态所需，主路径配方为 json-patch 三字段无需整体替换；步骤 2-3、5 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 记录应用 A 当前的 imagePullSecrets 名称和 imagePullPolicy 值，并导出还原基线（**必须剥离
    metadata 中的 resourceVersion/uid/creationTimestamp/generation 与整个 status**——结论：
    带 resourceVersion 的 `kubectl get -o yaml` 原样输出，无论 apply 还是 replace 都会因乐观锁
@@ -143,13 +145,14 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 7. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段。主路径下此项随载体配方 restorePatches 由载体 TTL 还原，无需手动执行）
 8. 观察 Pod 状态变化
 
-**注入验证**：
+## 注入验证
 1. 确认所有旧 Pod 已被替换（滚动更新完成）：**用 RS 视角判据，不要用 `kubectl rollout status`**——注入期新 Pod 永不 Ready（镜像拉取认证失败，故障本身），`rollout status` 等待 available 副本必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」；正确判据是 `kubectl get rs -n <namespace> -l <label>`：旧 RS DESIRED=0、新 RS DESIRED=目标副本数（或旧 Pod 名消失、新 Pod 处于 ImagePullBackOff）
 2. 执行 `kubectl get pods`，确认**所有**目标 Pod 状态为 ImagePullBackOff 或 ErrImagePull——两者是同一故障的先后渲染（首拉失败即 ErrImagePull，进入退避后转为 ImagePullBackOff），出现任一即判（不是仅一个新 Pod，而是全部副本）
 3. 执行 `kubectl describe pod <pod-name>`，确认 Events 中显示认证失败相关错误
 4. 确认错误信息包含 `unauthorized` 或 `authentication required`
 
-**注入恢复**（主路径下三字段还原无需 Agent 执行动作——载体 TTL 自治按 restorePatches 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。失效凭证 Secret 删除为非 patch 域动作，走 execute 计划收尾清理步。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下三字段还原无需 Agent 执行动作——载体 TTL 自治按 restorePatches 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。失效凭证 Secret 删除为非 patch 域动作，走 execute 计划收尾清理步。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期后武装的定时器自动用基线整体替换还原 imagePullSecrets/imagePullPolicy
    并删除无效 Secret。如需提前恢复，Agent 幂等重执行同款恢复命令（先把步骤 1 的基线 JSON 写入
    本地临时文件再 replace；定时器迟到触发无害——replace 对已还原对象是 no-op，delete 对已删
@@ -162,10 +165,10 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    （演练步骤 2 临时改的 100%）——三项都在基线快照内，无需逐项手动还原
 3. 等待 Pod 滚动更新完成
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods`，确认 Pod 状态恢复为 Running
 2. 确认镜像拉取成功，无认证错误
 
-**基准事实**：
+## 基准事实
 - **根因**：imagePullSecrets 缺失或 Secret 中的凭证已过期/无效，导致向私有镜像仓库拉取镜像时认证失败
 - **必现现象**：Pod ImagePullBackOff；Events 显示 unauthorized/authentication required；镜像仓库返回 401/403

@@ -1,6 +1,7 @@
 **用例名称** 应用日志数据积累 导致 Pod_磁盘空间使用率过高
 
-**故障定位**：持续型故障——填充文件存在即故障存活（占用的空间不会自行消失），
+## 故障定位
+持续型故障——填充文件存在即故障存活（占用的空间不会自行消失），
 贯穿整个故障窗口；填充文件删除（实验销毁/定时器清理）即空间释放、自动恢复。
 手段1（ChaosBlade `pod-disk fill`）与手段2（kubectl-native：容器内 fallocate/dd）
 是**并列的注入手段**，底层效果等价（blade 内部也是向目标路径写填充文件），
@@ -14,13 +15,13 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
 失败/ENOSPC"现象声明为**预期阴性**。`duration_seconds` 是必填的故障窗口契约，
 未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. Pod 视角 `df` 使用率上升（独立卷靶：可达目标百分比；无独立卷靶：上升声明的增量）
 2. 独立卷打满设计下：应用写入失败（`ENOSPC: No space left on device`）
 3. 无独立卷小增量设计下：写入失败**不出现**（预期阴性，见故障定位——出现反而异常）
 4. 节点 `DiskPressure` 事件：本用例设计上**不触发**（触发即爆炸半径失控，立即恢复并如实上报）
 
-**资源准备**：
+## 资源准备
 1. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（多容器/临时容器混存时
    `kubectl exec` 必须显式 `-c <容器名>`）
 2. **能力探测（决定手段选择）**——确认 ChaosBlade operator 实际健康，**以当次探测为准**：
@@ -59,7 +60,7 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
    常态）→ 路径 B（节点侧写）
 5. 确认目标目录当前用户可写（典型靶 uid=0、`/tmp` 1777，探测 `ls -ld <目标目录>` 即可）
 
-**演练步骤**：
+## 演练步骤
 1. 记录注入前基线（恢复验证的定量对照）：
    ```bash
    kubectl get pods -n <namespace> -l <label-selector> -o wide
@@ -105,7 +106,7 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
 自动清理并写还原标记）：
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
-  '( sleep <duration>; rm -f /tmp/fill_file; echo DISKFILL_RESTORED >> /tmp/diskfill.evd ) >/dev/null 2>&1 & \
+  '( sleep <recovery-seconds>; rm -f /tmp/fill_file; echo DISKFILL_RESTORED >> /tmp/diskfill.evd ) >/dev/null 2>&1 & \
    fallocate -l <填充量>G /tmp/fill_file && \
    ls -l /tmp/fill_file >> /tmp/diskfill.evd && \
    echo DISKFILL_INJECTED >> /tmp/diskfill.evd'
@@ -135,7 +136,14 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 杀掉；容器无 pkill 时旧定时器无法停止，到期会提前清理侵蚀故障窗口——须中止
 演练改人工恢复或如实上报缩短的窗口，见 SKILL.md 安全红线「故障窗口完整」）
 
-**注入验证**（两种手段共用；本用例判据全部是只读操作——df/ls/cat，verify 阶段
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径 A 的 sleep 定时器（与路径 B
+的 systemd-run 定时器同源）以它武装，让框架在观察窗终点主动派发的恢复先于
+自治到期落地；手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持
+`<duration>` 不动
+
+## 注入验证
+（两种手段共用；本用例判据全部是只读操作——df/ls/cat，verify 阶段
 read-only 纪律天然放行，无探针形态冲突）：
 1. **效果主证——使用率增量（对比基线）**：
    ```bash
@@ -165,7 +173,7 @@ read-only 纪律天然放行，无探针形态冲突）：
 5. **持续性检查（必做）**——占用是状态型故障，填充文件存活即故障存活：
    45s 后复查 `df -k` 已用量仍在高位（增量未消失）、`ls -l` 填充文件仍存在
 
-**注入恢复**：
+## 注入恢复
 1. 手段1：`blade destroy <experiment_uid>`，填充文件随实验销毁自动清理；
    使用了 `--retain-handle` 且空间未释放时重启目标 Pod
 2. 手段2：定时器到期自动 `rm -f` + 写 `DISKFILL_RESTORED`（主恢复路径）；
@@ -176,7 +184,7 @@ read-only 纪律天然放行，无探针形态冲突）：
       rm -f /tmp/fill_file; echo DISKFILL_RESTORED >> /tmp/diskfill.evd; true'
    ```
 
-**恢复验证**：
+## 恢复验证
 1. **空间定量回落（主证）**：`df -k <目标目录>` 已用 KB 回落到基线水平
    （±少量日志写入噪声，通常 < 几百 MB），Use% 回到基线值
 2. 填充文件不存在：`ls /tmp/fill_file` 报 No such file；证据文件含
@@ -185,7 +193,7 @@ read-only 纪律天然放行，无探针形态冲突）：
    第 3 条记录，无 Evicted/重启漂移——爆炸半径全程受控的最终证据）
 4. Pod 状态 Running、RESTARTS 与基线一致
 
-**基准事实**：
+## 基准事实
 - **根因**：应用日志未清理或数据写入过多，导致 Pod 存储空间被占满
 - **必现现象**：容器内 `df` 使用率上升（增量 = 填充量，定量可对账）
 - **条件现象**：应用写入失败/ENOSPC——仅独立卷打满设计下出现；无独立卷
@@ -236,13 +244,13 @@ read-only 纪律天然放行，无探针形态冲突）：
    打满形态的适用场景；若与 `/` 同设备，按小增量设计执行（填充量约束同路径 A）。
    也可用 `crictl inspect <containerID>` 读 `hostPath`↔`containerPath` 映射交叉核对。
 
-3. 注入 —— 往确认过的宿主机路径写填充文件（**先武装定时删除再填充**，定时器由
-   宿主机 systemd 管理，不受 debug pod 生命周期影响）：
+3. 注入 —— 往确认过的宿主机路径写填充文件（**先武装定时 truncate 清空再填充**，定时器由
+   宿主机 systemd(PID 1) 管理，不受 debug pod 生命周期影响）：
    ```bash
    kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
      -- chroot /host sh -c '
        systemd-run --on-active=<recovery-seconds>s --unit=blade-rmfill-<PodUID前8位> \
-         "sh -c \"rm -f <步骤2确认的路径>/fill_file; echo DISKFILL_RESTORED >> <步骤2确认的路径>/diskfill.evd\"" &&
+         "sh -c \"truncate -s 0 <步骤2确认的路径>/fill_file; echo DISKFILL_RESTORED >> <步骤2确认的路径>/diskfill.evd\"" &&
        fallocate -l <按路径A同式算出的填充量>G <步骤2确认的路径>/fill_file &&
        ls -l <步骤2确认的路径>/fill_file >> <步骤2确认的路径>/diskfill.evd &&
        echo DISKFILL_INJECTED >> <步骤2确认的路径>/diskfill.evd
@@ -252,6 +260,16 @@ read-only 纪律天然放行，无探针形态冲突）：
    - 文件名沿用 `fill_file`、证据文件 `diskfill.evd`，与路径 A 一致，便于统一清理；
      证据文件写在同一宿主机路径（容器内目标目录可见，`cat` 取证同路径 A）
    - 打满设计时 INJECTED 标记须在 fallocate 之前写入（同路径 A 陷阱说明）
+   - **timer 载荷用 `truncate -s 0` 而非 `rm -f`（守卫硬约束）**：本路径是宿主面注入
+     （`chroot /host`），守卫按「家族规范逆操作」认自恢复——`_disk_inverse` 从
+     `fallocate -l <size> <path>` 提取填充路径，要求同命令内有 `truncate -s 0 <同路径>`
+     才判有界恢复；`rm` 是宿主面刻意封禁词，用 `rm` 整条注入被 host-escape 门禁拒
+     （`__escape__`）。对活跃日志文件 `truncate -s 0` 也更优：rm 一个被进程持有的 fd
+     要到 fd 关闭才释放空间，truncate 立即释放且保持 fd 有效
+   - **填充 + timer 复合载荷必须写在同一条 `sh -c` 内，不可拆成「先武装 timer、后填充」
+     两条命令**：one-shot `kubectl debug` 载体是 ephemeral、不登记为 carrier，守卫只能
+     逐条命令孤立判定自恢复——拆开后武装命令无填充（判不出故障家族）、填充命令无同命令
+     逆转（判不出有界恢复），两条都被拒。上方载荷已是 combined 单命令形态，保持不拆
 
 验证（从容器内看使用率上升——这才是业务视角的效果判据；容器内 `df`/`cat`
 判据与路径 A「注入验证」完全一致，含爆炸半径交叉确认与预期阴性声明）：
@@ -264,14 +282,16 @@ kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadm
   -- chroot /host ls -lh <步骤2确认的路径>/fill_file
 ```
 
-恢复：
+恢复（**主路径 = 注入时武装的 systemd-run timer 到期自动 `truncate -s 0` 清空，Agent 无需干预**；下方为提前/带外恢复）：
 ```bash
-# 提前恢复（定时器为主路径，此为兜底；rm -f 幂等）
+# 人工带外提前恢复（人直接在自己 shell 跑、不经 Agent 守卫，rm 可彻底删文件）
 kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
   -- chroot /host sh -c 'rm -f <步骤2确认的路径>/fill_file'
 # systemd 定时器撤销（提前恢复时顺手清理）
 systemctl stop blade-rmfill-<PodUID前8位>.timer 2>/dev/null; true
 ```
+
+> 上方裸 `chroot /host rm -f`（或 `truncate -s 0`）**Agent 经 one-shot debug 下发必被 host-escape 门禁拒**——裸回收命令无故障家族、one-shot debug 又不登记 carrier 账本（`armed_fill_paths` 只由 exec 通道填充），守卫认不出它是已武装填充的逆操作；确需提前释放走人工带外，或 LLM 只读核实 + timer 自然到期。
 
 注意事项：
 - **写宿主机路径等于写进容器**——同一份存储的两个视角，容器内立刻可见
@@ -283,3 +303,7 @@ systemctl stop blade-rmfill-<PodUID前8位>.timer 2>/dev/null; true
 - Pod 重建后 `<PodUID>` 目录会更换，旧目录由 kubelet 回收；若注入后 Pod 已重建，
   填充文件随旧目录一起消失，此时**不要再执行 rm**（路径已不存在）
 - systemd-run 定时器兜底自恢复；定时器单元名带 PodUID 前缀防跨演练串扰
+- **路径 B 恢复判据是「文件 0 字节」不是「文件不存在」**：timer 到期跑的是
+  `truncate -s 0`（清空数据块、保留 0 字节 inode），与路径 A 的 pod-local `rm -f`
+  （彻底删文件、`ls` 报 No such file）不同。路径 B 恢复验证看 `chroot /host ls -l
+  <路径>/fill_file` 显示 size=0（或容器内 `df -k` 已用量回基线），而非文件消失

@@ -1,9 +1,9 @@
 # 恢复载体标准件（recovery-carrier）
 
-**定位**：当故障注入的恢复动作落在 **API 平面**（patch deployment / delete PVC / patch configmap / scale 等修改 K8s API 对象），且集群内没有可用的定时器宿主时，用一套**自建的临时资产栈**承载定时自恢复——不假设集群预装任何工具，不借用任何既有 Pod。这是通用化的标准路径：目标命名空间里四条 `kubectl` 命令建栈、一条 exec 武装、四条 delete 全清。API 平面恢复现有两条路由：apiserver-write 域 case（front matter `recovery_channel: apiserver-write` 声明）优先走 CR 通道（第十一节），CRD 不可装降级本标准件——两形态互斥不叠加，降级链互指见第十一节。
+**定位**：当故障注入的恢复动作落在 **API 平面**（patch deployment / delete PVC / patch configmap / scale 等修改 K8s API 对象），且集群内没有可用的定时器宿主时，用一套**自建的临时资产栈**承载定时自恢复——不假设集群预装任何工具，不借用任何既有 Pod。这是通用化的标准路径：目标命名空间里四条 `kubectl` 命令建栈、一条 exec 武装、四条 delete 全清。API 平面恢复（front matter `recovery_channel: apiserver-write` 声明的 case）主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用完成建栈+验权+武装+注入+读回；本标准件一~十节是装配器不可用时的降级兜底，也是结构性无法程序化的 case（cluster-scoped 靶 / DNS 自锁 / create 型注入）的主路径权威源。
 
 **适用判据**（三条全中才用本标准件）：
-1. 恢复动作是 API 对象写（不是节点本地文件/进程操作，也不是 blade 实验回滚）——即恢复住址三分类（第十一节）的 apiserver 写域；此类 case 已声明 `recovery_channel: apiserver-write`，**先试 CR 通道（第十一节）**，CRD 不可装（判定族见第十一节降级链）才落到本标准件
+1. 恢复动作是 API 对象写（不是节点本地文件/进程操作，也不是 blade 实验回滚）——即恢复住址三分类的 apiserver 写域；此类 case 已声明 `recovery_channel: apiserver-write`，主路径经程序化装配器 `faultdrill_assemble_carrier`，装配器不可用（镜像不可拉/节点不容纳/RBAC 不可授/验权 403）或 case 结构性无法程序化时才落到本标准件
 2. 集群无常驻可用宿主（无 ChaosBlade 工具 Pod、无带权限的调试载体）
 3. 恢复通道本身未被故障切断（DNS/网络类故障使 apiserver 不可达时，见「降级路径」）
 
@@ -94,7 +94,7 @@ kubectl get role drill-rc-<hash> -n <namespace> -o jsonpath='{.rules}'
 
 **恢复形态无关总则（硬立法——#51 B85 判例：Agent 合法切换恢复形态后 RBAC 授权面未联动，timer fire 时 PATCH×2 403 静默失败 + Pod 假性恢复）**：Role verbs 以**恢复脚本载荷实际使用的全部写动词**为准，不以规划期钦定的形态为准——规划期钦定 PUT、执行期切换为 json-patch（2 PATCH + 1 DELETE）时，授权面必须按实际载荷动词重建。**REST 方法→RBAC 动词映射**：`PATCH→patch`、`PUT→update`、`DELETE→delete`、`POST→create`。武装前的判定铁律：**载荷写动词 ⊄ Role verbs 即不得武装**（例如载荷含 `-X PATCH` 而 Role 只有 `get,update` → 缺 `patch`，中止）。本表左列的 API 请求形态仅是示例推导——Agent 换形态（PATCH↔PUT、增加/减少动作步）时按实际载荷动词重新查表。
 
-**自删规则两步建栈法（硬立法——pflag 合并污染判例，2026-09-17 真实 apiserver 实测）**：自删规则必须在建栈命令之后**独立追加**，**严禁**把 `--verb=delete --resource=<bindings 类> --resource-name=<自己名>` 合并进主授权的 `kubectl create role/clusterrole`——`kubectl create` 对重复 flag 的语义是「同类 flag 各自求并集后**复制进每一条规则**」：合并形态下主恢复规则被 `resourceNames` 锁名污染（锁名规则对未点名资源一律 403——SA 真实 token GET 目标资源 403，第三节验权硬门必中止，case 不可执行）+ delete verb 泄漏进主恢复规则（授权面扩大）。两步形态（cluster 变体；namespaced 栈把 clusterrole/clusterrolebindings 相应换成 role/rolebindings 并带 `-n <ns>`）：
+**自删规则两步建栈法（硬立法——pflag 合并污染判例，2026-09-17 真实 apiserver 实测）**：自删规则必须在建栈命令之后**独立追加**（**追加时机：武装之后、注入之前**——不可在建栈同期、武装前追加；armed-before-inject 门禁止武装前 patch 载体 Role，执行序见第九节「端到端建栈 SOP」），**严禁**把 `--verb=delete --resource=<bindings 类> --resource-name=<自己名>` 合并进主授权的 `kubectl create role/clusterrole`——`kubectl create` 对重复 flag 的语义是「同类 flag 各自求并集后**复制进每一条规则**」：合并形态下主恢复规则被 `resourceNames` 锁名污染（锁名规则对未点名资源一律 403——SA 真实 token GET 目标资源 403，第三节验权硬门必中止，case 不可执行）+ delete verb 泄漏进主恢复规则（授权面扩大）。两步形态（cluster 变体；namespaced 栈把 clusterrole/clusterrolebindings 相应换成 role/rolebindings 并带 `-n <ns>`）：
 
 ```bash
 # 1) 主授权照旧——只带恢复动作所需 flag，不带任何自删 flag
@@ -123,7 +123,7 @@ timer 尾步挂接（fail-open 逐环节守）：最后恢复 curl 升 `-sf` 后
 
 ## 三、SA 权限真实 token 验证（武装前必做）
 
-**禁用 `kubectl auth can-i --as=system:serviceaccount:<ns>:<sa>`**：impersonation 走的是**调用方**的权限视图，历史上产生过假放行（can-i 报可执行、真实请求 403）。武装必须用**载体 SA 的真实 token 发一次只读 GET**，以 HTTP 状态码二值判定：
+**禁用 `kubectl auth can-i --as=system:serviceaccount:<ns>:<sa>`**：impersonation 评估的是**模拟身份**，不是载体火时的真实请求——SA 的组成员资格（`system:serviceaccounts`、`system:serviceaccounts:<ns>`）不会自动附加到 impersonated 请求上（除非调用方用 `--as-group` 列全），评估面 ≠ 真实 SA token 请求的评估面；且探针跑在**调用方信道**上、额外要求调用方有 impersonate 权限（历史上产生过 can-i 报可执行、真实请求 403 的假放行）。武装必须用**载体 SA 的真实 token 发一次只读 GET**——同 token、同 URL、同 in-cluster 信道，验的就是 TTL 火时要走的那条路径，以 HTTP 状态码二值判定：
 
 ```bash
 kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \
@@ -159,7 +159,7 @@ kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \
 - 回显完整 + `"allowed": false` → **中止武装**（缺动词：按第二节形态无关总则补 Role 后重验）
 - 通道层错误（超时/解析失败/HTTP 400 json parse error）→ 见「降级路径」
 
-判定铁律：**全部写动词 allowed 才可武装；任一 false 即中止**——宁可在武装前中止（可修可重试），不可在 timer fire 时 403 静默（载体自治段无人监听、curl -sf 吞错、部分恢复的假性恢复比不恢复更隐蔽）。写动词清单的提取源是**恢复脚本载荷本身**（grep `-X PATCH|-X PUT|-X DELETE|-X POST`），不是规划声明——Agent 无论怎么换形态，载荷是最终真相。
+判定铁律：**全部主恢复写动词 allowed 才可武装；任一 false 即中止**——宁可在武装前中止（可修可重试），不可在 timer fire 时 403 静默（载体自治段无人监听、curl -sf 吞错、部分恢复的假性恢复比不恢复更隐蔽）。写动词清单的提取源是**恢复脚本载荷本身**（grep `-X PATCH|-X PUT|-X DELETE|-X POST`），不是规划声明——Agent 无论怎么换形态，载荷是最终真相。**唯一例外——可选自断授权尾步的自删 verb（DELETE 自己的 Binding）不纳入武装前 SSAR 硬门**：①它 fail-open（fire 时 403 只是授权残留，交第六节四连删除兜底，不是 B85 判例要防的主恢复静默失败）；②它的 Role 规则按第九节执行序在**武装后**才 json-patch 追加（armed 门禁止武装前 patch 载体 Role），故武装前 SSAR 它必然 allowed:false——若纳入硬门则启用尾步的 case 永远无法武装。自删 verb 的授权改由「武装后 patch + fire 前规则就位」保证：fire 时 DELETE 自己 Binding 即 200。SSAR 硬门只覆盖主恢复动词。
 
 ## 四、武装命令模板（定时器）
 
@@ -300,7 +300,7 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 
 ## 八、降级路径
 
-本节治理**本标准件自身**的建栈失败。CR 通道（第十一节）的降级目标即本标准件一~十节全流程——那侧的降级判定族与 replan 纪律见第十一节「降级链」，不在本节展开（防双源漂移）。
+本节治理**本标准件自身**的建栈失败。本标准件一~十节全流程是程序化装配器 `faultdrill_assemble_carrier` 不可用时的降级目标，也是结构性无法程序化的 case 的主路径。
 
 载体自建失败（镜像不可拉取 / 验权 403 / 通道不可达）时：
 1. **不得**反复重试绕行（换名重建、换命名空间、改清单路径均属绕行）
@@ -313,7 +313,7 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 
 以下全部是**通用方法论**——不绑定任何特定集群/厂商/镜像，一切环境值以当次探测结果为唯一权威；本节只给判别路径，避免逐次重新推导（唯一例外：末尾「本集群实证档案」为环境特定经验记忆——tag 锁定、只证工具链不证可用性，可用性仍以当次探测为准）：
 
-**任务生命周期契约（标准件路径——规划期一次定案，免逐次重新推导；CR 通道 case 的同构变体见第十一节，判据以彼节为准）**：
+**任务生命周期契约（标准件路径——规划期一次定案，免逐次重新推导）**：
 
 | 段 | 执行者 | 职责边界 |
 |---|---|---|
@@ -326,6 +326,7 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 2. **全清触发是条件式的**：窗口在任务存活期内到期 → 任务内清理链自动四连删除；任务先于窗口到期收尾（常态，见结论 1）→ 系统侧无到期触发点，全清依赖带外收尾（首选 `blade-ai recover --task-id`，第六节）+ Pod 骨架自过期 + RBAC 惰性对象兜底（第六节兜底事实）
 3. **Agent 的收尾义务 = 如实报告**：结果报告 cleanup 清单列出载体资产即可；不在线等恢复、不等骨架自过期
 4. **Agent 在线段不设计 early recovery（#52 实测立法，2026-09-18）**：载体武装 timer 后即处于 `recovery_armed` 锁定态，fire 前 target_guard 拒绝对该载体的第二次 mutation（含提前执行恢复动作），新建第二载体绕锁违反安全设计意图，勿走此路。daemon 挂起类故障按批准 duration **全窗设计**：提前恢复会使 verify 失去故障态采样（T 态进程、事件累积计数都在窗口存活期取得），且窗口尾部与 verify 报告生成本就天然重叠（#52 实测：fire 落在终报告生成中途，fire 后 35s 收尾，全窗零浪费）——计划里出现「T0+N 提前恢复」步骤即为立法违背，规划期删除
+5. **窗口预算自武装时刻起算（2026-09-21 NXDOMAIN 实测立法，inject-2340dac9）**：载体 TTL 时钟在武装瞬间启动，execute 武装后的一切消耗——生效等待（reload/rollout）、readback 复核、中段复查的 time_wait——都吃同一扇窗口；行为证据（故障态探针输出）只能在故障存活期内采集，窗口耗尽即永久丢失、不可事后补采（结论 1 的硬边界反面：不是 verify 不等窗口，而是窗口等不起 execute 的内部消耗）。规划期 duration 取值须预留内部消耗余量（装配含至多一次 pre-arming fail-closed 重试 + 生效等待 + 采样轮）；execute 期发现剩余窗口走不完中段复查时，优先保行为证据采集（白盒+行为+对照一轮同发）。实测教训：TTL 300s 被 execute 内部 431s 消耗（装配事故重试 118s + readback 侦查 60s + reload 等待 93s + 收尾）耗尽，行为证据零采集，verdict 封顶 partial
 
 （降级路径见第八节——载体建不起来即任务失败收尾，不改变本契约三段边界：Agent 段从不承担恢复执行。）
 
@@ -346,7 +347,7 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 | 11 | SSAR 写动词对账（逐写动词） | exec curl POST selfsubjectaccessreviews + 回执自证三态判定 | 第三节 |
 | 12 | 武装（推迟至第一个故障生效动作紧邻前） | exec `sh -c '( sleep N; <恢复动作> ) >/tmp/restore.log 2>&1 & echo armed'` | 第四节（形态/时序/字节预算三查） |
 
-顺序硬约束三条（其余顺序即表序）：**SA(5) 先于载体 Pod(8)**；**Role 追加(9) 须在载体注册(8) 之后**（patch 全局禁令在载体注册前生效）；**武装(12) 紧邻第一个故障生效动作之前**（勿按命令模板在计划文本中的出现位置机械摆放，见第四节「多步注入序列的武装点」）。可选变体注记：启用自断授权尾步时，自删规则的两步追加（json-patch `/rules/-` + resourceNames 锁名）插在步骤 6/9 同期（主授权建栈之后独立追加，第二节「自删规则两步建栈法」），尾步 DELETE 的 `curl -sf &&` 挂接在步骤 12 载荷末（第四节五条纪律）；五件套/六对象栈的集群级链同步。收尾侧（verify/全清/带外）不进本表——见本节顶部任务生命周期契约三段表。
+顺序硬约束三条（其余顺序即表序）：**SA(5) 先于载体 Pod(8)**；**Role 追加(9) 须在载体注册(8) 之后**（patch 全局禁令在载体注册前生效）；**武装(12) 紧邻第一个故障生效动作之前**（勿按命令模板在计划文本中的出现位置机械摆放，见第四节「多步注入序列的武装点」）。可选变体注记：启用自断授权尾步时，自删规则的两步追加（json-patch `/rules/-` + resourceNames 锁名）**排在武装(12)之后、注入之前**——不可与主授权建栈同期（步骤 6/9）追加（第二节「自删规则两步建栈法」）。原因：自删规则只在定时器 **fire 时**才被消费（删自己的 Binding），而 armed-before-inject 门要求 object-write patch 在载体武装后才放行，故把这条 patch 放到武装之后既过门、又赶在 fire 前就位（隔着整个故障窗口，完全来得及）。启用尾步时的执行序：建主授权 Role(6) → SSAR 主恢复动词(10/11) → 武装(12，载荷末已含自删 DELETE) → **patch Role 追加自删规则** → 注入（这条 patch 是秒级 setup，不破坏「武装紧邻注入」）。尾步 DELETE 的 `curl -sf &&` 仍挂接在步骤 12 载荷末（第四节五条纪律）；五件套/六对象栈的集群级链同步。收尾侧（verify/全清/带外）不进本表——见本节顶部任务生命周期契约三段表。
 
 **镜像选型（覆盖优先——无法钉节点）**：overrides 白名单不含 nodeSelector/nodeName，载体可能调度到**任意可调度节点**，镜像必须「任意节点都拿得到」。**主路径是零配置自动发现**：任务启动探测（preplan_probe）枚举健康 DaemonSet（desired==ready>0）的镜像——全节点缓存、无需网络拉取——自动并入载体允许集并在探测消息中给出候选清单，规划期直接选用（按第 3 条确认工具链即可）。探测消息不含候选或需自行核实时，按以下判别法：
 1. 权威缓存清单：`kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.images[*].names}{"\n"}{end}'`（kubelet 上报的每节点镜像缓存）；**DaemonSet 全节点覆盖（每个节点都有 Running 副本）的镜像 = 全节点缓存**，是天然候选
@@ -440,33 +441,3 @@ kubectl delete sa drill-rc-<hash> -n <靶ns> --ignore-not-found
 
 **通用性**：本变体不绑定任何特定命名空间——「恢复 ns」泛指恢复对象所在的任意命名空间；一切环境值（恢复 ns 名、凭证权限）以当次探测为唯一权威。
 
-## 十一、CR 通道（FaultDrill）——apiserver-write 域的第一路由
-
-**定位**：恢复动作住址 = apiserver 写的 case，第一路由是 FaultDrill CR 通道——**apply 一条 CR 替代本标准件一~十节的 SA 四件套建栈 + 载体 Pod + exec 武装链全序列**（CRD 由通道程序化惰性安装，LLM 工具面只放行 CR 实例）；本标准件是该通道不可装时的降级目标，两形态互斥不叠加。
-
-**判据（恢复动作住址三分类——case 语义，不可从 fault_spec 机械推导：同是 secret 写，恢复可能是逆 patch 也可能是删对象）**：
-1. 对称撤回（blade destroy 按 UID 撤回 / `--timeout` 超时自恢复）→ 零工坊域，不走本节不走本标准件
-2. 宿主本地命令（iptables/systemd/chmod/tc/kill 等节点本地操作）→ 宿主载体域，不走本节不走本标准件
-3. apiserver 写（逆 patch 还原 / 还原副本数等）→ **本节（CR 通道优先）**；CRD 不可装降级本标准件一~十节全流程
-
-三源路由（不靠 LLM 自觉）：case front matter `recovery_channel: apiserver-write` 声明（元数据第一源，已在 apiserver-write 域 case 盖章）→ planning 读声明路由（workflow 引导：声明 case 的 Execution Steps 载 CR 而非 SOP 写序列，明禁叠加 SOP）→ write-set 审批程序化校验（blade 载波词表命中 = 误路由在审批门拒绝并提示修正路由）。
-
-**一条 CR 的结构**（模板以各 case 文档头部「CR 通道模板」段为唯一权威，本节不复制防双源漂移）：`kind: FaultDrill`（组名/实例名前缀均可配，实例名零 drill/chaos/blade 词根）；spec 五要素——`targetRef`（**单一对象** patch 域：注入/恢复跨多对象的 case 不入本通道，留在 SOP 形态）、`patches`（注入域 json-patch）、`restorePatches`（恢复域：调和器 TTL 到点执行，Agent 死亡后 recover 重放同源）、`durationSeconds`（TTL 从 Injected 相位起算，取正文演练窗口同值）、`invalidSecret`（凭证族专用：源 Secret 引用 + 变换配方，**零凭证材料内联**——CR 不在 Secret encryption-at-rest 覆盖内，内联 = 凭证明文落 etcd）。`metadata.namespace` 必须显式写入（P10 两源纪律：句柄水合链 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位，recover get NotFound 误判实验丢失）。
-
-**恢复语义（恢复单一来源立法）**：CR 通道任务**不武装本标准件 timer**——timer 与调和器并存会双恢复赛跑。恢复由会话侧调和器承载（5s 周期现读 CR：patches/restorePatches/invalidSecret/durationSeconds 全部来自 CR，进程零硬编码，CR 是唯一事实源；TTL 判据读 `status.injectedAt` 集群状态非进程内存）；Agent 死亡/会话结束后 `blade-ai recover --task-id` 读 CR 重放同源，四态幂等收敛（Pending → 删 CR 零注入动作 / Injected → 调和恢复收敛 / Recovered → 零写 / NotFound → 跨 ns 核实后零动作告警——归因高容忍语义兼容 CRD 未装期 apply 失败残留）。注入动作连续失败达重试上限进 Failed 终态（restoreLog 记因不无限重试，可被 recover 处置）。
-
-**会话侧调和器的局限（如实披露）**：调和器是 Agent 进程内 asyncio 后台任务——会话死亡且无人调 recover 时，恢复延迟至下一次干预；但恢复意图永存 CR（patches/restorePatches/durationSeconds 在 apiserver），对照本标准件 timer 死亡 = 配方与定时器**双双永久丢失**仍是严格改进。集群内常驻控制器（operator Deployment，恢复不依赖任何进程存活）为 Phase 3 演进方向，届时本段局限整体作废。
-
-**降级链（双向互指）**：
-- **本通道 → 本标准件**：CRD 不可装判定族（探测拒绝 ∪ 安装拒绝 ∪ Established 等待超时 ∪ 存量 CRD schema 不兼容 ∪ apply 期 Forbidden）命中任一 → planning 直接计划 SOP 形态（一~十节全流程，不产生 CR 尝试轮次，降级事件记入任务观测消息）；execute 期意外失效 replan 一次同路径。apply 失败二分：环境层 Forbidden → 降级；配方层 schema 拒收 → **中止修配方不降级**（集群零副作用，不裸注入）。另注意「已存在」≠「可用」：存量旧版 CRD 缺 preserve-unknown 声明时 CR 会被 pruning 剥离，视同不可装。
-- **本标准件 → 本通道**：仅 apiserver-write 域 case（`recovery_channel: apiserver-write` 声明）走本通道；对称撤回/宿主域 case 不迁移不走本通道——write-set 审批门程序化拦截误路由（blade 词表命中拒）。
-
-**任务生命周期契约（CR 通道变体——与第九节三段契约同构，判据以本节为准）**：
-
-| 段 | 执行者 | 职责边界 |
-|---|---|---|
-| Agent 在线段 | 本任务 | apply CR → 程序化 readback 确认（patches/restorePatches 完整落地硬门，失败硬中止不进调和）→ 生效确认 → 窗口内采样 → 提交结论即收尾退出 |
-| 调和器自治段 | 会话侧调和器（恢复单点） | TTL 到点自动恢复——会话存活期内 Agent 是否被占用不影响触发 |
-| 带外段 | 人工/下一任务 | 首选 `blade-ai recover --task-id`（读 CR 四态收敛重放恢复 + 工件清理）——恢复意图永存 CR，迟到不丢失 |
-
-「武装与注入紧邻」时序在本通道的对应物：**CR 落地即携带 restorePatches + TTL（恢复意图随注入原子落集群）**——不存在「已注入无恢复配方」的中间态，第九节「恢复定时器未武装即不得注入」的硬序面由此结构性满足；readback 硬门则对应本标准件第三节的验权硬门位置（apply 后紧邻，未过不进后续）。

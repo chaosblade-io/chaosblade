@@ -1,6 +1,7 @@
 **用例名称** Sidecar进程被挂起 导致 Container_进程异常
 
-**故障定位**：状态型故障（信号驱动）——目标进程收到 SIGSTOP 即故障存活（内核挂起，
+## 故障定位
+状态型故障（信号驱动）——目标进程收到 SIGSTOP 即故障存活（内核挂起，
 不退出、不消耗 CPU，但完全停止执行、无法处理任何请求），SIGCONT 或容器重启即恢复；
 `duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。手段1（ChaosBlade
 `container-process stop`）与手段2（kubectl-native）是**并列的注入手段**，底层效果
@@ -21,7 +22,7 @@
 确认批准包含 node scope。**本用例与「Pod 主进程挂起」的分界**：挂的是 sidecar 容器
 内的进程，主容器必须全程正常（exec/重启计数双重对照）。
 
-**故障现象**：
+## 故障现象
 1. Sidecar 容器内主进程被 SIGSTOP 信号挂起，进程不退出但完全停止处理请求
 2. 如果 Sidecar 容器配置了独立 Liveness 探针，探针超时后可能触发容器重启
 3. 如果无 Liveness 探针，Sidecar 持续不可用但 Pod 状态仍显示 Running
@@ -29,7 +30,7 @@
 5. 主容器不受影响（预期阴性：主容器 restartCount 零漂移、exec 正常——出现漂移即
    爆炸半径失控）
 
-**资源准备**：
+## 资源准备
 1. 确认目标 Pod 包含多个容器，明确 Sidecar 容器名称；确认目标 Pod 所在 namespace 和 labels
 2. **多容器靶接线（靶为单容器 Pod 时）**：业务靶常见单容器形态——用 JSON patch 给靶
    Deployment 模板追加一个 sidecar 容器（演练资产，结束拆线归还）。sidecar 须同时承载
@@ -95,7 +96,7 @@
    记录：进程正常状态 `S (sleeping)`（恢复对照）、两容器 restartCount 基线、
    sidecar 受害服务连通基线（`echo PING | socat -T 3 - TCP:127.0.0.1:<port>` 回显）
 
-**演练步骤**：
+## 演练步骤
 
 > **爆炸半径分类（定案）**：`target-only`。路径 A：`kill -STOP` 经 `pgrep -x <进程名>`
 > 精确匹配 sidecar 容器内目标进程——exec 通道已用 `-c` 限定到 sidecar 容器，容器
@@ -132,7 +133,8 @@
 
 4. 观察 Sidecar 容器进程挂起后的行为（是否触发探针重启、主容器是否受影响）
 
-**注入验证**（手段1/手段2 路径 A 共用；路径 B 差异单列）：
+## 注入验证
+（手段1/手段2 路径 A 共用；路径 B 差异单列）：
 1. **效果主证——进程 T 状态**（仅适用手段1/路径 A；procps 镜像看 STAT 列；
    **busybox 镜像 ps 无 STAT 列**——输出仅 PID/USER/TIME/COMMAND——改用 /proc 判据）：
    ```bash
@@ -188,7 +190,7 @@
 7. 路径 A 补自证链：`cat /tmp/procstop.evd` 含 `PROCSTOP_INJECTED`（含
    `PROCSTOP_RESTORED` 即窗口已关，如实报告实际时长）
 
-**注入恢复**：
+## 注入恢复
 1. 手段1：`blade destroy <实验UID>`（向进程发送 SIGCONT 恢复执行）；或等待
    `--timeout` 到期后自动恢复（stop 动作超时后自动发 SIGCONT，进程从挂起状态继续执行）
 2. 手段2 路径 A：定时器到期自动 SIGCONT + 写 `PROCSTOP_RESTORED`（主恢复路径）；
@@ -207,7 +209,7 @@
    teardown 超越裁决）。取样义务属于**拆线动作的执行者**（Layer 1），不是恢复
    验证层（Layer 2）——拆线前不取样，Layer 2 将永远失去直接判据
 
-**恢复验证**：
+## 恢复验证
 1. **进程恢复运行（主证，路径 A）**：`grep State /proc/$(pgrep -x <进程名>)/status`
    回到 `S (sleeping)`（或 procps STAT 列不再显示 T）
 2. **路径 B 恢复主证**：`freezer.state` 读回 `THAWED` + **exec 恢复响应**
@@ -231,7 +233,7 @@
    实例化时按 teardown 超越裁决（载体消失本身即故障效果消失的证据），直接
    判据缺失须如实记 deviation
 
-**基准事实**：
+## 基准事实
 - **根因**：Sidecar 容器内目标进程被 SIGSTOP 信号挂起，进程不退出但停止调度执行，
   模拟死锁/卡死场景
 - **必现现象**：目标进程状态变为 T（Stopped）；Sidecar 服务完全无响应；Pod 状态
@@ -265,9 +267,16 @@ sidecar 常是 distroless 的极简镜像（istio-proxy、各类 driver-registra
 `pgrep -x` 不会命中它——这正是必须用 `-x` 的原因，见下方陷阱说明）：
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <sidecar-container-name> -- sh -c \
-  '( sleep <duration>; kill -CONT $(pgrep -x <process-name>); echo PROCSTOP_RESTORED >> /tmp/procstop.evd ) >/dev/null 2>&1 & \
+  '( sleep <recovery-seconds>; kill -CONT $(pgrep -x <process-name>); echo PROCSTOP_RESTORED >> /tmp/procstop.evd ) >/dev/null 2>&1 & \
    kill -STOP $(pgrep -x <process-name>) && echo PROCSTOP_INJECTED >> /tmp/procstop.evd'
 ```
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径A 的 sleep 定时器与路径B 的
+systemd-run `--on-active` 以它武装，让框架在观察窗终点主动派发的恢复先于自治到期
+落地；手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持
+`<duration>` 不动
+
 - 链条是**自证的**：`PROCSTOP_INJECTED`（kill -STOP 成功后写入）、
   `PROCSTOP_RESTORED`（定时器 SIGCONT 后写入）落盘证据文件 `/tmp/procstop.evd`，
   验证阶段 `cat` 取证，不受故障窗口是否已关闭的时序约束

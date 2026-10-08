@@ -15,7 +15,8 @@ recovery_channel: apiserver-write
 
 **用例名称** limit单位写错 导致 Pod_OOM内存异常
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 memory limits 与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 memory limits 与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -47,16 +48,17 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - 多容器 Pod 调整 containers/N 索引至目标容器；滚动由 patch 自动触发。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Pod 启动后立即异常退出，状态为 CrashLoopBackOff
 2. Pod 的 lastState 显示 reason: OOMKilled，或新 Pod 卡在 ContainerCreating（极小 limit 在 cgroup v2 下的实际形态，见注入验证第 3 条）
 3. 容器 memory limit 值极小（如 100m = 0.1 字节），应用启动即超限或无法启动
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认应用 A 的正常内存使用量（如 200Mi 以上）
 
-**演练步骤**（主路径 = 基线捕获（步骤 1-2 的读取部分，restorePatches 的基线值来源，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、patches=resources 错误单位注入+maxUnavailable 100%、restorePatches=基线还原、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 100% 在主路径下由配方注入域承载，无需单独执行；步骤 2-4 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+## 演练步骤
+（主路径 = 基线捕获（步骤 1-2 的读取部分，restorePatches 的基线值来源，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、patches=resources 错误单位注入+maxUnavailable 100%、restorePatches=基线还原、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 100% 在主路径下由配方注入域承载，无需单独执行；步骤 2-4 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 记录应用 A 当前的 resources 配置（基线捕获：Agent 读取输出并记录 JSON，恢复时使用）：
    ```bash
    kubectl get deployment <deployment-name> -n <namespace> \
@@ -113,7 +115,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 6. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段；置 100% 的数学必要性：2 副本 × 25% ⇒ floor(0.5)=0 个不可用，永不 Ready 的新 Pod 下滚动死锁——注入期新 Pod 本就永不 Ready，默认 MU 下 K8s 不会终止旧 Pod。主路径下此项随载体配方 restorePatches 由载体 TTL 还原，无需手动执行）
 7. 观察 Pod 启动行为
 
-**注入验证**：
+## 注入验证
 1. 确认所有旧 Pod 已被替换（滚动更新完成）：**用 RS 视角判据，不要用 `kubectl rollout status`**——注入期新 Pod CrashLoop 或卡 ContainerCreating（故障本身），`rollout status` 等待 available 副本必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」；正确判据是 `kubectl get rs -n <namespace> -l <label>`：旧 RS DESIRED=0、新 RS DESIRED=目标副本数（或旧 Pod 名消失、新 Pod 处于故障形态）
 2. 执行 `kubectl get pods`，确认**所有**目标 Pod 的故障形态到位（不是仅一个新 Pod，而是全部副本）：形态 A（OOMKilled）为 CrashLoopBackOff 且 RESTARTS 已高于注入前读数（单调递增计数器，高于基线即重启已发生，无需等待持续增长——状态标签是重启的渲染）；形态 B（ContainerCreating 卡死）容器未创建、**无 RESTARTS 增长**（重启计数无从累加，判据见第 3 条形态 B——勿把「无重启」误判为注入失败）
 3. 按 limit 取整结果分形态验证（两种形态均已复现）：
@@ -122,7 +124,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 4. 执行 `kubectl describe pod <pod-name>`，确认 limits.memory 为极小值
 5. 确认容器启动后立即异常退出（运行时间极短或无法启动）
 
-**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原 resources 基线与 maxUnavailable（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原 resources 基线与 maxUnavailable（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动将 resources 还原为步骤 1 基线；演练提前结束时由
    Agent 主动执行同一条恢复命令（幂等，定时器迟到再执行一次无副作用——用基线 JSON 整体
    replace resources 对象，limits/requests 一并还原。json patch 按字段精确替换，天然规避
@@ -134,7 +137,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
 2. 等待 Pod 滚动更新完成
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods`，确认 Pod 状态为 Running 且不再重启（恢复代新 Pod RESTARTS 冻结即为「不再重启」；形态 B 案注入期本无重启，判据退化为「新 Pod 创建成功转 Running」——ContainerCreating 解除本身就是恢复生效的最强证据）
 2. 确认容器正常运行，内存使用率在合理范围（`kubectl top pod <pod-name> -n <namespace>` 单行判据，截断免疫）
 3. 确认应用 A 服务正常
@@ -148,6 +151,6 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    即有残留不必猜哪个字段）。verify 窗口先于 timer fire 结束属常态（效果证据在窗口存活期采集），
    本条判据由带外终验兑现（timer fire 后读子树 + RS hash；Agent 收尾报告须注明恢复正确性待带外终验确认）
 
-**基准事实**：
+## 基准事实
 - **根因**：memory limit 单位写错（如 `100m` 而非 `100Mi`），导致 limit 值极小，容器启动后内存使用立即超过 limit 被 OOMKill，或在 cgroup v2 环境下因内存配置过小无法启动
 - **必现现象**：Pod 异常退出（OOMKilled）或无法创建（ContainerCreating 卡死 + FailedMount ENOSPC，极小 limit 在 cgroup v2 下的形态）；limits.memory 值不合理（如 100m）；容器运行时间极短或无法启动

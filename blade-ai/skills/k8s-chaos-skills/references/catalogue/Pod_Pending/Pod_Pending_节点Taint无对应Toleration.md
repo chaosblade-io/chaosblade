@@ -1,21 +1,21 @@
 **用例名称** 节点Taint无对应Toleration 导致 Pod_Pending
 
-**故障现象**：
+## 故障现象
 1. Pod 状态为 Pending，无法被调度到任何节点
 2. Pod Events 中显示 `N node(s) had untolerated taint {node.ops/pending-reboot: true}`
 3. 目标 Pod 可调度的所有节点均带有 Pod 无法容忍的污点
 
-**RCA症状**：
+## RCA症状
 1. Pod 状态为 Pending，无法被调度到任何节点
 2. Pod Events 中显示 `had untolerated taint`
 （以上为kubectl直接可观测的现象，不包含诊断结论）
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 确认集群中有多个可调度节点
 3. 记录应用 A 的 Pod 当前运行在哪些节点上（这些节点即为"目标节点"）；同时记录目标节点当前 taints 与 workload-affinity 标签基线（本用例基线预期均为空——**若节点有既有 taint/label，恢复时用精确移除**（taint 用 `$patch: delete` 按注入项 key 定向删除、label 只对注入键置 null），**不得整体清空 taints 数组**，否则误删集群固有污点）
 
-**演练步骤**：
+## 演练步骤
 
 > **爆炸半径控制**：本用例仅 taint 目标 Pod 所在的节点（而非全部集群节点），
 > 通过 nodeSelector 约束目标 Pod 只能调度到这些节点，从而在保证故障复现的同时
@@ -61,7 +61,7 @@
 9. 删除应用 A 的一个 Pod，触发重建调度（单副本 Deployment 下重建 Pod 即 Pending——应用不可用正是本用例的故障效果，爆炸半径已被步骤 4-5 的 nodeSelector 锁定）
 10. 观察新 Pod 的调度状态
 
-**注入验证**：
+## 注入验证
 1. 执行 `kubectl get pods`，确认新 Pod 状态为 Pending
 2. 执行 `kubectl describe pod <pod-name>`，确认 Events 中显示 untolerated taint 相关的调度失败原因。
    消息形态随 K8s 版本而异：老版本显示明细形态 `N node(s) had untolerated taint
@@ -78,7 +78,7 @@
 2. 行为复查：Pending Pod 未变 Running（`kubectl get pods -n <namespace> -l <app-label>`——调度器对 Pending Pod 周期重试，taint 未摘则永不成）
 3. 事件复查：FailedScheduling 事件 LAST SEEN 相比注入时有新增（调度器仍在周期性重试；新式字段形态下看 series.lastObservedTime 前进）
 
-**注入恢复**：
+## 注入恢复
 1. 等待 `<duration>` 到期，载体定时器自动执行 REST 还原（步骤 2 武装的两条 merge-patch curl：node 对象 taints 置 null/写回基线数组 + label 置 null 合并 patch、deployment nodeSelector 还原——taints 基线为空时 null 删键即精确恢复，节点既有污点零误伤）；演练提前结束时由 Agent 主动执行下方 kubectl 三连兜底（幂等，定时器迟到再执行一次无副作用；多条命令独立执行，多个目标节点时对每个
    节点各执行一遍污点与标签还原。nodeSelector 按步骤 1 基线还原——为空则整体移除、
    非空则用基线原值精确替换，避免无条件 remove 丢失原有键值）：
@@ -94,11 +94,11 @@
 2. 等待 Pod 滚动更新完成（恢复触发的第二次滚动：新 RS Pod 无 nodeSelector 可调度任意节点，无死锁机理；**用 RS 视角判据，不要用 `kubectl rollout status`**——Pending 期间 rollout status 必然超时误判，判据是旧 RS DESIRED=0、新 RS DESIRED=副本数）
 3. 演练全清（载体四件套四连删除 + 带外收尾）：任务先于窗口退出时载体资产清理依赖带外收尾——首选 `blade-ai recover --task-id`（三层收尾：补恢复/确认 + 恢复效果核实 + 程序化四连删除，见标准件第六节）；恢复效果核实注意 restore.log 取证（载体定时器 fire 的直接证据）与状态转移证据（taint 摘除 + nodeSelector 移除 + Pending Pod 转 Running）互为补充
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods`，确认 Pod 状态变为 Running
 2. 确认目标节点 taint 已恢复到演练前状态
 3. 确认 Deployment spec 已恢复到演练前状态
 
-**基准事实**：
+## 基准事实
 - **根因**：目标 Pod 可调度的所有节点被标记了 Taint，而 Pod 未配置对应的 Toleration，导致调度器无法找到合适节点
 - **必现现象**：Pod Pending；Events 显示 untolerated taint；目标节点带有不可容忍的污点

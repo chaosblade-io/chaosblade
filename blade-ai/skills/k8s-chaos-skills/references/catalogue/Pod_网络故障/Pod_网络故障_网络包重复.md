@@ -1,19 +1,20 @@
 **用例名称** 网络包重复 导致 Pod_网络故障
 
-**故障定位**：持续型故障——tc netem duplicate 规则是状态型故障，规则存活即故障存活，
+## 故障定位
+持续型故障——tc netem duplicate 规则是状态型故障，规则存活即故障存活，
 贯穿整个故障窗口；窗口结束实验销毁/定时删除即自动恢复。手段1（ChaosBlade）与
 手段2（kubectl-native）是**并列的注入手段**，底层效果完全等价（blade 内部也是下发
 同一条 netem duplicate 规则），按环境能力选用：集群装有 ChaosBlade 且 `pod-network`
 提供 duplicate action → 可用手段1（实验 UID 统一生命周期管理）；否则用手段2。
 `duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. 网络带宽消耗异常增加，重复包占用额外带宽
 2. 应用层可能收到重复消息，考验业务幂等性设计
 3. 网络延迟略有上升，TCP 层需额外 CPU 处理去重
 4. 监控系统显示网络接收包数异常偏高
 
-**资源准备**：
+## 资源准备
 1. 确认目标应用已正常运行，且有活跃的网络通信流量
 2. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（临时容器 `--target` 必须填容器名，
    填 Pod 名/服务名会被 API server 拒绝：`targetContainerName: Not found`）
@@ -46,7 +47,7 @@
      **能拉取**一个含 iproute2 的镜像（CNI 镜像如 terway/calico/cilium 通常自带；
      用 `kubectl get pods -A -o jsonpath='{{..image}}'` 找集群已在用的）
 
-**演练步骤**：
+## 演练步骤
 1. 记录注入前基线：
    ```bash
    kubectl get pods -n <namespace> -l <label-selector> -o wide
@@ -86,7 +87,7 @@ kubectl exec <pod-name> -n <namespace> -- tc -Version
 重定向后台化，否则 exec 挂住）：
 ```bash
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -- tc qdisc add dev eth0 root netem duplicate <percent>%
 ```
 
@@ -102,12 +103,12 @@ kubectl exec <pod-name> -n <namespace> -- tc qdisc add dev eth0 root netem dupli
 kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.hostNetwork}'
 # 期望输出为空或 false；输出 true 则停止。
 
-# 1) 注入 + 内置定时自删（一条命令完成：注入成功后 sleep <duration> 到期自动删除规则）。
+# 1) 注入 + 内置定时自删（一条命令完成：注入成功后 sleep <recovery-seconds> 到期自动删除规则）。
 #    --target 必须填实际容器名；--quiet 不进入交互附着，不要加 -it。
 kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
   --target=<container-name> --profile=netadmin --quiet -- sh -c \
   'tc qdisc add dev eth0 root netem duplicate <percent>% \
-   && tc qdisc show dev eth0 && echo INJECTED && sleep <duration> \
+   && tc qdisc show dev eth0 && echo INJECTED && sleep <recovery-seconds> \
    && tc qdisc del dev eth0 root && tc qdisc show dev eth0 && echo RECOVERED'
 ```
 链条是**自证的**：`add` 后、`INJECTED` 前的 `tc qdisc show` 把生效规则原文写入容器日志，
@@ -116,7 +117,12 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
 （窗口短于验证启动延迟时，窗口内探针结构性不可达；链内快照消除此竞态）。两处 show 必须保留，
 不得为缩短命令而省略（注意 wiz 等通道 sh -c 载荷有 1024 字节上限，本链远低于上限）。
 倒计时从武装时刻起算：注入成功（INJECTED 回显）与倒计时起点在同一条命令链内严格串行，无侵蚀间隙；武装后发生任何修复需重武装时，先用下方提前恢复命令另起临时容器删规则（旧链到期后的重复删除是幂等空触发、无害），再重跑注入命令重新武装+注入（见 SKILL.md 安全红线「故障窗口完整」）
-- 该命令整体阻塞 `<duration>` 秒（命令自身就是保活载体，自恢复随命令完成而闭环）；
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径A 的 sleep 定时器与路径B 的
+链内 sleep 自删链以它武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；
+手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
+- 该命令整体阻塞 `<recovery-seconds>` 秒（命令自身就是保活载体，自恢复随命令完成而闭环）；
   如需后台执行，将整条 kubectl debug 置于后台并轮询其输出/临时容器日志
 - 输出未直接回流时，从临时容器日志读取（`INJECTED`/`RECOVERED` 标记即注入/自恢复的确证；
   标记之间的 `tc qdisc show` 输出即白盒主证原文）：
@@ -142,7 +148,8 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
   替换而非叠加）；若是无关/过期残留，先 `tc qdisc del dev eth0 root` 清掉再重新武装注入。
   **不要盲目重试 `add`**，它只会反复报同样的错
 
-**注入验证**（两种手段共用——底层是同一条 netem 规则）：
+## 注入验证
+（两种手段共用——底层是同一条 netem 规则）：
 1. 白盒确认 netem 规则已生效。**手段2 路径B 的首选证据是注入容器日志**——链内 `tc qdisc show`
    快照在注入时刻已捕获，直接读日志取证（无窗口时序约束，验证阶段晚于窗口关闭也同样有效）：
    ```bash
@@ -187,7 +194,7 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
    为静观短窗口后 TX packets 增长率仍偏高。若窗口内提前恢复，说明故障窗口契约未达成，
    必须如实报告实际持续时长
 
-**注入恢复**：
+## 注入恢复
 
 手段1（ChaosBlade）：
 1. 提前恢复：销毁实验（移除 netem 规则）`blade destroy <experiment_uid>`
@@ -209,7 +216,8 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
      ```
      随后注入容器里的定时器到期再删一次，规则已不存在，删除静默失败无害
 
-**恢复验证**（两种手段共用）：
+## 恢复验证
+（两种手段共用）：
 1. 用注入验证第 1 条的同一路径确认规则已移除：
    ```bash
    kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
@@ -223,7 +231,7 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
    ```
 3. 确认 Pod 无 RESTARTS、`/proc/net/dev` TX packets 增长率回落至基线水平
 
-**基准事实**：
+## 基准事实
 - **根因**：Pod 网络接口上的 tc netem duplicate 规则按注入比例对出站数据包复制重发，接收端收到重复包，占用额外带宽与去重 CPU；TCP 按序号去重保证连接不中断
 - **必现现象**：`tc qdisc show` 出现 `netem ... duplicate <percent>%` 规则；eth0 TX packets 增长率按注入比例偏高；带宽占用增加；应用无幂等保护时可能处理重复业务消息；窗口结束规则移除后恢复
 - **blade 可用性因构建而异**：`pod-network duplicate` 并非所有 blade 发行版都提供（官方 v1.8.0 构建含 netem 全家桶 reorder/corrupt/duplicate/delay/loss，某定制发行 v1.8.5 仅 dns/drop/occupy）——以 `blade create k8s pod-network -h` 的 Available Commands 为准，没有 duplicate 就用手段2
@@ -236,6 +244,6 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
   `sh -c '<完整链>'` 作为 `--` 的单一参数
 - **临时容器本身无法从运行中的 Pod 移除**（Kubernetes 既定行为），只能随 Pod 重建消失；
   `tc qdisc del` 成功即代表故障已恢复，残留临时容器不影响业务容器
-- 自恢复基于武装的定时删除（路径A）或注入命令内置的 `sleep <duration>` 自删链（路径B）；
+- 自恢复基于武装的定时删除（路径A）或注入命令内置的 `sleep <recovery-seconds>` 自删链（路径B）；
   提前恢复用上方手动删除命令
 - 效果与手段1 完全等价——blade 底层就是下发同一条 netem duplicate 规则

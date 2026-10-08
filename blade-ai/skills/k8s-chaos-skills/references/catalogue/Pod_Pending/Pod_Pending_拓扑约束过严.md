@@ -15,7 +15,8 @@ recovery_channel: apiserver-write
 
 **用例名称** 拓扑约束过严 导致 Pod_Pending
 
-**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+## 载体配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -53,12 +54,12 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - maxUnavailable 还原须待恢复流程移除约束且第二次滚动完成后（正文「暂缓还原」纪律）——载体按 restorePatches 顺序执行，逆序排列已满足该纪律。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. Pod 状态为 Pending，无法被调度
 2. Pod Events 中显示 `didn't match pod topology spread constraints` 或 `didn't match pod anti-affinity rules`
 3. 由于拓扑分布约束或反亲和规则过严，调度器无法找到满足条件的节点
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行
 2. 记录可调度节点数——反亲和 required 以节点为拓扑域上限，副本扩容目标超过该值时 Pending 必现（演练步骤 4/7 的参数依据）：
    ```bash
@@ -86,7 +87,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl delete sa drill-rc-<hash> -n <namespace> --ignore-not-found
    ```
 
-**演练步骤**（主路径 = 基线捕获后调 `faultdrill_assemble_carrier`（参数取自载体配方），注入+武装+readback 工具内同步完成；以下手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+## 演练步骤
+（主路径 = 基线捕获后调 `faultdrill_assemble_carrier`（参数取自载体配方），注入+武装+readback 工具内同步完成；以下手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 记录还原基线（基线捕获：Agent 读取输出并记录以下字段的原始值，恢复时使用；
    topologySpreadConstraints/affinity 原本无约束时输出为空）：
    ```bash
@@ -143,7 +145,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 7. 将应用 A 的副本数扩大到超过集群节点数
 8. 观察无法调度的 Pod 状态
 
-**注入验证**：
+## 注入验证
 1. 确认所有旧 Pod 已被替换（滚动更新完成）：**用 RS 视角判据，不要用 `kubectl rollout status`**——注入期新 Pod 永不被调度（无节点可满足拓扑约束，故障本身），`rollout status` 等待 available 副本必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」；正确判据是 `kubectl get rs -n <namespace> -l <label>`：旧 RS DESIRED=0、新 RS DESIRED=目标副本数（或旧 Pod 名消失、新 Pod 处于 Pending）
 2. 执行 `kubectl get pods`，确认部分或全部 Pod 状态为 Pending
 3. 执行 `kubectl describe pod <pending-pod>`，确认 Events 显示拓扑约束或反亲和相关的调度失败原因
@@ -155,7 +157,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 2. 行为复查：超节点数扩出的副本仍 Pending（`kubectl get pods -n <namespace> -l <app-label>` 中 Pending 数不变）
 3. 事件复查：FailedScheduling 事件 LAST SEEN 相比注入时有新增（调度器仍在周期性重试）
 
-**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治按 restorePatches 逆序还原，fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：
+## 注入恢复
+（主路径下恢复无需 Agent 执行动作——载体 TTL 自治按 restorePatches 逆序还原，fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动还原拓扑约束与副本数；演练提前结束时由 Agent 主动执行
    同组恢复命令（幂等，定时器迟到再执行一次无副作用。json patch 按字段精确替换/移除，天然
    规避 resourceVersion 乐观锁问题，也不会像 apply 三方合并那样保留注入新增的字段。
@@ -177,7 +180,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
      -p='[{"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":"<基线值>"}]'
    ```
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get pods -n <namespace> -l <app-label>`，确认副本数回到基线且全部 Running/Ready、无 Pending 残留（第二次滚动已完成，无死锁）
 2. 确认约束字段已移除（或还原为基线值）：
    ```bash
@@ -193,6 +196,6 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl get events -n <namespace> --field-selector reason=FailedScheduling
    ```
 
-**基准事实**：
+## 基准事实
 - **根因**：topologySpreadConstraints 或 podAntiAffinity 配置过严，当副本数超过可用拓扑域时，调度器无法满足约束条件
 - **必现现象**：部分 Pod Pending；Events 显示拓扑约束或反亲和规则不满足；已调度 Pod 严格按约束分布

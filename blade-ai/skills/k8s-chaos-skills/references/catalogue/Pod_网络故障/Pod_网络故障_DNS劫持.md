@@ -1,6 +1,7 @@
 **用例名称** DNS劫持 导致 Pod_网络故障
 
-**故障定位**：持续型故障——/etc/hosts 劫持记录是状态型故障，记录存活即故障存活，
+## 故障定位
+持续型故障——/etc/hosts 劫持记录是状态型故障，记录存活即故障存活，
 贯穿整个故障窗口；窗口结束记录移除（实验销毁/定时器还原）即自动恢复。手段1（ChaosBlade）
 与手段2（kubectl-native）是**并列的注入手段**，底层效果完全等价（blade 内部也是向目标
 Pod 的 /etc/hosts 写入劫持记录），按环境能力选用：集群装有 ChaosBlade 且 operator 健康、
@@ -9,13 +10,13 @@ Pod 的 /etc/hosts 写入劫持记录），按环境能力选用：集群装有 
 裸 Pod/无主形态或不可滚动重建 → 路径 B（容器内直改 /etc/hosts）。
 `duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
-**故障现象**：
+## 故障现象
 1. Pod 对特定域名的解析被劫持到错误 IP 地址
 2. 应用连接到非预期的服务端点，请求失败或返回异常数据
 3. 与 DNS 解析失败（NXDOMAIN/超时）不同：域名仍可解析，但结果为错误 IP
 4. 仅影响指定域名，其他域名解析正常
 
-**资源准备**：
+## 资源准备
 1. 确认目标应用已正常运行，且依赖特定域名进行外部服务调用
 2. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（多容器/临时容器混存时
    `kubectl exec` 必须显式 `-c <容器名>`，否则命中默认容器可能不是业务容器）
@@ -39,7 +40,7 @@ Pod 的 /etc/hosts 写入劫持记录），按环境能力选用：集群装有 
 5. 确认目标域名当前可正常解析到正确 IP（ping 基线，见演练步骤第 1 条判据陷阱）
 6. 路径 B 额外前提：容器内 `/etc/hosts` 当前用户可写（见路径 B 前提验证，不要假定可写）
 
-**演练步骤**：
+## 演练步骤
 1. 记录注入前基线（⚠️ 判据陷阱：本场景注入层在 /etc/hosts，而
    nslookup 只查 DNS 服务器、**不读 /etc/hosts**——nslookup 看不见劫持效果，不能作判据。
    ping/wget 走 getaddrinfo（含 hosts 层），是正确判据工具）：
@@ -138,7 +139,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c 'ls -l /etc/hosts
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'cp /etc/hosts /etc/hosts.bak &&
-   { ( sleep <duration>; cat /etc/hosts.bak > /etc/hosts; rm -f /etc/hosts.bak; echo DNS_HIJACK_RESTORED >> /etc/hosts.bak.evd ) >/dev/null 2>&1 & } &&
+   { ( sleep <recovery-seconds>; cat /etc/hosts.bak > /etc/hosts; rm -f /etc/hosts.bak; echo DNS_HIJACK_RESTORED >> /etc/hosts.bak.evd ) >/dev/null 2>&1 & } &&
    echo "<错误IP> <target-domain>" >> /etc/hosts &&
    echo DNS_HIJACK_INJECTED >> /etc/hosts.bak.evd'
 ```
@@ -150,6 +151,13 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 380 字节，安全）。
 
 路径B 倒计时从武装时刻起算：备份→武装→注入在同一载荷内严格串行（无侵蚀间隙）；武装后发生任何修复需重武装时，须先用存量备份还原再重跑：`kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c 'pkill -f hosts.ba[k]; true'` 停旧定时器后用 `cat /etc/hosts.bak > /etc/hosts` 还原，然后重跑上方注入命令重武装+重注入——不可直接重跑，否则备份会混入劫持记录（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径 B 的容器内 sleep 定时器以它
+武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；路径 A 是 API 型恢复载体
+（json patch hostAliases），按 recovery-carrier.md 的 duration 双轨立法武装 `<duration>`，
+不适用 grace；手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持
+`<duration>` 不动
 
 结构说明：外层 `{ ... & }` 在前台执行（立即返回），保证备份**先于**注入完成；
 若写成 `cp ... && ( ... ) & echo ...` 会把备份与注入并行，备份可能混入劫持记录，
@@ -167,7 +175,8 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'pkill -f hosts.ba[k]; test -f /etc/hosts.bak && { cat /etc/hosts.bak > /etc/hosts; rm -f /etc/hosts.bak; echo DNS_HIJACK_RESTORED >> /etc/hosts.bak.evd; }; true'
 ```
 
-**注入验证**（两种手段共用——底层都是 /etc/hosts 劫持记录）：
+## 注入验证
+（两种手段共用——底层都是 /etc/hosts 劫持记录）：
 1. 白盒确认劫持记录已生效：
    ```bash
    kubectl exec <pod-name> -n <namespace> -c <container> -- cat /etc/hosts
@@ -201,7 +210,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    （链条严格串行，标记先后顺序即注入/还原的确证）。有界佐证为静观短窗口后请求该域名
    仍连接错误 IP。若窗口内提前恢复，说明故障窗口契约未达成，必须如实报告实际持续时长
 
-**注入恢复**：
+## 注入恢复
 
 手段1（ChaosBlade）：
 1. 提前恢复：销毁实验（移除劫持记录）`blade destroy <experiment_uid>`
@@ -218,7 +227,8 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    临时文件，容器一旦重启，kubelet 重新生成 /etc/hosts，修改**自动丢失**（这也算一种
    兜底恢复，但故障窗口契约因此提前终结，须如实报告）
 
-**恢复验证**（两种手段共用）：
+## 恢复验证
+（两种手段共用）：
 1. 在目标 Pod 内验证域名解析恢复正确（同样用 ping 而非 nslookup）：
    ```bash
    kubectl exec <pod-name> -n <namespace> -c <container> -- ping -c 1 -W 3 <target-domain>
@@ -230,7 +240,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 4. 确认应用日志不再出现连接错误
 5. 确认 Pod 无 RESTARTS、无新增异常事件
 
-**基准事实**：
+## 基准事实
 - **根因**：Pod 内 /etc/hosts 被写入劫持记录，特定域名经 getaddrinfo 解析到错误 IP 地址，
   导致应用连接到非预期端点
 - **必现现象**：目标域名解析（ping/getaddrinfo 路径）返回注入的错误 IP；应用对该域名的
@@ -244,7 +254,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 **手段2 注意事项**：
 - 路径 A 会触发滚动重建，故障在**新 Pod** 上生效，原 Pod 名会变 —— 注入后需重新获取 Pod 名
 - 自恢复基于注入前武装的定时器：路径 A 为载体 sh -c 载荷内定时器（到期自动按基线
-  还原 hostAliases，json patch 规避乐观锁与三方合并问题），路径 B 为容器内 sleep <duration> +
+  还原 hostAliases，json patch 规避乐观锁与三方合并问题），路径 B 为容器内 sleep <recovery-seconds> +
   备份还原；路径 A 定时器存活于载体 Pod，Pod 重建会丢失定时器，届时仍需 Agent
   主动执行（或人工）恢复命令兜底
 - 若应用绕过 hosts 直连 DNS 解析器（自带 resolver 或 DNS 缓存），两条路径都可能不生效；

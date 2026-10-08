@@ -1,16 +1,16 @@
 **用例名称** 日志未清理 导致 Pod_云盘空间打满
 
-**故障现象**：
+## 故障现象
 1. Pod 挂载的云盘空间使用率达到 100%
 2. 应用写入操作失败，日志报 `No space left on device`
 3. 应用功能异常，数据无法持久化
 
-**资源准备**：
+## 资源准备
 1. 确认应用 A 已正常运行，且挂载了 PVC 用于数据存储
 2. 确认 PVC 对应的云盘容量已知
 3. 确认监控系统可观测 PVC 磁盘使用率
 
-**演练步骤**：
+## 演练步骤
 1. 定位应用 A 的 Pod 及其 PVC 挂载路径
 2. 使用 chaosblade 对应用 A 的 Pod 注入磁盘填充，模拟日志堆积打满云盘：
    ```bash
@@ -24,24 +24,24 @@
    ```
 3. 观察应用 A 的写入行为和错误日志
 
-**注入验证**：
+## 注入验证
 1. 进入 Pod 查看挂载路径磁盘使用率：`df -h <挂载路径>`，确认使用率接近 100%
 2. 在 Pod 内尝试写入文件，确认报 `No space left on device` 错误
 3. 查看应用 A 日志，确认有写入失败相关错误
 4. 确认应用 A 的业务功能受影响（如数据写入失败）
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 chaosblade 磁盘填充实验：`blade destroy <UID>`
 2. 确认填充的临时文件被清理
 3. 若空间未释放，手动清理注入的文件
 
-**恢复验证**：
+## 恢复验证
 1. 进入 Pod 查看挂载路径磁盘使用率，确认恢复到正常水平
 2. 在 Pod 内尝试写入文件，确认成功
 3. 确认应用 A 的写入操作恢复正常
 4. 确认应用 A 业务功能恢复
 
-**基准事实**：
+## 基准事实
 - **根因**：云盘上的日志或数据文件持续增长且未配置清理策略，最终占满整个磁盘空间，导致新的写入操作失败
 - **必现现象**：磁盘使用率 100%；写入报 No space left on device；应用功能异常
 
@@ -73,13 +73,19 @@ kubectl exec <pod-name> -n <namespace> -- df -h <PVC挂载路径>
 #    两条命令分两次独立执行——不能用 && 串联：第二段 kubectl 会沦为第一条 exec
 #    载荷（sh -c）的死参数，填充静默丢失
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  '( sleep <duration>; rm -f <PVC挂载路径>/fill_file ) >/dev/null 2>&1 &'
+  '( sleep <recovery-seconds>; rm -f <PVC挂载路径>/fill_file ) >/dev/null 2>&1 &'
 # 使用 fallocate 快速填充磁盘
 kubectl exec <pod-name> -n <namespace> -- fallocate -l <算出的填充量>G <PVC挂载路径>/fill_file
 # 或使用 dd：
 kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=<PVC挂载路径>/fill_file bs=1M count=<填充量换算的MB数>
 ```
 倒计时从武装时刻起算：武装与填充命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f fill_fil[e]; true'` 停旧定时器再全额重武装；容器无 pkill 时旧定时器无法停止，到期会提前清理侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——路径 A 的 sleep 定时器（与路径 B
+的 systemd-run 定时器同源）以它武装，让框架在观察窗终点主动派发的恢复先于
+自治到期落地；手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持
+`<duration>` 不动
 
 恢复命令（提前恢复）：
 ```bash
@@ -92,7 +98,7 @@ kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f fill_file; rm -f <PVC�
 注意事项：
 - `fallocate` 分配速度快（仅分配元数据），`dd` 实际写入数据速度较慢但更真实（19.5G
   PVC 以 ~430MB/s 写入约 45s，dd 需 nohup 后台跑防命令执行超时）
-- 自恢复基于注入前武装的容器内后台定时器（sleep <duration> + rm 填充文件），到期自动清理
+- 自恢复基于注入前武装的容器内后台定时器（sleep <recovery-seconds> + rm 填充文件），到期自动清理
   （机制正常）；提前恢复用上方手动命令，**必须先 pkill 终止定时器**，否则跨轮次幽灵
   rm 会误删新一轮填充文件
 - 需按**增量**计算填充大小以确保磁盘使用率达到预期值（填充量 = 文件系统总容量 × 目标使用率 − 当前已用量，先用 `df -h <PVC挂载路径>` 查看）；盲目填一个大数可能越过云盘实际容量直接报 ENOSPC，也可能远达不到打满效果
@@ -135,11 +141,11 @@ PVC 在容器里是一个挂载点，它的真实存储在宿主机的 kubelet �
    kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
      -- chroot /host sh -c '
        systemd-run --on-active=<recovery-seconds>s --unit=blade-rmfill-<PodUID前8位> \
-         rm -f <步骤2确认的路径>/fill_file &&
+         truncate -s 0 <步骤2确认的路径>/fill_file &&
        fallocate -l <按路径A同式算出的填充量>G <步骤2确认的路径>/fill_file
      '
    ```
-   - **先武装定时删除再填充** —— debug pod 可能先于清理被删；定时器由宿主机 systemd(PID 1)
+   - **先武装定时 truncate 清空再填充** —— debug pod 可能先于清理被删；定时器由宿主机 systemd(PID 1)
      管理，不受 debug pod 生命周期影响
    - `fallocate` 不可用时改 `dd if=/dev/zero of=<路径>/fill_file bs=1M count=<MB>`（MB 为填充量换算值）
 
@@ -154,11 +160,13 @@ kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadm
 容器内 `df` 的 `Use%` 应显著上升。**节点侧看到文件存在只说明写成功，不代表业务容器
 感知到空间不足** —— 以容器内 `df` 为准。
 
-恢复：
+恢复（**主路径 = 注入时武装的 systemd-run timer 到期自动 `truncate -s 0` 清空，Agent 无需干预**；下方为提前/带外恢复）：
 ```bash
 kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
   -- chroot /host rm -f <步骤2确认的路径>/fill_file
 ```
+
+> 上方裸 `chroot /host rm -f`（或 `truncate -s 0`）**Agent 经 one-shot debug 下发必被 host-escape 门禁拒**——裸回收命令无故障家族、one-shot debug 又不登记 carrier 账本（`armed_fill_paths` 只由 exec 通道填充），守卫认不出它是已武装填充的逆操作；确需提前释放走人工带外（人直接在自己 shell 跑、不经 Agent 守卫，rm 可彻底删文件）。
 
 注意事项：
 - **写宿主机路径等于写进容器** —— 同一份存储的两个视角，容器内立刻可见
@@ -167,4 +175,4 @@ kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadm
   **不要再执行 rm**（路径已不存在）
 - PVC 若被多个 Pod 共享（ReadWriteMany），填满会影响所有挂载方 —— 注入前用
   `kubectl get pvc <name> -n <namespace> -o jsonpath={.spec.accessModes}` 确认
-- 无 `--timeout` 自动恢复，靠上面的 `systemd-run` 定时删除兜底
+- 无 `--timeout` 自动恢复，靠上面的 `systemd-run` 定时 `truncate -s 0` 清空兜底

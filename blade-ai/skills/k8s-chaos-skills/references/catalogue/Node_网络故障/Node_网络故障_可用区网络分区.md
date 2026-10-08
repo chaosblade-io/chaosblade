@@ -1,12 +1,12 @@
 **用例名称** 可用区网络分区 导致 Node_网络故障
 
-**故障现象**：
+## 故障现象
 1. 目标可用区内所有节点的网络通信中断，模拟整个可用区网络分区
 2. 可用区内所有 Pod 与外部通信中断，跨 AZ 流量被切断
 3. 多个节点同时变为 NotReady（kubelet 与 API Server 断联）
 4. 集群调度器将工作负载从故障 AZ 迁移至健康 AZ
 
-**资源准备**：
+## 资源准备
 1. 确认目标可用区名称（AZ 标签值）。标签有新旧两版（新版 `topology.kubernetes.io/zone`、旧版 `failure-domain.beta.kubernetes.io/zone`），**两版都要查、以当次实测为准**（存在新版全空而旧版可用的集群——旧版已 deprecated 但部分托管集群仅打旧版；后续所有按 AZ 选节点的命令均沿用实测命中的那版标签）：
    ```bash
    kubectl get nodes -L topology.kubernetes.io/zone
@@ -27,7 +27,7 @@
    - 上述节点即使落在目标 AZ 内也**一律从注入列表剔除**；若查不到（托管控制面/组件标签缺失）则记为"排除节点未定"，按现状注入其余节点，并依赖运行期纪律兜底：注入期间任何查询超时按"暂不可得（indeterminate）"处理并重试（见守卫/验证启发式），绝不当作"节点已断/全部成功"，报告中说明排除节点未能确认、观测通道可能随注入中断。
    - 判读细则：控制面节点查询结果为**空**通常意味着托管控制面（控制面不在数据面节点上），该类排除节点集为空、无需剔除——这与"组件标签缺失查不到落点"的"未定"是两种不同结论，勿混淆。目标 AZ 有多个可选时，**优先选择不含命令下发基础设施落点的 AZ**（下发组件落在对方 AZ 时，注入目标 AZ 的同时带外命令通道天然无恙——AZ 选型本身就是一条安全设计；如执行器双副本均在 AZ-b 时选 AZ-a 注入）。
 
-**演练步骤**：
+## 演练步骤
 1. 查询目标可用区的所有节点名称：
    ```bash
    kubectl get nodes -l topology.kubernetes.io/zone=<az-name> -o jsonpath='{.items[*].metadata.name}'
@@ -61,7 +61,7 @@
 >
 > 守卫仍逐调用（逐批）复核每条命令。若排除节点未定（查不到控制面/下发基础设施落点），仍按分批方式注入其余节点，依赖运行期"超时即重试、不从局部推整体"的纪律兜底，并在报告中标注排除节点未能确认。
 
-**注入验证**：
+## 注入验证
 
 > ⚠️ **自断链路故障的判读规范（务必先读）**：本故障屏蔽的 6443/10250 正是 `kubectl exec` 等带内命令下发依赖的通道。因此通过 exec/kubectl-native 方式注入时，**注入用的那条 exec 命令自身会超时或断连（如 `timed out after 10s`），这是预期的成功信号，不是失败**。收到超时后：
 > 1. **不要重试同一条 exec，也不要归因为“镜像没 shell / 通道坏了”**——通道正是被你成功切断的；
@@ -93,7 +93,7 @@
    kubectl get events --field-selector reason=NodeNotReady
    ```
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 ChaosBlade 实验：
    ```bash
    blade destroy <experiment_uid>
@@ -102,7 +102,7 @@
    依赖 `--timeout` 自动恢复。SSH 通道可逐节点 SSH 登录恢复。
 2. 超时自动恢复后确认节点状态
 
-**恢复验证**：
+## 恢复验证
 1. 确认所有节点恢复为 Ready：
    ```bash
    kubectl get nodes -l topology.kubernetes.io/zone=<az-name>
@@ -110,7 +110,7 @@
 2. 确认跨 AZ 网络连通性恢复
 3. 确认被驱逐的 Pod 已重新调度并 Running
 
-**基准事实**：
+## 基准事实
 - **根因**：目标可用区内所有节点宿主机网络栈被注入 iptables DROP 规则，模拟 AZ 级网络分区
 - **必现现象**：AZ 内所有节点变为 NotReady；跨 AZ 流量中断；集群触发大规模 Pod 重新调度
 
@@ -144,6 +144,7 @@ for NODE in $TARGET_NODES; do
   #    恢复链（systemd-run 载荷内的 iptables -D 系列）用 `;` 串联而非 `&&`——每条 -D 都被尝试，
   #    某条规则不存在也不中断后续删除；注入链（外层）用 `&&` 保证武装成功后才下 DROP。
   #    ✅ 注入后本条 exec 会因 6443/10250 被切断而超时（如 timed out after 10s）——这是预期成功信号，**不要重试该 exec、不要换镜像**；继续下一个节点，并改用集群侧 `kubectl get nodes -l <实测命中的zone标签>=<az-name>` 验证。
+  # <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
   kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c '
     systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-az sh -c "
       iptables -D OUTPUT -p tcp --dport 6443 -j DROP;

@@ -1,17 +1,17 @@
 **用例名称** 节点DNS劫持 导致 Node_网络故障
 
-**故障现象**：
+## 故障现象
 1. 节点宿主机与 hostNetwork Pod 对特定域名的 DNS 解析被劫持到错误 IP
 2. 多个应用同时出现对同一域名的连接异常
 3. 与 Pod 级 DNS 劫持不同：作用点为宿主机 /etc/hosts；但非 hostNetwork Pod（绝大多数业务 Pod）的 /etc/hosts 由 kubelet 独立管理，宿主机劫持对其零传导（见注意事项）
 4. 模拟节点级 DNS 污染或中间人攻击场景
 
-**资源准备**：
+## 资源准备
 1. 确认目标节点名称及其上运行的依赖特定域名的工作负载
 2. 确认目标域名当前可正常解析
 3. 确认 ChaosBlade Operator 已部署（DaemonSet 通道）或具备节点 SSH 访问权限（SSH 通道）
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标节点名称和上面运行的 Pod：
    ```bash
    kubectl get pods -o wide --field-selector spec.nodeName=<node-name>
@@ -47,7 +47,7 @@
    - `--ip`：劫持后指向的错误 IP（必填）
 4. 记录返回的 experiment_uid，用于后续恢复
 
-**注入验证**：
+## 注入验证
 1. 在目标节点宿主机侧验证劫持生效（hosts 修改路径的正证据）：
    ```bash
    kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host getent hosts <target-domain>
@@ -61,14 +61,14 @@
 4. 查看应用日志确认出现连接异常（受影响的是宿主机进程与 hostNetwork Pod 上的应用；非 hostNetwork Pod 的应用不受影响）
 5. **验证传导边界（case 现象 3 的判据形态——正验证「故障边界」）**：在该节点上的非 hostNetwork Pod（普通业务 Pod）内执行 `getent hosts <target-domain>`（或 nslookup）→ 仍返回真实 IP——kubelet 独立管理其 /etc/hosts（仅 localhost 与 Pod IP 条目），宿主劫持零传导；该判据与宿主侧错误 IP 恰构成「故障在位 + 边界清晰」的完整证据链
 
-**注入恢复**：
+## 注入恢复
 1. 销毁 ChaosBlade 实验：
    ```bash
    blade destroy <experiment_uid>
    ```
 2. 或等待 `--timeout` 到期自动恢复
 
-**恢复验证**：
+## 恢复验证
 1. 在目标节点宿主机侧验证解析恢复（与注入验证第 1 条同路径对比，确认回到注入前基线的真实 IP）：
    ```bash
    kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host getent hosts <target-domain>
@@ -78,7 +78,7 @@
 3. 确认应用日志不再出现连接错误
 4. 确认业务调用恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：节点宿主机级别 DNS 解析被劫持（/etc/hosts 修改），特定域名被解析到错误 IP；影响宿主机进程与 hostNetwork Pod（其 /etc/hosts 为宿主机 hosts 的 kubelet 管理副本）；非 hostNetwork Pod 的容器内解析不受影响（独立 /etc/hosts + 集群 DNS）
 - **必现现象**：该节点宿主机与 hostNetwork Pod 对目标域名解析结果为错误 IP；非 hostNetwork Pod 解析不受影响（零传导）；其他节点不受影响
 
@@ -104,6 +104,7 @@
 # 探测失败）：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host systemctl status blade-restore-hosts.timer
 # 第 1 条：备份 + 武装定时还原（`&&` 串联保证武装失败时不会留下无主备份）
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c 'cp /etc/hosts /etc/hosts.bak && systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-hosts mv /etc/hosts.bak /etc/hosts'
 # 第 2 条：注入劫持记录（宿主 glibc resolver 对新连接立即生效）
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c 'echo "<错误IP> <target-domain>" >> /etc/hosts'

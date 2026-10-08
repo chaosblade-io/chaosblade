@@ -15,7 +15,8 @@ recovery_channel: apiserver-write
 
 **用例名称** 节点排空Drain 导致 Node_维护
 
-**恢复动作配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：解除 cordon（uncordon）。**靶为 Node（cluster-scoped），装配器 M1 不支持**（四对象栈 Role/RoleBinding 无法授权 cluster-scoped 资源，工具对 Node 靶 fail-closed 拒绝）——本配方不经装配器，作为 Agent 主动兜底与恢复验证的权威动作清单；自治通道走正文宿主机 systemd timer（kubelet.conf 凭证对 uncordon 实际放行）：
+## 恢复动作配方
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：解除 cordon（uncordon）。**靶为 Node（cluster-scoped），装配器 M1 不支持**（四对象栈 Role/RoleBinding 无法授权 cluster-scoped 资源，工具对 Node 靶 fail-closed 拒绝）——本配方不经装配器，作为 Agent 主动兜底与恢复验证的权威动作清单；自治通道走正文宿主机 systemd timer（kubelet.conf 凭证对 uncordon 实际放行）：
 
 ```yaml
 targetRef:                                # 靶（cluster-scoped，无 namespace）
@@ -28,25 +29,25 @@ patches:                                  # 注入域（json-patch 语义；实�
 restorePatches:                           # 恢复域：宿主机 timer 自治（uncordon）+ Agent 主动兜底
 - op: remove
   path: /spec/unschedulable
-durationSeconds: <duration>               # 演练窗口（宿主机 timer 的 --on-active 参数）
+durationSeconds: <duration>               # 观察窗 D（框架在场契约）；宿主机 timer 的 --on-active 取 recovery_timer_seconds=D+G（见 SKILL.md 双数窗口契约）
 ```
 
 - cluster-scoped 目标（Node）：targetRef 无 namespace 字段；恢复不经装配器（见配方标题）。
 - drain 的驱逐序列（`kubectl drain --ignore-daemonsets …`）保留为 execute 计划普通步骤——配方只承载 cordon patch 域；被驱逐 Pod 不回迁（重建留在落位节点，正文恢复验证语义不变）。
 - 恢复由宿主机 timer（uncordon 自治）+ Agent 主动兜底承载——cluster-scoped 靶无载体 TTL 通道，属 recovery-carrier spec「降级路径」的结构性形态；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
-**故障现象**：
+## 故障现象
 1. 节点被标记为 SchedulingDisabled，不再接受新 Pod 调度
 2. 节点上所有非 DaemonSet Pod 被安全驱逐
 3. 被驱逐 Pod 在其他节点重建；如集群资源不足，部分 Pod 进入 Pending
 4. 模拟节点维护/升级场景下的工作负载迁移
 
-**资源准备**：
+## 资源准备
 1. 确认目标节点上有业务 Pod 运行（非仅 DaemonSet Pod）
 2. 确认集群中其他节点有足够资源接纳被驱逐的 Pod
 3. 确认目标节点名称（通过 `kubectl get nodes` 获取）
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标节点当前运行的 Pod：
    ```bash
    kubectl get pods --all-namespaces --field-selector spec.nodeName=<node-name> -o wide
@@ -58,7 +59,8 @@ durationSeconds: <duration>               # 演练窗口（宿主机 timer 的 -
    transient timer 由宿主机 systemd(PID 1) 管理，不依赖 debug Pod 存活（drain 驱逐 debug
    Pod 后恢复仍生效）。timer 载荷中的 kubectl 以宿主机 kubelet.conf 为凭证，该凭证允许修改
    spec.unschedulable（uncordon 实际放行；但受 NodeRestriction 限制不能修改 taints，见
-   "节点污点注入Taint"用例）。`<duration>` 需覆盖 drain 与观察窗口）：
+   "节点污点注入Taint"用例）。`<recovery-seconds>` 取 prompt 下发的 `recovery_timer_seconds`
+   （= duration + grace，见 SKILL.md 双数窗口契约），需覆盖 drain 与观察窗口）：
    ```bash
    # 冲突预检（固定单元名 + 残留预检）：systemctl status blade-restore-drain.timer
    # 回执 not-found（exit 4）= 无残留可武装——这是预检通过的预期形态，勿误读为探测失败重试
@@ -67,7 +69,7 @@ durationSeconds: <duration>               # 演练窗口（宿主机 timer 的 -
    # **载荷形态红线（引号红线）**：systemd-run 直接 exec kubectl + 参数（无 sh -c 包装、
    # 零引号零嵌套）——多参数经 systemd-run 原生 argv 传递不经 shell 解释，比嵌套 sh -c
    # "kubectl ..." 形态（外单引号内双引号，传输层三层契约缺口高发区）结构性更稳
-   kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host systemd-run --on-active=<duration>s --unit=blade-restore-drain kubectl --kubeconfig=/etc/kubernetes/kubelet.conf uncordon <node-name>
+   kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-drain kubectl --kubeconfig=/etc/kubernetes/kubelet.conf uncordon <node-name>
    # 标记不可调度
    kubectl cordon <node-name>
    ```
@@ -92,7 +94,7 @@ durationSeconds: <duration>               # 演练窗口（宿主机 timer 的 -
      运气而非保证）；零 unmanaged Pod 名册 = 无需 `--force` 的结构性证明
 4. 观察被驱逐 Pod 的重建情况
 
-**注入验证**：
+## 注入验证
 0. **drain 命令回执是一等 L1 证据**：输出含 `evicting pod <ns>/<pod>` 逐行记录（每个非 DS Pod 一条）+ 节点 `drained` 收尾行——回执本身即驱逐过程直接证据（与 df/字节数同级的直证），勿只依赖事后状态推断。**回执截断预期**：drain 是长命令（grace-period 等待逐个驱逐落地），执行 harness 的 30s task ceiling 会先于 kubectl 自身 `--timeout=120s` 触发截断——截断 ≠ 驱逐失败。等价判据双收：①事件面新 `Killing` 记录（`kubectl get events -n <ns> --field-selector involvedObject.name=<pod>`——REASON=Killing、COUNT 较 baseline Δ+1、FIRST SEEN 落在注入窗内，驱逐的集群侧工件）；②节点名册 Pod GONE（`--field-selector spec.nodeName=<node>` 列表中原 Pod 消失）。**勿重发 drain**——驱逐已落地后重发对已删除 Pod 报 not found，且重复 mutation 违反最小动作纪律
 1. 执行 `kubectl get nodes`，确认目标节点状态为 `Ready,SchedulingDisabled`（权威形态：`kubectl get node <node-name> -o jsonpath='{.spec.unschedulable}'` = `true`——SchedulingDisabled 是展示层标签，判据读 spec 字段）
 2. 执行 `kubectl get pods --field-selector spec.nodeName=<node-name> --all-namespaces`，确认仅剩 DaemonSet Pod
@@ -102,8 +104,8 @@ durationSeconds: <duration>               # 演练窗口（宿主机 timer 的 -
    kubectl get pods --all-namespaces --field-selector status.phase=Pending
    ```
 
-**注入恢复**：
-1. 等待 `<duration>` 到期，定时器自动恢复节点为可调度状态；演练提前结束时由 Agent 主动执行
+## 注入恢复
+1. 等待 `<recovery-seconds>` 到期，定时器自动恢复节点为可调度状态；演练提前结束时由 Agent 主动执行
    同一条恢复命令（幂等，定时器迟到再执行一次无副作用），并停掉已武装的 timer 避免迟到重放：
    ```bash
    kubectl uncordon <node-name>
@@ -116,11 +118,11 @@ durationSeconds: <duration>               # 演练窗口（宿主机 timer 的 -
 > kubelet.conf——对 uncordon 实际放行）。Agent 主动 uncordon 兜底始终有效。被驱逐的 Pod
 > 不会自动迁回本节点（uncordon 后仅恢复可调度性，新 Pod 与再平衡由调度器决定）。
 
-**恢复验证**：
+## 恢复验证
 1. 执行 `kubectl get nodes`，确认目标节点状态恢复为 `Ready`（无 SchedulingDisabled；权威形态：`.spec.unschedulable` 缺失或 false）
 2. 执行 `kubectl get pods --all-namespaces --field-selector status.phase=Pending`，确认无 Pending Pod
 3. 确认业务 Pod 全部 Running 且 Ready——**语义边界：被驱逐 Pod 不会迁回原节点**（uncordon 仅恢复可调度性，重建 Pod 留在驱逐后落位的节点，由调度器决定；判「在其他节点 Running」而非「回原节点」），以基线快照 UID 对照确认重建完成（新 UID + 新 nodeName + Running = 迁移成功）
 
-**基准事实**：
+## 基准事实
 - **根因**：节点被 cordon + drain 标记为不可调度并驱逐所有工作负载，模拟节点维护场景下的 Pod 迁移行为
 - **必现现象**：节点状态为 SchedulingDisabled；非 DaemonSet Pod 被驱逐并在其他节点重建；drain 命令输出 evicting/evicted 信息
