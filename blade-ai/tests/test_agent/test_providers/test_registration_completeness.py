@@ -71,6 +71,9 @@ class _FullSeamFakeProvider:
             return None
         return {"carrier": "my_carrier", "key": "value"}
 
+    def enforce_contract_duration(self, tool_name, tool_args, duration_seconds):
+        return None
+
     def issue_time_method(self, tool_name, tool_args, *, is_host):
         if tool_name != "my_tool":
             return None

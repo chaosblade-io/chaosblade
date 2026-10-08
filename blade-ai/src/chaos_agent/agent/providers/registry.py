@@ -485,6 +485,84 @@ class FaultProviderRegistry:
         return _is_recovery_carrier_run(list(run_v_args), name)
 
     @classmethod
+    def is_apply_native_fault_injection(cls, tool_name: str, tool_args: dict) -> bool:
+        """Domain-routing seam for the apply-native fault-injection predicate
+        (apply-native-fault-attribution).
+
+        The blade carrier's ``was_blade_create_attempted`` must recognise a
+        ``kubectl apply``/``create -f`` of a PERSISTENT fault object as a native
+        takeover, so a state-less restored session whose ``blade_create`` failed
+        and was taken over by an apply-native fault is not mis-routed into the
+        terminal "attempted-and-failed". The judgement is k8s-native vocabulary
+        (``k8s_native.classifier.is_apply_native_fault_injection`` — the SAME
+        canonical predicate the issue-time attribution and the armed-before-
+        inject gate borrow; one implementation, never a hand-copied
+        manifest-kind list). Reaching it through the registry keeps the
+        no-cross-carrier-import rule (phase-14 G3 pattern): ``chaosblade`` does
+        not reach sideways into ``k8s_native``. Lazy import keeps the
+        registration-time import order untouched.
+        """
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            is_apply_native_fault_injection,
+        )
+
+        return is_apply_native_fault_injection(tool_name, tool_args)
+
+    @classmethod
+    def enforce_contract_duration(
+        cls, tool_name: str, tool_args: dict, duration_seconds: int
+    ) -> "str | None":
+        """Pin a freshly issued injection call's duration carrier to the
+        approved window, performed in place by the first provider that
+        claims the call, else ``None``.
+
+        Issue-time write seam (same shape as ``parse_injection_params``): the
+        execute loop consults the registry before dispatch, so each backend
+        rewrites its OWN carrier — the ChaosBlade provider owns the
+        ``--timeout`` flag of both its surfaces, where that flag IS the
+        fault's duration. A provider returning ``None`` means "not my
+        carrier, or already pinned" — the scan continues. Providers that
+        omit the hook contribute nothing (getattr default).
+
+        Two-number window contract: the hook receives the fault's own
+        recovery-timer seconds ``D + G`` (``recovery_timer_seconds``, the
+        single source), NOT the approved observation window ``D``. The
+        grace ``G`` makes an actively dispatched framework recovery land
+        before self-recovery expiry; only the framework-death branch ever
+        touches D+G. Computed HERE once so every carrier is armed with the
+        same number and no provider re-derives it.
+
+        A non-positive ``duration_seconds`` is NOT a contract and is refused
+        HERE, before any provider sees it. The execute loop guards ``> 0`` at
+        its only call site, but that guard lives in the CALLER: a future call
+        site that forgets it would have the carriers rewrite a good command
+        into ``--timeout 0``, an invalid window that also slips past the
+        guard's duration anchor (whose comparison goes silent on a zero
+        side). Refusing at the single dispatch point makes every current and
+        future carrier structurally unable to emit one.
+        """
+        if int(duration_seconds or 0) <= 0:
+            logger.warning(
+                "enforce_contract_duration: refused non-positive duration %r "
+                "for %s — no contract to pin, command left untouched",
+                duration_seconds, tool_name,
+            )
+            return None
+        from chaos_agent.utils.fault_type import recovery_timer_seconds
+
+        pinned = recovery_timer_seconds(duration_seconds)
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            enforce = getattr(provider, "enforce_contract_duration", None)
+            if enforce is None:
+                continue
+            note = enforce(tool_name, tool_args, pinned)
+            if note is not None:
+                return note
+        return None
+
+    @classmethod
     def parse_injection_params(cls, tool_name: str, tool_args: dict) -> "dict | None":
         """Structured injection parameters for a freshly issued tool call,
         parsed by the first provider that recognises the call, else ``None``.

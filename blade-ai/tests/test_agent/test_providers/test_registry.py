@@ -141,6 +141,12 @@ class _FakeProvider:
         # structurally (runtime_checkable conformance requires the method).
         return None
 
+    def enforce_contract_duration(self, tool_name, tool_args, duration_seconds):
+        # Contract-duration pin hook — a provider that owns no duration
+        # carrier answers None; pinned structurally (runtime_checkable
+        # conformance requires the method).
+        return None
+
     def issue_time_method(self, tool_name, tool_args, *, is_host):
         # Phase-7 T4: issue-time attribution hook — default None pinned
         # structurally (runtime_checkable conformance requires the method).

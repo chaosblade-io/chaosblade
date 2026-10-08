@@ -494,6 +494,24 @@ class FaultProvider(Protocol):
         generic loop never names a carrier-specific parser."""
         return None
 
+    def enforce_contract_duration(
+        self, tool_name: str, tool_args: dict, duration_seconds: int
+    ) -> Optional[str]:
+        """Pin a freshly ISSUED injection call's duration carrier to the
+        approved fault window, in place.
+
+        Issue-time write seam (same shape as :meth:`parse_injection_params`):
+        the execute loop consults the registry before dispatch, so each
+        backend rewrites its OWN duration carrier — the ``--timeout`` flag
+        of the ChaosBlade surfaces, which IS the fault's duration there (the
+        experiment auto-destroys at that bound). Any other value breaks the
+        window the user approved: larger overstays it, smaller ends the
+        fault early. A provider returning ``None`` means "not my carrier, or
+        nothing to change" — the scan continues. Consulted via
+        ``FaultProviderRegistry.enforce_contract_duration`` so the generic
+        loop never names a carrier-specific rewriter."""
+        return None
+
     def issue_time_method(
         self, tool_name: str, tool_args: dict, *, is_host: bool
     ) -> Optional[str]:
