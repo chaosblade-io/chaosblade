@@ -17,9 +17,14 @@ kickoff), screener/phase duty (constrain current behaviour), and the tool
 schemas themselves. The tool-surface axis is CONDITIONAL: it belongs in a
 declaration message only when the inertia source survives (history
 carries earlier-phase tool_calls), the surface actually differs, and no
-other carrier covers it — the inject→recover graft is the only seam
-where all three hold (#29 first-run evidence: recover-98caf0cd
-msg[7]-[11], three kubectl_read calls rejected by ToolNode).
+other carrier covers it. Two seams currently qualify: the inject→recover
+graft (all three hold by construction — #29 first-run evidence:
+recover-98caf0cd msg[7]-[11], three kubectl_read calls rejected by
+ToolNode) and the execute→verify flip (A2: the verifier inherits the
+execute history verbatim, the full ``kubectl`` tool flips to
+``kubectl_read``, and the verifier prompt sections are tool-surface
+silent — the unknown-tool rejection fires only after the inertia has
+already cost a round).
 
 This module provides construction only. The four pre-existing
 implementations (kickoff marker / verifier context kwargs / the bare
@@ -75,7 +80,7 @@ def build_boundary_declaration(
     return "\n".join(lines)
 
 
-# The inject→recover graft declaration — the one seam where all three
+# The inject→recover graft declaration — the first seam where all three
 # tool-surface conditions hold. Wording reuses field-proven semantic
 # skeletons ("captured BEFORE fault injection" baseline labels, the
 # verifier's "stale ... is NOT evidence" principle, layer-1's "tools
@@ -98,4 +103,26 @@ INJECT_TO_RECOVER_BOUNDARY_DECLARATION = build_boundary_declaration(
         "seen only in earlier tool calls may belong to a different "
         "phase's surface and may not exist now"
     ),
+)
+
+
+# The execute→verify tool-surface note (A2) — the second qualifying seam.
+# Unlike the graft above this is NOT a full three-axis declaration: the
+# verifier's first-iteration context message already carries role and
+# evidence-tense (Layer-1 result, baseline labels, method notes), so only
+# the tool-surface axis is new information. The wording specializes the
+# graft's channel-neutral skeleton to the concrete flip: execute bound
+# the full ``kubectl``, verify binds ``kubectl_read`` — and unlike the
+# graft the history's `kubectl` calls were legitimately executed then
+# (not a foreign surface), so the note states ownership, not suspicion.
+# NOT channel-neutral on purpose: the flip it names is kubectl-specific;
+# a host-channel task never carries `kubectl` tool calls, so the
+# conditional injection never fires there.
+EXECUTE_TO_VERIFY_TOOL_SURFACE_NOTE = (
+    "**TOOL SURFACE (execute → verify)**: the tools currently bound to "
+    "you are the authority. This verification phase binds `kubectl_read` "
+    "(the read-only surface: get / describe / top / logs, read-only "
+    "exec / debug); the `kubectl` calls visible in the history above "
+    "belong to the execute phase's surface and that name is not bound "
+    "here."
 )
