@@ -916,6 +916,42 @@ class TestWasBladeCreateAttemptedKubectlOverride:
         )
         assert _was_blade_create_attempted([msg1] + probe + fallback) is False
 
+    def test_failed_blade_create_with_apply_native_fallback(self):
+        """II-a regression: blade_create failed and the agent fell back to an
+        ``apply`` of a PERSISTENT fault object (NetworkPolicy). The ``apply``
+        verb is absent from KUBECTL_WRITE_SUBCOMMANDS, so without threading
+        ``is_apply_native_fault_injection`` into the takeover scan this
+        state-less fallback path (no durable ``injection_method``) fell through
+        to the blade_create loop and mis-routed a live, recoverable fault into
+        'attempted-and-failed'. The native takeover must be recognised → False.
+        """
+        msg1 = ToolMessage(
+            content='Error: injection FAILED permanently (exit 1, class=target_gone)',
+            name="blade_create",
+            tool_call_id="tc1",
+        )
+        netpol = (
+            "apiVersion: networking.k8s.io/v1\n"
+            "kind: NetworkPolicy\n"
+            "metadata:\n  name: drill-netpol-abc\n  namespace: default\n"
+        )
+        apply_pair = [
+            AIMessage(content="", tool_calls=[{
+                "name": "kubectl",
+                "args": {
+                    "subcommand": "apply", "v_args": "-f -", "stdin_data": netpol,
+                },
+                "id": "tc2", "type": "tool_call",
+            }]),
+            ToolMessage(
+                content="networkpolicy.networking.k8s.io/drill-netpol-abc created",
+                name="kubectl", tool_call_id="tc2",
+            ),
+        ]
+        # no injection_method → the state-less fallback scan alone must
+        # recognise the apply-native takeover (True=blind before II-a wiring).
+        assert _was_blade_create_attempted([msg1] + apply_pair) is False
+
 
 # ---------------------------------------------------------------------------
 # _find_blade_query_in_messages
@@ -2825,6 +2861,106 @@ class TestBaselineComparisonInLayer2Context:
         assert baseline["success_count"] == 0
 
 
+class TestVehicleAnchorContradictionGuard:
+    """The VEHICLE WARNING must never name the approved anchor.
+
+    task-29848471's warning points the model at the anchor when a vehicle
+    name pollutes the target list. Two defenses under test: (1) the
+    pod-scoped-debug source-3 fix keeps the anchor from reading as a
+    vehicle at all; (2) even when vehicle classification DOES fire on an
+    anchor name (defense-in-depth — e.g. a mis-registered artifact), the
+    contradictory name is dropped instead of emitted, because a brief that
+    says "verify ONLY X … X is NOT a fault target" is worse than no brief.
+    """
+
+    def _base_state(self, messages=None, execution_artifacts=None):
+        return {
+            "task_id": "test-veh-1",
+            "fault_scope": "pod",
+            "fault_target": "network",
+            "fault_action": "delay",
+            "experiment_uid": "uid-veh-1",
+            "injection_method": "kubectl-native",
+            "target": {
+                "namespace": "default",
+                "names": ["drill-reorder-target"],
+                "labels": {},
+            },
+            "approved_target": {
+                "namespace": "default",
+                "names": ["drill-reorder-target"],
+                "resolved_names": ["drill-reorder-target"],
+            },
+            "params": {},
+            "injection_parsed_params": {},
+            "kubeconfig": "/path/to/kubeconfig",
+            "messages": messages or [],
+            "execution_artifacts": execution_artifacts or [],
+        }
+
+    def _context(self, state):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            _build_first_iteration_context,
+        )
+        layer1 = Layer1Result(
+            status="passed", affected_count=1, raw_output="Success",
+        )
+        return _build_first_iteration_context(
+            state, layer1, "uid-veh-1", "Pod_网络延迟",
+            "/path/to/kubeconfig", None, "",
+        )
+
+    def test_pod_scoped_debug_meta_anchor_not_flagged_as_vehicle(self):
+        """Source-3 fix: a pod-scoped debug meta names the TARGET pod; the
+        anchor must not be classified as a vehicle, so no warning fires."""
+        meta = (
+            '{"name":"drill-reorder-target","namespace":"default",'
+            '"ephemeral_container":"debugger-s85qz","ready":true,'
+            '"cleaned":false,"debug_profile":"netadmin"}'
+        )
+        state = self._base_state(messages=[
+            ToolMessage(
+                content=f"injected\n[debug-pod-meta: {meta}]",
+                name="kubectl",
+                tool_call_id="tc-ec",
+            ),
+        ])
+        context = self._context(state)
+        assert "VEHICLE WARNING" not in context
+
+    def test_vehicle_warning_drops_anchor_contradiction(self):
+        """Defense-in-depth: vehicle=True forced via a REGISTERED artifact
+        (source 1) so the source-3 fix cannot save this — the verifier-side
+        guard must drop the anchor name itself instead of emitting a
+        self-contradictory warning."""
+        state = self._base_state(execution_artifacts=[{
+            "artifact_id": "debug_pod:default/drill-reorder-target",
+            "type": "debug_pod",
+            "kind": "pod",
+            "name": "drill-reorder-target",
+            "namespace": "default",
+            "status": "active",
+        }])
+        context = self._context(state)
+        assert "VEHICLE WARNING" not in context
+
+    def test_vehicle_warning_still_emitted_for_real_vehicle(self):
+        """A vehicle that is NOT the anchor must still get the warning —
+        the contradiction guard must not swallow genuine vehicle hits."""
+        state = self._base_state(execution_artifacts=[{
+            "artifact_id": "debug_pod:default/node-debugger-n1-abc12",
+            "type": "debug_pod",
+            "kind": "pod",
+            "name": "node-debugger-n1-abc12",
+            "namespace": "default",
+            "status": "active",
+        }])
+        state["target"]["names"] = ["node-debugger-n1-abc12"]
+        context = self._context(state)
+        assert "VEHICLE WARNING" in context
+        assert "node-debugger-n1-abc12" in context
+
+
 class TestFillFileCheck:
     """Test that Fill File Check section is present for node-disk-fill."""
 
@@ -4448,6 +4584,99 @@ class TestVerificationCycleDetection:
         ) == []
 
 
+class TestExecuteToVerifyToolSurface:
+    """A2: announce the kubectl→kubectl_read surface flip to the verifier.
+
+    The verifier inherits the execute phase's message history verbatim;
+    when that history carries full-``kubectl`` tool results, the model's
+    few-shot context contains calls this phase's binding rejects as
+    unknown-tool (the mirror image of #29's recover graft, where
+    kubectl_read inertia met a full-kubectl surface). The three
+    boundary.py conditions hold — inertia source survives, surface
+    differs, no other carrier covers the axis — so the flip gets ONE
+    conditional note in the first-iteration context.
+    """
+
+    @staticmethod
+    def _layer2_messages(history):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            _build_layer2_messages,
+        )
+        from chaos_agent.agent.result.verdict import Layer1Result
+
+        state = {
+            "task_id": "t-a2",
+            "messages": history,
+            "execution_artifacts": [],
+            "kubeconfig": "/kc",
+        }
+        layer1 = Layer1Result(status="passed", affected_count=1, raw_output="ok")
+        return _build_layer2_messages(
+            state, layer1, "uid-a2", "cpu-fullload", "/kc", count=1,
+        )
+
+    @staticmethod
+    def _context_text(msgs):
+        return "\n".join(
+            str(m.content) for m in msgs
+            if isinstance(m, HumanMessage)
+            and "Layer 1 Result" in str(m.content)
+        )
+
+    def test_note_fires_when_history_carries_full_kubectl(self):
+        msgs = self._layer2_messages([
+            HumanMessage(content="inject"),
+            AIMessage(content="", tool_calls=[{
+                "name": "kubectl", "args": {"v_args": "get pods"},
+                "id": "c1",
+            }]),
+            ToolMessage(content="pod list", tool_call_id="c1", name="kubectl"),
+        ])
+        text = self._context_text(msgs)
+        assert "**TOOL SURFACE (execute → verify)**" in text
+        assert "`kubectl_read`" in text
+        # Ownership framing, not suspicion: the history's calls were
+        # legitimate THEN — the note states which surface owns the name.
+        assert "belong to the execute phase's surface" in text
+        assert "not bound" in text
+
+    def test_note_silent_without_kubectl_inertia(self):
+        # No kubectl tool results in history (ChaosBlade-exec path,
+        # host-channel task, or read-only-only history) → no inertia to
+        # redirect; the note would name a tool the history never shows.
+        cases = [
+            [HumanMessage(content="inject")],
+            [
+                AIMessage(content="", tool_calls=[{
+                    "name": "kubectl_read", "args": {"v_args": "get pods"},
+                    "id": "c1",
+                }]),
+                ToolMessage(content="ok", tool_call_id="c1", name="kubectl_read"),
+            ],
+            [
+                AIMessage(content="", tool_calls=[{
+                    "name": "blade_create", "args": {"cmd": "x"}, "id": "c2",
+                }]),
+                ToolMessage(content="ok", tool_call_id="c2", name="blade_create"),
+            ],
+        ]
+        for history in cases:
+            text = self._context_text(self._layer2_messages(history))
+            assert "TOOL SURFACE (execute → verify)" not in text
+
+    def test_boundary_wording_is_single_sourced(self):
+        # The note's wording lives in boundary.py (the single source for
+        # boundary vocabulary) — the verifier messages layer only
+        # injects it, never re-writes it.
+        from chaos_agent.agent.prompts.boundary import (
+            EXECUTE_TO_VERIFY_TOOL_SURFACE_NOTE,
+        )
+        assert EXECUTE_TO_VERIFY_TOOL_SURFACE_NOTE.startswith(
+            "**TOOL SURFACE (execute → verify)**"
+        )
+        assert "kubectl_read" in EXECUTE_TO_VERIFY_TOOL_SURFACE_NOTE
+
+
 class TestRecoveryTimerReminder:
     """Case #46 F1: the verifier must SEE the armed timer's remaining time.
 
@@ -4501,13 +4730,19 @@ class TestRecoveryTimerReminder:
         # after firing). The optimistic "at or near completion" reading
         # would launder a nonconvergence finding; a still-present fault
         # signature must instead be flagged as recovery-NOT-converged.
-        # Minimal-wording variant (prompt minimalism): ~55 words, four
-        # semantic units intact.
+        # Minimal-wording variant (prompt minimalism), five semantic units
+        # intact.
         assert "TRIGGERED" in text
         assert "not necessarily completed" in text
         assert "NOT converged" in text
         assert "recovery at or near completion" not in text
-        assert "pre-fire evidence" in text
+        # The pre-fire anchor scopes the PERSISTENCE verdict only (A6):
+        # executor-window records (the carrier's restore log) stay
+        # legitimate behavioural evidence — the anchor never forbade
+        # reading what the timer actually executed.
+        assert "persistence verdict rests on pre-fire evidence" in text
+        assert "executor-window records" in text
+        assert "behavioural evidence" in text
 
     def test_no_armed_artifact_is_silent(self):
         from chaos_agent.agent.nodes.verify._verifier_messages import (
@@ -4613,50 +4848,485 @@ class TestRecoveryTimerReminder:
         ]
 
 
-class TestStampWindowStart:
-    """Fault-window hold origin (``injection_window_start_time``).
+# TestStampWindowStart RETIRED (hold-reanchor-recovery-grace): the
+# fault-window hold's origin moved off the verifier-entry stamp
+# (``injection_window_start_time``) onto the issued stamp
+# (``injection_start_time``) — the same origin the fault's own recovery
+# timer counts from. The stamp function and its state field are gone;
+# the hold-side contract lives in
+# tests/test_server/routes/test_turn_hold_fault_window.py and the
+# node-chain survival contract in
+# tests/test_agent/test_pipeline_terminal_state_contract.py.
 
-    The window origin is stamped at the verifier entry — the moment the
-    execute-loop concluded. Contract: write-once per attempt (verifier
-    self-loop re-entries keep the first stamp), attribution-guarded (no
-    stamp without a committed injection), and cleared at replan seams
-    (pinned in test_execute_loop's TestResetAttributionState).
+
+class TestRecoveryTimerReminderResidencySplit:
+    """#59 (Pod_被驱逐重建_DiskPressure): the reminder no longer asserts
+    "authoritative" for EVERY armed timer. The ledger records which realm
+    the reversal lives in (``recovery_form``), and the wording splits: a
+    host systemd timer (PID 1) keeps its authority; an in-chain /
+    timeout-bound reversal is CARRIER-RESIDENT — the DiskPressure drill
+    evicted its own recovery carrier and the verifier was told,
+    authoritatively, to wait ~495s for a fire that could never happen.
     """
 
-    def test_stamps_when_injection_committed(self):
-        from chaos_agent.agent.nodes.verify.verifier import _stamp_window_start
-        from chaos_agent.utils.time import parse_iso_timestamp
-
-        state = {"injection_start_time": "2026-09-19T10:00:00+08:00"}
-        result: dict = {}
-        _stamp_window_start(state, result)
-        # A parseable ISO stamp close to now (the execute-loop end moment).
-        assert "injection_window_start_time" in result
-        stamp = parse_iso_timestamp(result["injection_window_start_time"])
-        assert stamp is not None
-
-    def test_write_once_keeps_first_stamp(self):
-        """Verifier self-loop re-entries (this node returns per ReAct step)
-        must keep the FIRST stamp — the origin is a fact about the
-        execute-loop boundary, not about any given verify iteration."""
-        from chaos_agent.agent.nodes.verify.verifier import _stamp_window_start
-
-        state = {
-            "injection_start_time": "2026-09-19T10:00:00+08:00",
-            "injection_window_start_time": "2026-09-19T11:00:00+08:00",
+    @staticmethod
+    def _armed(deadline, *, form=None, **kwargs):
+        artifact = {
+            "type": "recovery_carrier",
+            "name": "drill-rc-x",
+            "namespace": "default",
+            "status": "recovery_armed",
+            "recovery_timeout_seconds": 300,
+            "recovery_deadline_epoch": deadline,
         }
-        result: dict = {}
-        _stamp_window_start(state, result)
-        # No key written: the existing origin is authoritative.
-        assert "injection_window_start_time" not in result
+        if form:
+            artifact["recovery_form"] = form
+        artifact.update(kwargs)
+        return artifact
 
-    def test_no_stamp_without_committed_injection(self):
-        """A turn that never committed an injection has no window to
-        anchor — stamping anyway would let the hold flip a recover
-        dispatch for a turn with no experiment in flight."""
-        from chaos_agent.agent.nodes.verify.verifier import _stamp_window_start
+    def test_host_timer_keeps_authoritative_wording(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_recovery_timer_reminder,
+        )
+        now = 1_000_000.0
+        state = {"execution_artifacts": [
+            self._armed(now + 155, form="host_timer"),
+        ]}
+        text = build_recovery_timer_reminder(state, now=now)
+        assert "authoritative" in text
+        assert "HOST-MANAGED" in text
+        # The whole point of the realm record: the fire is independent of
+        # the carrier's fate, and the wording must say so.
+        assert "fires even if the carrier pod dies" in text
+        assert "CONDITIONAL" not in text
 
-        state = {"injection_start_time": None}
-        result: dict = {}
-        _stamp_window_start(state, result)
-        assert "injection_window_start_time" not in result
+    def test_carrier_resident_form_reads_conditional(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_recovery_timer_reminder,
+        )
+        now = 1_000_000.0
+        for form in ("in_chain", "timeout"):
+            state = {"execution_artifacts": [self._armed(now + 155, form=form)]}
+            text = build_recovery_timer_reminder(state, now=now)
+            assert "CONDITIONAL" in text, form
+            assert "CARRIER-RESIDENT" in text, form
+            # The liveness precondition and the dead-carrier consequence:
+            # probe first, and a dead carrier means ACTIVE recovery.
+            assert "no longer Running" in text, form
+            assert "VOID" in text, form
+            assert "ACTIVE recovery" in text, form
+            assert "authoritative" not in text, form
+
+    def test_absent_form_defaults_to_carrier_resident(self):
+        # Ledger entries written before the field existed: the conservative
+        # direction — an extra liveness probe costs one read, a false
+        # "authoritative" costs the whole recovery window.
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_recovery_timer_reminder,
+        )
+        now = 1_000_000.0
+        state = {"execution_artifacts": [self._armed(now + 155)]}
+        text = build_recovery_timer_reminder(state, now=now)
+        assert "CONDITIONAL" in text
+        assert "authoritative" not in text
+
+    def test_post_fire_residency_split(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_recovery_timer_reminder,
+        )
+        now = 1_000_000.0
+        host = build_recovery_timer_reminder(
+            {"execution_artifacts": [self._armed(now - 30, form="host_timer")]},
+            now=now,
+        )
+        assert "HOST-MANAGED" in host
+        assert "regardless of the carrier's fate" in host
+        resident = build_recovery_timer_reminder(
+            {"execution_artifacts": [self._armed(now - 30, form="in_chain")]},
+            now=now,
+        )
+        assert "CARRIER-RESIDENT" in resident
+        # A carrier that died before the fire took the reversal with it —
+        # the post-fire text must leave that possibility open instead of
+        # implying the fire necessarily executed.
+        assert "died earlier" in resident
+        assert "may still be in place" in resident
+
+
+class TestObservedBlastRadius:
+    """#59: the terminal card's ``blast_radius_detail`` carried ONLY the
+    planning-time prediction while ``side_effects`` held the measured
+    outcome — the card asserted "exactly 3 evictions" against 7 measured
+    evictions across two generations. Finalize now appends the measured
+    side, clearly labelled, next to the plan.
+    """
+
+    def test_render_counts_lists_names_dicts_and_scalars(self):
+        from chaos_agent.agent.nodes.verify._verifier_finalize import (
+            _render_observed_blast_radius,
+        )
+        rendered = _render_observed_blast_radius({
+            "evicted_pods": [
+                {"name": "app-7x1"}, {"name": "app-7x2"},
+                {"name": "app-7x3"}, {"name": "app-7x4"},
+                {"name": "app-7x5"}, {"name": "app-7x6"},
+                {"name": "app-7x7"}, {"name": "app-7x8"},
+                {"name": "app-7x9"},
+            ],
+            "kubelet_gc_triggered": True,
+            "eviction_generations": 2,
+            "empty_list": [],
+            "false_flag": False,
+            "zero_count": 0,
+        })
+        assert "evicted_pods=9" in rendered
+        assert "app-7x1" in rendered
+        # 8 names shown, the 9th folded into the overflow marker.
+        assert "…+1" in rendered
+        assert "app-7x9" not in rendered
+        assert "kubelet_gc_triggered=true" in rendered
+        assert "eviction_generations=2" in rendered
+        assert "empty_list" not in rendered
+        assert "false_flag" not in rendered
+        assert "zero_count" not in rendered
+
+    def test_render_empty_and_garbage_yield_empty(self):
+        from chaos_agent.agent.nodes.verify._verifier_finalize import (
+            _render_observed_blast_radius,
+        )
+        assert _render_observed_blast_radius({}) == ""
+        assert _render_observed_blast_radius(None) == ""  # type: ignore[arg-type]
+
+    def test_apply_appends_observed_after_planned(self):
+        from chaos_agent.agent.nodes.verify._verifier_finalize import (
+            _apply_observed_blast_radius,
+        )
+        state = {
+            "blast_radius_detail": (
+                "planned: exactly 3 evictions (drill pods exempt)"
+            ),
+        }
+        verification = {"side_effects": {"evicted_pods": [{"name": "p1"}]}}
+        result_update: dict = {}
+        _apply_observed_blast_radius(state, verification, result_update)
+        detail = result_update["blast_radius_detail"]
+        # The prediction stays intact as the prefix; the observation is a
+        # labelled second line — the card can no longer contradict itself
+        # silently.
+        assert detail.startswith("planned: exactly 3 evictions")
+        assert "\nObserved (verify-time): " in detail
+        assert "evicted_pods=1 [p1]" in detail
+
+    def test_apply_without_planned_detail_uses_observed_only(self):
+        from chaos_agent.agent.nodes.verify._verifier_finalize import (
+            _apply_observed_blast_radius,
+        )
+        state: dict = {}
+        verification = {"side_effects": {"evicted_pods": [{"name": "p1"}]}}
+        result_update: dict = {}
+        _apply_observed_blast_radius(state, verification, result_update)
+        assert result_update["blast_radius_detail"] == (
+            "Observed (verify-time): evicted_pods=1 [p1]"
+        )
+
+    def test_apply_replaces_instead_of_stacking_across_rounds(self):
+        # Re-verify rounds re-run finalize; a naive append would stack one
+        # "Observed" line per round. The marker split keeps only the head.
+        from chaos_agent.agent.nodes.verify._verifier_finalize import (
+            _apply_observed_blast_radius,
+        )
+        state = {
+            "blast_radius_detail": (
+                "planned: 3 evictions\n"
+                "Observed (verify-time): evicted_pods=1 [p1]"
+            ),
+        }
+        verification = {"side_effects": {"evicted_pods": [{"name": "p2"}]}}
+        result_update: dict = {}
+        _apply_observed_blast_radius(state, verification, result_update)
+        assert result_update["blast_radius_detail"].count("Observed") == 1
+        assert "evicted_pods=1 [p2]" in result_update["blast_radius_detail"]
+        assert "p1" not in result_update["blast_radius_detail"]
+
+    def test_apply_without_side_effects_is_a_noop(self):
+        from chaos_agent.agent.nodes.verify._verifier_finalize import (
+            _apply_observed_blast_radius,
+        )
+        state = {"blast_radius_detail": "planned: 3 evictions"}
+        result_update: dict = {}
+        _apply_observed_blast_radius(state, {}, result_update)
+        assert result_update == {}
+
+
+class TestInjectionWindowClock:
+    """Case #58 (inject-3dae7b4f msg 104): the verifier LLM reverse-engineered
+    the window position from message ORDER because no channel carried T0/D/now.
+    The clock renders those facts per builder call, timer-reminder style."""
+
+    @staticmethod
+    def _t0_iso(now: float, offset: float) -> str:
+        from chaos_agent.utils.time import BEIJING_TZ
+        from datetime import datetime
+        return datetime.fromtimestamp(now - offset, BEIJING_TZ).isoformat()
+
+    def _state(self, now: float, *, offset: float, duration: int | None):
+        state: dict = {"injection_start_time": self._t0_iso(now, offset)}
+        if duration is not None:
+            state["fault_spec"] = {"duration_seconds": duration}
+        return state
+
+    def test_in_window_renders_remaining_budget(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_injection_window_clock,
+        )
+        now = 1_000_000.0
+        # Case #58 shape: injected 101s ago, duration 300s → 199s left.
+        text = build_injection_window_clock(
+            self._state(now, offset=101, duration=300), now=now,
+        )
+        assert "~101s elapsed" in text
+        assert "~199s remaining" in text
+        # A missing signature IN-window is injection-failure evidence, not
+        # recovery evidence — the exact confusion the clock exists to kill
+        # (stated as the negation "not that it already recovered").
+        assert "did NOT take effect" in text
+        assert "not that it already recovered" in text
+
+    def test_window_closed_renders_neutral_overrun_semantics(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_injection_window_clock,
+        )
+        now = 1_000_000.0
+        text = build_injection_window_clock(
+            self._state(now, offset=400, duration=300), now=now,
+        )
+        assert "CLOSED ~100s ago" in text
+        # Post-close neutrality mirrors the timer reminder's
+        # TRIGGERED-not-completed stance: absence is expected, a
+        # still-present signature means NOT converged.
+        assert "not necessarily" in text
+        assert "NOT converged" in text
+        assert "not persistence evidence" in text
+
+    def test_no_duration_renders_t0_and_elapsed_only(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_injection_window_clock,
+        )
+        now = 1_000_000.0
+        text = build_injection_window_clock(
+            self._state(now, offset=50, duration=None), now=now,
+        )
+        assert "~50s have elapsed" in text
+        assert "No fault duration on record" in text
+
+    def test_no_t0_is_silent(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_injection_window_clock,
+        )
+        now = 1_000_000.0
+        # Replan seams clear injection_start_time; the clock must not anchor
+        # on a stale T0 (same silence contract as the timer reminder).
+        for state in ({}, {"fault_spec": {"duration_seconds": 300}}):
+            assert build_injection_window_clock(state, now=now) == ""
+
+    def test_unparseable_t0_is_silent(self):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_injection_window_clock,
+        )
+        now = 1_000_000.0
+        state = {"injection_start_time": "not-a-timestamp"}
+        assert build_injection_window_clock(state, now=now) == ""
+
+
+class TestCarrierStatusLedger:
+    """Case #67 (W-67-12): the verifier must SEE the authoritative carrier
+    roster, because every prose statement about a carrier's lifecycle in its
+    context is a write-time snapshot that nothing updates.
+
+    The plan recorded two Completed node-debugger probes as "folded into the
+    cleanup step"; the framework force-deleted both at planning exit through
+    the transport; the verifier still reported them as "STILL NEEDS CLEANUP".
+    Every durable field was correct — the only statement in the model's
+    context was the stale one.
+    """
+
+    @staticmethod
+    def _state():
+        return {
+            "execution_artifacts": [
+                {
+                    "type": "recovery_carrier",
+                    "kind": "pod",
+                    "name": "drill-rc-1",
+                    "namespace": "default",
+                    "status": "recovery_armed",
+                },
+                {
+                    "type": "debug_pod",
+                    "kind": "pod",
+                    "name": "node-debugger-n-6k658",
+                    "namespace": "default",
+                    "status": "active",
+                },
+            ],
+            "cleaned_debug_pods": [
+                "node-debugger-n-fdfj5",
+                "node-debugger-n-7j6b2",
+            ],
+        }
+
+    @staticmethod
+    def _text(state):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_carrier_status_ledger,
+        )
+        return build_carrier_status_ledger(state)
+
+    def test_renders_every_carrier_with_its_source(self):
+        text = self._text(self._state())
+        assert "**CARRIER STATUS (system-computed, authoritative" in text
+        assert "this task built 4 carrier(s)" in text
+        assert (
+            "recovery_carrier default/drill-rc-1: status=recovery_armed" in text
+        )
+        assert "debug_pod default/node-debugger-n-6k658: status=active" in text
+        assert "debug_pod node-debugger-n-fdfj5: status=cleaned" in text
+        assert "debug_pod node-debugger-n-7j6b2: status=cleaned" in text
+        assert text.count("(source: carrier ledger)") == 2
+        assert text.count("(source: framework cleanup record)") == 2
+
+    def test_no_carrier_task_is_byte_identical(self):
+        """Silence contract, shared with the timer reminder and the window
+        clock: a task that built no carrier (the ChaosBlade path times out
+        inside the experiment and registers none) gets NO extra block, so its
+        verifier context is untouched by this fix."""
+        for state in (
+            {},
+            [],
+            {"execution_artifacts": []},
+            {"cleaned_debug_pods": []},
+            {"execution_artifacts": [{"type": "fault_target", "name": "v-0"}]},
+        ):
+            assert self._text(state) == "", state
+
+    def test_cleaned_is_never_upgraded_to_confirmed_absent(self):
+        """Honesty pin: cleanup is fire-and-forget by design and never re-reads
+        absence, so the block may state that a delete was ISSUED and may NOT
+        state that the carrier is gone. An upgraded claim would be a false
+        all-clear built out of the framework's own bookkeeping."""
+        text = self._text(self._state())
+        assert "ISSUED" in text
+        assert "not a confirmed-absent claim" in text
+        lowered = text.lower()
+        for forbidden in (
+            "is gone",
+            "no longer exists",
+            "confirmed absent",
+            "verified deleted",
+            "successfully deleted",
+            "absence confirmed",
+        ):
+            assert forbidden not in lowered, forbidden
+
+    def test_block_declares_precedence_over_earlier_prose(self):
+        """The stale statement in case #67 was EARLIER prose (plan text). A
+        fresh authoritative block that does not say it wins leaves the model
+        with two contradicting claims and no tie-breaker — the fourth prose
+        claim, not a resolution."""
+        text = self._text(self._state())
+        assert "superseded by it" in text
+        assert "plan text" in text
+        assert "write-time snapshot" in text
+        assert "Never report a carrier" in text
+
+    def test_pending_list_is_read_not_recomputed(self):
+        """Single-source pin: the outstanding-teardown line must come from
+        ``operation_result.pending_vehicle_teardown`` — the reader every
+        terminal surface already uses — so this block and the task-end
+        envelope cannot disagree. Re-deriving it here is the two-
+        implementations shape this batch exists to remove."""
+        with patch(
+            "chaos_agent.agent.result.operation_result."
+            "pending_vehicle_teardown",
+            return_value=["sentinel:ns/x"],
+        ) as pending:
+            text = self._text(self._state())
+        assert pending.called
+        assert "outstanding teardown at this moment: sentinel:ns/x" in text
+        tail = text.split("outstanding teardown", 1)[1]
+        assert "drill-rc-1" not in tail
+        assert "node-debugger" not in tail
+
+    def test_all_cleaned_renders_no_outstanding_teardown(self):
+        state = {
+            "execution_artifacts": [
+                {
+                    "type": "recovery_carrier",
+                    "kind": "pod",
+                    "name": "drill-rc-1",
+                    "namespace": "default",
+                    "status": "cleaned",
+                },
+            ],
+        }
+        text = self._text(state)
+        assert "outstanding teardown at this moment: none" in text
+
+    def test_render_is_fresh_and_does_not_mutate_state(self):
+        """Same freshness contract as the two clocks above: rendered per
+        builder call and never persisted, so the block cannot itself become
+        the next stale snapshot. A carrier cleaned AFTER the first render must
+        show up in the second."""
+        state = self._state()
+        before = json.dumps(state, sort_keys=True, default=str)
+        first = self._text(state)
+        assert self._text(state) == first
+        assert json.dumps(state, sort_keys=True, default=str) == before
+        state["cleaned_debug_pods"].append("node-debugger-n-late")
+        state["execution_artifacts"][1]["status"] = "cleaned"
+        second = self._text(state)
+        assert "node-debugger-n-late: status=cleaned" in second
+        assert "node-debugger-n-6k658: status=cleaned" in second
+        assert "this task built 5 carrier(s)" in second
+
+    def _layer2_text(self, state, skill):
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            _build_layer2_messages,
+        )
+        from chaos_agent.agent.result.verdict import Layer1Result
+        layer1 = Layer1Result(
+            status="passed", affected_count=1, raw_output="Success",
+        )
+        msgs = _build_layer2_messages(
+            state, layer1, "uid-c67", skill, "/path/to/kc", count=1,
+        )
+        return "\n".join(
+            m.content for m in msgs
+            if isinstance(m, HumanMessage) and isinstance(m.content, str)
+        )
+
+    def test_layer2_context_carries_the_block(self):
+        """Wiring invariant: an authoritative block no builder appends never
+        reaches the model. Case #67's durable fields were ALL correct and the
+        verdict was still wrong — the fact lived in the record and was absent
+        from the context."""
+        state = {**self._state(), "messages": [HumanMessage(content="inject")]}
+        text = self._layer2_text(state, "net-loss")
+        assert "CARRIER STATUS (system-computed" in text
+        assert "node-debugger-n-fdfj5: status=cleaned" in text
+
+    def test_layer2_context_omits_the_block_without_carriers(self):
+        """The silence contract, with its own capture-surface self-check: the
+        SAME builder configuration is first shown to emit the block once a
+        carrier exists, so the negative assertion below cannot pass on a
+        builder that never ran the injection at all."""
+        state = {"messages": [HumanMessage(content="inject")]}
+        assert "CARRIER STATUS (system-computed" not in self._layer2_text(
+            state, "cpu-fullload",
+        )
+        # Self-check: one carrier in, one block out — same state object, same
+        # builder arguments.
+        state["cleaned_debug_pods"] = ["node-debugger-n-fdfj5"]
+        assert "CARRIER STATUS (system-computed" in self._layer2_text(
+            state, "cpu-fullload",
+        )

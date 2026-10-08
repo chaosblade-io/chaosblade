@@ -1354,7 +1354,7 @@ async def _run_layer2_verification(
                     f"\n## Recovery Verification Instructions\n"
                     f"Follow the recovery verification approach below as the primary reference.\n\n"
                     f"<recovery-verification>\n{recovery_section}\n</recovery-verification>\n\n"
-                    f"1. Follow the **恢复验证** section above exactly. "
+                    f"1. Follow the `## 恢复验证` section above exactly. "
                     f"Execute every verification step it specifies.\n"
                     f"2. If a step cannot be executed, note it and design an equivalent check.\n"
                     f"3. If ALL steps pass, conclude Layer2 as 'passed'.\n"
@@ -1366,9 +1366,9 @@ async def _run_layer2_verification(
                 # Fallback: inject full content if extraction failed
                 instructions_section = (
                     f"\n## Recovery Verification Instructions\n"
-                    f"Follow the **恢复验证** section in the skill case as the primary reference.\n\n"
+                    f"Follow the `## 恢复验证` section in the skill case as the primary reference.\n\n"
                     f"<skill-case>\n{skill_case}\n</skill-case>\n\n"
-                    f"1. Follow the **恢复验证** section exactly.\n"
+                    f"1. Follow the `## 恢复验证` section exactly.\n"
                     f"2. If a step cannot be executed, note it and design an equivalent check.\n"
                     f"3. You MUST produce a RECOVERY_VERIFICATION_CHECKLIST with one item per step.\n"
                     f"{step_hint}\n"
@@ -1746,6 +1746,16 @@ async def _run_layer2_verification(
         "verifier_loop_count": count,
         "recover_layer1_cache": layer1_to_dict(layer1),  # persist for subsequent iterations
         "layer2_context_added": True,  # mark Layer 2 context as built
+        # Phase declaration (case recover-c7b5a83d): a deterministic Layer 1
+        # (experiment destroy / restore-recipe replay) falls through to this
+        # branch WITHOUT writing ``recover_phase`` — only the LLM-driven
+        # Layer 1 terminal did. The next iteration then re-read the default
+        # ``layer1_recovery`` and the Layer-1 continue branch hijacked every
+        # Layer 2 round (Layer 1 executor prompt + submit stripped + L1
+        # iteration budget consumed + the screener's readonly gate below the
+        # phase check never armed). Every Layer 2 round declares its own
+        # phase, same pattern as ``recover_layer1_type`` materialization.
+        "recover_phase": "layer2_verification",
         # B51: pin the shared counter at Layer 2's first iteration so later
         # iterations can derive the Layer-2-local count. Always (re-)pin on a
         # fresh Layer 2 entry: a stale pin from an earlier Layer 2 run must

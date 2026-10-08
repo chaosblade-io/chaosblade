@@ -638,6 +638,192 @@ class TestMakeRecoverVerifier:
             assert "messages" in result
             assert result["verifier_loop_count"] == 1
 
+    @pytest.mark.asyncio
+    async def test_deterministic_l1_fallthrough_declares_layer2_phase(self):
+        """Regression (case recover-c7b5a83d): a deterministic Layer 1
+        (experiment destroy / restore-recipe replay) falls through to Layer 2
+        WITHOUT writing ``recover_phase`` — the field only the LLM-driven
+        Layer 1 terminal ever wrote. The next iteration then re-read the
+        default ``layer1_recovery`` and the Layer-1 continue branch hijacked
+        every Layer 2 round (executor prompt, submit stripped, L1 iteration
+        budget consumed, screener readonly gate never armed — 24/51 historical
+        recover sessions show the free-text detour shape).
+
+        Every Layer 2 round must declare its own phase in the same
+        result_update that builds its context. Asserted on the REAL write
+        path (deterministic destroy mocked, phase NOT pre-set by the fixture
+        — the pre-set ``recover_phase="layer2_verification"`` fixtures all
+        bypass this writer, which is exactly why the bug survived them).
+        """
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [
+            {"name": "kubectl", "args": {"subcommand": "get", "v_args": "pods -n default -o json"}}
+        ]
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "pod-kill",
+                "kubeconfig": "",
+                "verifier_loop_count": 0,
+            }
+            result = await node(state)
+
+        assert result.get("recover_phase") == "layer2_verification", (
+            "deterministic-L1 fall-through must declare the Layer 2 phase in "
+            "its own result_update — otherwise the next iteration re-reads "
+            "the layer1_recovery default and the L1 continue branch hijacks it"
+        )
+        # The flag finalize's anti-laziness guard reads stays in the same
+        # update (a stale True from round 1 fed the wrong-reason rejection
+        # in the case session).
+        assert result.get("recover_layer2_first") is True
+        # The screener's readonly gate (graph.py) reads this same field and
+        # runs AFTER this update merges into state — so the declaration also
+        # arms the Layer-2 read-only discipline from THIS round's tool calls
+        # on (pre-fix: the gate never armed on the deterministic path).
+        _merged = {**state, **result}
+        assert _merged.get("recover_phase", "layer1_recovery") == "layer2_verification"
+
+    @pytest.mark.asyncio
+    async def test_second_round_after_deterministic_l1_stays_layer2(self):
+        """The hijack itself, end to end at the node level: apply round 1's
+        REAL delta to the state and run the node again.
+
+        Pre-fix round 2 re-read phase=layer1_recovery (the deterministic
+        fall-through never wrote it) and the Layer-1 continue branch took
+        over — its delta carries ``layer1_iteration_count`` and never writes
+        ``recover_layer2_first``. Post-fix the delta proves the Layer 2
+        branch ran: phase re-declared, first-flag False, and the L1
+        iteration counter untouched. The screener readonly gate (graph.py)
+        reads this same phase field, so the declaration also re-arms the
+        Layer-2 read-only discipline the hijack silently disabled.
+        """
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [
+            {"name": "kubectl", "args": {"subcommand": "get", "v_args": "pods -n default -o json"}}
+        ]
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "pod-kill",
+                "kubeconfig": "",
+                "verifier_loop_count": 0,
+                "messages": [],
+            }
+            round1 = await node(state)
+            merged = {
+                **state,
+                **round1,
+                "messages": state["messages"] + list(round1.get("messages", [])),
+            }
+            round2 = await node(merged)
+
+            # Deterministic destroy ran exactly once — round 2 restored the
+            # Layer 1 result from the cache instead of re-destroying.
+            assert mock_l1.await_count == 1
+
+        assert round2.get("recover_phase") == "layer2_verification"
+        assert round2.get("recover_layer2_first") is False, (
+            "round 2 ran in the Layer 2 branch (pre-fix: the L1 continue "
+            "branch never wrote this key at all)"
+        )
+        assert "layer1_iteration_count" not in round2, (
+            "Layer-2 observation rounds must not consume the Layer-1 "
+            "iteration budget (the hijacked branch incremented it here)"
+        )
+        assert round2["verifier_loop_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_deterministic_l1_free_text_verdict_not_guard_rejected(self):
+        """The case session's exact ending shape, end to end: deterministic
+        Layer 1 → Layer 2 observation round → free-text verdict (no
+        tool_calls). Pre-fix the second round was hijacked (L1 executor
+        prompt, RECOVERY_EXECUTION_RESULT demanded, submit stripped) and the
+        stale ``recover_layer2_first=True`` made finalize's anti-laziness
+        guard reject a session that HAD observed. Post-fix the free-text
+        verdict is a legitimate Layer 2 conclusion: router sends it to
+        finalize, the guard does NOT fire (first-flag correctly False from
+        round 2's own write), and the verdict is accepted as-is.
+        """
+        from chaos_agent.agent.router import should_continue_recover_verifier
+
+        # Round 1: LLM observes (tool_calls). Round 2: LLM concludes in text.
+        # Real AIMessages — the router reads ``type == "ai"`` and tool_calls
+        # off the message; a MagicMock fails both checks silently.
+        observe = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "kubectl", "args": {"subcommand": "get", "v_args": "pods -n default -o json"}, "id": "c1", "type": "tool_call"}
+            ],
+        )
+        conclude = AIMessage(content=(
+            "RECOVERY_VERIFICATION_RESULT:\n"
+            "- Layer1 (deterministic destroy): passed\n"
+            "- Layer2 (fault-specific): passed - selector back to baseline\n"
+            "- Overall: recovered\n"
+            "- Warnings: none"
+        ))
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=[observe, conclude])
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "pod-kill",
+                "kubeconfig": "",
+                "verifier_loop_count": 0,
+                "messages": [],
+            }
+            round1 = await node(state)
+            merged = {
+                **state,
+                **round1,
+                "messages": state["messages"] + list(round1.get("messages", [])),
+            }
+            round2 = await node(merged)
+
+        # Router: free-text with Layer 2 context built → finalize (not the
+        # L1-continue route the hijacked round used to force).
+        assert should_continue_recover_verifier({**merged, **round2}) == "finalize"
+
+        # Finalize accepts the verdict — the anti-laziness guard must NOT
+        # fire on a session whose first Layer 2 turn observed.
+        fin = await _drive_finalize(merged, round2)
+        assert fin["result"]["recovered"] is True, (
+            "free-text verdict after a real observation round must finalize "
+            "directly — the guard rejecting it is the case session's detour"
+        )
+        assert fin["recover_verification"]["level"] == "recovered"
+
 
     @pytest.mark.asyncio
     async def test_b51_convergence_hint_silent_on_first_layer2_after_long_layer1(self):
@@ -3264,7 +3450,9 @@ class TestExtractRecoveryVerificationSection:
             "Use blade destroy to recover\n"
         )
         result = _extract_recovery_verification_section(content)
-        assert "**恢复验证**：" in result
+        # 合成头统一为 ## 形态（与语料主形态一致）；输入 fixture 保持 legacy
+        # 加粗形态以同时钉住 find_section 的双形态兼容。
+        assert "## 恢复验证" in result
         assert "kubectl top node" in result
         assert "confirm CPU back to baseline" in result
         assert "**恢复说明**：" not in result
@@ -3348,7 +3536,7 @@ class TestExtractRecoveryVerificationSection:
             "blade destroy\n"
         )
         result = _extract_recovery_verification_section(content)
-        assert "**恢复验证**：" in result
+        assert "## 恢复验证" in result
 
     def test_colon_vs_fullwidth_colon(self):
         """恢复验证 delimiter works with both ：(fullwidth) and :(halfwidth)."""

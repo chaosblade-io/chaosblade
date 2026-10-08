@@ -90,7 +90,7 @@ _CAPS: dict[str, tuple[object, int]] = {
     "blade_python_revoke": (blade_python_revoke, 375),
     "submit_fault_intent": (submit_fault_intent, 775),  # class-A floor (~586) + dynamic INTENT_* enums; +case hint param (case_resource_path); +intent-accuracy provenance contract (probe trail / template-not-data); +one-line duration contract (duration_seconds channel); +names-vs-labels disambiguation (names = scope-kind instances, workload/owner targets → labels — confusion caused real wrong-target submissions)
     "submit_batch_intent": (submit_batch_intent, 395),  # +one-line duration contract (duration_seconds channel)
-    "submit_verification": (submit_verification, 495),
+    "submit_verification": (submit_verification, 610),  # 495→610 (B2 submit-time consistency contract, 2026-09-21 review): the four downgrade rules _verification_from_submit_args enforces (verified+peo=false→partial; verified+layer2 failed→unverified; layer2 partial→overall partial; layer2 passed + failed items with absence evidence→layer2 partial, else warning) were previously invisible until the post-hoc mismatch warning — the model could only learn the contract AFTER an inconsistent submit was rewritten under it. Teaching them at the only call-site-adjacent surface is contract-mandated semantics, not long-tail bloat (mirror of submit_recover_verification's unverified-verdict-semantics raise). Wording compressed 127→100 tok before raising (rule 3 applied first); measured 595 + ~2% serialization-drift headroom.
     "submit_recover_verification": (submit_recover_verification, 455),  # +unverified verdict vocabulary (openspec unverified-verdict-semantics): overall 4-value domain + "unverified ≠ unrecovered" anti-conflation note + layer2 "unknown" — contract-mandated, not long-tail example bloat; +B76 round-14 root-cause fix: vocabulary lines now DERIVED from the verdict enums (full 6-word layer2 + 7-word item sets — class-A closed-set contract, cited incident: three contradictory hand-copied vocabularies found live)
     "blade_create": (blade_create, 610),            # class-A floor (~597)
     "blade_destroy": (blade_destroy, 365),
@@ -128,7 +128,40 @@ _CAPS: dict[str, tuple[object, int]] = {
     # three teaching elements (when to pass / must-be-inside-the-allowlist
     # fail-closed / omitted→tool-picks) are class-A safety semantics, not
     # examples; measured 717, 730 keeps the same drift headroom.
-    "faultdrill_assemble_carrier": (faultdrill_assemble_carrier, 730),
+    # 730→940 (2026-09-21 NXDOMAIN inject-2340dac9 generic fix): the
+    # remaining overage is three incident-distilled class-A contracts —
+    # (1) null-value live-capture on restore replace ops (the plan relay
+    # froze a 2-space Corefile indent over a 1-space live baseline; the
+    # baseline guard caught it but the fail-closed retry cost 118s — the
+    # null form removes the LLM from the byte-exact relay path entirely);
+    # (2) readback_compare exact|whitespace_insensitive with fail-closed
+    # validation and conservative default (the ACK controller normalised
+    # the written value's indentation, exact-compare readback produced a
+    # partial false-negative + a 60.4s manual-scouting round); (3) One
+    # ARMING per task window replacing the NEVER-call-twice wording (the
+    # model read pre-arming fail-closed retries as contract violations —
+    # execute burned 431s across two assembler incidents). Rule-2/3
+    # content (Corefile/Caddyfile examples, mechanism prose) was
+    # compressed FIRST (991→919); measured 919, 940 keeps the same drift
+    # headroom rationale as the 717→730 raise.
+    # 940→1110 (2026-09-28 #51-R5 create-domain recovery gap): +extra_delete
+    # — the OPTIONAL create-domain inverse channel. A json-patch restore can
+    # only rewrite an existing object's fields; it cannot express "delete an
+    # independently created prop Secret", so a fault whose inject plan built
+    # a prop object outside the patch domain (the case frontmatter's
+    # mechanism_writes) left that object with NO autonomous executor — the
+    # armed timer's TTL and the recover replay both only patched the target
+    # back and the prop outlived the fault (#51-R5 live-fire). The overage is
+    # class-A safety semantics, not examples: the entry shape, the
+    # fail-closed cross-namespace / cluster-scoped refusal (the namespaced
+    # carrier Role cannot authorize outside its own namespace), and the
+    # dual-executor idempotence (rides BOTH timer and replay, a 404 is a
+    # clean no-op) are the contract the LLM must honour at the call site.
+    # Rule-3 compression applied first (the drafted bullet measured 1123;
+    # tightened to 1084 before raising). Measured 1084, 1110 keeps the same
+    # ~2.4% cross-environment serialization-drift headroom as the 919→940
+    # raise above.
+    "faultdrill_assemble_carrier": (faultdrill_assemble_carrier, 1110),
 }
 
 # The two flagship tools carry the full five-section structure; long-tail
@@ -177,7 +210,21 @@ _SECTIONS = (
 # faultdrill_assemble_carrier (650→730, #55 M3 retest inject-593c7826 —
 # see the row note) carries the total with it; 10740 keeps the same
 # drift headroom over the measured 10718.
-_TOTAL_CAP = 10740
+# 10740→10940 (2026-09-21 NXDOMAIN inject-2340dac9): carried by the
+# faultdrill_assemble_carrier class-A raise (730→940 — three
+# incident-distilled contracts, see the row note; rule-2/3 content was
+# compressed first, 991→919 measured). Measured total 10920, 10940
+# keeps the same drift headroom as the line above.
+# 10940→11090 (2026-09-21 B2 review pass): carried by the
+# submit_verification contract raise (495→610 — submit-time
+# consistency contract, rule-3 compression applied first, see the row
+# note). Measured total 11070, 11090 keeps the same drift headroom.
+# 11090→11240 (2026-09-28 #51-R5 create-domain recovery gap): carried by
+# the faultdrill_assemble_carrier class-A raise (940→1110 — the
+# extra_delete create-domain inverse channel, rule-3 compression applied
+# first, see the row note). Measured total 11218, 11240 keeps the same
+# ~20-tok drift headroom as the line above.
+_TOTAL_CAP = 11240
 
 
 class TestToolDescriptionBudget:

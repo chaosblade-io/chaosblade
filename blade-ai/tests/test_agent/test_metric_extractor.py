@@ -150,15 +150,22 @@ class TestDescribePod:
 
     def test_oomkilled_last_termination(self):
         stdout = (
-            "Last State:     Terminated\n"
-            "  Reason:       OOMKilled\n"
-            "  Exit Code:    137\n"
+            "Containers:\n"
+            "  app:\n"
+            "    Last State:     Terminated\n"
+            "      Reason:       OOMKilled\n"
+            "      Exit Code:    137\n"
         )
         result = extract_metrics("kubectl", "describe pod x", stdout)
         assert result["Last termination reason"] == "OOMKilled"
 
     def test_evicted_termination(self):
-        stdout = "Last State:\n  Reason: Evicted\n"
+        stdout = (
+            "Containers:\n"
+            "  app:\n"
+            "    Last State:\n"
+            "      Reason: Evicted\n"
+        )
         result = extract_metrics("kubectl", "describe pod x", stdout)
         assert result["Last termination reason"] == "Evicted"
 
@@ -169,7 +176,7 @@ class TestDescribePod:
 
     def test_describe_po_alias(self):
         # `describe po` (the short form) must also dispatch.
-        stdout = "Restart Count:  3\n"
+        stdout = "Containers:\n  app:\n    Restart Count:  3\n"
         result = extract_metrics("kubectl", "describe po my-pod", stdout)
         assert result["RestartCount"] == "3"
 
@@ -237,6 +244,112 @@ class TestGetPodJson:
         stdout = json.dumps(pod)
         result = extract_metrics("kubectl", "get pod x -o json", stdout)
         assert result["Pod Ready"] == "False"
+
+
+# ---------------------------------------------------------------------------
+# kubectl get deployment/node -o json (m7: non-pod scopes)
+# ---------------------------------------------------------------------------
+
+
+class TestGetDeploymentNodeJson:
+    def test_deployment_replica_state(self):
+        # m7 (r68 review, measured): the dispatch was pod-only, so the
+        # r43 live case's own scope (deployment mechanism readback)
+        # produced NO structured metrics while the pod form did.
+        dep = {
+            "spec": {"replicas": 0},
+            "status": {
+                "readyReplicas": 0,
+                "replicas": 0,
+                "unavailableReplicas": 3,
+            },
+        }
+        result = extract_metrics(
+            "kubectl", "get deployment demo -n default -o json", json.dumps(dep),
+        )
+        assert result["Spec replicas"] == "0"
+        assert result["Status readyReplicas"] == "0"
+        assert result["Status unavailableReplicas"] == "3"
+        assert result["Status replicas"] == "0"
+
+    def test_deployment_deploy_alias_and_ojson(self):
+        dep = {"spec": {"replicas": 2}, "status": {"readyReplicas": 2, "replicas": 2}}
+        result = extract_metrics(
+            "kubectl", "get deploy demo -ojson", json.dumps(dep),
+        )
+        assert result["Spec replicas"] == "2"
+        assert result["Status readyReplicas"] == "2"
+
+    def test_node_conditions(self):
+        node = {
+            "status": {"conditions": [
+                {"type": "MemoryPressure", "status": "True"},
+                {"type": "Ready", "status": "True"},
+            ]},
+        }
+        result = extract_metrics(
+            "kubectl", "get node worker-1 -o json", json.dumps(node),
+        )
+        assert result["Node MemoryPressure"] == "True"
+        assert result["Node Ready"] == "True"
+
+    def test_deployment_invalid_json_returns_empty(self):
+        result = extract_metrics("kubectl", "get deployment d -o json", "{ broken")
+        assert result == {}
+
+    def test_deployment_without_json_flag_not_parsed(self):
+        # The -o json gate stays authoritative: a table-form get must not
+        # route into the JSON parser (it would find no dict and return
+        # {} — the regression guard for the dispatch's shape).
+        dep = {"spec": {"replicas": 0}, "status": {"replicas": 0}}
+        result = extract_metrics(
+            "kubectl", "get deployment d", json.dumps(dep),
+        )
+        assert "Spec replicas" not in result
+
+    def test_deployment_generic_list_form_iterates(self):
+        # r68 self-review C1 (measured in .b4tmp/r68_review_c1_probe.py):
+        # the nameless ``get deployments -o json`` returns the GENERIC
+        # List shape (kind="List" — unlike pods' dedicated PodList kind)
+        # and used to yield {} while the pod parser's List precedent
+        # yielded metrics. Unrolled per-item; key collisions last-wins
+        # (same policy as the pod parser — a multi-deployment listing
+        # reports the LAST item).
+        dep_list = {
+            "kind": "List",
+            "items": [
+                {"spec": {"replicas": 3},
+                 "status": {"readyReplicas": 1, "replicas": 3}},
+                {"spec": {"replicas": 2},
+                 "status": {"readyReplicas": 2, "replicas": 2}},
+            ],
+        }
+        result = extract_metrics(
+            "kubectl", "get deployments -n default -o json",
+            json.dumps(dep_list),
+        )
+        assert result == {
+            "Spec replicas": "2",
+            "Status readyReplicas": "2",
+            "Status replicas": "2",
+        }
+
+    def test_node_generic_list_form_iterates(self):
+        # r68 self-review C1: same generic-List unroll for nodes.
+        node_list = {
+            "kind": "List",
+            "items": [
+                {"status": {"conditions": [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "MemoryPressure", "status": "True"},
+                ]}},
+            ],
+        }
+        result = extract_metrics(
+            "kubectl", "get nodes -o json", json.dumps(node_list),
+        )
+        assert result["Node Ready"] == "True"
+        assert result["Node MemoryPressure"] == "True"
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +614,9 @@ class TestExtractBaselineMetricsWrapper:
     def test_disk_fault_keeps_disk_metrics(self):
         baseline = self._baseline(
             ("df -h", "overlay  50G  13G  38G  26% /\n", "Disk usage"),
-            ("describe pod x", "Restart Count:  7\nReady             True\n",
+            ("describe pod x",
+             "Containers:\n  app:\n    Restart Count:  7\n"
+             "Ready             True\n",
              "Pod status"),
         )
         result = extract_baseline_metrics(baseline, "disk", "fill")
@@ -543,3 +658,133 @@ class TestExtractBaselineMetricsWrapper:
         result = extract_baseline_metrics(baseline, "weird-fault", "weird-action")
         assert "Disk usage (overlay)" in result
         assert "CPU usage" in result
+
+
+# ---------------------------------------------------------------------------
+# describe pod — section awareness (live case inject-3dae7b4f)
+# ---------------------------------------------------------------------------
+
+
+class TestDescribePodSectionAwareness:
+    """``describe pod`` parsing must be immune to the Ephemeral Containers
+    section. Once a pod-scoped ``kubectl debug`` has ever run against a
+    target, the pod carries a permanently-accumulating ephemeral section
+    (26 dead debuggers on the live target — 577 lines after the 22-line
+    business section). Old last-wins logic read the LAST ephemeral
+    container's RestartCount 0 / container ID as the pod's baseline
+    (business truth: RestartCount 329)."""
+
+    _BUSINESS_CID = "containerd://f69d92f1ea72"
+    _EPHEMERAL_CID = "containerd://c0c6f9018f2d"
+
+    def _describe(self):
+        # Shape-faithful skeleton of the live target's describe output:
+        # business section first, top-level Conditions table, then the
+        # ephemeral graveyard. Ephemeral uses DIFFERENT values than the
+        # business section so a section-blind parser cannot pass by luck.
+        return (
+            "Name:         drill-reorder-target\n"
+            "Namespace:    default\n"
+            "Status:       Running\n"
+            "Containers:\n"
+            "  target:\n"
+            f"    Container ID:  {self._BUSINESS_CID}\n"
+            "    Image:         registry/terway:v1.12.1\n"
+            "    State:          Running\n"
+            "    Ready:          True\n"
+            "    Restart Count:  329\n"
+            "    Last State:     Terminated\n"
+            "      Reason:       Completed\n"
+            "Conditions:\n"
+            "  Type           Status\n"
+            "  Initialized    True \n"
+            "  Ready          True \n"
+            "Ephemeral Containers:\n"
+            "  debugger-b46sh:\n"
+            f"    Container ID:  {self._EPHEMERAL_CID}\n"
+            "    State:          Terminated\n"
+            "      Reason:       OOMKilled\n"
+            "    Ready:          False\n"
+            "    Restart Count:  0\n"
+        )
+
+    def test_ephemeral_section_does_not_override_business_metrics(self):
+        result = extract_metrics(
+            "kubectl", "describe pod drill-reorder-target -n default",
+            self._describe(),
+        )
+        assert result["RestartCount"] == "329"
+        assert result["Container ID"] == self._BUSINESS_CID
+        # Business Reason is Completed; the ephemeral Reason (OOMKilled)
+        # must NOT win — it belongs to a dead debugger, not the pod.
+        assert result["Last termination reason"] == "Completed"
+
+    def test_pod_ready_read_from_top_level_conditions(self):
+        # Top-level Conditions table (no colon after Ready) is the source;
+        # per-container ``Ready:`` fields (with colon) never match, in the
+        # business section or the ephemeral one.
+        result = extract_metrics(
+            "kubectl", "describe pod drill-reorder-target -n default",
+            self._describe(),
+        )
+        assert result["Pod Ready"] == "True"
+
+    def test_ephemeral_only_output_yields_no_misread_metrics(self):
+        # Degenerate shape: business container list empty, only an
+        # ephemeral section — nothing may be read as pod metrics.
+        stdout = (
+            "Name:         drill-reorder-target\n"
+            "Containers:\n"
+            "Ephemeral Containers:\n"
+            "  debugger-b46sh:\n"
+            f"    Container ID:  {self._EPHEMERAL_CID}\n"
+            "    Restart Count:  0\n"
+        )
+        result = extract_metrics("kubectl", "describe pod x", stdout)
+        assert "RestartCount" not in result
+        assert "Container ID" not in result
+
+    def test_init_containers_section_is_ignored_too(self):
+        # Init containers restart once per boot by design — their restart
+        # count is noise for fault-effect judgement, same class as the
+        # ephemeral section.
+        stdout = (
+            "Containers:\n"
+            "  app:\n"
+            f"    Container ID:  {self._BUSINESS_CID}\n"
+            "    Restart Count:  2\n"
+            "Init Containers:\n"
+            "  init-db:\n"
+            "    Container ID:  containerd://initcid0000\n"
+            "    Restart Count:  40\n"
+        )
+        result = extract_metrics("kubectl", "describe pod x", stdout)
+        assert result["RestartCount"] == "2"
+        assert result["Container ID"] == self._BUSINESS_CID
+
+    def test_json_supplement_command_hits_structured_parser(self):
+        """The Target-conditions supplement is now ``get -o json`` — the
+        dispatch must route it to the structured parser (business
+        containerStatuses first), locking the command-shape ↔ parser
+        contract so a future wording change cannot silently break the
+        hit."""
+        pod_json = json.dumps({
+            "kind": "Pod",
+            "status": {
+                "containerStatuses": [{
+                    "restartCount": 329,
+                    "containerID": self._BUSINESS_CID,
+                    "ready": True,
+                }],
+                "phase": "Running",
+            },
+        })
+        result = extract_metrics(
+            "kubectl",
+            "get pod drill-reorder-target -n default -o json"
+            " --show-managed-fields=false",
+            pod_json,
+        )
+        assert result["RestartCount"] == "329"
+        assert result["Container ID"] == self._BUSINESS_CID
+        assert result["Pod phase"] == "Running"

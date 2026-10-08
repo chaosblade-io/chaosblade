@@ -64,6 +64,16 @@ Inputs:
   - warnings: optional warning strings.
   - chosen_candidate: chosen candidate index (multi-candidate); 0 otherwise.
 
+Consistency contract (enforced on submit — inconsistent sets are
+DOWNGRADED, not accepted):
+  - "verified" + primary_evidence_observed=false → "partial";
+    "verified" + layer2_status="failed" → "unverified";
+    layer2_status="partial" → overall "partial".
+  - layer2_status="passed" + failed checklist items →
+    inconsistency warning; if those items' evidence shows absence
+    (metric far below threshold, "not observed"), layer2 → "partial"
+    (the observed record outranks conclusions).
+
 Output: confirmation string (verdict taken from these args)."""
 
 

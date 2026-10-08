@@ -22,6 +22,7 @@ from chaos_agent.agent.nodes.verify._verifier_hints import (
 # Phase-4 T6: verdict-direct (was a forward through the _verifier_layer1
 # shim pre-cleanup).
 from chaos_agent.agent.result.verdict import ChecklistItemStatus, Layer1Result
+from chaos_agent.agent.prompts.boundary import EXECUTE_TO_VERIFY_TOOL_SURFACE_NOTE
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
     _extract_verification_step_descriptions,
@@ -30,6 +31,7 @@ from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
 from chaos_agent.utils.message_integrity import apply_synthetic_pair_gate
+from chaos_agent.utils.time import parse_iso_timestamp
 from chaos_agent.utils.truncation import build_truncation_notice
 
 logger = logging.getLogger(__name__)
@@ -438,6 +440,96 @@ def _build_convergence_hint(count: int) -> str:
     return ""
 
 
+def _history_carries_full_kubectl_calls(state: AgentState) -> bool:
+    """Inertia-source probe for the execute→verify tool-surface seam (A2).
+
+    The verifier inherits the execute phase's message history verbatim; a
+    ``kubectl`` ToolMessage in it means the model's few-shot context
+    contains full-surface calls that this phase's binding
+    (``kubectl_read``) will reject as unknown-tool. Without such
+    evidence there is no inertia to redirect — the note would name a
+    tool the history never shows (a ChaosBlade-exec path, a host-channel
+    task whose execute surface was ``host_inject``).
+    """
+    for msg in state.get("messages", []):
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "kubectl":
+            return True
+    return False
+
+
+def build_injection_window_clock(state: AgentState, *, now: float | None = None) -> str:
+    """Render the injection fault window's phase facts for the verifier.
+
+    Case #58 (inject-3dae7b4f msg 104): the verifier LLM has no wall clock and
+    its context channels carry no timestamps, so it reverse-engineered the
+    window position from message ORDER ("Injection happened, then I waited 8s,
+    read log, then update_progress...") and finally rushed all probes at once
+    — 199s of window budget left, unbeknownst to it. The two facts it needed
+    (T0 = ``injection_start_time``, D = ``fault_spec.duration_seconds``) sat
+    in state the whole time; this renders them plus the system-computed
+    elapsed/remaining so the model plans sampling instead of archaeology.
+
+    Same freshness contract as ``build_recovery_timer_reminder`` (Case #46,
+    same root cause, recover side): rendered on every builder call, NOT
+    persisted to state, so the numbers never go stale and never accumulate.
+
+    Three renderings, keyed on the window position:
+    - in-window: remaining budget — a missing fault signature NOW is
+      injection-failure evidence, not recovery evidence;
+    - window closed: overrun — absence is EXPECTED (not persistence
+      evidence); a still-present signature means recovery has NOT converged;
+      the in-window verdict rests on pre-close evidence (wording mirrors the
+      timer reminder's TRIGGERED-not-completed neutrality);
+    - no duration on record: T0 + elapsed only (still kills the archaeology).
+
+    Returns ``""`` when T0 is absent or unparseable — replan seams clear
+    ``injection_start_time`` until the next injection re-stamps it, and the
+    clock must stay silent rather than anchor on a stale T0.
+    """
+    t0 = state.get("injection_start_time")
+    if not isinstance(t0, str) or not t0:
+        return ""
+    try:
+        t0_epoch = parse_iso_timestamp(t0).timestamp()
+    except (ValueError, TypeError):
+        return ""
+    from chaos_agent.agent.spec.fault_spec import read_fault_spec as _rfs_iw
+    spec = _rfs_iw(state)
+    duration = spec.duration_seconds if spec else 0
+    current = time.time() if now is None else float(now)
+    elapsed = max(0, int(current - t0_epoch))
+
+    if duration <= 0:
+        return (
+            f"**INJECTION CLOCK (system-computed, authoritative)**: injection "
+            f"committed at {t0}; ~{elapsed}s have elapsed since injection. "
+            f"(No fault duration on record — window position cannot be "
+            f"computed; do not infer it from message order.)"
+        )
+    remaining = duration - elapsed
+    if remaining > 0:
+        return (
+            f"**INJECTION WINDOW CLOCK (system-computed, authoritative)**: "
+            f"injection committed at {t0}; fault duration {duration}s; "
+            f"~{elapsed}s elapsed, ~{remaining}s remaining in the fault "
+            f"window. Evidence semantics: the fault is expected to be "
+            f"observable NOW; a missing fault signature at this point is "
+            f"evidence the injection did NOT take effect, not that it "
+            f"already recovered."
+        )
+    return (
+        f"**INJECTION WINDOW CLOCK (system-computed, authoritative)**: "
+        f"injection committed at {t0}; fault duration {duration}s; the fault "
+        f"window CLOSED ~{elapsed - duration}s ago — any bounded "
+        f"self-recovery was due by then (triggered, not necessarily "
+        f"converged). Evidence semantics: absence of the fault signature "
+        f"from now on is EXPECTED and is not persistence evidence; a "
+        f"still-present signature means recovery has NOT converged (record "
+        f"it); the in-window verdict rests on evidence gathered before the "
+        f"close."
+    )
+
+
 def build_recovery_timer_reminder(
     state: AgentState,
     *,
@@ -458,6 +550,17 @@ def build_recovery_timer_reminder(
 
     Returns ``""`` when no armed carrier carries a numeric deadline (the
     ChaosBlade path times out inside the experiment, never here).
+
+    #59 (Pod_被驱逐重建_DiskPressure): the reminder used to assert
+    "authoritative" for EVERY armed timer while the DiskPressure fault had
+    already evicted the carrier — the in-chain reversal was dead and the
+    verifier was told, authoritatively, to wait ~495s for a fire that could
+    never happen. The ledger now records WHICH realm the reversal lives in
+    (``recovery_form``): a host systemd timer (PID 1) fires regardless of
+    the carrier's fate, while an in-chain / timeout-bound reversal is
+    carrier-resident and void the moment the carrier dies. The wording
+    splits accordingly — authority for host timers, an explicit liveness
+    condition for carrier-resident ones.
     """
     artifacts = state.get("execution_artifacts") or []
     armed: list[tuple[float, dict]] = []
@@ -475,17 +578,41 @@ def build_recovery_timer_reminder(
         window = artifact.get("recovery_timeout_seconds")
         return f" (window {window}s)" if isinstance(window, (int, float)) else ""
 
+    def _is_host_timer(artifact: dict) -> bool:
+        # Absent form (ledger written before the field existed) reads as the
+        # carrier-resident case — the conservative direction: an extra
+        # liveness probe costs one read, a false "authoritative" costs the
+        # whole recovery window (#59).
+        return str(artifact.get("recovery_form") or "") == "host_timer"
+
     future = [(d, a) for d, a in armed if d > current]
     if future:
         # The NEXT fire is the planning anchor when several carriers are armed.
         deadline, artifact = min(future, key=lambda pair: pair[0])
         seconds = max(0, int(deadline - current))
+        if _is_host_timer(artifact):
+            return (
+                f"**RECOVERY TIMER (system-computed, authoritative)**: the recovery "
+                f"carrier's self-recovery timer{_window_text(artifact)} fires in "
+                f"~{seconds}s. It is HOST-MANAGED (a systemd transient timer under "
+                f"PID 1), so it fires even if the carrier pod dies. Evidence "
+                f"semantics: any probe taken after that moment can no longer "
+                f"serve as persistence evidence; any wait longer than "
+                f"~{seconds}s ends after the fire."
+            )
         return (
-            f"**RECOVERY TIMER (system-computed, authoritative)**: the recovery "
-            f"carrier's self-recovery timer{_window_text(artifact)} fires in "
-            f"~{seconds}s. Evidence semantics: any probe taken after that moment "
-            f"can no longer serve as persistence evidence; any wait longer "
-            f"than ~{seconds}s ends after the fire."
+            f"**RECOVERY TIMER (system-computed, CONDITIONAL)**: the recovery "
+            f"carrier was armed with a CARRIER-RESIDENT (in-chain / "
+            f"timeout-bounded) reversal{_window_text(artifact)} that fires in "
+            f"~{seconds}s. Unlike a host-managed systemd timer it runs INSIDE "
+            f"the carrier pod: if the carrier is no longer Running (evicted, "
+            f"completed, deleted — probe `kubectl get pod` for it first), the "
+            f"schedule is VOID and NO self-recovery is pending; a "
+            f"still-present fault signature on a dead carrier then requires "
+            f"ACTIVE recovery, not waiting. Evidence semantics while the "
+            f"carrier lives: any probe taken after the fire moment can no "
+            f"longer serve as persistence evidence; any wait longer than "
+            f"~{seconds}s ends after the fire."
         )
     # No future fire left: report the most recent one. Post-fire wording must
     # stay NEUTRAL about recovery outcome: fire proves the actions were
@@ -493,17 +620,103 @@ def build_recovery_timer_reminder(
     # then hung 12 minutes on the OrderedReady wedge). A still-present fault
     # signature after the fire is recovery-NOT-converged evidence — optimism
     # like "recovery at or near completion" would launder exactly that
-    # finding, and the verdict must rest on pre-fire evidence.
+    # finding. The pre-fire anchor scopes the PERSISTENCE question only
+    # (A6): records the executor kept inside the window — the carrier's
+    # restore log, the assembler receipt trail — stay legitimate
+    # behavioural evidence of what the timer actually did.
     deadline, artifact = max(armed, key=lambda pair: pair[0])
+    _residency = (
+        "It was HOST-MANAGED (systemd transient timer under PID 1), so the "
+        "fire happened regardless of the carrier's fate."
+        if _is_host_timer(artifact)
+        else "It was CARRIER-RESIDENT: the fire ran only if the carrier "
+        "survived to that moment — a carrier that died earlier took the "
+        "reversal with it, and the fault may still be in place."
+    )
     return (
         f"**RECOVERY TIMER (system-computed, authoritative)**: the recovery "
         f"carrier's self-recovery timer{_window_text(artifact)} fired "
         f"~{int(current - deadline)}s ago — the recovery actions were TRIGGERED, "
-        f"not necessarily completed. Evidence semantics: fault signatures "
+        f"not necessarily completed. {_residency} "
+        f"Evidence semantics: fault signatures "
         f"observed from now on are not persistence evidence; a still-present "
-        f"signature means recovery has NOT converged (record it); the verdict "
-        f"rests on pre-fire evidence."
+        f"signature means recovery has NOT converged (record it); the "
+        f"persistence verdict rests on pre-fire evidence; executor-window "
+        f"records (e.g. the carrier's restore log) remain legitimate "
+        f"behavioural evidence of what the timer executed."
     )
+
+
+def build_carrier_status_ledger(state: AgentState) -> str:
+    """Render the authoritative carrier roster for the verifier (W-67-12).
+
+    Same root cause as the two clocks above — the verifier's context channels
+    carry prose, and prose about a carrier's lifecycle is a WRITE-TIME snapshot
+    that nothing updates. Case #67: the plan recorded "two Completed
+    node-debugger pods folded into the cleanup step", the framework force-deleted
+    both at planning exit, and the verifier still warned that they "STILL NEED
+    CLEANUP". Every durable field was correct; the only statement in the
+    verifier's context was the stale one.
+
+    This renders the merged roster (structured ledger + the framework's own
+    cleanup record) instead of adding a fourth prose claim, and it states its
+    own precedence so an earlier snapshot cannot stand unopposed. Two honesty
+    rules it must not break:
+
+    * ``cleaned`` means a delete was ISSUED. Cleanup is fire-and-forget by
+      design and never re-reads absence, so this block may not say "gone".
+    * The pending list is not re-derived here — it is
+      ``operation_result.pending_vehicle_teardown``, the single source every
+      terminal surface already reads, so this block and the task-end envelope
+      cannot disagree.
+
+    Returns ``""`` when the task built no carrier at all (the ChaosBlade path
+    times out inside the experiment and registers none), leaving such a
+    verifier's context byte-identical to before.
+    """
+    from chaos_agent.agent.execution_artifacts import (
+        CARRIER_SOURCE_CLEANUP_RECORD,
+        carrier_status_facts,
+    )
+    from chaos_agent.agent.result.operation_result import pending_vehicle_teardown
+
+    carriers = carrier_status_facts(state).get("carriers") or []
+    if not carriers:
+        return ""
+    lines = [
+        "**CARRIER STATUS (system-computed, authoritative for carrier "
+        f"lifecycle)**: this task built {len(carriers)} carrier(s):",
+    ]
+    for row in carriers:
+        identity = str(row.get("name") or "")
+        namespace = str(row.get("namespace") or "")
+        if namespace:
+            identity = f"{namespace}/{identity}"
+        origin = (
+            "framework cleanup record"
+            if row.get("source") == CARRIER_SOURCE_CLEANUP_RECORD
+            else "carrier ledger"
+        )
+        lines.append(
+            f"  - {row.get('type') or 'carrier'} {identity}: "
+            f"status={row.get('status') or 'unknown'} (source: {origin})"
+        )
+    pending = pending_vehicle_teardown(state)
+    lines.append(
+        "  - outstanding teardown at this moment: "
+        f"{', '.join(pending) if pending else 'none'}"
+    )
+    lines.append(
+        "Semantics: `status=cleaned` means the framework ISSUED a delete "
+        "through the transport and did not re-read absence afterwards — it is "
+        "not a confirmed-absent claim, and a carrier you need proof about must "
+        "be probed. This block is the authority for carrier lifecycle: a "
+        "carrier status stated EARLIER in this conversation (plan text, a "
+        "progress-ledger entry, an earlier warning of your own) is a "
+        "write-time snapshot and is superseded by it. Never report a carrier "
+        "as needing cleanup while it is listed here as cleaned."
+    )
+    return "\n".join(lines)
 
 
 def _build_layer2_messages(
@@ -591,6 +804,28 @@ def _build_layer2_messages(
         # Subsequent iterations approaching limit: inject convergence nudge
         messages.append(HumanMessage(content=wrap_system_reminder(convergence_hint)))
 
+    # Injection-window phase facts (Case #58): same no-wall-clock root cause
+    # as the recovery timer below (Case #46, fix scoped to recover side only
+    # at the time). Frame first, carrier-specific deadline detail second.
+    # Same freshness contract: rendered every builder call, not persisted.
+    window_clock = build_injection_window_clock(state)
+    if window_clock:
+        messages.append(HumanMessage(content=wrap_system_reminder(window_clock)))
+
+    # Per-receipt dates (Case #64). The clock above says where NOW sits; it
+    # cannot say where a PAST observation sat, because nothing recorded when
+    # each receipt landed. The verifier therefore read its probes as an
+    # undated list and reasoned "three Services refuse, one pod IP answers"
+    # into an environment-wide egress fault — missing that the recovery
+    # carrier had curled a ClusterIP successfully ~26s earlier. Stamped at the
+    # dispatch chokepoint (agent.evidence_clock), rendered here beside the
+    # clock on the same freshness contract: every builder call, never
+    # persisted.
+    from chaos_agent.agent.evidence_clock import render_evidence_timeline
+    evidence_timeline = render_evidence_timeline(state)
+    if evidence_timeline:
+        messages.append(HumanMessage(content=wrap_system_reminder(evidence_timeline)))
+
     # Recovery-timer visibility (Case #46): the verifier LLM has no wall clock
     # and its context channels carry no timestamps, so the armed self-recovery
     # timer's fire moment had to be reverse-engineered from pod ages — a
@@ -602,6 +837,16 @@ def _build_layer2_messages(
     timer_reminder = build_recovery_timer_reminder(state)
     if timer_reminder:
         messages.append(HumanMessage(content=wrap_system_reminder(timer_reminder)))
+
+    # Carrier-lifecycle authority (Case #67, W-67-12): the three blocks above
+    # give the model a clock; this one gives it the current status of every
+    # carrier the task built, so a plan-time or ledger-time prose snapshot
+    # cannot remain the only statement about whether a carrier still needs
+    # cleanup. Same freshness contract — rendered every builder call, never
+    # persisted, so it cannot itself go stale.
+    carrier_status = build_carrier_status_ledger(state)
+    if carrier_status:
+        messages.append(HumanMessage(content=wrap_system_reminder(carrier_status)))
 
     # Final-iteration conclusion prompt (tools will be unbound at this count).
     # Skipped when verifier_json_mode is on: verifier.py appends the JSON
@@ -814,9 +1059,26 @@ def _build_first_iteration_context(
     _vehicle_hits = [
         n for n in (target.get("names") or []) if is_vehicle_name(n, state)
     ]
+    _anchor = state.get("approved_target") or {}
+    _anchor_names = list(_anchor.get("resolved_names") or _anchor.get("names") or [])
+    if _vehicle_hits and _anchor_names:
+        # The approved anchor is the FROZEN user intent and outranks any
+        # heuristic vehicle classification: a name that is BOTH vehicle and
+        # anchor means the classification misfired for that name (live
+        # case: a pod-scoped ``kubectl debug`` meta made the anchor itself
+        # read as an ephemeral vehicle, and the warning below would then
+        # tell the model to verify and NOT verify the SAME pod). Drop the
+        # contradictory names — a missed vehicle hint is a lesser failure
+        # than a self-contradictory brief.
+        _contradictions = [n for n in _vehicle_hits if n in _anchor_names]
+        if _contradictions:
+            logger.warning(
+                "vehicle classification contradicts the approved anchor on "
+                "name(s) %s — dropping them from the vehicle warning",
+                _contradictions,
+            )
+            _vehicle_hits = [n for n in _vehicle_hits if n not in _anchor_names]
     if _vehicle_hits:
-        _anchor = state.get("approved_target") or {}
-        _anchor_names = list(_anchor.get("resolved_names") or _anchor.get("names") or [])
         _anchor_labels = _anchor.get("labels") or {}
         _anchor_desc = (
             f"names {_anchor_names}" if _anchor_names
@@ -1032,7 +1294,7 @@ def _build_first_iteration_context(
                 f"action={fault_action})\n"
                 f"3. State which candidate you chose and why "
                 f"(one sentence)\n"
-                f"4. Follow THAT candidate's **注入验证** steps as your "
+                f"4. Follow THAT candidate's `## 注入验证` steps as your "
                 f"verification checklist. If it has no 注入验证 section, "
                 f"design your own checklist based on the candidate's "
                 f"content. Do NOT mix content from different candidates\n"
@@ -1108,7 +1370,7 @@ def _build_first_iteration_context(
             # ═══ Mode 2: GUIDED — 注入验证 exists but unparseable ═══
             context += (
                 "### Verification Strategy (Guided)\n"
-                "The skill case's **注入验证** section above contains "
+                "The skill case's `## 注入验证` section above contains "
                 "verification guidance in prose format (no numbered steps). "
                 "Read the section carefully and extract the verification "
                 "intent. Design your own numbered VERIFICATION_CHECKLIST "
@@ -1248,6 +1510,16 @@ def _build_first_iteration_context(
     )
     if method_note:
         context += method_note + "\n"
+    # Tool-surface axis (A2): execute bound the full ``kubectl``; this
+    # phase binds ``kubectl_read``. Announce the flip ONLY when the
+    # inertia source survives (the inherited history actually carries
+    # ``kubectl`` tool results) — otherwise the note would name a tool
+    # the history never shows (ChaosBlade-exec paths, host-channel
+    # tasks). Wording lives in boundary.py — the single source for
+    # boundary vocabulary; this is its second qualifying seam, after
+    # the inject→recover graft.
+    if _history_carries_full_kubectl_calls(state):
+        context += EXECUTE_TO_VERIFY_TOOL_SURFACE_NOTE + "\n\n"
     # ── Conditional rules (only when relevant) ──
     if baseline and baseline.get("success_count", 0) > 0:
         context += f"{_BASELINE_INTEGRITY_PROMPT}\n\n"

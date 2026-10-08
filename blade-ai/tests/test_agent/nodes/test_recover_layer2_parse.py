@@ -1,6 +1,5 @@
 """Tests for _recover_layer2_parse.py — recovery verification parsing."""
 
-import pytest
 
 from chaos_agent.agent.nodes.recover._recover_layer2_parse import (
     _detect_recovery_contradiction,

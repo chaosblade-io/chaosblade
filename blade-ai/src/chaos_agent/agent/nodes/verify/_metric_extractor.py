@@ -103,6 +103,17 @@ def extract_metrics(
     ):
         metrics.update(_parse_get_pod_json(stdout))
 
+    # ── kubectl get deployment/node -o json — the workload/node scopes'
+    #    authoritative shape (m7, r68 review; measured: dispatch was
+    #    pod-only so a deployment-scope ``get -o json`` — the r43 live
+    #    case's mechanism readback form — produced NO structured metrics
+    #    while the pod form did). Same -o json gate as the pod branch.
+    if "-o json" in cmd_lower or "-ojson" in cmd_lower or "--output=json" in cmd_lower:
+        if "get deployment" in cmd_lower or "get deploy " in cmd_lower:
+            metrics.update(_parse_get_deployment_json(stdout))
+        elif "get node" in cmd_lower or "get no " in cmd_lower:
+            metrics.update(_parse_get_node_json(stdout))
+
     # ── kubectl top pod/node
     if "top pod" in cmd_lower or "top node" in cmd_lower:
         metrics.update(_parse_kubectl_top(stdout))
@@ -183,13 +194,45 @@ def _parse_df_usage(stdout: str) -> dict[str, str]:
     return metrics
 
 
+# Top-level section header of a ``kubectl describe`` block print — a line
+# that is ONLY a title (``Containers:``, ``Init Containers:``,
+# ``Ephemeral Containers:``, ``Conditions:`` …). Field lines always carry a
+# value after the colon, so a value-less ``Name:``-at-line-end can never be
+# a field. Matched on the RAW line: stripping first would erase the
+# top-level-vs-indented distinction the section tracking depends on.
+_DESCRIBE_SECTION = re.compile(r"^([A-Za-z][A-Za-z ]*):[ \t]*$")
+
+
 def _parse_describe_pod(stdout: str) -> dict[str, str]:
     """``kubectl describe pod``: restart count, container ID, ready state,
-    termination reason."""
-    metrics: dict[str, str] = {}
+    termination reason.
 
-    for line in stdout.splitlines():
-        s = line.strip()
+    Section-aware. ``Restart Count`` / ``Container ID`` / termination
+    ``Reason`` lines repeat under EVERY container section — business
+    ``Containers:``, ``Init Containers:``, and, once a pod-scoped
+    ``kubectl debug`` has EVER run against the pod, a permanently
+    accumulating ``Ephemeral Containers:`` section (ephemeral containers
+    survive until the pod is recreated; a reused drill target accumulated
+    26 dead debuggers — 577 ephemeral lines after the 22-line business
+    section). Old last-wins logic read the LAST ephemeral container's
+    values as the pod's metrics (live case inject-3dae7b4f: baseline
+    RestartCount 0 / debugger container ID vs business truth 329). Only
+    the business ``Containers:`` section feeds those metrics now.
+    ``Pod Ready`` is section-independent: its pattern matches the
+    top-level Conditions table (``Ready   True``, no colon), never the
+    per-container ``Ready:`` field — so it keeps scanning the whole
+    output.
+    """
+    metrics: dict[str, str] = {}
+    in_business_section = False
+    for raw_line in stdout.splitlines():
+        section = _DESCRIBE_SECTION.match(raw_line)
+        if section:
+            in_business_section = section.group(1) == "Containers"
+            continue
+        if not in_business_section:
+            continue
+        s = raw_line.strip()
         # ``Restart Count:  8`` (the variable-whitespace form 'describe' uses)
         if "Restart Count" in s:
             try:
@@ -199,25 +242,23 @@ def _parse_describe_pod(stdout: str) -> dict[str, str]:
         # ``Container ID:  containerd://a1b2…`` — the last token is the
         # runtime-qualified ID. A change across the timeline is the
         # deterministic kill signature (process kill → container
-        # replacement). Last occurrence wins, mirroring Restart Count
+        # replacement). Last occurrence wins within the business section
         # (multi-container pods: the rule layer sees the last container).
         if "Container ID" in s:
             _cid = s.split()[-1] if s.split() else ""
             if _cid and "://" in _cid:
                 metrics["Container ID"] = _cid
-        # Ready conditions appear in multiple forms:
-        #   ``Ready             True``
-        #   ``Ready   True``
-        # Use regex to tolerate variable spacing without false matches.
-        m = re.search(r"^\s*Ready\s+(True|False)\b", s)
-        if m:
-            metrics["Pod Ready"] = m.group(1)
         # Last termination reason
         if "Reason:" in s:
             for kw in ("OOMKilled", "Error", "Completed", "Evicted"):
                 if kw in s:
                     metrics["Last termination reason"] = kw
                     break
+    # Pod Ready — top-level Conditions table only (see docstring).
+    for raw_line in stdout.splitlines():
+        m = re.search(r"^\s*Ready\s+(True|False)\b", raw_line)
+        if m:
+            metrics["Pod Ready"] = m.group(1)
     return metrics
 
 
@@ -268,6 +309,73 @@ def _parse_get_pod_json(stdout: str) -> dict[str, str]:
         for cond in status.get("conditions") or []:
             if isinstance(cond, dict) and cond.get("type") == "Ready":
                 metrics["Pod Ready"] = cond.get("status", "Unknown")
+    return metrics
+
+
+def _parse_get_deployment_json(stdout: str) -> dict[str, str]:
+    """``kubectl get deployment -o json``: workload replica state.
+
+    m7 (r68 review): the r43 live case's scope — its mechanism readback
+    (``get deployment -o json``) previously produced NO structured
+    metrics because the JSON dispatch was pod-only. Fields follow the
+    workload drills' judgement vocabulary (replica mismatch, HPA cap,
+    scaled-down): spec.replicas vs status.readyReplicas/replicas/
+    unavailableReplicas.
+
+    r68 self-review C1 (measured in .b4tmp/r68_review_c1_probe.py): the
+    nameless form ``get deployments -o json`` returns the GENERIC List
+    shape (``{"kind": "List", "items": […]}`` — unlike pods' dedicated
+    ``PodList`` kind) and used to yield ``{}`` while the pod parser's
+    List precedent yielded metrics. Unrolled the same way: per-item
+    extraction, key collisions last-wins (a multi-deployment listing
+    reports the LAST item — same policy as the pod parser).
+    """
+    metrics: dict[str, str] = {}
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return metrics
+    if not isinstance(data, dict):
+        return metrics
+    items = data.get("items", []) if data.get("kind") == "List" else [data]
+    for dep in items:
+        if not isinstance(dep, dict):
+            continue
+        spec = dep.get("spec") or {}
+        status = dep.get("status") or {}
+        if "replicas" in spec:
+            metrics["Spec replicas"] = str(spec["replicas"])
+        for field in ("readyReplicas", "availableReplicas", "unavailableReplicas", "replicas"):
+            if field in status:
+                metrics[f"Status {field}"] = str(status[field])
+    return metrics
+
+
+def _parse_get_node_json(stdout: str) -> dict[str, str]:
+    """``kubectl get node -o json``: node condition state.
+
+    m7 (r68 review): the node drills' judgement vocabulary is the
+    conditions array (MemoryPressure / DiskPressure / Ready / …) — the
+    JSON form is the API server's authoritative shape.
+
+    r68 self-review C1: same generic-List unroll as the deployment
+    parser (nameless ``get nodes -o json``) — per-item extraction,
+    key collisions last-wins.
+    """
+    metrics: dict[str, str] = {}
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return metrics
+    if not isinstance(data, dict):
+        return metrics
+    items = data.get("items", []) if data.get("kind") == "List" else [data]
+    for node in items:
+        if not isinstance(node, dict):
+            continue
+        for cond in (node.get("status") or {}).get("conditions") or []:
+            if isinstance(cond, dict) and cond.get("type"):
+                metrics[f"Node {cond['type']}"] = str(cond.get("status", "Unknown"))
     return metrics
 
 

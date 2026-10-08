@@ -1016,6 +1016,69 @@ def _layer1_contradiction_gap_fires(
     )
 
 
+def _render_observed_blast_radius(side_effects: dict) -> str:
+    """Compact one-line rendering of verify-time measured side effects.
+
+    #59: the terminal card's ``blast_radius_detail`` carried ONLY the
+    planning-time prediction (frozen in ``finish_planning`` args) while
+    ``side_effects`` held the measured outcome — the card asserted
+    "exactly 3 evictions; 8 system DS + 2 drill pods exempt" against 7
+    measured evictions across two generations. This renders the measured
+    side so finalize can append it, clearly labelled, next to the plan.
+    """
+    if not isinstance(side_effects, dict) or not side_effects:
+        return ""
+    parts: list[str] = []
+    for key, value in side_effects.items():
+        if isinstance(value, list):
+            if not value:
+                continue
+            if all(isinstance(v, dict) for v in value):
+                names = "; ".join(
+                    str(v.get("name") or v.get("pod") or v.get("node") or "?")
+                    for v in value[:8]
+                )
+                suffix = "" if len(value) <= 8 else f"; …+{len(value) - 8}"
+                parts.append(f"{key}={len(value)} [{names}{suffix}]")
+            else:
+                parts.append(f"{key}={len(value)}")
+        elif isinstance(value, bool):
+            if value:
+                parts.append(f"{key}=true")
+        elif value not in (None, "", 0):
+            parts.append(f"{key}={value}")
+    return "; ".join(parts)[:400]
+
+
+def _apply_observed_blast_radius(
+    state: AgentState,
+    verification: dict,
+    result_update: dict,
+) -> None:
+    """Append the measured blast radius to the planning-time prediction.
+
+    The planning value stays intact as the prefix (the confirmation card
+    legitimately rendered it as a prediction); the observation rides a
+    labelled second line so the terminal card can no longer contradict
+    itself. Re-verify rounds REPLACE the observation instead of stacking
+    (split on the marker, keep the head).
+    """
+    try:
+        observed = _render_observed_blast_radius(
+            verification.get("side_effects") or {},
+        )
+    except Exception:  # noqa: BLE001 — rendering is never fatal
+        return
+    if not observed:
+        return
+    marker = "\nObserved (verify-time): "
+    planned = str(state.get("blast_radius_detail") or "")
+    head = planned.split(marker, 1)[0].rstrip()
+    result_update["blast_radius_detail"] = (
+        f"{head}{marker}{observed}" if head else f"Observed (verify-time): {observed}"
+    )
+
+
 def make_finalize_verification(registry=None):
     """Build the finalize_verification node."""
 
@@ -1459,6 +1522,9 @@ def make_finalize_verification(registry=None):
                 f"Layer2={verification.get('layer2', {}).get('status', 'unknown')}, "
                 f"Details={l2_details}"
             )
+        # #59 terminal-card fix: append the MEASURED side effects next to
+        # the planning-time prediction (see _apply_observed_blast_radius).
+        _apply_observed_blast_radius(state, verification, result_update)
         result_update = write_inject_verification(
             result_update,
             result=result,

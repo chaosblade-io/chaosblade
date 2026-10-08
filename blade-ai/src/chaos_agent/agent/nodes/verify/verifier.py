@@ -15,7 +15,7 @@ import logging
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from chaos_agent.agent.node_names import VERIFIER
+from chaos_agent.agent.node_names import VERIFIER, VERIFIER_LOOP
 from chaos_agent.agent.capabilities import (
     build_capability_context,
     filter_tools_for_context,
@@ -26,6 +26,7 @@ from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
     inject_task_id_into_tool_calls,
     sync_kubewiz_runtime,
 )
+from chaos_agent.agent.nodes.execute.react_helpers import record_ai_message
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store
 from chaos_agent.agent.nodes.verify._verifier_layer1 import (
     run_layer1_for_state,
@@ -61,6 +62,7 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
 )
 from chaos_agent.agent.nodes.execute.llm_step_helpers import (
     build_stagnation_hint,
+    fold_hint_state,
     persist_corrective_hint,
     filter_stagnant_tool,
     post_invoke_debug,
@@ -93,7 +95,6 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
-from chaos_agent.utils.time import now_iso
 from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.providers import FaultProviderRegistry
 
@@ -123,35 +124,6 @@ def _resolve_fault_dispatch(state):
     recover chain uses (experiment claim → message-history claim →
     attribution handle → method)."""
     return FaultProviderRegistry.resolve_fault_dispatch(state)
-
-
-def _stamp_window_start(state: AgentState, result: dict) -> None:
-    """Stamp ``injection_window_start_time`` at the verifier entry.
-
-    The verifier is the first node after the execute-loop concludes, so
-    this moment IS the execute-loop end for window purposes — the
-    fault-window hold (``turn_hold_fault_window``) anchors its contract
-    window here, and verification time counts against that window (an
-    execute-loop that kept probing after blade_create succeeded must not
-    have eroded it first).
-
-    Write-once per attempt: verifier self-loop re-entries (L2 needing
-    more tool evidence) keep the FIRST stamp — the window origin is a
-    fact about the execute-loop boundary, not about any given verify
-    iteration. Re-arming happens exclusively at replan seams, where
-    ``reset_attribution_state`` clears the field and the replanned
-    attempt's verifier entry stamps a fresh origin.
-
-    Guarded on ``injection_start_time`` (the blade_create-moment
-    attribution evidence): a turn that never committed an injection has
-    no window to anchor, and stamping anyway would let the hold flip a
-    recover dispatch for a turn with no experiment in flight.
-    """
-    if state.get("injection_window_start_time"):
-        return
-    if not state.get("injection_start_time"):
-        return
-    result["injection_window_start_time"] = now_iso()
 
 
 def _recovery_vehicle_of(state: dict) -> str | None:
@@ -363,11 +335,6 @@ async def verifier(state: AgentState) -> dict:
         await dispatch_node_message("verifier", f"Verification result: {layer1.status}")
 
     result_dict = write_inject_verification(result=result, verification=verification)
-    # Window origin (fault-window hold): the execute-loop just concluded —
-    # this entry is the earliest moment that fact is observable. Must ride
-    # the TOP-LEVEL update (not inside ``result``) to reach the state
-    # channel; write-once + attribution-guarded, see the helper.
-    _stamp_window_start(state, result_dict)
     if not _verified:
         result_dict.update(fail_state(
             FailureCategory.VERIFICATION_FAILED,
@@ -572,6 +539,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         # the summarised half of history and a hint sits at its FIRST
         # occurrence, so message-derived counts reset mid-drill.
         _hint_counts = dict(state.get("hint_repeat_counts") or {})
+        _hinted_calls = dict(state.get("hinted_error_calls") or {})
 
         # Repeated tool call detection (reuse from agent_loop)
         loop_hint = detect_repeated_tool_calls(state.get("messages", []), phase="verify")
@@ -601,12 +569,19 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 counts=_hint_counts, counts_out=_hint_counts,
             ))
 
-        # Tool error introspection (runtime feedback > static docs)
-        error_hint = detect_tool_error_hint(messages)
-        if error_hint:
+        # Tool error introspection (runtime feedback > static docs).
+        # ``escalate_after`` is not passed: None inherits the legislation, so
+        # this kind escalates by construction. Key is the failing tool, which
+        # only the detector knows.
+        _err = detect_tool_error_hint(messages, hinted_calls=_hinted_calls)
+        if _err:
+            error_hint, error_tool, error_call = _err
+            _err_key = error_tool or "verify"
+            if error_call:
+                _hinted_calls[error_call] = f"tool_error:{_err_key}"
             messages.append(persist_corrective_hint(
                 _hints_for_state, state.get("messages", []),
-                "tool_error", "verify", error_hint,
+                "tool_error", _err_key, error_hint,
                 counts=_hint_counts, counts_out=_hint_counts,
             ))
 
@@ -706,6 +681,14 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         inject_task_id_into_tool_calls(response, task_id)
         sync_kubewiz_runtime(state)
 
+        # Immediate archival with loop attribution — same record_ai_message
+        # pattern as execute_loop/agent_loop (which is why their AI turns
+        # carry ``_node`` in the task JSON while the verifier's did not:
+        # Case #58 archived 5 verifier AI turns with no node). The hook's
+        # flush later re-writes the same messages idempotently (id-first
+        # dedup, B78).
+        record_ai_message(hook, state, response, node_name=VERIFIER_LOOP)
+
         # Read-only phase discipline is enforced by the verifier_screener
         # graph-edge node (graph.py) between this node and verifier_tools,
         # mirroring phase1_screener / tool_screener.
@@ -715,12 +698,6 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             "verifier_loop_count": count,
             "inject_layer1_cache": layer1_to_dict(layer1),  # persist for subsequent iterations
         }
-        # Window origin (fault-window hold): the execute-loop just concluded
-        # — this FIRST verifier step is the earliest observable moment of
-        # that fact. Write-once per attempt: verifier self-loop re-entries
-        # (this node returns per ReAct step) keep the first stamp; replan
-        # seams clear the field and the replanned attempt re-stamps here.
-        _stamp_window_start(state, result_update)
 
         tool_calls = getattr(response, "tool_calls", None) or []
         # Scheme B: verifier_loop is a pure ReAct step. Persist the response
@@ -731,8 +708,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         result_update["messages"] = (
             _main_hm_for_state + _synthetic_for_state + _hints_for_state + [response]
         )
-        if _hint_counts != (state.get("hint_repeat_counts") or {}):
-            result_update["hint_repeat_counts"] = _hint_counts
+        fold_hint_state(result_update, state, _hint_counts, _hinted_calls)
 
         if settings.is_debug:
             post_invoke_debug(tracker, response, count, "Layer 2 iteration")

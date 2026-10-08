@@ -329,6 +329,66 @@ class TestPromptTeachingDerivation:
         )
         assert set(_ITEM_STATUS_PROSE.split(", ")) == CHECKLIST_STATUS_VALUES
 
+    def test_submit_doc_teaches_the_consistency_contract(self):
+        # B2: the downgrade rules the enforcer actually applies are
+        # TAUGHT at submit time — the model sees the contract while
+        # filling the args, not only in the post-hoc warning after a
+        # mismatch cost a re-verify round.
+        doc = submit_verification.description
+        assert "Consistency contract" in doc
+        assert "DOWNGRADED" in doc
+        # Each taught rule mirrors a real enforcement branch in
+        # _verification_from_submit_args (order: the doc's bullet list).
+        # Arrow form ("+ →") keeps the contract inside the schema budget
+        # cap (610, see test_tool_description_budget.py).
+        assert '"verified" + primary_evidence_observed=false' in doc
+        assert '"verified" + layer2_status="failed"' in doc
+        assert 'layer2_status="partial" → overall "partial"' in doc
+        assert "inconsistency warning" in doc
+        assert "absence" in doc
+
+    def test_taught_contract_matches_the_enforcer(self):
+        # Behavioural anchor: for every taught rule, the enforcer really
+        # downgrades exactly as the doc says — the contract can never
+        # drift into teaching a rule code does not apply.
+        # Rule 1: verified + no primary evidence -> partial
+        r = _verification_from_submit_args({
+            "overall": "verified", "layer2_status": "passed",
+            "primary_evidence_observed": False,
+        })
+        assert r["level"] == "partial"
+        # Rule 2: verified + layer2 failed -> unverified
+        r = _verification_from_submit_args({
+            "overall": "verified", "layer2_status": "failed",
+            "primary_evidence_observed": True,
+        })
+        assert r["level"] == "unverified"
+        # Rule 3: layer2 partial forces level partial
+        r = _verification_from_submit_args({
+            "overall": "verified", "layer2_status": "partial",
+            "primary_evidence_observed": True,
+        })
+        assert r["level"] == "partial"
+        # Rule 4: layer2 passed + failed checklist item with ABSENCE
+        # evidence -> layer2 partial (objective measurement overrides);
+        # without absence evidence the mismatch stays a warning only.
+        r = _verification_from_submit_args({
+            "overall": "verified", "layer2_status": "passed",
+            "primary_evidence_observed": True,
+            "checklist": [{"step": 1, "status": "failed",
+                           "evidence": "cpu far below threshold"}],
+        })
+        assert r["layer2"]["status"] == "partial"
+        assert any("inconsistency" in w for w in r["warnings"])
+        r_warn_only = _verification_from_submit_args({
+            "overall": "verified", "layer2_status": "passed",
+            "primary_evidence_observed": True,
+            "checklist": [{"step": 1, "status": "failed",
+                           "evidence": "timing delay"}],
+        })
+        assert r_warn_only["layer2"]["status"] == "passed"
+        assert any("inconsistency" in w for w in r_warn_only["warnings"])
+
 
 # ---------------------------------------------------------------------------
 # 4. Parsing: the derived regexes parse every enum member

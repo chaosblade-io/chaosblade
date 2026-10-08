@@ -494,7 +494,6 @@ class TestBudgetHintsPersistByReplacement:
     def test_all_three_tiers_are_persisted(self, module_path):
         import importlib
         import inspect
-        import re
 
         src = inspect.getsource(importlib.import_module(module_path))
         for marker in ("Iteration Progress", "CRITICAL WARNING", "FINAL ITERATION"):
