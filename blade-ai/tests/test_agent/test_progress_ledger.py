@@ -775,6 +775,507 @@ def test_update_progress_is_classified_readonly_not_an_injection():
     assert infer_effective_target("update_progress", {}).scope == SCOPE_READONLY
 
 
+# ── finish_execution soft gate (SKILL.md 生效确认硬门禁) ────────────────
+#
+# Live case inject-3dae7b4f: the executor obeyed the old "then STOP"
+# directive, finished 46s before the verifier's first behavioral probe, and
+# the drill survived only on fault-window slack. The gate is SOFT — the
+# terminal ledger write always proceeds; what changes is the RECEIPT: a
+# red-line reminder instead of "do not call more tools", so a model that
+# genuinely forgot the behavioral probe can still take it next turn.
+
+class TestFinishExecutionSoftGate:
+    """behavioral_reminder_due + the conditional finish_execution receipt."""
+
+    @staticmethod
+    def _ai(call_id, name, args):
+        from langchain_core.messages import AIMessage
+        return AIMessage(content="", tool_calls=[
+            {"name": name, "id": call_id, "type": "tool_call", "args": args},
+        ])
+
+    @staticmethod
+    def _tm(call_id, content="ok"):
+        from langchain_core.messages import ToolMessage
+        return ToolMessage(content=content, tool_call_id=call_id, name="tool")
+
+    def _finish(self, messages, artifacts=None):
+        from chaos_agent.tools.progress import finish_execution
+        # InjectedToolCallId tools demand the full ToolCall protocol form
+        # (a bare args dict is rejected at the @tool boundary).
+        state = {"messages": messages}
+        if artifacts is not None:
+            state["execution_artifacts"] = artifacts
+        return finish_execution.invoke({
+            "name": "finish_execution",
+            "type": "tool_call",
+            "id": "fin1",
+            "tool_call_id": "fin1",
+            "args": {
+                "summary": "fault injected",
+                "state": state,
+            },
+        })
+
+    @staticmethod
+    def _receipt_text(cmd):
+        return cmd.update["messages"][0].content
+
+    def test_live_shape_fires_the_reminder(self):
+        # inject-3dae7b4f's exact transcript shape: injection (kubectl
+        # patch) → mechanism readback (get -o json) → finish. No
+        # behavioral read after the injection → the receipt must carry
+        # the red line, and must NOT tell the model "do not call more
+        # tools" over it.
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d --patch-file p.json"}),
+            self._tm("t1", "deployment.apps/d patched"),
+            self._ai("t2", "kubectl",
+                     {"subcommand": "get", "v_args": "deployment d -o json"}),
+            self._tm("t2", '{"spec": {"template": {}}}'),
+            self._ai("t3", "update_progress",
+                     {"log_append": [{"event": "injected", "status": "observed"}]}),
+            self._tm("t3", "progress recorded"),
+        ]
+        cmd = self._finish(msgs)
+        receipt = self._receipt_text(cmd)
+        assert "RED-LINE REMINDER" in receipt
+        assert "do not call more tools" not in receipt
+        # SOFT gate: the terminal ledger delta still proceeds untouched
+        # (phase marker + log entry) — hard-blocking the write is
+        # deliberately out of scope until more live data accumulates.
+        assert cmd.update["progress_ledger"]["state_update"] == {
+            "phase": "execution-complete",
+        }
+        assert cmd.update["progress_ledger"]["log_append"][0]["status"] == "observed"
+
+    def test_behavioral_probe_after_injection_silences_gate(self):
+        # The compliant shape: one behavioral probe (logs) after the
+        # injection → the classic receipt, no reminder.
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d --patch-file p.json"}),
+            self._tm("t1", "deployment.apps/d patched"),
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "logs", "v_args": "pod/d -n ns --previous"}),
+            self._tm("t2", "back-off restarting failed container"),
+        ]
+        receipt = self._receipt_text(self._finish(msgs))
+        assert "do not call more tools" in receipt
+        assert "RED-LINE REMINDER" not in receipt
+
+    def test_no_injection_no_reminder(self):
+        # Fail-open: a transcript with no injection (read-only exit) must
+        # never be nagged about evidence for a fault that never landed.
+        msgs = [
+            self._ai("t1", "kubectl_read", {"subcommand": "get", "v_args": "pods -A"}),
+            self._tm("t1", "NAME  READY"),
+        ]
+        assert "RED-LINE REMINDER" not in self._receipt_text(self._finish(msgs))
+
+    def test_failed_injection_is_no_anchor(self):
+        # An errored blade_create is not an anchor — the model retries or
+        # replans; nagging about behavioral evidence for a fault that
+        # never landed would be noise.
+        msgs = [
+            self._ai("t1", "blade_create", {"command": "blade create k8s pod-cpu fullload"}),
+            self._tm("t1", "Error: create experiment failed"),
+        ]
+        assert "RED-LINE REMINDER" not in self._receipt_text(self._finish(msgs))
+
+    def test_probe_before_injection_does_not_count(self):
+        # SKILL.md's 先只读探针 (pre-arm state-file reads) predates the
+        # fault — evidence taken BEFORE the injection is not behavioral
+        # evidence OF the fault.
+        msgs = [
+            self._ai("t0", "kubectl",
+                     {"subcommand": "exec", "v_args": "pod/d -- cat /tmp/pids"}),
+            self._tm("t0", "1234"),
+            self._ai("t1", "blade_create", {"command": "blade create k8s pod-cpu fullload"}),
+            self._tm("t1", '{"success": true, "uid": "abc123"}'),
+        ]
+        assert "RED-LINE REMINDER" in self._receipt_text(self._finish(msgs))
+
+    def test_reinjection_resets_the_evidence_window(self):
+        # Two injections (retry / second fault): only probes AFTER the
+        # LAST injection count — a probe before a re-injection observed
+        # the previous fault, not the current one.
+        msgs = [
+            self._ai("t1", "blade_create", {"command": "blade create k8s pod-cpu fullload"}),
+            self._tm("t1", '{"success": true, "uid": "u1"}'),
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "logs", "v_args": "pod/d -n ns"}),
+            self._tm("t2", "symptom seen"),
+            self._ai("t3", "blade_create", {"command": "blade create k8s pod-mem load"}),
+            self._tm("t3", '{"success": true, "uid": "u2"}'),
+        ]
+        assert "RED-LINE REMINDER" in self._receipt_text(self._finish(msgs))
+
+    def test_exec_read_counts_as_behavioral(self):
+        # exec is dual-purpose (mechanism rules readback AND in-container
+        # probe) — the soft gate reads it as behavioral evidence, the
+        # forgiving direction: a missed reminder costs less than a false
+        # one at a SOFT gate whose only act is receipt wording.
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d --patch-file p.json"}),
+            self._tm("t1", "deployment.apps/d patched"),
+            self._ai("t2", "kubectl",
+                     {"subcommand": "exec", "v_args": "pod/d -- curl -m 3 svc-x"}),
+            self._tm("t2", "curl: (28) Operation timed out"),
+        ]
+        assert "RED-LINE REMINDER" not in self._receipt_text(self._finish(msgs))
+
+    def test_registered_teardown_delete_keeps_evidence_window(self):
+        # M3 (r68 review, class-one recurrence): the framework ITSELF
+        # teaches cleanup (kubectl_cli recommends the debug-pod delete),
+        # so the compliant flow ends inject → probe → cleanup → finish.
+        # A delete recognized as an anchor erased the probe that DID land
+        # (measured in .b4tmp/r68_m3_probe.py case A2) — the teardown
+        # judgement is single-sourced through make_teardown_matcher, so a
+        # REGISTERED-vehicle delete neither anchors nor resets.
+        artifacts = [{
+            "type": "debug_pod", "kind": "Pod",
+            "name": "node-debugger-xxx", "namespace": "default",
+        }]
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d --patch-file p.json"}),
+            self._tm("t1", "deployment.apps/d patched"),
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "logs", "v_args": "pod/d -n ns"}),
+            self._tm("t2", "symptom seen"),
+            self._ai("t3", "kubectl",
+                     {"subcommand": "delete", "v_args": "pod node-debugger-xxx -n default"}),
+            self._tm("t3", 'pod "node-debugger-xxx" deleted'),
+        ]
+        receipt = self._receipt_text(self._finish(msgs, artifacts))
+        assert "RED-LINE REMINDER" not in receipt
+        assert "do not call more tools" in receipt
+
+    def test_unregistered_delete_still_anchors_conservatively(self):
+        # The DEMOLITION face is REGISTRY-matched by design (the
+        # delete-pod-to-restart fault form is a real native mutation):
+        # without a registration the delete stays an anchor — the
+        # fail-safe direction for a gate whose only act is receipt
+        # wording.
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d --patch-file p.json"}),
+            self._tm("t1", "deployment.apps/d patched"),
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "logs", "v_args": "pod/d -n ns"}),
+            self._tm("t2", "symptom seen"),
+            self._ai("t3", "kubectl",
+                     {"subcommand": "delete", "v_args": "pod some-unregistered-pod -n default"}),
+            self._tm("t3", 'pod "some-unregistered-pod" deleted'),
+        ]
+        assert "RED-LINE REMINDER" in self._receipt_text(self._finish(msgs))
+
+    def test_uncordon_recovery_is_not_an_anchor(self):
+        # M3 case B (measured): uncordon is the cordon drill's RECOVERY
+        # verb — anchoring it reset the window after cleanup and erased
+        # the landed probe. node drill: cordon inject → probe → uncordon
+        # restore → finish must get the classic receipt.
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "cordon", "v_args": "node worker-1"}),
+            self._tm("t1", "node/worker-1 cordoned"),
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "get", "v_args": "events -n default"}),
+            self._tm("t2", "Normal  NotReady  ..."),
+            self._ai("t3", "kubectl",
+                     {"subcommand": "uncordon", "v_args": "node worker-1"}),
+            self._tm("t3", "node/worker-1 uncordoned"),
+        ]
+        receipt = self._receipt_text(self._finish(msgs))
+        assert "RED-LINE REMINDER" not in receipt
+        assert "do not call more tools" in receipt
+
+    def test_blade_python_revoke_is_not_an_anchor(self):
+        # M3 case C (measured): the prefix form swallowed the UNDO —
+        # blade_python_revoke is teardown, exact-name anchoring follows
+        # the provider's own inject_tool_names vocabulary.
+        msgs = [
+            self._ai("t1", "blade_python_create", {"command": "blade py create ..."}),
+            self._tm("t1", '{"success": true, "uid": "u1"}'),
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "logs", "v_args": "pod/d -n ns"}),
+            self._tm("t2", "symptom seen"),
+            self._ai("t3", "blade_python_revoke", {"uid": "u1"}),
+            self._tm("t3", '{"success": true}'),
+        ]
+        receipt = self._receipt_text(self._finish(msgs))
+        assert "RED-LINE REMINDER" not in receipt
+        assert "do not call more tools" in receipt
+
+    def test_host_profile_readonly_diagnostic_is_behavioral_probe(self):
+        # M2 (r68 review, measured in .b4tmp/r68_m2_probe.py): the host
+        # profile's EXECUTE surface binds ONLY host_inject, so the host's
+        # only issuable probe form is host_inject's read-only-diagnostic
+        # superset role. Without content awareness the reminder was
+        # UNCONDITIONAL on host and its suggested kubectl probes had no
+        # tool to run them.
+        msgs = [
+            self._ai("t1", "host_inject",
+                     {"command": "tc qdisc add dev eth0 root netem delay 500ms"}),
+            self._tm("t1", "done"),
+            self._ai("t2", "host_inject", {"command": "df -h /var/lib"}),
+            self._tm("t2", "/dev/sda1  50G  12G  38G  24% /var/lib"),
+        ]
+        receipt = self._receipt_text(self._finish(msgs))
+        assert "RED-LINE REMINDER" not in receipt
+        assert "do not call more tools" in receipt
+
+    def test_host_profile_no_probe_still_reminds(self):
+        # M2's other arm: a real host injection with NO probe after it
+        # still nags — content awareness must not swallow the anchor.
+        msgs = [
+            self._ai("t1", "host_inject",
+                     {"command": "tc qdisc add dev eth0 root netem delay 500ms"}),
+            self._tm("t1", "done"),
+        ]
+        assert "RED-LINE REMINDER" in self._receipt_text(self._finish(msgs))
+
+    def test_kubectl_debug_and_run_are_anchors(self):
+        # m4 (r68 review, schema-dumped): ``debug`` (the node-debugger
+        # carrier write) and ``run`` (the recovery-carrier run shape) are
+        # issuable writes on the FULL kubectl surface — they were missing
+        # from the anchor set while four dead entries (replace/edit/
+        # remove/rollout — unavailable or not whitelisted) sat in it.
+        for sub, v_args in (
+            ("debug", "node/worker-1 --image=busybox -- chroot /host"),
+            ("run", "carrier --image=alpine -- sleep 3600"),
+        ):
+            msgs = [
+                self._ai("t1", "kubectl", {"subcommand": sub, "v_args": v_args}),
+                self._tm("t1", "created"),
+            ]
+            assert "RED-LINE REMINDER" in self._receipt_text(self._finish(msgs)), sub
+
+    def test_kubectl_read_debug_probe_is_behavioral(self):
+        # m4's dual-face ruling: kubectl_read's Literal surface is
+        # read-only INCLUDING debug — an in-container probe through it is
+        # behavioral evidence, never an anchor (only the FULL kubectl
+        # debug write anchors).
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d -p '{...}'"}),
+            self._tm("t1", "patched"),
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "debug", "v_args": "pod/d --image=busybox -- cat /proc/pressure"}),
+            self._tm("t2", "some 10 50 100"),
+        ]
+        receipt = self._receipt_text(self._finish(msgs))
+        assert "RED-LINE REMINDER" not in receipt
+        assert "do not call more tools" in receipt
+
+    def test_debug_dual_face_isolated_predicates_agree(self):
+        # r68 self-review C14 (measured): the shared
+        # _BEHAVIORAL_READ_SUBCOMMANDS set used to answer True for
+        # kubectl-face debug too — masked only by the caller's if/elif
+        # order, leaving the ISOLATED predicate disagreeing with the
+        # anchor side (duplicate-oracle seed: any future direct caller
+        # would misread a debug-pod creation as behavioral evidence).
+        # The split pins both faces at the predicate level.
+        from chaos_agent.tools.progress import (
+            _is_behavioral_read,
+            _is_injection_call,
+        )
+        args = {"subcommand": "debug", "v_args": "node/n1 --image=busybox"}
+        assert _is_injection_call("kubectl", args) is True
+        assert _is_behavioral_read("kubectl", args) is False
+        assert _is_injection_call("kubectl_read", args) is False
+        assert _is_behavioral_read("kubectl_read", args) is True
+
+    def test_redline_reminder_is_one_shot_per_window(self):
+        # m5 (r68 review, measured in .b4tmp/r68_m5_probe.py): without a
+        # latch the reminder re-fired on every finish while the model
+        # kept choosing mechanism readbacks — a ping-pong whose rounds
+        # consumed the fault window the reminder exists to protect. One
+        # reminder per injection window; after it the receipt returns to
+        # the classic wording.
+        inject = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d -p '{...}'"}),
+            self._tm("t1", "patched"),
+        ]
+        first = self._receipt_text(self._finish(inject))
+        assert "RED-LINE REMINDER" in first
+        history = inject + [
+            # round 1's receipt is now transcript fact (pairing by
+            # tool_call_id, the same way live rounds land)
+            self._ai("f1", "finish_execution", {"summary": "done"}),
+            self._tm("f1", first),
+            # the model answers with a mechanism readback, NOT a probe
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "get", "v_args": "deployment d -o json"}),
+            self._tm("t2", '{"spec": {}}'),
+        ]
+        second = self._receipt_text(self._finish(history))
+        assert "RED-LINE REMINDER" not in second
+        assert "do not call more tools" in second
+
+    def test_redline_reminder_rearms_after_reinjection(self):
+        # The latch is PER WINDOW, not global: a re-injection (retry,
+        # second fault) opens a fresh evidence window whose probe is
+        # again owed — the transcript-derived latch must re-arm.
+        inject = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d -p '{...}'"}),
+            self._tm("t1", "patched"),
+        ]
+        first = self._receipt_text(self._finish(inject))
+        history = inject + [
+            self._ai("f1", "finish_execution", {"summary": "done"}),
+            self._tm("f1", first),
+            # re-injection: new window
+            self._ai("t2", "blade_create", {"command": "blade create k8s pod-cpu fullload"}),
+            self._tm("t2", '{"success": true, "uid": "u2"}'),
+        ]
+        assert "RED-LINE REMINDER" in self._receipt_text(self._finish(history))
+
+    def test_time_wait_receipt_carries_redline_for_first_banned_move(self):
+        # o10 (r68 review, measured in .b4tmp/r68_o10_probe.py): SKILL.md
+        # bans THREE moves on missing behavioral evidence (不得进入等待/
+        # 不得拆线/不得结束执行段) — only the third had a guard. time_wait
+        # is the FIRST banned move's channel: its receipt now carries the
+        # same soft-gate reminder (the wait itself proceeds).
+        import asyncio
+
+        from chaos_agent.tools.wait import reset_wait_state, time_wait
+
+        async def _wait(state):
+            reset_wait_state()
+            return await time_wait.ainvoke({"seconds": 1, "state": state})
+
+        msgs = [
+            self._ai("t1", "kubectl",
+                     {"subcommand": "patch", "v_args": "deployment d -p '{...}'"}),
+            self._tm("t1", "patched"),
+        ]
+        r1 = asyncio.run(_wait({"messages": msgs}))
+        assert "RED-LINE REMINDER" in r1
+        assert "Waited 1 seconds" in r1  # the wait itself proceeded (soft)
+
+        # probed → no reminder; latched → no repeat (one-shot per window)
+        probed = msgs + [
+            self._ai("t2", "kubectl_read",
+                     {"subcommand": "logs", "v_args": "pod/d -n ns"}),
+            self._tm("t2", "symptom seen"),
+        ]
+        assert "RED-LINE REMINDER" not in asyncio.run(_wait({"messages": probed}))
+
+        latched = msgs + [
+            self._ai("w1", "time_wait", {"seconds": 1}),
+            self._tm("w1", r1),
+        ]
+        assert "RED-LINE REMINDER" not in asyncio.run(_wait({"messages": latched}))
+
+    def test_predicate_fail_open_shapes(self):
+        # Non-dict / malformed state never raises and never nags. Anchored
+        # on behavioral_reminder_due (the LATCH predicate — the only live
+        # consumer of the window engine) since r68 review F1 retired the
+        # zero-consumer behavioral_evidence_missing predicate.
+        from chaos_agent.tools.progress import behavioral_reminder_due
+        assert behavioral_reminder_due(None) is False
+        assert behavioral_reminder_due("garbage") is False
+        assert behavioral_reminder_due({"messages": "not-a-list"}) is False
+        assert behavioral_reminder_due({"messages": []}) is False
+
+
+class TestAnchorVocabularyReconciliation:
+    """The soft gate's vocabulary sets are MIRRORS of the tools' own
+    issuable surfaces (r68 review F2: the mirror used to be checked only
+    by eyeball — drift on either side was review-intercepted, not
+    test-intercepted).
+
+    Sources of truth:
+      - kubectl's docstring whitelist (the only declaration of its
+        free-string subcommand surface),
+      - kubectl_cli.READONLY_SUBCOMMANDS + the kubectl_read Literal
+        (the read-only face's twin declarations).
+    """
+
+    def test_write_anchor_set_mirrors_kubectl_docstring_whitelist(self):
+        # _KUBECTL_INJECTION_SUBCOMMANDS must be EXACTLY the docstring
+        # whitelist minus its read verbs minus ``uncordon`` (M3 ruling:
+        # the cordon drill's RECOVERY verb, never an anchor). Any side
+        # drifting — a new whitelist verb (e.g. ``rollout``) added without
+        # an anchor entry, or a dead entry re-added here — goes red.
+        import re
+
+        from chaos_agent.tools.kubectl_cli import kubectl
+        from chaos_agent.tools.progress import _KUBECTL_INJECTION_SUBCOMMANDS
+
+        doc = kubectl.description or ""
+        i = doc.index("subcommand:")
+        j = doc.index(";", i)
+        whitelist = set(re.findall(r"[a-z-]+", doc[i + len("subcommand:"):j]))
+        # kubectl-face read verbs: mechanism readbacks (get/describe) and
+        # behavioral probes (top/logs/exec) are never anchors.
+        read_side = {"get", "describe", "top", "logs", "exec"}
+        assert _KUBECTL_INJECTION_SUBCOMMANDS == whitelist - read_side - {"uncordon"}
+
+    def test_behavioral_read_probe_faces_exist_in_readonly_literal(self):
+        # Every shared behavioral-read verb must be actually issuable on
+        # kubectl_read's read-only face, and the dual-faced ``debug``
+        # (read probe on kubectl_read, anchor on kubectl) must exist
+        # there too — a probe the tool cannot issue is a nag the model
+        # cannot satisfy. Also pins kubectl_cli's own twin declarations
+        # (tuple vs Literal enum) to each other.
+        from chaos_agent.tools.kubectl_cli import READONLY_SUBCOMMANDS, kubectl_read
+        from chaos_agent.tools.progress import _BEHAVIORAL_READ_SUBCOMMANDS
+
+        assert _BEHAVIORAL_READ_SUBCOMMANDS <= set(READONLY_SUBCOMMANDS)
+        assert "debug" in READONLY_SUBCOMMANDS
+        schema = kubectl_read.args_schema.model_json_schema()
+        enum = set(schema["properties"]["subcommand"].get("enum") or [])
+        assert enum == set(READONLY_SUBCOMMANDS)
+
+    def test_receipt_tools_mounted_and_latched(self):
+        # r68 review F3: the soft-gate channel has THREE sync points — the
+        # latch's tool-name set (REDLINE_RECEIPT_TOOLS), the receipt mark
+        # the latch matches on, and the in-tool mounting of
+        # behavioral_reminder_due. o10 added a channel by hand-editing all
+        # three; a future third banned-move channel edited ONE-sidedly
+        # would either ping-pong its reminder (mounted but unlatched) or
+        # carry a dead entry (latched but unmounted). This AST-scans every
+        # @tool function in the tools package for a behavioral_reminder_due
+        # call and pins the mount set to the latch set exactly. The mark
+        # constant itself is value-anchored by the hard-coded
+        # "RED-LINE REMINDER" assertions in the end-to-end receipt tests
+        # above (a renamed mark would break those, not this one).
+        import ast
+        from pathlib import Path
+
+        import chaos_agent.tools.progress as _progress
+        from chaos_agent.tools.progress import REDLINE_RECEIPT_TOOLS
+
+        def _is_tool_deco(d) -> bool:
+            # ``@tool`` and ``@tool(...)`` are both mounting surfaces.
+            target = d.func if isinstance(d, ast.Call) else d
+            return isinstance(target, ast.Name) and target.id == "tool"
+
+        mounted: set[str] = set()
+        for py in (Path(_progress.__file__).parent).glob("*.py"):
+            tree = ast.parse(py.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if not any(_is_tool_deco(d) for d in node.decorator_list):
+                    continue
+                for sub in ast.walk(node):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Name)
+                        and sub.func.id == "behavioral_reminder_due"
+                    ):
+                        mounted.add(node.name)
+        assert mounted == set(REDLINE_RECEIPT_TOOLS)
+
+
 # ── Persistence: survives interruption (real checkpointer) ─────────────
 
 @pytest.mark.asyncio

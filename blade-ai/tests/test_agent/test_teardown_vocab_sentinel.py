@@ -151,6 +151,18 @@ WHITELIST: dict[tuple[str, str], str] = {
     "KUBECTL_WRITE_SUBCOMMANDS`` publishes the word set to instances — it "
     "binds names and never touches message history, so no exemption "
     "applies here.",
+    (
+        "agent/nodes/planning/tool_screener.py",
+        "_is_object_write_injection",
+    ): "armed-before-inject object-write predicate (#65 apply-native fault "
+    "attribution): consumes the mutation vocabulary to answer 'mutation verb "
+    "OR apply/create of a persistent fault object', but the teardown "
+    "exemption is applied by its SINGLE caller — the armed-gate conjunct "
+    "``not _vehicle_delete_is_cleanup(...)`` (tool_screener L1934) — so a "
+    "drill-vehicle cleanup delete can never arm the gate through this "
+    "predicate. Mirrors the issue_time_method entry (a classifier that sees "
+    "only calls which already passed the caller's teardown skip); pinned by "
+    "the test_screener armed-gate cases.",
 }
 
 #: Message-scanning primitives REGISTERED OUT of the watch set, each

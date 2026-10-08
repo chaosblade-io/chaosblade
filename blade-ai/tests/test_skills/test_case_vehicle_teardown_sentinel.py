@@ -91,10 +91,20 @@ _VEHICLE_TEARDOWN_EXEMPT: dict[str, str] = {
     "Pod_OOM内存异常_limit单位写错.md": "assembler-note-only signature; degraded host is an existing tool Pod",
     "Pod_Terminating_Finalizers未清理.md": "assembler-note-only signature; degraded host is an existing tool Pod",
     "Pod_镜像拉取失败_凭证缺失或过期.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    # Added 2026-09-22 (#62 live-test prep): same per-case assembler migration
+    # shape as the M2 batch above (M4-style) — same exemption reason.
+    "Pod_镜像拉取失败_容器镜像被篡改.md": "assembler-note-only signature; degraded host is an existing tool Pod",
     "Pod_镜像拉取失败_镜像不存在或标签错误.md": "assembler-note-only signature; degraded host is an existing tool Pod",
     "Service_调用失败_ReadinessProbe配置不一致.md": "assembler-note-only signature; degraded host is an existing tool Pod",
     "Service_调用失败_selector不匹配.md": "assembler-note-only signature; degraded host is an existing tool Pod",
     "workload_副本被缩容_人为误操作.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    # Added 2026-09-23 (expand-k8s-case-coverage batch A): assembler-main-path
+    # cases — the drill-rc- signature appears ONLY in the assembler carrier-stack
+    # note; the degraded path delegates to the recovery-carrier SOP by reference
+    # ("武装命令形态参照 ConfigMap 篡改 case"), which itself carries the full
+    # tail-step knowledge — same exemption shape as the M2/M4 batches.
+    "Ingress_入口异常_后端服务不存在.md": "assembler-note-only signature; degraded path delegates to the ConfigMap SOP by reference",
+    "Ingress_入口异常_TLS证书过期.md": "assembler-note-only signature; degraded path delegates to the ConfigMap SOP by reference",
 }
 
 # The merged self-revoke flag strings (F-A propagation vector): a case
