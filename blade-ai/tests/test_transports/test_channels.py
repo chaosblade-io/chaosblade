@@ -643,7 +643,15 @@ class TestWizStderrPreservation:
         # shell logic only survives inside an explicit sh -c.
         assert wrapped.startswith("sh -c '")
         assert "( kubectl get pods ) 2>\"$E\"" in wrapped
-        assert '[ $rc -ne 0 ] && { printf "\\n"; cat "$E"; }' in wrapped
+        # The fold fires on failure OR non-empty stderr (the success-path
+        # stderr-preservation fix) — pin the condition so it cannot silently
+        # regress to the old failure-only ``[ $rc -ne 0 ]`` gate that rm -f'd
+        # a rc=0 command's stderr unread.
+        assert '{ [ $rc -ne 0 ] || [ -s "$E" ]; } && {' in wrapped
+        # The fold is sentinel-bracketed (protocol.WIZ_STDERR_BEGIN/_END)
+        # so parse_wiz_output can restore the POSIX stream split.
+        assert 'printf "\\n__WIZ_STDERR_BEGIN__\\n"; cat "$E"' in wrapped
+        assert 'printf "\\n__WIZ_STDERR_END__"; }; rm -f "$E"' in wrapped
         assert wrapped.rstrip("'").endswith("exit $rc")
 
     def test_wrapper_quotes_inner_args(self):
@@ -665,15 +673,25 @@ class TestWizStderrPreservation:
         assert inner == "kubectl patch deploy/x -p '{\"spec\":{\"replicas\":1}}'"
 
     @pytest.mark.parametrize("inner_cmd, expect_out, rc", [
-        # failure with BOTH streams → stderr appended after a newline
-        # separator (a mid-line stdout must not fuse with the first stderr line)
+        # failure with BOTH streams → stderr arrives sentinel-bracketed on
+        # stdout (the WIRE format; parse_wiz_output unfolds it back onto
+        # result.stderr — see TestWizStderrUnfold's round-trip below)
         (["sh", "-c", "printf partial; printf real-error >&2; exit 3"],
-         "partial\nreal-error", 3),
-        # failure with stderr only → still surfaces (leading blank line is
-        # the separator; stdout was empty)
-        (["sh", "-c", "printf only-err >&2; exit 1"], "\nonly-err", 1),
-        # success with stderr noise → stdout stays byte-identical
-        (["sh", "-c", "printf clean-ok; printf warn >&2"], "clean-ok", 0),
+         "partial\n__WIZ_STDERR_BEGIN__\nreal-error\n__WIZ_STDERR_END__", 3),
+        # failure with stderr only → the fold still lands on stdout (the
+        # BEGIN marker's leading newline is the separator)
+        (["sh", "-c", "printf only-err >&2; exit 1"],
+         "\n__WIZ_STDERR_BEGIN__\nonly-err\n__WIZ_STDERR_END__", 1),
+        # success with stderr noise → the fold NOW lands on stdout too: the
+        # wrapper preserves stderr whenever it is non-empty, not only on
+        # failure (THE FIX — systemd-run's "Running as unit" rides stderr on
+        # a rc=0 success). parse_wiz_output unfolds it back onto
+        # result.stderr; see test_success_with_stderr_recovers below.
+        (["sh", "-c", "printf clean-ok; printf warn >&2"],
+         "clean-ok\n__WIZ_STDERR_BEGIN__\nwarn\n__WIZ_STDERR_END__", 0),
+        # CLEAN success (empty stderr) → byte-identical: no markers, no fold.
+        # The invariant the fix must NOT break.
+        (["sh", "-c", "printf clean-ok"], "clean-ok", 0),
     ])
     def test_wrapper_semantics_via_local_shell(self, inner_cmd, expect_out, rc):
         import subprocess
@@ -702,3 +720,162 @@ class TestWizStderrPreservation:
         wrapped = KubewizHostChannel().wrap_command(["df", "-h"], target)
         cmd_str = wrapped[wrapped.index("--command") + 1]
         assert cmd_str.startswith("sh -c ")
+
+
+# ── wiz stderr unfold (B86 root fix) ──────────────────────────
+
+class TestWizStderrUnfold:
+    """The channel layer now RESTORES the POSIX stream split on arrival:
+    ``parse_wiz_output`` reverses the sentinel fold, so failure text rides
+    ``result.stderr`` again and consumers no longer need to remember the
+    fold (B86 family: detail-less failures + stderr-keyword verdicts
+    collapsing to UNKNOWN). Markerless or ambiguous stdout fails closed —
+    the pre-fix folded semantics, never worse."""
+
+    def _receipt(self, inner_stdout: str, inner_stderr: str, rc: int) -> CommandResult:
+        """A channel receipt exactly as the wrapper + wiz relay deliver it."""
+        from chaos_agent.transports.protocol import WIZ_STDERR_BEGIN, WIZ_STDERR_END
+
+        folded = inner_stdout + WIZ_STDERR_BEGIN + inner_stderr + WIZ_STDERR_END
+        return CommandResult(
+            exit_code=0,  # the wiz CLI itself succeeded; inner rc rides stdout
+            stdout=f"exit_code: {rc}\n{folded}",
+            stderr="",
+        )
+
+    def test_failure_restores_both_streams(self):
+        out = parse_wiz_output(self._receipt("partial", "the real error", 1))
+        assert out.exit_code == 1
+        assert out.stdout == "partial"
+        assert out.stderr == "the real error"
+
+    def test_stderr_only_failure_recovers_empty_stdout(self):
+        # BEGIN's leading newline belongs to the marker — an empty inner
+        # stdout recovers as "" (not "\n").
+        out = parse_wiz_output(self._receipt("", "only-err", 1))
+        assert out.exit_code == 1
+        assert out.stdout == ""
+        assert out.stderr == "only-err"
+
+    def test_wiz_cli_stderr_rides_after_inner_stderr(self):
+        from dataclasses import replace
+
+        receipt = replace(self._receipt("partial", "inner-err", 2),
+                          stderr="wiz-cli-noise")
+        out = parse_wiz_output(receipt)
+        assert out.exit_code == 2
+        assert out.stderr == "inner-err\nwiz-cli-noise"
+
+    def test_success_stays_byte_identical(self):
+        r = CommandResult(exit_code=0, stdout="exit_code: 0\nclean-ok", stderr="")
+        out = parse_wiz_output(r)
+        assert out.exit_code == 0
+        assert out.stdout == "clean-ok"
+        assert out.stderr == ""
+
+    def test_markerless_failure_stays_folded(self):
+        # Legacy / pre-fix receipts and foreign wrappers carry no markers —
+        # fail closed: nothing is rewritten, semantics unchanged.
+        r = CommandResult(
+            exit_code=0, stdout="exit_code: 1\nout\nerr-on-stdout", stderr="")
+        out = parse_wiz_output(r)
+        assert out.exit_code == 1
+        assert out.stdout == "out\nerr-on-stdout"
+        assert out.stderr == ""
+
+    def test_duplicated_begin_fails_closed(self):
+        from chaos_agent.transports.protocol import WIZ_STDERR_BEGIN, WIZ_STDERR_END
+
+        payload = "a" + WIZ_STDERR_BEGIN + "x" + WIZ_STDERR_BEGIN + "y" + WIZ_STDERR_END
+        r = CommandResult(
+            exit_code=0, stdout=f"exit_code: 1\n{payload}", stderr="")
+        out = parse_wiz_output(r)
+        assert out.stdout == payload  # untouched
+
+    def test_nonterminal_end_fails_closed(self):
+        from chaos_agent.transports.protocol import WIZ_STDERR_BEGIN, WIZ_STDERR_END
+
+        payload = WIZ_STDERR_BEGIN + "y" + WIZ_STDERR_END + "trailing"
+        r = CommandResult(
+            exit_code=0, stdout=f"exit_code: 1\n{payload}", stderr="")
+        out = parse_wiz_output(r)
+        assert out.stdout == payload  # untouched
+
+    def test_end_inside_stderr_survives_verbatim(self):
+        # Only the TERMINAL END is the marker; an END inside the stderr
+        # payload is payload, not a marker.
+        out = parse_wiz_output(
+            self._receipt("", "boom __WIZ_STDERR_END__ tail", 2))
+        assert out.exit_code == 2
+        assert out.stderr == "boom __WIZ_STDERR_END__ tail"
+
+    def test_relay_trailing_newline_is_tolerated(self):
+        from chaos_agent.transports.protocol import WIZ_STDERR_BEGIN, WIZ_STDERR_END
+
+        # Probed live 2026-09-22: the wiz relay prints stdout with one
+        # extra trailing newline AFTER the END marker (the local wrapper
+        # output ends at END). The unfold must still fire; only the
+        # relay's newline is dropped.
+        folded = "partial" + WIZ_STDERR_BEGIN + "real-error" + WIZ_STDERR_END + "\n"
+        r = CommandResult(exit_code=0, stdout=f"exit_code: 3\n{folded}", stderr="")
+        out = parse_wiz_output(r)
+        assert out.exit_code == 3
+        assert out.stdout == "partial"
+        assert out.stderr == "real-error"
+
+    def test_local_shell_roundtrip_restores_streams(self):
+        # Full chain minus the platform hop: the wrapper (real sh
+        # semantics) → the receipt shape wiz delivers (CLI rc=0, stdout
+        # starts with "exit_code:") → parse_wiz_output → streams restored.
+        import subprocess
+
+        from chaos_agent.transports.channels import _wiz_preserve_stderr
+
+        inner = ["sh", "-c", "printf partial; printf real-error >&2; exit 3"]
+        p = subprocess.run(
+            ["sh", "-c", _wiz_preserve_stderr(inner)],
+            capture_output=True, text=True, timeout=10,
+        )
+        r = CommandResult(
+            exit_code=0,
+            stdout=f"exit_code: {p.returncode}\n{p.stdout}",
+            stderr="",
+        )
+        out = parse_wiz_output(r)
+        assert out.exit_code == 3
+        assert out.stdout == "partial"
+        assert out.stderr == "real-error"
+
+    def test_success_with_stderr_recovers_on_wire_and_unfolds(self):
+        # THE FIX, end to end. A rc=0 command that writes its confirmation to
+        # stderr (systemd-run's "Running as unit", dd/tar/curl stats) used to
+        # have that evidence rm -f'd unread by the failure-only fold gate: the
+        # success receipt came back EMPTY (incident #66/#67 — the armed-timer
+        # receipt was len=0/status=success) and every "did it really arm?"
+        # read could only guess from framework bookkeeping. The wrapper now
+        # folds on non-empty stderr regardless of rc, and parse_wiz_output's
+        # unfold is no longer rc-gated, so the confirmation survives on
+        # result.stderr with exit_code 0 and stdout byte-clean.
+        import subprocess
+
+        from chaos_agent.transports.channels import _wiz_preserve_stderr
+
+        inner = [
+            "sh", "-c",
+            "printf armed-ok; "
+            "printf 'Running as unit: blade-restore-x.service' >&2",
+        ]
+        p = subprocess.run(
+            ["sh", "-c", _wiz_preserve_stderr(inner)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert p.returncode == 0
+        r = CommandResult(
+            exit_code=0,
+            stdout=f"exit_code: {p.returncode}\n{p.stdout}",
+            stderr="",
+        )
+        out = parse_wiz_output(r)
+        assert out.exit_code == 0
+        assert out.stdout == "armed-ok"
+        assert out.stderr == "Running as unit: blade-restore-x.service"

@@ -17,7 +17,7 @@ from chaos_agent.config.settings import settings
 from chaos_agent.models.command_result import CommandResult
 
 from .base import PROFILE_HOST, PROFILE_K8S, TransportTarget
-from .protocol import parse_wiz_output
+from .protocol import WIZ_STDERR_BEGIN, WIZ_STDERR_END, parse_wiz_output
 
 
 def _wiz_timeout_seconds(timeout: float | None) -> int:
@@ -120,7 +120,8 @@ def strip_execution_location(shown: str) -> str:
 
 
 def _wiz_preserve_stderr(cmd: list[str]) -> str:
-    """Build a wiz ``--command`` payload whose remote stderr survives the relay.
+    """Build a wiz ``--command`` payload whose remote stderr survives the relay
+    AND whose stream split survives the round trip.
 
     Probed live against the platform: when the inner command exits non-zero
     with BOTH streams non-empty (e.g. kubectl renders a half-baked jsonpath
@@ -136,23 +137,46 @@ def _wiz_preserve_stderr(cmd: list[str]) -> str:
 
     The script runs the payload in a SUBSHELL (so an inner ``exit`` cannot
     skip the cleanup), tees stderr to a pid-scoped temp file and appends it
-    to stdout ONLY on non-zero exit (preceded by a newline so a stdout that
-    ended mid-line doesn't fuse with the first stderr line), so success-path
-    output stays byte-identical (no deprecation-warning contamination of
-    parseable stdout).
+    to stdout whenever the command FAILED or wrote anything to stderr,
+    BRACKETED BETWEEN SENTINELS (``protocol.WIZ_STDERR_BEGIN``/``_END``) so
+    ``parse_wiz_output`` can restore the POSIX stream split on arrival — the
+    fold is a transport-internal encoding, never a contract consumers see.
+    (The pre-fix fold surfaced error text on stdout with stderr empty, which
+    silently broke every stderr-based failure read downstream — the B86
+    family; consumers must not be asked to remember the fold.) Folding on
+    NON-EMPTY STDERR — not only on failure — is what preserves the
+    confirmation line POSIX tools write to stderr on SUCCESS (systemd-run's
+    ``Running as unit``, dd/tar/curl stats): the old ``[ $rc -ne 0 ]``-only
+    gate ``rm -f``'d that evidence unread, leaving success receipts empty and
+    every "did the timer really arm?" read guessing from bookkeeping alone.
+    A CLEAN success (empty stderr) stays byte-identical: no markers, no
+    contamination of parseable stdout.
+
+    CONTRACT: ``openspec/specs/transport-stream-contract`` — the two POSIX
+    streams are independent of exit code. This fold gate MUST stay
+    failure-OR-stderr-nonempty, never regress to exit-code-only (which rm -f's
+    the success-path stderr unread). ``test_wrapper_shape`` pins the shape.
     """
     cmd_str = " ".join(shlex.quote(p) for p in cmd)
+    begin_fmt = WIZ_STDERR_BEGIN.replace("\n", "\\n")
+    end_fmt = WIZ_STDERR_END.replace("\n", "\\n")
     script = (
         f'E="/tmp/.wiz_err_$$"; '
         f'( {cmd_str} ) 2>"$E"; rc=$?; '
-        '[ $rc -ne 0 ] && { printf "\\n"; cat "$E"; }; '
+        f'{{ [ $rc -ne 0 ] || [ -s "$E" ]; }} && {{ printf "{begin_fmt}"; cat "$E"; '
+        f'printf "{end_fmt}"; }}; '
         'rm -f "$E"; exit $rc'
     )
     return f"sh -c {shlex.quote(script)}"
 
 
 def _wiz_unwrap_for_display(cmd_str: str) -> str:
-    """Recover the semantic command from a ``sh -c`` wrapped payload."""
+    """Recover the semantic command from a ``sh -c`` wrapped payload.
+
+    The stripped tail mirrors ``_wiz_preserve_stderr``'s CURRENT payload
+    (sentinel-bracketed fold); ``test_unwrap_roundtrip`` pins the two
+    shapes together so they cannot drift.
+    """
     if not cmd_str.startswith("sh -c "):
         return cmd_str
     try:
@@ -164,8 +188,9 @@ def _wiz_unwrap_for_display(cmd_str: str) -> str:
         return cmd_str
     inner = script[len(prefix):]
     inner = re.sub(
-        r' 2>"\$E"; rc=\$\?; \[ \$rc -ne 0 \] && \{ printf "\\n"; '
-        r'cat "\$E"; \}; '
+        r' 2>"\$E"; rc=\$\?; \{ \[ \$rc -ne 0 \] \|\| \[ -s "\$E" \]; \} && '
+        r'\{ printf "\\n__WIZ_STDERR_BEGIN__\\n"; '
+        r'cat "\$E"; printf "\\n__WIZ_STDERR_END__"; \}; '
         r'rm -f "\$E"; exit \$rc$',
         "",
         inner,

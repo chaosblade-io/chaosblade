@@ -243,6 +243,14 @@ async def execute_via_transport(
     # matching filters non-wiz channels out — their stderr never carries
     # the platform's dispatch wording. Guard/audit stay outside the loop:
     # one guard pass, one audit record with the FINAL result.
+    #
+    # B86 root fix note: adapt_result (step 4 below) may RESTORE inner
+    # stderr from the channel's sentinel fold, so result.stderr on a
+    # non-zero exit can carry the inner command's error text — that is the
+    # point of the fix, not a leak into this domain. The transient
+    # signatures are platform-dispatch wording ("no executor available" /
+    # "heartbeat is stale"); no kubectl or inner failure text produces
+    # them, so the restore cannot fan a command failure into a retry.
     retry_delays = transient_retry_delays()
     attempt = 0
     while True:

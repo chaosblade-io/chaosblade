@@ -82,12 +82,59 @@ def _annotate(text: str) -> str:
     return f"{explanation} {text}".strip() if explanation else text
 
 
+#: Sentinel pair the channel's stderr-preservation wrapper prints around
+#: the inner-stderr block it folds into stdout whenever the command failed
+#: OR wrote anything to stderr (see ``channels._wiz_preserve_stderr``).
+#: ``parse_wiz_output`` reverses the fold to restore the POSIX stream
+#: contract — stderr rides ``result.stderr`` — so stderr-based reads hold on
+#: this channel too (the B86 family: empty error details + stderr-keyword
+#: verdicts collapsing to UNKNOWN; and the success-path loss that hid
+#: systemd-run's ``Running as unit`` confirmation). Ambiguous or absent
+#: markers fail closed: no unfold, the pre-fix folded semantics — never
+#: worse.
+WIZ_STDERR_BEGIN = "\n__WIZ_STDERR_BEGIN__\n"
+WIZ_STDERR_END = "\n__WIZ_STDERR_END__"
+
+
+def _unfold_wiz_stderr(stdout: str) -> tuple[str, str] | None:
+    """Split a marker-bracketed fold back into ``(stdout, stderr)``.
+
+    Byte-exact by construction: the leading newline of ``BEGIN`` belongs
+    to the marker (so an empty inner stdout recovers as ``""``, not
+    ``"\n"``), and exactly the trailing ``END`` is stripped — an ``END``
+    occurring INSIDE the stderr payload survives verbatim. ``None`` when
+    the markers are absent, duplicated, or not terminal — the caller must
+    leave such text untouched rather than rewrite a foreign payload.
+
+    The relay appends a trailing newline to the stdout it prints (probed
+    live 2026-09-22: the local wrapper output ends AT the ``END`` marker,
+    the delivered receipt carries one extra ``\n`` — which broke the
+    strict ``endswith`` on first live fire), so the terminal check
+    tolerates trailing whitespace: bytes AFTER ``END`` are dropped, every
+    byte before it keeps its own bytes.
+    """
+    probe = stdout.rstrip()
+    if probe.count(WIZ_STDERR_BEGIN) != 1:
+        return None
+    if not probe.endswith(WIZ_STDERR_END):
+        return None
+    idx = stdout.index(WIZ_STDERR_BEGIN)
+    inner_stdout = stdout[:idx]
+    end = probe.rindex(WIZ_STDERR_END)
+    inner_stderr = stdout[idx + len(WIZ_STDERR_BEGIN):end]
+    return inner_stdout, inner_stderr
+
+
 def parse_wiz_output(result: CommandResult) -> CommandResult:
     """Parse wiz stdout protocol and return corrected CommandResult.
 
     Unlike the old ``_adapt_kubewiz_result``, this function does NOT
     check ``settings.kube_connection_mode`` — it is only called by
     channels that know they need wiz protocol parsing.
+
+    CONTRACT: ``openspec/specs/transport-stream-contract`` — this is the
+    SINGLE unfold point restoring the POSIX stream split; the unfold is NOT
+    exit-code-gated (a rc=0 success that wrote stderr carries the same fold).
     """
     # wiz itself failed — stderr already contains the error. Annotate it when
     # the failure is a response-parsing complaint rather than a command outcome.
@@ -119,6 +166,30 @@ def parse_wiz_output(result: CommandResult) -> CommandResult:
         real_exit_code = 1
 
     clean_stdout = lines[1] if len(lines) > 1 else ""
+
+    # Reverse the channel's stderr-fold (root fix for the B86 family, and
+    # for the success-path stderr loss the old ``!= 0`` gate hid): the
+    # wrapper brackets the inner stderr in stdout between sentinels whenever
+    # the command failed OR wrote anything to stderr — restore it to
+    # result.stderr so the POSIX contract every downstream read assumes
+    # holds on this channel too. The wiz CLI's own stderr (normally empty on
+    # rc=0) rides along after the inner stderr. The unfold is NOT gated on
+    # the exit code: a success that wrote stderr (systemd-run's ``Running as
+    # unit``) carries the same fold and must be restored just the same.
+    # Markerless stdout (legacy/pre-fix receipts, foreign wrappers, clean
+    # successes with empty stderr) stays untouched — _unfold_wiz_stderr
+    # fails closed on absent/duplicated/non-terminal markers, so this is
+    # backward compatible by construction.
+    unfolded = _unfold_wiz_stderr(clean_stdout)
+    if unfolded is not None:
+        clean_stdout, inner_stderr = unfolded
+        stderr = "\n".join(
+            p for p in (inner_stderr, result.stderr) if p
+        )
+        return replace(
+            result, exit_code=real_exit_code,
+            stdout=clean_stdout, stderr=stderr,
+        )
 
     return CommandResult(
         exit_code=real_exit_code,
