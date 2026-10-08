@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -13,7 +12,6 @@ from chaos_agent.agent.postmortem.builder import (
 )
 from chaos_agent.agent.postmortem.generator import generate_postmortem, make_summary
 from chaos_agent.agent.postmortem.store import (
-    POSTMORTEM_DIR,
     postmortem_exists,
     read_postmortem,
     save_postmortem,
@@ -394,7 +392,6 @@ class TestStore:
         # write followed the symlink, this file would get our content.
         decoy = tmp_path / "decoy.txt"
         decoy.write_text("decoy original content", encoding="utf-8")
-        os_symlink_supported = True
         try:
             target_path.symlink_to(decoy)
         except (OSError, NotImplementedError):

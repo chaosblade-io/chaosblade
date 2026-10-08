@@ -62,6 +62,168 @@ VEHICLE_ARTIFACT_TYPES: frozenset[str] = frozenset({
     "debug_pod", "occupant_pod", "occupant_deployment", "recovery_carrier",
 })
 
+# Recovery-bearing carriers: the vehicle subset whose lifecycle actually
+# underwrites a fault's reversal. ``debug_pod`` is a PROBE channel — its
+# lifecycle says nothing about whether the fault was reversed — so it is
+# deliberately excluded. Single source for BOTH the injection-time
+# underwriter check (nodes.planning.tool_screener) and the clearance-time
+# liability predicate (persistence.task_store.may_carry_live_fault), so the
+# two can never drift on "which artifact types are recovery carriers".
+RECOVERY_CARRIER_TYPES: frozenset[str] = VEHICLE_ARTIFACT_TYPES - {"debug_pod"}
+
+
+# ---------------------------------------------------------------------------
+# Recovery-clock anchors (W-67-15 / W-67-16)
+# ---------------------------------------------------------------------------
+#
+# A recovery carrier's countdown is described by FIVE distinct moments that
+# live on FIVE different clocks, and until now each sat in its own field (or
+# in no field at all), so nothing in the record ever put two of them side by
+# side:
+#
+#   confirmed_live     the carrier pod was read back as ready  (framework clock)
+#   framework_commit   the framework processed the arming exec (framework clock)
+#   host_armed         systemd actually accepted the transient unit (HOST clock)
+#   recovery_deadline  framework_commit + the parsed window    (framework clock)
+#   host_fire          the unit actually ran                   (HOST clock)
+#
+# The two clocks are not the same and the gap is not bounded by anything the
+# framework controls: between commit and host_armed sit the transport
+# round-trip, host-side queueing, and the ``&&``-chain's first half. Case #66
+# measured that gap at 22s, case #67 at 51s (deadline vs. fire) with an 85s
+# commit-vs-armed gap — and BOTH numbers were produced by hand, out of band,
+# by cross-reading the task JSON against the host journal. Nothing in the
+# record showed the drift, so nothing could regress on it.
+#
+# The anchors are therefore laid out side by side, each tagged with WHERE the
+# number came from. ``host_armed`` and ``host_fire`` are ``unobserved`` today:
+# systemd-run reports ``Running as unit: ...`` on stderr and the success path
+# drops stderr, so the host clock is genuinely not on record. Recording that
+# absence explicitly is the point — a slot that says "unobserved" is a standing,
+# machine-readable statement of what this framework cannot currently prove,
+# and it is the slot the stderr-receipt work fills in without any further
+# change to the schema or to a consumer.
+
+#: The number came from the framework's own wall clock at the moment it
+#: processed a tool call. Usable for conservative estimates ("at least N
+#: seconds remain"), NOT usable as evidence that anything happened on the host.
+PROVENANCE_FRAMEWORK = "framework_bookkeeping"
+#: The number was read back from the host (a unit receipt, a journal line).
+#: This is the only provenance that can serve as evidence of a host-side event.
+PROVENANCE_HOST = "host_observed"
+#: No channel currently records this moment. Distinct from "0" / "missing":
+#: an unobserved anchor is a known gap, not an absent value.
+PROVENANCE_UNOBSERVED = "unobserved"
+
+#: The five anchors in causal order. Single source for both the writer
+#: (:func:`recovery_time_anchors`) and every reader, so a new anchor cannot
+#: appear in one view and not the other.
+RECOVERY_TIME_ANCHOR_SLOTS: tuple[str, ...] = (
+    "confirmed_live",
+    "framework_commit",
+    "host_armed",
+    "recovery_deadline",
+    "host_fire",
+)
+
+#: Consecutive anchor pairs whose gap is worth persisting. Only pairs whose
+#: BOTH ends are observed yield a number (:func:`recovery_anchor_offsets`);
+#: the rest are reported as gaps. ``commit->host_armed`` and
+#: ``deadline->host_fire`` are the two the #66/#67 audits measured by hand.
+RECOVERY_ANCHOR_OFFSET_PAIRS: tuple[tuple[str, str], ...] = (
+    ("confirmed_live", "framework_commit"),
+    ("framework_commit", "host_armed"),
+    ("host_armed", "recovery_deadline"),
+    ("recovery_deadline", "host_fire"),
+)
+
+
+def _epoch(value: Any) -> float | None:
+    """Coerce a stored timestamp to ``float``, or ``None`` when there is none.
+
+    ``bool`` is excluded explicitly: it is an ``int`` subclass, so a corrupted
+    ``True`` would otherwise read as epoch 1 and anchor a timeline in 1970.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def recovery_time_anchors(artifact: dict | None) -> dict:
+    """The five recovery-clock anchors of one carrier, side by side.
+
+    Pure derivation from the artifact's own authoritative fields — it stores
+    nothing and cannot drift from them. Every slot is ALWAYS present, so a
+    consumer can iterate the schema without first probing which fields this
+    particular carrier happens to carry, and so an unobserved anchor is
+    indistinguishable-by-shape from an observed one only in its ``epoch``
+    (``None``), never in its ``provenance``.
+
+    Returns an all-unobserved table for a non-dict / empty artifact rather than
+    ``{}``: "this carrier has no recovery clock on record" is a fact worth
+    rendering, an empty dict is not.
+    """
+    art = artifact if isinstance(artifact, dict) else {}
+
+    def _slot(value: Any, provenance: str) -> dict:
+        epoch = _epoch(value)
+        if epoch is None:
+            return {"epoch": None, "provenance": PROVENANCE_UNOBSERVED}
+        return {"epoch": epoch, "provenance": provenance}
+
+    return {
+        # Stamped once, when the pod first registered as active (see the
+        # freshness note in ``collect_execution_artifacts``). A framework read
+        # of the API server — real evidence about the POD, still framework-
+        # clocked, and absent for carriers that never went through the
+        # debug-pod registration path.
+        "confirmed_live": _slot(
+            art.get("confirmed_live_epoch"), PROVENANCE_FRAMEWORK,
+        ),
+        "framework_commit": _slot(
+            art.get("recovery_armed_commit_epoch"), PROVENANCE_FRAMEWORK,
+        ),
+        # Populated only by a host receipt. No writer exists yet — see the
+        # block comment above. The slot is declared so the absence is part of
+        # the schema instead of a hole the reader has to know about.
+        "host_armed": _slot(art.get("host_armed_epoch"), PROVENANCE_HOST),
+        "recovery_deadline": _slot(
+            art.get("recovery_deadline_epoch"), PROVENANCE_FRAMEWORK,
+        ),
+        "host_fire": _slot(art.get("host_fire_epoch"), PROVENANCE_HOST),
+    }
+
+
+def recovery_anchor_offsets(anchors: dict | None) -> dict:
+    """Gap between each consecutive anchor pair, plus the gaps we cannot see.
+
+    This is the reconciliation the #66/#67 audits had to do by hand. Split in
+    two on purpose: ``seconds`` holds only pairs whose BOTH ends are observed
+    (a number computed from one observed end and one framework-clock end would
+    look like a measurement while being a guess), ``unobserved`` names every
+    pair that is missing an end and which end is missing. A reader — human or
+    regression test — therefore sees the drift AND the reason the drift is
+    partly unknown, from the record alone.
+    """
+    table = anchors if isinstance(anchors, dict) else {}
+    seconds: dict[str, float] = {}
+    unobserved: dict[str, list[str]] = {}
+    for first, second in RECOVERY_ANCHOR_OFFSET_PAIRS:
+        label = f"{first}_to_{second}"
+        a = table.get(first) if isinstance(table.get(first), dict) else {}
+        b = table.get(second) if isinstance(table.get(second), dict) else {}
+        start, end = _epoch(a.get("epoch")), _epoch(b.get("epoch"))
+        if start is not None and end is not None:
+            seconds[label] = round(end - start, 3)
+            continue
+        missing = [
+            name
+            for name, value in ((first, start), (second, end))
+            if value is None
+        ]
+        unobserved[label] = missing
+    return {"seconds": seconds, "unobserved": unobserved}
+
 
 def parse_debug_pod_metadata(content: str) -> dict:
     """Parse the structured marker emitted by ``tools.kubectl_cli``."""
@@ -75,6 +237,30 @@ def parse_debug_pod_metadata(content: str) -> dict:
     except (TypeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def debug_meta_scope(metadata: dict) -> str:
+    """Classify a ``[debug-pod-meta]`` payload: ``"pod"`` or ``"node"``.
+
+    Single semantic authority for debug-meta payloads produced by
+    ``tools.kubectl_cli``. A payload carrying ``ephemeral_container`` is a
+    POD-scoped ``kubectl debug <pod> --target=<c>``: the attached ephemeral
+    container runs INSIDE the target pod, so ``name`` is the USER'S
+    workload — not a tool-created vehicle, and no standalone debug pod
+    exists to register or clean up. Every other payload is a node-scoped
+    debug: a standalone ``node-debugger-*`` pod that IS task-owned
+    machinery. An empty or invalid payload returns ``""``.
+
+    Consumers must ask HERE instead of re-deriving the rule locally: the
+    three sibling guards (artifact collection, cleanup extraction, vehicle
+    screening) each grew their own ``ephemeral_container`` check at
+    different times — two were fixed under Task-5193538b while the third
+    drifted and misread the fault TARGET as a vehicle in a live run
+    (self-contradictory VEHICLE WARNING naming the anchor).
+    """
+    if not isinstance(metadata, dict) or not metadata:
+        return ""
+    return "pod" if metadata.get("ephemeral_container") else "node"
 
 
 def parse_drill_vehicle_markers(content: str) -> list[dict]:
@@ -132,7 +318,9 @@ def is_vehicle_name(name: str, state: dict | None) -> bool:
          facts that survive message trimming).
       2. ``kubectl_exec_pod_name`` — the tool pod used for exec-injection.
       3. ``debug-pod-meta`` tags in message history (covers artifacts not yet
-         collected this iteration).
+         collected this iteration). A POD-scoped debug meta is skipped —
+         its ``name`` is the TARGET pod, the user's workload (see
+         :func:`debug_meta_scope`).
       4. Heuristic: the ``node-debugger-`` creation prefix.
     """
     if not name or not isinstance(state, dict):
@@ -150,7 +338,14 @@ def is_vehicle_name(name: str, state: dict | None) -> bool:
         content = getattr(message, "content", None)
         if not isinstance(content, str) or "debug-pod-meta" not in content:
             continue
-        if parse_debug_pod_metadata(content).get("name") == name:
+        metadata = parse_debug_pod_metadata(content)
+        if debug_meta_scope(metadata) == "pod":
+            # Pod-scoped debug: ``name`` is the TARGET pod (the user's
+            # workload), not a vehicle. Without this skip the anchor itself
+            # reads as a vehicle and the verifier's VEHICLE WARNING turns
+            # self-contradictory ("verify ONLY X … X is NOT a fault target").
+            continue
+        if metadata.get("name") == name:
             return True
     from chaos_agent.agent.nodes.execute._debug_pod import DEBUG_POD_NAME_PREFIX
     return str(name).startswith(DEBUG_POD_NAME_PREFIX)
@@ -767,6 +962,22 @@ def collect_execution_artifacts(
                     continue
                 if namespace and artifact.get("namespace") != namespace:
                     continue
+                # #59 cascade: deleting an ARMED carrier pod kills a
+                # CARRIER-RESIDENT reversal (an in-chain sleep or timeout
+                # wrapper rides the pod's own process tree) — the fill it
+                # would have reclaimed leaks with no pending self-recovery.
+                # Stamp the void fact so the early-recovery lane keeps
+                # accepting a standalone reclaim for the recorded fill path.
+                # A host-managed timer survives the pod under PID 1 and
+                # stays valid — no stamp, the lane stays correctly closed.
+                # (The same stamp the dead-carrier branch of cleanup
+                # applies; this is its manual-delete twin.)
+                if (
+                    artifact.get("status") == "recovery_armed"
+                    and str(artifact.get("recovery_form") or "")
+                    != "host_timer"
+                ):
+                    artifact["recovery_void"] = True
                 artifact["status"] = "cleaned"
                 artifact["cleanup_tool_call_id"] = getattr(
                     message, "tool_call_id", "",
@@ -861,6 +1072,129 @@ def find_active_debug_pod(
     return matches[0] if len(matches) == 1 else None
 
 
+#: Which record a carrier row in :func:`carrier_status_facts` came from.
+#: The structured ledger, which survives message trimming and carries type,
+#: namespace and lifecycle status.
+CARRIER_SOURCE_LEDGER = "execution_artifacts"
+#: The bare name set the framework's own cleanup paths write. A planning-phase
+#: probe carrier deleted through the transport leaves NO ``kubectl`` ToolMessage
+#: behind, so it never reaches the ledger — this set is the only record that the
+#: framework issued its delete.
+CARRIER_SOURCE_CLEANUP_RECORD = "cleanup_record"
+
+
+def carrier_status_facts(state: dict | None) -> dict:
+    """One roster of every carrier this task built, with each row's source.
+
+    Two records answer "what happened to this task's carriers?" and until now
+    no reader merged them, so every consumer saw a partial view:
+
+    * ``execution_artifacts`` — structured and durable, but populated only from
+      ``kubectl`` / ``execute_skill_script`` ToolMessages. The framework's own
+      cleanup deletes through the transport, so a carrier IT removed leaves no
+      ToolMessage and no ledger transition.
+    * ``cleaned_debug_pods`` — a bare name set written by exactly those cleanup
+      paths (planning exit, verify finalize). It is the only record of a
+      planning-probe carrier's fate, and nothing rendered it.
+
+    Case #67 is what the gap cost: the plan text recorded "two Completed
+    node-debugger pods (fdfj5, 7j6b2) folded into the cleanup step", the
+    framework force-deleted both at planning exit, and the verifier — reading
+    only prose, with no authoritative roster in its context — still reported
+    them as "STILL NEEDS CLEANUP". The report was false while every durable
+    field was correct.
+
+    Honesty constraint carried into every row: ``status == "cleaned"`` means a
+    delete was ISSUED, not that absence was confirmed — cleanup is
+    fire-and-forget by design (see ``_CLEANUP_CONCURRENCY``). A row therefore
+    never claims more than its source can prove, and the render must not either.
+    """
+    values = state if isinstance(state, dict) else {}
+    carriers: list[dict] = []
+    seen: set[str] = set()
+    for artifact in values.get("execution_artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("type") not in VEHICLE_ARTIFACT_TYPES:
+            continue
+        name = str(artifact.get("name") or "")
+        if not name:
+            continue
+        seen.add(name)
+        carriers.append({
+            "name": name,
+            "namespace": str(artifact.get("namespace") or ""),
+            "type": str(artifact.get("type") or ""),
+            "kind": str(artifact.get("kind") or ""),
+            "status": str(artifact.get("status") or ""),
+            "source": CARRIER_SOURCE_LEDGER,
+        })
+    # Names the framework deleted that have NO ledger row — planning-probe
+    # carriers, and any artifact collection that has not run yet this turn.
+    # ``cleaned`` (not ``active``): the delete was issued; absence is unproven.
+    # ``kind`` is recorded alongside ``type`` per this module's convention
+    # (``_debug_pod_artifact`` does the same, and the P5 vehicle-kind sentinel
+    # enforces it): ``cleaned_debug_pods`` only ever holds debug POD names, so
+    # the kind is a fact, not a placeholder.
+    for name in values.get("cleaned_debug_pods") or []:
+        name = str(name or "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        carriers.append({
+            "name": name,
+            "namespace": "",
+            "type": "debug_pod",
+            "kind": "pod",
+            "status": "cleaned",
+            "source": CARRIER_SOURCE_CLEANUP_RECORD,
+        })
+    return {"carriers": carriers}
+
+
+async def _read_pod_phase(
+    artifact: dict,
+    *,
+    kubeconfig: str,
+    task_id: str,
+) -> str | None:
+    """Live-read a vehicle pod's Kubernetes phase; ``None`` on any failure.
+
+    #59: the carrier ledger's ``phase`` was written once at creation and
+    never refreshed, so a carrier evicted mid-drill kept reporting
+    ``Running`` in the terminal recovery handle. This is the cheap
+    single-purpose read that refreshes it — fire-and-forget like the rest
+    of cleanup; a failed read yields ``None`` and callers keep their
+    previous (ledger-only) behaviour.
+    """
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
+    from chaos_agent.transports import (
+        PROFILE_K8S,
+        TransportTarget,
+        execute_via_transport,
+    )
+
+    name = str(artifact.get("name") or "")
+    namespace = str(artifact.get("namespace") or "")
+    if not name or not namespace:
+        return None
+    get_cmd = build_kubectl_cmd("get", [
+        "pod", name, "-n", namespace,
+        "-o", "jsonpath={.status.phase}",
+    ], kubeconfig=kubeconfig)
+    try:
+        result = await execute_via_transport(
+            get_cmd, TransportTarget.from_state({}), timeout=15,
+            task_id=task_id, expect_profile=PROFILE_K8S,
+        )
+    except Exception:  # noqa: BLE001 — liveness read is best-effort
+        return None
+    if result.exit_code != 0:
+        return None
+    phase = (result.stdout or "").strip()
+    return phase or None
+
+
 async def cleanup_debug_pod_artifacts(
     artifacts: list[dict] | None,
     *,
@@ -909,7 +1243,31 @@ async def cleanup_debug_pod_artifacts(
             and isinstance(recovery_deadline, (int, float))
             and recovery_deadline > time.time()
         ):
-            return
+            # #59 liveness truth: keep-while-armed used to be a pure ledger
+            # judgement — a carrier evicted by its own fault stayed "held"
+            # (and the ledger kept its stale phase) long after the pod was
+            # gone. Verify the carrier is ALIVE before holding: a dead
+            # carrier releases the hold (there is nothing left to keep)
+            # and a CARRIER-RESIDENT reversal is stamped void (a host-managed
+            # timer survives the carrier and stays valid). An unreadable
+            # phase keeps the hold — fail-safe, not fail-open. ``recovery_void``
+            # has no in-process reader by design: it rides the artifact dict
+            # into the task JSON (execution_artifacts / recovery_handle) as an
+            # audit fact — a recover-graph or external consumer reads WHY no
+            # self-recovery is pending off the persisted record, not off a
+            # live render here.
+            phase = await _read_pod_phase(
+                artifact, kubeconfig=kubeconfig, task_id=task_id,
+            )
+            if phase is None:
+                return
+            artifact["phase"] = phase
+            if phase in ("Running", "Pending"):
+                return
+            if str(artifact.get("recovery_form") or "") != "host_timer":
+                artifact["recovery_void"] = True
+            # Fall through to delete: the carrier is dead, so the
+            # keep-while-armed hold protects nothing.
         name = str(artifact.get("name") or "")
         namespace = str(artifact.get("namespace") or "")
         if not name or not namespace:
@@ -1038,7 +1396,9 @@ def _debug_pod_artifact(
     # pod-scoped debug produces NO durable debug_pod artifact (the ephemeral
     # container is not a separately-managed carrier — the tc/exec runs in the
     # target pod's own namespaces, screened as a plain scope=pod call).
-    if metadata.get("ephemeral_container"):
+    # Classification via the shared authority (debug_meta_scope) so this guard
+    # cannot drift from its siblings in _debug_pod / is_vehicle_name.
+    if debug_meta_scope(metadata) == "pod":
         return {}
     ready = metadata.get("ready") is True
     cleaned = metadata.get("cleaned") is True
@@ -1245,6 +1605,7 @@ def _mark_bounded_host_recovery(
         return
     if artifact.get("type") == "debug_pod":
         from chaos_agent.agent.target_guard.carriers import (
+            RECOVERY_FAMILIES,
             classify_host_operation,
             host_operation_has_bounded_recovery,
         )
@@ -1252,6 +1613,23 @@ def _mark_bounded_host_recovery(
         family = classify_host_operation(inner)
         if not family or not host_operation_has_bounded_recovery(inner, family):
             return
+        # #59 / W-67-8: record WHAT the fault armed so the carrier gate's
+        # early-recovery lane can later match a standalone pure inverse against
+        # it, and so the recovery ledger can tell a host-managed timer
+        # (survives the carrier) from an in-chain reversal (dies with it). The
+        # disk family records the filled path AND any device-mapper mapping
+        # name (reclaimed by ``dmsetup remove``); the network family records the
+        # inserted rule fingerprints (reclaimed by a matching ``-D`` / ``qdisc
+        # del``). The recovery registry drives EVERY bounded-reclaim face from
+        # one enumeration, so a new family records its fingerprint here by
+        # construction — no per-family ``if`` to forget (the gap that left the
+        # network face's ``iptables -D`` lane structurally unreachable).
+        for face in RECOVERY_FAMILIES:
+            if face.family != family:
+                continue
+            value = face.ledger_extract(inner)
+            if value:
+                artifact[face.ledger_key] = value
     # The deadline is the FAULT WINDOW, not any sleep in the command. A
     # timer-armed stop loop carries a short loop-interval sleep (e.g.
     # ``sleep 15`` between rounds) while its window is the systemd-run
@@ -1263,20 +1641,24 @@ def _mark_bounded_host_recovery(
     # timer's pattern, and that pattern's embedded ``sleep 30[0]`` literal
     # would otherwise arm the carrier for a fraction of the real window).
     timeout_seconds = _systemd_timer_seconds(inner)
+    recovery_form = "host_timer" if timeout_seconds else ""
     if not timeout_seconds:
         timeout_seconds = _timeout_bound_seconds(inner)
+        recovery_form = "timeout" if timeout_seconds else ""
     if not timeout_seconds:
         sleeps = re.findall(r"\bsleep\s+([1-9][0-9]*)\b", inner)
         if not sleeps:
             return
         timeout_seconds = max(int(value) for value in sleeps)
+        recovery_form = "in_chain"
     # Keep-while-armed is a LOWER bound: a later exec carrying a SHORTER
     # sleep (a verification probe riding the carrier — REST probes wrap
     # ``sleep 2 && curl ...``) must not eat into an armed window, or
     # finalize's cleanup deletes a timer host whose countdown is still
     # running. A LONGER re-arm still extends the window.
     old_deadline = artifact.get("recovery_deadline_epoch")
-    new_deadline = time.time() + timeout_seconds
+    commit_epoch = time.time()
+    new_deadline = commit_epoch + timeout_seconds
     if (
         artifact.get("status") == "recovery_armed"
         and isinstance(old_deadline, (int, float))
@@ -1290,6 +1672,31 @@ def _mark_bounded_host_recovery(
     artifact["host_exec_tool_call_id"] = tool_call_id
     artifact["recovery_timeout_seconds"] = timeout_seconds
     artifact["recovery_deadline_epoch"] = new_deadline
+    # The framework's own commit moment, stored rather than left as the
+    # ``deadline - timeout`` difference it is arithmetically equal to: the
+    # difference only reconstructs it while both operands stay in sync, and a
+    # re-arm moves the deadline without recording which commit it moved from.
+    # Provenance matters more than the value — this is a FRAMEWORK clock reading
+    # taken while processing a tool call, not the moment systemd accepted the
+    # unit on the host (W-67-15: those two were 85s apart in case #67).
+    artifact["recovery_armed_commit_epoch"] = commit_epoch
+    # Reconciliation table, persisted so the anchor spread survives into the
+    # task JSON instead of having to be re-derived by hand from four scattered
+    # fields at audit time. Derived by the single-source reader and rewritten
+    # on every (re-)arm, so the persisted copy is a snapshot of the derivation
+    # rather than a fifth independent statement of the same facts — a merge
+    # pass never touches it (``_merge_discovered_artifact`` only fills EMPTY
+    # fields) and nothing mutates it in place.
+    artifact["recovery_time_anchors"] = recovery_time_anchors(artifact)
+    # #59: which execution realm the reversal lives in — a host systemd
+    # timer fires from PID 1 regardless of the carrier's fate, while an
+    # in-chain / timeout-bound reversal is carrier-resident and is VOID
+    # the moment the carrier dies (the DiskPressure drill evicted its own
+    # recovery carrier and the ledger kept counting down a dead timer).
+    # Absent for ledger entries written before this field existed; readers
+    # treat the absence as the carrier-resident (conservative) case.
+    if recovery_form:
+        artifact["recovery_form"] = recovery_form
 
 
 def _option_value(v_args: str, option: str) -> str:
@@ -1677,6 +2084,7 @@ def _artifact_key(artifact: dict) -> str:
 
 
 __all__ = [
+    "carrier_status_facts",
     "cleanup_debug_pod_artifacts",
     "collect_execution_artifacts",
     "find_active_debug_pod",
@@ -1686,6 +2094,8 @@ __all__ = [
     "make_teardown_matcher",
     "parse_debug_pod_metadata",
     "parse_drill_vehicle_markers",
+    "recovery_anchor_offsets",
+    "recovery_time_anchors",
     "VEHICLE_ARTIFACT_TYPES",
     "vehicle_artifact_types",
 ]

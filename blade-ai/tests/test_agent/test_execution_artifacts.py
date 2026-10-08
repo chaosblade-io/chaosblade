@@ -8,13 +8,26 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from chaos_agent.agent.execution_artifacts import (
+    CARRIER_SOURCE_CLEANUP_RECORD,
+    CARRIER_SOURCE_LEDGER,
+    PROVENANCE_FRAMEWORK,
+    PROVENANCE_HOST,
+    PROVENANCE_UNOBSERVED,
+    RECOVERY_ANCHOR_OFFSET_PAIRS,
+    RECOVERY_TIME_ANCHOR_SLOTS,
+    VEHICLE_ARTIFACT_TYPES,
+    carrier_status_facts,
     cleanup_debug_pod_artifacts,
     collect_execution_artifacts,
+    debug_meta_scope,
     find_active_debug_pod,
+    is_vehicle_name,
     issue_call_is_registered_teardown,
     make_teardown_matcher,
     parse_debug_pod_metadata,
     parse_drill_vehicle_markers,
+    recovery_anchor_offsets,
+    recovery_time_anchors,
 )
 from chaos_agent.agent.providers import FaultProviderRegistry
 from chaos_agent.config.settings import settings
@@ -61,6 +74,65 @@ def test_parse_debug_pod_metadata():
         "ready": True,
         "privileged": True,
     }
+
+
+def test_debug_meta_scope_single_authority():
+    """One classifier answers "is this meta's ``name`` the user's target pod
+    or a tool-created vehicle" for every consumer (artifact collection,
+    cleanup extraction, vehicle screening) — the three sibling guards each
+    re-derived the rule locally before and drifted apart."""
+    assert debug_meta_scope(
+        {"name": "drill-reorder-target", "ephemeral_container": "debugger-s85qz"}
+    ) == "pod"
+    assert debug_meta_scope(
+        {"name": "node-debugger-n1-abc12", "namespace": "kubewiz"}
+    ) == "node"
+    # Falsy ephemeral marker falls back to node-scoped semantics.
+    assert debug_meta_scope({"ephemeral_container": ""}) == "node"
+    assert debug_meta_scope({}) == ""
+    assert debug_meta_scope(None) == ""
+
+
+def test_is_vehicle_name_pod_scoped_meta_target_is_not_vehicle():
+    # Live-run regression (inject-3dae7b4f): a POD-scoped ``kubectl debug
+    # <pod> --target=<c>`` emits a meta whose ``name`` is the TARGET pod.
+    # Source-3 used to match it blindly, so the anchor itself read as a
+    # vehicle and the verifier brief turned self-contradictory ("verify
+    # ONLY X … X is NOT a fault target").
+    meta = (
+        '{"name":"drill-reorder-target","namespace":"default",'
+        '"ephemeral_container":"debugger-s85qz","ready":true,'
+        '"cleaned":false,"debug_profile":"netadmin"}'
+    )
+    state = {
+        "execution_artifacts": [],
+        "messages": [
+            ToolMessage(
+                content=f"injected\n[debug-pod-meta: {meta}]",
+                name="kubectl",
+                tool_call_id="tc-ec",
+            ),
+        ],
+    }
+    assert is_vehicle_name("drill-reorder-target", state) is False
+
+
+def test_is_vehicle_name_node_scoped_meta_is_vehicle():
+    meta = (
+        '{"name":"node-debugger-n1-abc12","namespace":"kubewiz",'
+        '"uid":"uid-1","node":"n1","phase":"Running","ready":true}'
+    )
+    state = {
+        "execution_artifacts": [],
+        "messages": [
+            ToolMessage(
+                content=f"created\n[debug-pod-meta: {meta}]",
+                name="kubectl",
+                tool_call_id="tc-node",
+            ),
+        ],
+    }
+    assert is_vehicle_name("node-debugger-n1-abc12", state) is True
 
 
 def test_collect_ready_debug_pod_artifact():
@@ -2271,3 +2343,811 @@ async def test_sweep_vehicle_types_bypass_the_claim_seam(_sweep_claim):
     assert updated[0]["status"] == "cleaned"
     assert cleaned == ["node-debugger-n1-abc12"]
     assert _sweep_claim["calls"] == []
+
+
+# ---------------------------------------------------------------------------
+# #59 (Pod_被驱逐重建_DiskPressure): the arming ledger records WHICH realm
+# the reversal lives in, and keep-while-armed verifies the carrier is ALIVE.
+# ---------------------------------------------------------------------------
+
+
+def _armed_disk_exec(command: str):
+    return _bounded_exec_with_command(command)
+
+
+def test_disk_fill_arming_records_fill_path_and_host_timer_form():
+    # The #59 compliant shape: a disk fill whose rollback rides a host-managed
+    # transient timer (PID 1). The ledger must record BOTH the filled path
+    # (so a standalone early reclaim can be matched against it) and the
+    # realm (so liveness reasoning knows the fire survives the carrier).
+    command = (
+        "node-debugger-n1-abc12 -n kubewiz -- chroot /host sh -c "
+        "'dd if=/dev/zero of=/var/tmp/kubelet-fill.bin bs=1M count=4096 && "
+        "systemd-run --on-active=600s --unit=drill-reclaim-x "
+        "truncate -s 0 /var/tmp/kubelet-fill.bin'"
+    )
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        artifacts = collect_execution_artifacts(_armed_disk_exec(command))
+
+    assert artifacts[0]["status"] == "recovery_armed"
+    assert artifacts[0]["recovery_fill_path"] == "/var/tmp/kubelet-fill.bin"
+    assert artifacts[0]["recovery_form"] == "host_timer"
+    assert artifacts[0]["recovery_deadline_epoch"] == 1600
+
+
+def test_in_chain_reversal_records_in_chain_form_and_fill_path():
+    # The pre-#59 case shape: fill + sleep + inverse in ONE exec — the
+    # reversal lives inside the carrier and dies with it.
+    command = (
+        "node-debugger-n1-abc12 -n kubewiz -- chroot /host sh -c "
+        "'dd if=/dev/zero of=/var/tmp/fill.bin bs=1M count=1024 && "
+        "sleep 300 && truncate -s 0 /var/tmp/fill.bin'"
+    )
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        artifacts = collect_execution_artifacts(_armed_disk_exec(command))
+
+    assert artifacts[0]["status"] == "recovery_armed"
+    assert artifacts[0]["recovery_fill_path"] == "/var/tmp/fill.bin"
+    assert artifacts[0]["recovery_form"] == "in_chain"
+
+
+def test_timeout_bounded_disk_form_records_timeout_form():
+    command = (
+        "node-debugger-n1-abc12 -n kubewiz -- chroot /host sh -c "
+        "'timeout 300 dd if=/dev/zero of=/var/tmp/fill.bin bs=1M count=2048'"
+    )
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        artifacts = collect_execution_artifacts(_armed_disk_exec(command))
+
+    assert artifacts[0]["status"] == "recovery_armed"
+    assert artifacts[0]["recovery_form"] == "timeout"
+
+
+def test_non_disk_family_arms_without_fill_path():
+    # ``recovery_fill_path`` is disk-specific legislation; a network fault
+    # armed through a timer must not grow a phantom fill path.
+    command = (
+        "node-debugger-n1-abc12 -n kubewiz -- chroot /host sh -c "
+        "'iptables -I OUTPUT -j DROP && systemd-run --on-active=600s "
+        "iptables -D OUTPUT -j DROP'"
+    )
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        artifacts = collect_execution_artifacts(_armed_disk_exec(command))
+
+    assert artifacts[0]["status"] == "recovery_armed"
+    assert "recovery_fill_path" not in artifacts[0]
+    assert artifacts[0]["recovery_form"] == "host_timer"
+
+
+def _armed_ledger_artifact(**overrides):
+    """One armed debug-pod artifact, ledger-shaped for the liveness seam."""
+    artifacts = collect_execution_artifacts(_debug_messages())
+    base = {
+        "status": "recovery_armed",
+        "recovery_deadline_epoch": 1600,
+        "recovery_timeout_seconds": 600,
+    }
+    artifacts[0].update(base)
+    artifacts[0].update(overrides)
+    return artifacts
+
+
+@pytest.mark.asyncio
+async def test_dead_carrier_releases_hold_and_voids_carrier_resident_reversal():
+    # #59's exact failure: DiskPressure evicted the carrier mid-drill while
+    # the ledger kept holding for an in-chain reversal that could never
+    # fire. A dead carrier (Failed) must release the hold AND stamp the
+    # carrier-resident reversal void — the terminal handle then tells the
+    # truth about why no self-recovery is pending.
+    artifacts = _armed_ledger_artifact(recovery_form="in_chain")
+    with (
+        patch(
+            "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+        ),
+        patch(
+            "chaos_agent.agent.execution_artifacts._read_pod_phase",
+            new=AsyncMock(return_value="Failed"),
+        ),
+        patch(
+            "chaos_agent.agent.nodes.execute._debug_pod.delete_debug_pod",
+            new=AsyncMock(return_value="confirmed"),
+        ) as delete,
+    ):
+        updated, names = await cleanup_debug_pod_artifacts(
+            artifacts, kubeconfig="/tmp/kc", task_id="task-1",
+        )
+
+    assert delete.await_count == 1
+    assert updated[0]["status"] == "cleaned"
+    assert updated[0]["recovery_void"] is True
+    assert updated[0]["phase"] == "Failed"
+    assert names == ["node-debugger-n1-abc12"]
+
+
+@pytest.mark.asyncio
+async def test_dead_carrier_with_host_timer_releases_hold_but_keeps_timer_valid():
+    # A host-managed timer (PID 1) survives the carrier: the hold releases
+    # (nothing left to keep alive) but NO void is stamped — the fire is
+    # still coming and the verifier must keep waiting on the fault side.
+    artifacts = _armed_ledger_artifact(recovery_form="host_timer")
+    with (
+        patch(
+            "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+        ),
+        patch(
+            "chaos_agent.agent.execution_artifacts._read_pod_phase",
+            new=AsyncMock(return_value="Failed"),
+        ),
+        patch(
+            "chaos_agent.agent.nodes.execute._debug_pod.delete_debug_pod",
+            new=AsyncMock(return_value="confirmed"),
+        ) as delete,
+    ):
+        updated, names = await cleanup_debug_pod_artifacts(
+            artifacts, kubeconfig="/tmp/kc", task_id="task-1",
+        )
+
+    assert delete.await_count == 1
+    assert updated[0]["status"] == "cleaned"
+    assert "recovery_void" not in updated[0]
+    assert names == ["node-debugger-n1-abc12"]
+
+
+@pytest.mark.asyncio
+async def test_unreadable_phase_keeps_the_hold_fail_safe():
+    # Fail-safe, not fail-open: a phase read that fails (transport hiccup,
+    # eviction race) keeps the hold — releasing on a read error would trade
+    # a stale hold for a possibly-killed live timer.
+    artifacts = _armed_ledger_artifact(recovery_form="in_chain")
+    with (
+        patch(
+            "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+        ),
+        patch(
+            "chaos_agent.agent.execution_artifacts._read_pod_phase",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(
+            "chaos_agent.agent.nodes.execute._debug_pod.delete_debug_pod",
+            new=AsyncMock(),
+        ) as delete,
+    ):
+        updated, names = await cleanup_debug_pod_artifacts(
+            artifacts, kubeconfig="/tmp/kc", task_id="task-1",
+        )
+
+    delete.assert_not_awaited()
+    assert updated[0]["status"] == "recovery_armed"
+    assert names == []
+
+
+@pytest.mark.asyncio
+async def test_live_carrier_still_holds_and_phase_refreshes():
+    # Running carrier: hold intact, and the ledger's stale creation-time
+    # ``phase`` is refreshed so the terminal report stops asserting
+    # "Running" for a pod that died and came back (or vice versa).
+    artifacts = _armed_ledger_artifact(recovery_form="in_chain")
+    with (
+        patch(
+            "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+        ),
+        patch(
+            "chaos_agent.agent.execution_artifacts._read_pod_phase",
+            new=AsyncMock(return_value="Running"),
+        ),
+        patch(
+            "chaos_agent.agent.nodes.execute._debug_pod.delete_debug_pod",
+            new=AsyncMock(),
+        ) as delete,
+    ):
+        updated, names = await cleanup_debug_pod_artifacts(
+            artifacts, kubeconfig="/tmp/kc", task_id="task-1",
+        )
+
+    delete.assert_not_awaited()
+    assert updated[0]["status"] == "recovery_armed"
+    assert updated[0]["phase"] == "Running"
+    assert names == []
+
+
+def _manual_delete_messages():
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "kubectl",
+                "args": {
+                    "subcommand": "delete",
+                    "v_args": "pod node-debugger-n1-abc12 -n kubewiz",
+                },
+                "id": "tc-del",
+            }],
+        ),
+        ToolMessage(
+            content='pod "node-debugger-n1-abc12" deleted',
+            name="kubectl",
+            tool_call_id="tc-del",
+        ),
+    ]
+
+
+def test_manual_delete_of_armed_in_chain_carrier_stamps_void():
+    # #59 cascade, manual-delete twin: deleting an ARMED carrier pod kills
+    # its carrier-resident reversal (the in-chain sleep rides the pod's own
+    # process tree), so the fill it would have reclaimed leaks with no
+    # pending self-recovery. The void stamp keeps the early-recovery lane
+    # open for a standalone reclaim of the recorded fill path — without
+    # it the record reaches ``cleaned`` without ``recovery_void`` and the
+    # lane's collector passes it by (adversarial self-review cascade:
+    # cleanup stamps void for a dead carrier, the manual delete did not).
+    command = (
+        "node-debugger-n1-abc12 -n kubewiz -- chroot /host sh -c "
+        "'dd if=/dev/zero of=/var/tmp/fill.bin bs=1M count=1024 && "
+        "sleep 300 && truncate -s 0 /var/tmp/fill.bin'"
+    )
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        artifacts = collect_execution_artifacts(
+            _armed_disk_exec(command) + _manual_delete_messages(),
+        )
+
+    assert artifacts[0]["status"] == "cleaned"
+    assert artifacts[0]["recovery_void"] is True
+    # The fill path survives on the record: the lane's (node, path) match
+    # unit reads it after the delete.
+    assert artifacts[0]["recovery_fill_path"] == "/var/tmp/fill.bin"
+
+
+def test_manual_delete_of_armed_host_timer_carrier_keeps_timer_valid():
+    # A host-managed timer survives the pod under PID 1: manually deleting
+    # its carrier releases nothing that was pending — NO void stamp, the
+    # lane stays correctly closed (the fire is still coming).
+    command = (
+        "node-debugger-n1-abc12 -n kubewiz -- chroot /host sh -c "
+        "'dd if=/dev/zero of=/var/tmp/fill.bin bs=1M count=4096 && "
+        "systemd-run --on-active=600s --unit=drill-reclaim-x "
+        "truncate -s 0 /var/tmp/fill.bin'"
+    )
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        artifacts = collect_execution_artifacts(
+            _armed_disk_exec(command) + _manual_delete_messages(),
+        )
+
+    assert artifacts[0]["status"] == "cleaned"
+    assert "recovery_void" not in artifacts[0]
+
+
+# ── R3-fix(d): recovery-clock anchor reconciliation (W-67-15 / W-67-16) ──
+
+
+#: Which durable field each anchor slot reads. Pinned here rather than
+#: inferred from the module: if a slot is ever repointed at another field,
+#: the provenance tests below go red instead of silently re-labelling a
+#: framework-clock reading as a host observation.
+_ANCHOR_FIELDS = {
+    "confirmed_live": "confirmed_live_epoch",
+    "framework_commit": "recovery_armed_commit_epoch",
+    "host_armed": "host_armed_epoch",
+    "recovery_deadline": "recovery_deadline_epoch",
+    "host_fire": "host_fire_epoch",
+}
+
+#: The clock realm each slot's number comes from.
+_ANCHOR_REALM = {
+    "confirmed_live": PROVENANCE_FRAMEWORK,
+    "framework_commit": PROVENANCE_FRAMEWORK,
+    "host_armed": PROVENANCE_HOST,
+    "recovery_deadline": PROVENANCE_FRAMEWORK,
+    "host_fire": PROVENANCE_HOST,
+}
+
+
+def _full_anchor_artifact(**overrides):
+    """One carrier carrying every anchor the schema declares."""
+    artifact = {
+        "type": "recovery_carrier",
+        "kind": "pod",
+        "name": "drill-rc-anchor",
+        "namespace": "default",
+        "status": "recovery_armed",
+        # Case #67's measured spread: 100s of framework bookkeeping before
+        # the commit, 85s from commit to systemd accepting the unit, and a
+        # fire 51s AHEAD of the framework's own deadline.
+        "confirmed_live_epoch": 1000.0,
+        "recovery_armed_commit_epoch": 1100.0,
+        "host_armed_epoch": 1185.0,
+        "recovery_deadline_epoch": 1520.0,
+        "host_fire_epoch": 1469.0,
+    }
+    artifact.update(overrides)
+    return artifact
+
+
+class TestRecoveryTimeAnchors:
+    """The five recovery-clock moments side by side, each labelled with WHERE
+    its number came from.
+
+    Root cause: confirmed_live / commit / host_armed / deadline / host_fire
+    live on two different clocks and sat in four separate fields (or in no
+    field at all), so the 85s and 51s gaps in cases #66/#67 could only be
+    found by hand, out of band. Nothing in the record ever put two of them
+    next to each other, so nothing could regress on the drift.
+    """
+
+    def test_every_declared_slot_is_always_present(self):
+        table = recovery_time_anchors(_full_anchor_artifact())
+        assert tuple(table) == RECOVERY_TIME_ANCHOR_SLOTS
+        for slot in RECOVERY_TIME_ANCHOR_SLOTS:
+            assert set(table[slot]) == {"epoch", "provenance"}
+
+    def test_observed_slot_reports_its_own_clock_realm(self):
+        source = _full_anchor_artifact()
+        table = recovery_time_anchors(source)
+        for slot, field in _ANCHOR_FIELDS.items():
+            assert table[slot]["epoch"] == float(source[field]), slot
+            assert table[slot]["provenance"] == _ANCHOR_REALM[slot], slot
+        # Only the two host-clock anchors may serve as evidence that anything
+        # happened ON THE HOST. A framework read of the API server is real
+        # evidence about the pod and still framework-clocked.
+        assert {
+            slot
+            for slot in RECOVERY_TIME_ANCHOR_SLOTS
+            if table[slot]["provenance"] == PROVENANCE_HOST
+        } == {"host_armed", "host_fire"}
+
+    @pytest.mark.parametrize("slot", RECOVERY_TIME_ANCHOR_SLOTS)
+    def test_missing_slot_downgrades_to_unobserved(self, slot):
+        """Honesty invariant: a slot with no number behind it must NOT keep
+        its declared provenance. ``host_observed`` on an empty slot claims the
+        host was read when it never was — precisely the laundering the
+        provenance vocabulary exists to prevent."""
+        artifact = _full_anchor_artifact()
+        del artifact[_ANCHOR_FIELDS[slot]]
+        row = recovery_time_anchors(artifact)[slot]
+        assert row == {"epoch": None, "provenance": PROVENANCE_UNOBSERVED}
+        assert row["provenance"] != _ANCHOR_REALM[slot]
+
+    @pytest.mark.parametrize("slot", RECOVERY_TIME_ANCHOR_SLOTS)
+    @pytest.mark.parametrize("corrupt", ["1520", True, [], {}, object()])
+    def test_corrupt_slot_downgrades_to_unobserved(self, slot, corrupt):
+        """A non-numeric value reads as unobserved, never as an epoch. ``bool``
+        is an ``int`` subclass, so a corrupted ``True`` would otherwise anchor
+        the whole timeline at epoch 1 (1970) and every offset derived from it
+        would be astronomically wrong while looking well-formed."""
+        row = recovery_time_anchors(
+            _full_anchor_artifact(**{_ANCHOR_FIELDS[slot]: corrupt}),
+        )[slot]
+        assert row["epoch"] is None
+        assert row["provenance"] == PROVENANCE_UNOBSERVED
+
+    def test_no_record_yields_a_full_unobserved_table_not_an_empty_dict(self):
+        """"This carrier has no recovery clock on record" is a fact worth
+        rendering; ``{}`` is not. A reader iterating the schema must not have
+        to probe which slots this particular carrier happens to carry."""
+        for artifact in (None, {}, [], "drill-rc-anchor"):
+            table = recovery_time_anchors(artifact)  # type: ignore[arg-type]
+            assert tuple(table) == RECOVERY_TIME_ANCHOR_SLOTS, artifact
+            assert all(
+                row == {"epoch": None, "provenance": PROVENANCE_UNOBSERVED}
+                for row in table.values()
+            ), artifact
+
+    def test_derivation_is_pure_and_idempotent(self):
+        """The table is derived from the artifact's own authoritative fields
+        and stores nothing of its own, so re-deriving from an artifact that
+        ALREADY carries a persisted table returns that same table. Were it a
+        fifth independent statement instead, the persisted copy and the reader
+        could disagree — the two-implementations shape again."""
+        artifact = _full_anchor_artifact()
+        once = recovery_time_anchors(artifact)
+        carried = {**artifact, "recovery_time_anchors": once}
+        assert recovery_time_anchors(carried) == once
+        moved = recovery_time_anchors(
+            _full_anchor_artifact(recovery_armed_commit_epoch=1200.0),
+        )
+        assert moved["framework_commit"]["epoch"] == 1200.0
+        assert once["framework_commit"]["epoch"] == 1100.0
+
+
+class TestRecoveryAnchorOffsets:
+    """The reconciliation table the #66/#67 audits had to build by hand."""
+
+    def test_every_declared_pair_lands_in_exactly_one_bucket(self):
+        """Completeness invariant: a pair is either measured or named as a
+        gap, never neither. A silently dropped pair is how a drift stops being
+        regressed on — the failure mode this table exists to end."""
+        labels = {f"{a}_to_{b}" for a, b in RECOVERY_ANCHOR_OFFSET_PAIRS}
+        assert len(labels) == len(RECOVERY_ANCHOR_OFFSET_PAIRS)
+        tables = [
+            recovery_time_anchors(_full_anchor_artifact()),
+            recovery_time_anchors({}),
+            recovery_time_anchors(_full_anchor_artifact(host_armed_epoch=None)),
+            recovery_time_anchors(
+                _full_anchor_artifact(
+                    confirmed_live_epoch=None, host_fire_epoch=None,
+                ),
+            ),
+        ]
+        for table in tables:
+            offsets = recovery_anchor_offsets(table)
+            assert set(offsets["seconds"]) | set(offsets["unobserved"]) == labels
+            assert not set(offsets["seconds"]) & set(offsets["unobserved"])
+
+    def test_all_anchors_observed_yields_the_drift_numbers(self):
+        offsets = recovery_anchor_offsets(
+            recovery_time_anchors(_full_anchor_artifact()),
+        )
+        assert offsets["unobserved"] == {}
+        assert offsets["seconds"]["confirmed_live_to_framework_commit"] == 100.0
+        assert offsets["seconds"]["framework_commit_to_host_armed"] == 85.0
+        assert offsets["seconds"]["host_armed_to_recovery_deadline"] == 335.0
+        assert offsets["seconds"]["recovery_deadline_to_host_fire"] == -51.0
+
+    def test_one_unobserved_end_gaps_both_neighbouring_pairs(self):
+        """A number built from one observed end and one framework-clock end
+        would LOOK like a measurement while being a guess. With ``host_armed``
+        missing, neither neighbouring pair may yield a number — and the table
+        must name WHICH end is missing, not just that the pair is unknown."""
+        offsets = recovery_anchor_offsets(recovery_time_anchors({
+            "confirmed_live_epoch": 1000.0,
+            "recovery_armed_commit_epoch": 1100.0,
+            "recovery_deadline_epoch": 1520.0,
+        }))
+        assert offsets["seconds"] == {"confirmed_live_to_framework_commit": 100.0}
+        assert offsets["unobserved"] == {
+            "framework_commit_to_host_armed": ["host_armed"],
+            "host_armed_to_recovery_deadline": ["host_armed"],
+            "recovery_deadline_to_host_fire": ["host_fire"],
+        }
+
+    def test_malformed_slot_rows_read_as_gaps(self):
+        """A slot row that is not ``{"epoch": <number>, ...}`` contributes no
+        end to either of its pairs — a malformed row must degrade to a gap,
+        never be coerced into a number."""
+        offsets = recovery_anchor_offsets({"host_fire": 1500})
+        assert offsets["seconds"] == {}
+        assert offsets["unobserved"]["recovery_deadline_to_host_fire"] == [
+            "recovery_deadline",
+            "host_fire",
+        ]
+        assert len(offsets["unobserved"]) == len(RECOVERY_ANCHOR_OFFSET_PAIRS)
+        # Well-formed row, garbage epoch: same verdict.
+        broken = recovery_anchor_offsets({
+            "recovery_deadline": {"epoch": 1520.0},
+            "host_fire": {"epoch": "1469", "provenance": PROVENANCE_HOST},
+        })
+        assert broken["seconds"] == {}
+        assert broken["unobserved"]["recovery_deadline_to_host_fire"] == [
+            "host_fire",
+        ]
+
+    def test_case67_record_shape_names_the_blind_spot(self):
+        """Field pin, and an honest one. Case #67's record carried framework
+        clocks only, so the two gaps the audit measured by hand (85s
+        commit→armed, 51s deadline→fire) were NOT recoverable from it. This
+        fix does not make them recoverable either — that needs the host stderr
+        receipt. What it does is name both as known gaps, so the blind spot is
+        a machine-readable schema fact instead of an auditor's discovery."""
+        offsets = recovery_anchor_offsets(recovery_time_anchors({
+            "type": "recovery_carrier",
+            "kind": "pod",
+            "recovery_armed_commit_epoch": 1_766_558_751.0,
+            "recovery_deadline_epoch": 1_766_559_307.0,
+        }))
+        assert offsets["seconds"] == {}
+        assert offsets["unobserved"]["framework_commit_to_host_armed"] == [
+            "host_armed",
+        ]
+        assert offsets["unobserved"]["recovery_deadline_to_host_fire"] == [
+            "host_fire",
+        ]
+
+    def test_garbage_and_empty_input_yield_all_gaps(self):
+        for table in (None, {}, [], "confirmed_live"):
+            offsets = recovery_anchor_offsets(table)  # type: ignore[arg-type]
+            assert offsets["seconds"] == {}
+            assert len(offsets["unobserved"]) == len(RECOVERY_ANCHOR_OFFSET_PAIRS)
+            assert all(
+                sorted(missing) == sorted(pair)
+                for pair, missing in zip(
+                    RECOVERY_ANCHOR_OFFSET_PAIRS,
+                    offsets["unobserved"].values(),
+                )
+            ), table
+
+
+def _rearm_messages(tool_call_id: str, sleep_seconds: int):
+    """One more host-exec round on the same carrier, with its own bound."""
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "kubectl",
+                "args": {
+                    "subcommand": "exec",
+                    "v_args": (
+                        "node-debugger-n1-abc12 -n kubewiz -- chroot /host "
+                        "sh -c 'iptables -I OUTPUT -j DROP && nohup sh -c "
+                        f'"sleep {sleep_seconds} && iptables -D OUTPUT -j DROP" '
+                        ">/dev/null 2>&1 &'"
+                    ),
+                },
+                "id": tool_call_id,
+            }],
+        ),
+        ToolMessage(
+            content="injection started",
+            name="kubectl",
+            tool_call_id=tool_call_id,
+        ),
+    ]
+
+
+class _Clock:
+    """A manually advanced stand-in for the framework's wall clock, so a
+    re-arm / replay can be tested across two different "now" values without
+    sleeping."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestArmingWritesTheAnchorTable:
+    """The writer face of R3-fix(d): arming records the commit moment and
+    persists the reconciliation table, and nothing else may move them."""
+
+    @staticmethod
+    def _armed(clock):
+        with patch("chaos_agent.agent.execution_artifacts.time.time", clock):
+            return collect_execution_artifacts(_bounded_exec_messages())
+
+    @staticmethod
+    def _recollect(clock, messages, existing):
+        with patch("chaos_agent.agent.execution_artifacts.time.time", clock):
+            return collect_execution_artifacts(messages, existing)
+
+    def test_arming_records_commit_and_persisted_table(self):
+        artifact = self._armed(_Clock())[0]
+        assert artifact["status"] == "recovery_armed"
+        assert artifact["recovery_armed_commit_epoch"] == 1000.0
+        assert artifact["recovery_deadline_epoch"] == 1600.0
+        # The persisted copy must equal a fresh recomputation, or record and
+        # reader are two independent statements of the same facts.
+        assert artifact["recovery_time_anchors"] == recovery_time_anchors(artifact)
+        assert artifact["recovery_time_anchors"]["framework_commit"] == {
+            "epoch": 1000.0,
+            "provenance": PROVENANCE_FRAMEWORK,
+        }
+
+    def test_commit_is_stored_not_left_as_a_difference(self):
+        """``deadline - timeout`` only reconstructs the commit while both
+        operands stay in sync, and a re-arm moves the deadline without
+        recording which commit it moved from — hence the dedicated field."""
+        artifact = self._armed(_Clock())[0]
+        assert (
+            artifact["recovery_deadline_epoch"]
+            - artifact["recovery_armed_commit_epoch"]
+            == artifact["recovery_timeout_seconds"]
+        )
+
+    def test_host_anchors_stay_unobserved_on_the_written_record(self):
+        """Field pin on the gap this batch does NOT close: no writer fills
+        ``host_armed`` / ``host_fire`` (systemd-run reports the unit on stderr
+        and the success path drops stderr). The persisted table must SAY so,
+        not leave a reader to infer it from an absent key."""
+        artifact = self._armed(_Clock())[0]
+        table = artifact["recovery_time_anchors"]
+        assert table["host_armed"]["provenance"] == PROVENANCE_UNOBSERVED
+        assert table["host_fire"]["provenance"] == PROVENANCE_UNOBSERVED
+        offsets = recovery_anchor_offsets(table)
+        assert set(offsets["seconds"]) <= {"confirmed_live_to_framework_commit"}
+        assert "framework_commit_to_host_armed" in offsets["unobserved"]
+        assert "recovery_deadline_to_host_fire" in offsets["unobserved"]
+
+    def test_longer_rearm_refreshes_commit_and_table(self):
+        clock = _Clock()
+        first = self._armed(clock)
+        clock.now = 1100.0
+        artifact = self._recollect(
+            clock,
+            _bounded_exec_messages() + _rearm_messages("tc-exec2", 900),
+            first,
+        )[0]
+        assert artifact["recovery_deadline_epoch"] == 2000.0
+        assert artifact["recovery_armed_commit_epoch"] == 1100.0
+        assert artifact["recovery_time_anchors"] == recovery_time_anchors(artifact)
+        assert (
+            artifact["recovery_time_anchors"]["framework_commit"]["epoch"] == 1100.0
+        )
+        # The first arm's liveness stamp is a durable fact, not re-derived.
+        assert artifact["confirmed_live_epoch"] == 1000.0
+
+    def test_shorter_rearm_moves_neither_commit_nor_table(self):
+        clock = _Clock()
+        before = self._armed(clock)[0]
+        snapshot = dict(before)
+        clock.now = 1100.0
+        artifact = self._recollect(
+            clock,
+            _bounded_exec_messages() + _rearm_messages("tc-exec3", 30),
+            [before],
+        )[0]
+        # Keep-while-armed is a LOWER bound: a verification probe riding the
+        # carrier must not eat into an armed window.
+        assert artifact["recovery_deadline_epoch"] == 1600.0
+        assert (
+            artifact["recovery_armed_commit_epoch"]
+            == snapshot["recovery_armed_commit_epoch"]
+        )
+        assert artifact["recovery_time_anchors"] == snapshot["recovery_time_anchors"]
+
+    def test_replayed_arm_never_rewrites_the_table(self):
+        clock = _Clock()
+        before = self._armed(clock)[0]
+        snapshot = dict(before)
+        # Same history, later clock: a replay must not re-arm (which would
+        # both push the deadline and restamp the commit).
+        clock.now = 1100.0
+        artifact = self._recollect(clock, _bounded_exec_messages(), [before])[0]
+        assert artifact["host_exec_seen_ids"] == ["tc-exec"]
+        assert artifact["recovery_deadline_epoch"] == 1600.0
+        assert (
+            artifact["recovery_armed_commit_epoch"]
+            == snapshot["recovery_armed_commit_epoch"]
+        )
+        assert artifact["recovery_time_anchors"] == snapshot["recovery_time_anchors"]
+
+
+# ── R3-fix(c): one authoritative carrier roster (W-67-12) ──
+
+
+def _carrier_row(**overrides):
+    row = {
+        "type": "recovery_carrier",
+        "kind": "pod",
+        "name": "drill-rc-1",
+        "namespace": "default",
+        "status": "recovery_armed",
+    }
+    row.update(overrides)
+    return row
+
+
+class TestCarrierStatusFacts:
+    """Two records answer "what happened to this task's carriers?" and no
+    reader merged them, so every consumer saw a partial view."""
+
+    def test_merges_ledger_rows_with_the_framework_cleanup_record(self):
+        state = {
+            "execution_artifacts": [_carrier_row()],
+            "cleaned_debug_pods": ["node-debugger-n-fdfj5"],
+        }
+        rows = carrier_status_facts(state)["carriers"]
+        assert [row["name"] for row in rows] == [
+            "drill-rc-1",
+            "node-debugger-n-fdfj5",
+        ]
+        assert [row["source"] for row in rows] == [
+            CARRIER_SOURCE_LEDGER,
+            CARRIER_SOURCE_CLEANUP_RECORD,
+        ]
+
+    def test_ledger_wins_when_a_name_appears_in_both_records(self):
+        """The cleanup record is a bare name set with no namespace, type or
+        status; letting it win would REPLACE facts with a placeholder."""
+        rows = carrier_status_facts({
+            "execution_artifacts": [_carrier_row(status="cleaned")],
+            "cleaned_debug_pods": ["drill-rc-1"],
+        })["carriers"]
+        assert len(rows) == 1
+        assert rows[0]["source"] == CARRIER_SOURCE_LEDGER
+        assert rows[0]["namespace"] == "default"
+        assert rows[0]["type"] == "recovery_carrier"
+
+    def test_cleanup_record_row_claims_only_what_it_proves(self):
+        """Honesty pin: ``cleaned_debug_pods`` records that the framework
+        ISSUED a delete through the transport. Cleanup never re-reads absence,
+        so the row's status is ``cleaned`` and nothing stronger. ``kind`` is a
+        fact here, not a placeholder — that set only ever holds debug POD
+        names."""
+        rows = carrier_status_facts(
+            {"cleaned_debug_pods": ["node-debugger-n-7j6b2"]},
+        )["carriers"]
+        assert rows == [{
+            "name": "node-debugger-n-7j6b2",
+            "namespace": "",
+            "type": "debug_pod",
+            "kind": "pod",
+            "status": "cleaned",
+            "source": CARRIER_SOURCE_CLEANUP_RECORD,
+        }]
+
+    def test_non_vehicle_and_nameless_rows_are_excluded(self):
+        rows = carrier_status_facts({
+            "execution_artifacts": [
+                _carrier_row(type="fault_target", name="victim-0"),
+                _carrier_row(name=""),
+                "not-a-dict",
+                _carrier_row(),
+            ],
+            "cleaned_debug_pods": ["", None],
+        })["carriers"]
+        assert [row["name"] for row in rows] == ["drill-rc-1"]
+
+    def test_every_vehicle_type_reaches_the_roster(self):
+        """Generality pin: the filter is ``VEHICLE_ARTIFACT_TYPES``, not a
+        hand-listed pair, so a new vehicle form is carried without a change
+        here. The probe channel (debug_pod) is carried too — the question this
+        roster answers is "what did this task BUILD", not "what underwrites
+        the reversal" (that narrower set is ``RECOVERY_CARRIER_TYPES``)."""
+        rows = carrier_status_facts({
+            "execution_artifacts": [
+                _carrier_row(type=kind, name=f"drill-v-{kind}")
+                for kind in sorted(VEHICLE_ARTIFACT_TYPES)
+            ],
+        })["carriers"]
+        assert {row["type"] for row in rows} == set(VEHICLE_ARTIFACT_TYPES)
+
+    def test_empty_and_non_dict_state_yield_an_empty_roster(self):
+        for state in (None, {}, [], {"execution_artifacts": None}):
+            assert carrier_status_facts(state) == {"carriers": []}, state
+
+    def test_case67_field_shape_lists_both_probes_as_cleaned(self):
+        """Field pin (case #67): the plan text said two Completed
+        node-debugger probes were "folded into the cleanup step", the
+        framework force-deleted both at planning exit THROUGH THE TRANSPORT
+        (so no ``kubectl`` ToolMessage exists and the ledger never saw it),
+        and the verifier — with only that prose in context — still reported
+        them as needing cleanup. This roster is what was missing."""
+        rows = carrier_status_facts({
+            "execution_artifacts": [
+                _carrier_row(),
+                _carrier_row(
+                    type="debug_pod",
+                    name="node-debugger-n-6k658",
+                    status="active",
+                ),
+            ],
+            "cleaned_debug_pods": [
+                "node-debugger-n-fdfj5",
+                "node-debugger-n-7j6b2",
+            ],
+        })["carriers"]
+        assert len(rows) == 4
+        assert {
+            row["name"]: row["status"]
+            for row in rows
+            if row["source"] == CARRIER_SOURCE_CLEANUP_RECORD
+        } == {
+            "node-debugger-n-fdfj5": "cleaned",
+            "node-debugger-n-7j6b2": "cleaned",
+        }
+
+    def test_roster_does_not_disturb_the_pending_teardown_single_source(self):
+        """Non-degradation pin: ``pending_vehicle_teardown`` stays the single
+        source for the task-end envelope and reads ONLY the structured ledger.
+        This roster is a SUPERSET view for the verifier's context — the bare
+        name set must not leak into terminal liability, or an already-deleted
+        planning probe would be reported as owing a teardown."""
+        from chaos_agent.agent.result.operation_result import (
+            pending_vehicle_teardown,
+        )
+        ledger_only = {"execution_artifacts": [_carrier_row()]}
+        merged = {**ledger_only, "cleaned_debug_pods": ["node-debugger-n-fdfj5"]}
+        expected = ["recovery_carrier:default/drill-rc-1"]
+        assert pending_vehicle_teardown(ledger_only) == expected
+        assert pending_vehicle_teardown(merged) == expected

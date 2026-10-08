@@ -1,6 +1,7 @@
 """Graph-level terminal-state contract for the fault-window hold origin.
 
-Provenance (adversarial review, 2026-09-19): the hold tests in
+Provenance (adversarial review, 2026-09-19; re-anchored by
+hold-reanchor-recovery-grace, 2026-09-22): the hold tests in
 tests/test_server/routes/test_turn_hold_fault_window.py feed a
 hand-built ``SnapshotPipelineGraph`` terminal state — the REAL inject
 pipeline's post-verifier node chain (``terminal_reports`` →
@@ -13,13 +14,15 @@ This module puts teeth on exactly that gap: it chains the REAL nodes
 (``verifier`` simple entry → ``terminal_reports`` → ``save_memory``)
 inside a real ``StateGraph(AgentState)`` round-trip — the same defense
 pattern as test_recover_verifier.py's B51 pin — and asserts the
-TERMINAL state still carries both window fields the hold reads:
+TERMINAL state still carries the window origin the hold reads:
 
-  - ``injection_start_time`` — the execute-loop attribution stamp
-    (input here; must survive the chain byte-identical);
-  - ``injection_window_start_time`` — stamped by the REAL verifier
-    entry, riding the TOP-LEVEL state channel (not nested inside
-    ``result``), and surviving both store nodes' updates.
+  - ``injection_start_time`` — the ISSUED stamp, the hold's window
+    origin AND the same origin the fault's own recovery timer counts
+    from (input here; must survive the chain byte-identical);
+  - the retired ``injection_window_start_time`` (verifier-entry
+    origin) must NOT reappear: the verifier no longer stamps any
+    window field, and a stale re-introduction would silently shift
+    the hold's dispatch off the issued anchor.
 """
 
 from __future__ import annotations
@@ -86,9 +89,9 @@ async def test_terminal_state_keeps_window_fields_through_real_node_chain(monkey
     graph.add_edge("terminal_reports", "save_memory")
     graph.add_edge("save_memory", END)
 
-    # The "execute-loop just concluded" input shape: attribution origin
-    # stamped, window origin NOT yet — the verifier inside the chain
-    # must be the one to stamp it (that seam is the contract).
+    # The "execute-loop just concluded" input shape: the issued stamp
+    # is already in place — nothing downstream may re-anchor or clear
+    # it (that stamp IS the hold's window origin now).
     start_iso = now_iso()
     initial = {
         "task_id": "inject-20260919-120000-term01",
@@ -113,21 +116,18 @@ async def test_terminal_state_keeps_window_fields_through_real_node_chain(monkey
     assert out.get("finished_at"), "save_memory did not complete"
     assert "postmortem" in out, "terminal_reports did not write its R11 keys"
 
-    # THE contract: both window fields live in the terminal state.
+    # THE contract: the hold's window origin lives in the terminal state.
     assert out.get("injection_start_time") == start_iso, (
-        "the execute-loop attribution origin must survive the node chain "
+        "the issued stamp (hold window origin) must survive the node chain "
         "byte-identical — a clearing write in terminal_reports/save_memory "
         "silently degrades the fault-window hold to switch-off"
     )
-    window_iso = out.get("injection_window_start_time")
-    assert window_iso, (
-        "the verifier-entry stamp must ride the TOP-LEVEL state channel "
-        "through the LangGraph merge — a nested placement starves the hold"
-    )
     # The hold parses exactly this value and silently no-ops on an
     # unparseable one (the unparseable guard), so parse it HERE too.
-    window_dt = parse_iso_timestamp(window_iso)
-    assert window_dt >= parse_iso_timestamp(start_iso), (
-        "the window origin is stamped at verifier entry — after the "
-        "execute-loop attribution origin, never before it"
+    assert parse_iso_timestamp(out.get("injection_start_time")) is not None
+    # The retired verifier-entry origin must not reappear: nothing in
+    # the chain stamps a window field anymore.
+    assert not out.get("injection_window_start_time"), (
+        "injection_window_start_time is retired (hold-reanchor-recovery-"
+        "grace) — a node re-stamping it would drift the contract"
     )

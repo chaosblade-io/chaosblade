@@ -954,6 +954,141 @@ class TestLiabilityLedger:
         assert may_carry_live_fault({"task_state": "injecting"}) is False
         assert may_carry_live_fault({}) is False
 
+    # -- Plan A: recover-proxy guard + TTL-carrier clearance channel -------
+
+    def test_recover_operation_row_is_never_a_live_liability(self):
+        """B-64-B double-book fix：recover 代理行继承 inject run 的
+        injection_start_time，但自身不发注入；leg B 的 _injection_was_issued
+        在继承时间戳上误发，把同一故障再记一次活负债。recover 守卫短路成
+        False——故障的生死只看 inject 行自己的证据。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        recover_proxy = {
+            "operation": "recover",
+            "task_state": "recovering",
+            "target": '{"names": ["pod1"]}',
+            "injection_start_time": self._ISSUED,  # inherited from inject run
+        }
+        assert may_carry_live_fault(recover_proxy) is False
+        # the SAME shape as an inject row stays live (guard is operation-scoped)
+        assert may_carry_live_fault(dict(recover_proxy, operation="inject")) is True
+
+    def test_ttl_carrier_cleaned_clears_committed_row(self):
+        """自计时 recovery_carrier 到达终态 cleaned，就是 UID-less native
+        故障的死亡证明——这类故障从不走 recover flow，永远产不出
+        recover_verification 裁决。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        base = {
+            "task_state": "injected",
+            "target": '{"names": ["pod1"]}',
+            "injection_start_time": self._ISSUED,
+        }
+        assert may_carry_live_fault(base) is True  # no clearance evidence yet
+        cleaned = dict(
+            base,
+            execution_artifacts='[{"type": "recovery_carrier", "status": "cleaned"}]',
+        )
+        assert may_carry_live_fault(cleaned) is False
+
+    def test_void_carrier_does_not_clear(self):
+        """recovery_void=True 意味反转随载体一起死了——故障活过了它的移除
+        器，载体缺席是活故障的证据，不是清算证据。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        voided = {
+            "task_state": "injected",
+            "target": '{"names": ["pod1"]}',
+            "injection_start_time": self._ISSUED,
+            "execution_artifacts": (
+                '[{"type": "recovery_carrier", "status": "cleaned", '
+                '"recovery_void": true}]'
+            ),
+        }
+        assert may_carry_live_fault(voided) is True
+
+    def test_debug_pod_probe_cleaned_does_not_clear(self):
+        """debug_pod 是探针通道不是反转载体：它被清理跟故障有没被反转无关。
+        经 RECOVERY_CARRIER_TYPES 排除，所以只有探针的行仍为活候选。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        probe_only = {
+            "task_state": "injected",
+            "target": '{"names": ["pod1"]}',
+            "injection_start_time": self._ISSUED,
+            "execution_artifacts": '[{"type": "debug_pod", "status": "cleaned"}]',
+        }
+        assert may_carry_live_fault(probe_only) is True
+
+    def test_host_timer_carrier_clears_only_after_deadline(self):
+        """分离式 host_timer 才是反转机制；载体 cleaned 不代表定时器已触
+        发。清算要求 deadline 已过点。"""
+        import time as _time
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        base = {
+            "task_state": "injected",
+            "target": '{"names": ["pod1"]}',
+            "injection_start_time": self._ISSUED,
+        }
+        pending = dict(base, execution_artifacts=(
+            '[{"type": "recovery_carrier", "status": "cleaned", '
+            '"recovery_form": "host_timer", "recovery_deadline_epoch": '
+            f'{_time.time() + 3600}}}]'
+        ))
+        assert may_carry_live_fault(pending) is True  # timer hasn't fired
+        passed = dict(base, execution_artifacts=(
+            '[{"type": "recovery_carrier", "status": "cleaned", '
+            '"recovery_form": "host_timer", "recovery_deadline_epoch": '
+            f'{_time.time() - 10}}}]'
+        ))
+        assert may_carry_live_fault(passed) is False  # self-recovery fired
+
+    # -- boot reconcile: monotone-down ghost cleanup ----------------------
+
+    @pytest.mark.asyncio
+    async def test_reconcile_clears_stale_ghost(self, store):
+        """开机重算清掉一个谓词已不再支持的陈旧 liability_live=1（这
+        里：标志写入后 TTL 载体自清）。"""
+        await store.upsert(
+            "task-ghost",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+        )
+        # land the carrier's terminal clearance WITHOUT recomputing the flag
+        await store._backend.upsert_details(
+            "task-ghost",
+            ["task_id", "execution_artifacts"],
+            ["task-ghost", '[{"type": "recovery_carrier", "status": "cleaned"}]'],
+        )
+        row = await store._backend.select_task("task-ghost")
+        assert int(row["liability_live"]) == 1  # stale: no write path recomputed
+        changed = await store.reconcile_liability_flags()
+        assert changed >= 1
+        row = await store._backend.select_task("task-ghost")
+        assert int(row["liability_live"]) == 0
+        assert "task-ghost" not in {t["task_id"] for t in await store.query_active()}
+
+    @pytest.mark.asyncio
+    async def test_reconcile_never_resurrects_a_stored_zero(self, store):
+        """单调向下契约：一个存 0 但谓词会判活的行（pre-fix row-split 族：
+        recovered 词、故障句柄仍投影、本行无裁决）绝不被写回 1。复活它
+        们会把已恢复故障洪水般重新列进 query_active。"""
+        await store.upsert(
+            "task-split",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+        )
+        # predicate=True at write -> stored 1; force the word-backfill's 0
+        await store._backend.upsert_task(
+            "task-split", ["task_id", "liability_live"], ["task-split", 0],
+        )
+        row = await store._backend.select_task("task-split")
+        assert int(row["liability_live"]) == 0
+        await store.reconcile_liability_flags()
+        row = await store._backend.select_task("task-split")
+        assert int(row["liability_live"]) == 0  # NOT resurrected
+
     # -- ledger wings roundtrip + monotonic merge -------------------------
 
     @pytest.mark.asyncio

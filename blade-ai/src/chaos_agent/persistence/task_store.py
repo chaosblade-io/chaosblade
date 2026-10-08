@@ -25,6 +25,7 @@ import asyncio
 import atexit
 import json
 import logging
+import time
 from typing import Optional
 
 from chaos_agent.agent.state import (
@@ -120,6 +121,60 @@ def _recovery_fully_cleared(record: dict) -> bool:
         ):
             return True
     return False
+
+
+def _carriers_terminally_cleared(record: dict) -> bool:
+    """True when every recovery-bearing carrier artifact reached its OWN
+    terminal cleared state — the TTL / self-destruct clearance channel that
+    :func:`_recovery_fully_cleared` (recover-flow verdict only) is blind to.
+
+    A self-timed carrier (``recovery_carrier`` armed with a restore payload,
+    or a drill occupant deleted wholesale) never routes through the recover
+    flow, so no ``recover_verification`` verdict ever lands and leg B would
+    otherwise haunt ``query_active`` forever. Its own artifact record IS the
+    death certificate. A carrier counts as terminally cleared when ALL hold:
+
+      * ``status == "cleaned"`` — the carrier object is gone;
+      * NOT ``recovery_void`` — the reversal did not die WITH the carrier
+        (``recovery_void=True`` means the fault outlived its remover, so the
+        carrier's absence is evidence of a LIVE fault, not a cleared one);
+      * if a detached host timer was the reversal mechanism
+        (``recovery_form == "host_timer"``), its ``recovery_deadline_epoch``
+        has already passed — the self-recovery actually fired.
+
+    ``debug_pod`` is a PROBE channel, not a recovery carrier: its lifecycle
+    says nothing about whether the fault was reversed, so it is excluded via
+    the single-source ``RECOVERY_CARRIER_TYPES`` (agent.execution_artifacts).
+    No registered recovery carrier → False: nothing on this row can prove
+    clearance, so the row STAYS a candidate and is surfaced to the LLM with
+    its observed facts (fail-closed — never auto-clear a bare-native row the
+    framework recorded no teardown for).
+    """
+    from chaos_agent.agent.execution_artifacts import RECOVERY_CARRIER_TYPES
+
+    arts = _decode_json_value(record.get("execution_artifacts"))
+    if not isinstance(arts, list):
+        return False
+    carriers = [
+        a for a in arts
+        if isinstance(a, dict) and a.get("type") in RECOVERY_CARRIER_TYPES
+    ]
+    if not carriers:
+        return False
+    now = time.time()
+    for a in carriers:
+        if a.get("status") != "cleaned":
+            return False
+        if a.get("recovery_void"):
+            return False
+        if a.get("recovery_form") == "host_timer":
+            deadline = a.get("recovery_deadline_epoch")
+            try:
+                if deadline is None or float(deadline) > now:
+                    return False
+            except (TypeError, ValueError):
+                return False
+    return True
 
 
 def _injection_was_issued(record: dict) -> bool:
@@ -220,10 +275,16 @@ def may_carry_live_fault(record: dict) -> bool:
        a fault handle still projects (``has_active_fault`` — carrier-agnostic
        committed predicate) OR the issued-evidence pair survived on its own
        (``_injection_was_issued``: write-once ``injection_start_time`` plus
-       intent evidence) → True UNLESS the recover flow's own final verdict
-       proves the whole task cleared (``_recovery_fully_cleared``).
+       intent evidence) → True UNLESS a clearance channel proves the fault
+       dead: either the recover flow's own final verdict
+       (``_recovery_fully_cleared``) OR a self-timed carrier that reached its
+       own terminal cleared state (``_carriers_terminally_cleared`` — the TTL
+       channel that never routes through the recover flow).
 
     C) Never injected → False.
+
+    A ``recover``-operation row always answers False up front: it is a
+    cleanup agent, never a fault owner (see the guard in the body).
 
     The function is PURE over its record: both write paths (``upsert``
     inference and ``update_task_state`` recompute) feed it the merged
@@ -233,6 +294,16 @@ def may_carry_live_fault(record: dict) -> bool:
     wing only grows, and the recovery verdict only lands at finalize.
     """
     from chaos_agent.agent.state import has_active_fault
+
+    # A recover-flow row is a cleanup agent, never a fault owner. It shares
+    # the drill timeline and so inherits the inject run's write-once
+    # ``injection_start_time``, but issues no injection of its own — leg B's
+    # ``_injection_was_issued`` therefore misfires on the inherited stamp and
+    # double-books the SAME fault as a second live liability (B-64-B): the
+    # inject row already carries it, and the fault lives or dies on THAT row's
+    # own evidence. Short-circuit before any wing/fallback reading.
+    if str(record.get("operation") or "inject") == "recover":
+        return False
 
     owned = _decode_json_value(record.get("owned_experiment_uids"))
     retired = _decode_json_value(record.get("retired_experiment_uids"))
@@ -257,9 +328,18 @@ def may_carry_live_fault(record: dict) -> bool:
     # (legacy experiment_uid / injection_method columns, native carriers)
     # OR the issued-evidence pair survived on its own (command went out,
     # carrier fields later cleared). Both are "committed"; neither clears
-    # without the recover flow's own final verdict.
+    # without a clearance channel — the recover flow's own final verdict OR a
+    # self-timed carrier's terminal cleared record.
     if has_active_fault(record) or _injection_was_issued(record):
-        return not _recovery_fully_cleared(record)
+        if _recovery_fully_cleared(record):
+            return False
+        # The recover-flow verdict is not the only clearance channel: a
+        # self-timed carrier (TTL restore / wholesale-delete occupant) never
+        # routes through recover, so its own terminal artifact record is the
+        # death certificate. Absent either proof, stay live (fail-closed).
+        if _carriers_terminally_cleared(record):
+            return False
+        return True
 
     # C) No committed fault, no ledger → nothing owed.
     return False
@@ -621,6 +701,10 @@ class TaskStore:
                 "target": target,
                 "target_name": d.get("target_name", ""),
                 "params": detail.get("params") or {},
+                # Carrier facts the presenter renders verbatim so the LLM can
+                # judge liveness itself (see experiment_display). Already
+                # decoded by _row_to_dict; [] when the row registered none.
+                "execution_artifacts": detail.get("execution_artifacts") or [],
                 "experiment_uid": d.get("experiment_uid", ""),
                 "plan_summary": detail.get("plan_summary") or "",
                 "gmt_create": d.get("gmt_create", ""),
@@ -628,6 +712,71 @@ class TaskStore:
                 "error": d.get("error"),
             })
         return results
+
+    async def reconcile_liability_flags(self) -> int:
+        """Recompute ``liability_live`` for every row from the single-source
+        predicate and persist corrections. Returns the number of rows changed.
+
+        ``liability_live`` is otherwise only recomputed on the two WRITE paths
+        (``upsert`` inference, ``update_task_state``), so a row written before
+        the predicate learned a new clearance channel — a TTL carrier that
+        self-destructed, or a recover-proxy double-book — keeps a stale ``1``
+        forever and haunts ``query_active`` / the boot card. This one-shot
+        boot pass re-derives the column from each row's OWN persisted record
+        so stale ghosts self-heal without a schema migration.
+
+        MONOTONE-DOWN by construction: this pass only ever clears a stale
+        ``1 → 0``; it NEVER resurrects a stored ``0 → 1``. That constraint is
+        load-bearing, not cosmetic. The stored column is a MIX of predicate
+        writes and the word-based backfill migration
+        (``SET liability_live=1 WHERE task_state NOT IN <cleared>``), so the
+        two disagree in BOTH directions on legacy rows. Measured on a real
+        tasks.db: 38 rows carry ``task_state='recovered'`` with a still-
+        projecting fault handle but NO clearance verdict on the row — the
+        pre-fix row-split family whose recover verdict landed on the sibling
+        ``recover-`` proxy row instead of this inject row. The fail-closed
+        predicate correctly reads those as LIVE (no on-row proof of death),
+        but they were genuinely recovered, so writing them back to ``1`` would
+        flood ``query_active`` with dozens of already-cleared faults. Clearing
+        ghosts is this pass's only job; the row-split verdict gap is a separate
+        concern and is deliberately left untouched here.
+
+        Fail-open at the caller: any error is logged and swallowed there so a
+        reconcile hiccup never aborts store creation (and thus startup).
+        """
+        changed = 0
+        offset = 0
+        page = 500
+        while True:
+            rows = await self._backend.select_tasks_ordered(page, offset)
+            if not rows:
+                break
+            for row in rows:
+                task_id = row.get("task_id")
+                if not task_id:
+                    continue
+                stored = int(row.get("liability_live") or 0)
+                if stored != 1:
+                    continue  # monotone-down: never resurrect a stored 0
+                # Rebuild the same merged tasks+task_details logical record
+                # the write paths feed the predicate (raw values; JSON columns
+                # are decoded inside may_carry_live_fault).
+                record = dict(row)
+                detail_row = await self._backend.select_details(task_id)
+                if detail_row:
+                    record.update(
+                        {k: v for k, v in detail_row.items() if k not in ("id",)}
+                    )
+                if may_carry_live_fault(record):
+                    continue  # predicate still supports the flag — keep it
+                await self._backend.upsert_task(
+                    task_id, ["task_id", "liability_live"], [task_id, 0]
+                )
+                changed += 1
+            if len(rows) < page:
+                break
+            offset += page
+        return changed
 
     async def delete(self, task_id: str) -> bool:
         """Delete a task and its associated details + spans.
@@ -1119,6 +1268,21 @@ async def get_task_store() -> TaskStore:
 
     _store = TaskStore(backend=backend)
     _store_key = key
+    # One-shot boot reconcile: heal stale ``liability_live`` flags written by
+    # an older predicate (TTL carriers that self-cleared, recover-proxy
+    # double-books). Runs only here, on store (re)creation — the cached-store
+    # fast path above returns before this. Fail-open: a reconcile error must
+    # never block store creation, and thus never block startup.
+    try:
+        _healed = await _store.reconcile_liability_flags()
+        if _healed:
+            logger.info(
+                "task_store: reconciled %d stale liability_live flag(s)", _healed
+            )
+    except Exception:
+        logger.warning(
+            "task_store: liability reconcile skipped on error", exc_info=True
+        )
     return _store
 
 

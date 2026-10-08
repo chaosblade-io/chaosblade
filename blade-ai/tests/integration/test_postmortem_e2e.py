@@ -676,8 +676,7 @@ class TestResultPayloadShape:
         """R18 — sync_to_store must persist the postmortem dict (as JSON
         string) into the task_details.postmortem column so future SQL
         queries can aggregate across tasks without walking disk files."""
-        from chaos_agent.persistence import task_store as _store_mod
-        from chaos_agent.persistence.task_store import TaskStore, _JSON_COLUMNS
+        from chaos_agent.persistence.task_store import _JSON_COLUMNS
 
         # postmortem MUST be in the JSON columns frozenset so the dict
         # gets json.dumps'd before insert.

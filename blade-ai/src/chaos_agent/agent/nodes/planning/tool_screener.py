@@ -65,7 +65,7 @@ from chaos_agent.agent.capabilities import explain_tool_refusal, tool_call_allow
 from chaos_agent.agent.execution_artifacts import (
     _RECOVERY_CARRIER_CREATE_KINDS,
     _exec_pod_identity,
-    VEHICLE_ARTIFACT_TYPES,
+    RECOVERY_CARRIER_TYPES,
     is_vehicle_name,
     is_vehicle_teardown_delete,
     vehicle_artifact_types,
@@ -106,7 +106,6 @@ from chaos_agent.agent.target_guard.classifier import (
 from chaos_agent.agent.providers.message_scanning import (
     KUBECTL_WRITE_SUBCOMMANDS,
 )
-from chaos_agent.agent.providers.registry import FaultProviderRegistry
 from chaos_agent.agent.result.verdict import FailureCategory
 from chaos_agent.config.settings import settings
 from chaos_agent.tools.guard_gateway import decision_to_feedback, get_guard_gateway
@@ -360,10 +359,10 @@ def _identity_matches_approved(
 #     fault riding it, wholesale. Teardown-by-deletion needs no timer, so an
 #     ``active`` registration already underwrites recovery.
 # A ``debug_pod`` is a PROBE channel, not a recovery underwriter, and is
-# deliberately excluded.
-_RECOVERY_UNDERWRITER_TYPES: frozenset[str] = frozenset(
-    VEHICLE_ARTIFACT_TYPES - {"debug_pod"},
-)
+# deliberately excluded — single-sourced as ``RECOVERY_CARRIER_TYPES``
+# (agent.execution_artifacts), the same set the clearance-time liability
+# predicate reads, so injection and recovery never drift on the definition.
+_RECOVERY_UNDERWRITER_TYPES: frozenset[str] = RECOVERY_CARRIER_TYPES
 _RECOVERY_CARRIER_TYPE = "recovery_carrier"
 _TEARDOWN_UNDERWRITER_TYPES: frozenset[str] = frozenset(
     _RECOVERY_UNDERWRITER_TYPES - {_RECOVERY_CARRIER_TYPE},
@@ -466,6 +465,38 @@ def _carrier_family_in_write_set(approved: ApprovedTarget) -> bool:
         e.scope for e in (approved.mechanism_entries or ())
     )
     return bool(write_set & carrier_kinds)
+
+
+def _is_object_write_injection(tool_name: str, tool_args: dict) -> bool:
+    """Armed-before-inject trigger: is this an OBJECT-WRITE injection?
+
+    An object-write injection lands the fault through an API-server object
+    write whose reversal is the ONLY bounded recovery — either a mutation
+    verb (``KUBECTL_WRITE_SUBCOMMANDS``: patch/delete/scale/...) where the
+    verb itself mutates a live object, OR an ``apply``/``create -f`` of a
+    PERSISTENT fault object (networkpolicy/configmap/secret/pvc/...) that
+    then lives unbounded — no UID, no ``activeDeadlineSeconds``, no
+    self-timeout, exactly like a mutation. Both halves are the SAME
+    canonical predicates the issue-time attribution uses
+    (``KUBECTL_WRITE_SUBCOMMANDS`` and ``is_apply_native_fault_injection``)
+    — the gate borrows no separate vocabulary, which is precisely the
+    conflation that had left apply-native faults ungated.
+
+    Command-mode ``exec``/``debug`` injections are deliberately EXCLUDED
+    (neither signal matches them): their recovery-timer forms are
+    case-legislated, not structurally provable at this gate.
+    """
+    if tool_args.get("subcommand") in KUBECTL_WRITE_SUBCOMMANDS:
+        return True
+    # Lazy import — ``k8s_native.classifier`` is a legal family-facility seam
+    # (test_generic_layer_import_audit pins ``classifier`` as seam, not a
+    # concrete provider module); imported on demand to keep the planning
+    # node's module load light, matching the registry seam above.
+    from chaos_agent.agent.providers.k8s_native.classifier import (
+        is_apply_native_fault_injection,
+    )
+
+    return is_apply_native_fault_injection(tool_name, tool_args)
 
 
 def _declared_verbs_in_symmetric_revert_domain(approved: ApprovedTarget) -> bool:
@@ -1852,10 +1883,12 @@ async def tool_screener(state: AgentState) -> dict:
                     effective, approved,
                 )
                 # Armed-before-inject gate (inject-cc2d5080): a kubectl
-                # OBJECT-WRITE injection (the verb itself is the mutation,
-                # ``KUBECTL_WRITE_SUBCOMMANDS`` — the same single-source
-                # vocabulary the issue-time attribution uses) carries no
-                # experiment UID and no self-timeout, so its ONLY bounded
+                # OBJECT-WRITE injection — a mutation verb (the verb itself
+                # is the mutation) OR an ``apply``/``create -f`` of a
+                # persistent fault object that then lives unbounded; both
+                # halves reuse the SAME canonical predicates the issue-time
+                # attribution uses (``_is_object_write_injection``) — carries
+                # no experiment UID and no self-timeout, so its ONLY bounded
                 # recovery is the recovery-carrier timer the plan stacks
                 # (a REST-reversible object write can always construct the
                 # SA carrier path — no exemption form exists). In that
@@ -1894,7 +1927,7 @@ async def tool_screener(state: AgentState) -> dict:
                     decision.verdict == GuardVerdict.ALLOW
                     and tool_name == "kubectl"
                     and isinstance(tool_args, dict)
-                    and tool_args.get("subcommand") in KUBECTL_WRITE_SUBCOMMANDS
+                    and _is_object_write_injection(tool_name, tool_args)
                     and approved is not None
                     and _carrier_family_in_write_set(approved)
                     and not _recovery_vehicle_armed(vehicle_cache, state)
