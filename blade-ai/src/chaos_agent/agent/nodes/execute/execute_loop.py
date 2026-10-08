@@ -40,6 +40,7 @@ from chaos_agent.agent.nodes.verify._verifier_messages import (
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store
 from chaos_agent.agent.nodes.execute.llm_step_helpers import (
     build_stagnation_hint,
+    fold_hint_state,
     persist_corrective_hint,
     persist_replaceable_hint,
     filter_stagnant_tool,
@@ -81,6 +82,7 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.utils.skill_case_section import is_case_document
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
@@ -702,12 +704,6 @@ def reset_attribution_state(
     result["kubectl_exec_pod_name"] = None
     result["inject_layer1_cache"] = None
     result["injection_start_time"] = None
-    # Fault-window hold origin: retired with the same attribution — the
-    # replanned attempt's window must re-anchor at ITS execute-loop end
-    # (the next verifier entry re-stamps), never inherit this attempt's
-    # verifier-entry stamp (a stale origin would silently erode the new
-    # attempt's window by the replan cycle's entire duration).
-    result["injection_window_start_time"] = None
     # Ledger plan-scoped-field reset (C1 knife-2 + O2): retire the previous
     # plan's execution facts together with its attribution. Two fields are
     # plan-scoped — they describe THE PLAN THAT JUST RAN and must not leak
@@ -776,6 +772,7 @@ def _build_execution_hints(
     state: AgentState,
     persist_into: list | None = None,
     counts_out: dict | None = None,
+    hinted_out: dict | None = None,
 ) -> tuple[list[HumanMessage], str | None]:
     """Build all execution-phase hints to inject before the LLM call.
 
@@ -798,6 +795,11 @@ def _build_execution_hints(
     # ``counts_out`` into its state update.
     _counts = counts_out if counts_out is not None else {}
     _counts.update(state.get("hint_repeat_counts") or {})
+    # Instance-level dedup carrier for the tool-error hint, folded back by the
+    # caller via ``fold_hint_state``. On state for the same compaction reason as
+    # the counts (see AgentState.hinted_error_calls).
+    _hinted = hinted_out if hinted_out is not None else {}
+    _hinted.update(state.get("hinted_error_calls") or {})
 
     loop_hint = detect_repeated_tool_calls(messages, phase="execute")
     if loop_hint:
@@ -825,10 +827,18 @@ def _build_execution_hints(
             counts=_counts, counts_out=_counts,
         ))
 
-    error_hint = detect_tool_error_hint(messages)
-    if error_hint:
+    # ``escalate_after`` is deliberately NOT passed here or on the transient
+    # hint below: None now means INHERIT ``settings.hint_escalate_after``, so
+    # these two kinds are subject to the escalation legislation by construction
+    # rather than by each call site remembering the kwarg.
+    _err = detect_tool_error_hint(messages, hinted_calls=_hinted)
+    if _err:
+        error_hint, error_tool, error_call = _err
+        _err_key = error_tool or "execute"
+        if error_call:
+            _hinted[error_call] = f"tool_error:{_err_key}"
         hints.append(persist_corrective_hint(
-            _persist, _history, "tool_error", "execute", error_hint,
+            _persist, _history, "tool_error", _err_key, error_hint,
             counts=_counts, counts_out=_counts,
         ))
 
@@ -871,6 +881,21 @@ def _process_response_tool_calls(
 ) -> None:
     """Process tool_calls from the LLM response: blade params, FCAT, scale tracking."""
     tool_calls = getattr(response, "tool_calls", None) or []
+    # Contract duration pin (issue-time write): the approved window in
+    # ``FaultSpec.duration_seconds`` is the ONLY legal value on a carrier's
+    # duration surface — the blade ``--timeout`` flag IS the fault's
+    # duration, and the faultdrill assembler's ``duration_seconds`` argument
+    # is rendered into the carrier's own restore timer; on either, a
+    # different value leaves the fault resident past the approved window or
+    # ends it early. Dispatched through the provider registry (each backend
+    # rewrites its own carrier) and applied BEFORE dispatch, so the
+    # executor's config-default fallback only ever serves a run that
+    # carries no contract at all.
+    from chaos_agent.agent.spec.fault_spec import read_fault_spec as _rfs_contract
+    _spec_for_contract = _rfs_contract(state)
+    _contract_duration = int(
+        getattr(_spec_for_contract, "duration_seconds", 0) or 0
+    )
     # A productive turn (issued tool calls) breaks any text-only stall streak:
     # reset the consecutive-stall counter so a later, unrelated stall gets a
     # fresh nudge budget instead of inheriting an old strike.
@@ -890,6 +915,66 @@ def _process_response_tool_calls(
         )
         if parsed_params:
             result["injection_parsed_params"] = parsed_params
+
+        if _contract_duration > 0:
+            _pinned_from = FaultProviderRegistry.enforce_contract_duration(
+                tc_name, tc_args, _contract_duration
+            )
+            if _pinned_from:
+                # Two-number window contract: the pin writes the carrier's
+                # timer with recovery_timer_seconds(D) = D+G — render THAT
+                # number, not the observation window D, or the log/ledger
+                # contradicts the value the guard later sees on the carrier.
+                from chaos_agent.utils.fault_type import (
+                    recovery_timer_seconds as _rts_pin,
+                )
+
+                _pinned_secs = _rts_pin(_contract_duration)
+                logger.info(
+                    "Contract recovery timer pinned: %s %s -> %ss "
+                    "(recovery_timer_seconds = duration %ss + recovery grace)",
+                    tc_name, _pinned_from, _pinned_secs, _contract_duration,
+                )
+                # Third surface, and the only one an auditor can actually
+                # read: the logger above does not reach ``inject --stream``
+                # (which renders tracker events only) and the session
+                # ledger below does not either. Without this the rewrite is
+                # invisible, so the plan's 300 and the dispatched call's
+                # 420 look like an unexplained drift instead of a pin
+                # (Case #64 / W-64-2). SYSTEM category + no debug marker,
+                # so it survives non-debug rendering — see
+                # ``StatusTracker.intervention``.
+                if tracker is not None:
+                    tracker.intervention(
+                        "pin",
+                        f"[contract] {tc_name}: {_pinned_from} -> "
+                        f"{_pinned_secs}s (fault window "
+                        f"{_contract_duration}s + recovery grace "
+                        f"{_pinned_secs - _contract_duration}s)"[:200],
+                        {
+                            "tool": tc_name,
+                            "before": _pinned_from,
+                            "after": _pinned_secs,
+                            "window": _contract_duration,
+                            "authority": "two-number window contract",
+                        },
+                    )
+                from chaos_agent.memory.session_store import get_global_session_store
+                _pin_store = get_global_session_store()
+                _pin_tid = state.get("task_id", "")
+                if _pin_store and _pin_tid:
+                    _pin_store.append_messages(
+                        _pin_tid,
+                        [HumanMessage(
+                            content=(
+                                f"[contract] {tc_name} recovery timer pinned "
+                                f"to {_pinned_secs}s "
+                                f"(duration {_contract_duration}s + recovery "
+                                f"grace): {_pinned_from} -> {_pinned_secs}s"
+                            )
+                        )],
+                        node_name=EXECUTE_LOOP,
+                    )
 
         if tc_name == "blade_create":
             logger.info(f"Blade create params: {tc_args}")
@@ -2271,7 +2356,18 @@ async def _build_execute_system_prompt(
     # Build structured_params_hint from FaultSpec. Duration rides along:
     # the execute prompt (MINIMAL mode) has no Reviewed FaultSpec section,
     # so this hint is the executor's ONLY view of the contracted injection
-    # window — command-level timers (sleep N / --timeout N) anchor on it.
+    # window. TWO numbers under the window contract:
+    #   duration            = D   — the observation window (framework
+    #                               presence obligation; NOT a timer the
+    #                               executor arms);
+    #   recovery_timer_seconds = D+G — what command-level self-recovery
+    #                               timers (sleep N / --timeout N /
+    #                               systemd-run --on-active) must be armed
+    #                               with, computed by the framework so the
+    #                               LLM never derives its own buffer. The
+    #                               grace G lets an actively dispatched
+    #                               framework recovery land before the
+    #                               fault self-recovers.
     _spec_for_hint = read_fault_spec(state)
     structured_params_hint = ""
     if _spec_for_hint and _spec_for_hint.is_complete:
@@ -2281,6 +2377,18 @@ async def _build_execute_system_prompt(
             f"action={_spec_for_hint.fault_action}, "
             f"duration={_spec_for_hint.duration_seconds}s"
         )
+        try:
+            from chaos_agent.utils.fault_type import recovery_timer_seconds
+
+            structured_params_hint += (
+                f", recovery_timer_seconds="
+                f"{recovery_timer_seconds(_spec_for_hint.duration_seconds)}s"
+            )
+        except ValueError:
+            # Non-positive contract duration: the registry refuses to pin
+            # it upstream and the guard anchor stays silent — no timer to
+            # render, so the hint carries only the (already-complete) D.
+            pass
     # Build user_params_hint from FaultSpec.params so user-specified
     # values (e.g. finalizer=...) take priority over skill template
     # placeholders during Phase 2 execution.
@@ -2442,6 +2550,9 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         hook_updates = {}
         if hook:
             hook_updates = await hook(state)
+        # Sub-span boundary: see agent_loop — hook work is its own cost centre
+        # and must not be folded into the LLM number.
+        tracker.mark("hook")
 
         # 2b. Emit ToolMessage results from previous iteration (debug only)
         emit_debug_tool_messages(tracker, state)
@@ -2460,9 +2571,10 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
 
             # --- Execution hints (stagnation, idle, conflict, errors) ---
             _hint_counts: dict = {}
+            _hinted_calls: dict = {}
             hints, stagnant_tool = _build_execution_hints(
                 messages, state, persist_into=_hints_for_state,
-                counts_out=_hint_counts,
+                counts_out=_hint_counts, hinted_out=_hinted_calls,
             )
             messages.extend(hints)
 
@@ -2562,10 +2674,14 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
 
             # Record system prompt to session store (dedup handles repeated prompts)
             record_system_prompt(hook, state, execute_prompt, node_name=EXECUTE_LOOP)
+            # Sub-span boundary: prompt assembly, separated from model time.
+            tracker.mark("prompt-build")
 
             response = await llm_to_call.ainvoke(
                 [SystemMessage(content=execute_prompt)] + messages
             )
+            # Sub-span boundary: this interval alone is model time.
+            tracker.mark("llm-call")
         else:
             response = None
 
@@ -2857,7 +2973,10 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     continue
                 content = msg.content if isinstance(msg.content, str) else ""
                 # Detect catalogue use-case files by key section markers
-                if content and ("**故障现象**" in content or "**注入验证**" in content or "**恢复验证**" in content):
+                # (heading-anchored — see skill_case_section.is_case_document:
+                # the bare-marker form also matched the intent-extraction table
+                # row in SKILL.md, which this tool is allowed to return).
+                if is_case_document(content):
                     result["skill_case_content"] = content
                     logger.info("Extracted skill_case_content from read_skill_resource ToolMessage")
                     break
@@ -2887,8 +3006,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     len(getattr(response, "invalid_tool_calls", None) or []),
                 )
                 result["messages"] = _hints_for_state + [safe_message] + truncated_results
-                if _hint_counts and _hint_counts != (state.get("hint_repeat_counts") or {}):
-                    result["hint_repeat_counts"] = _hint_counts
+                fold_hint_state(result, state, _hint_counts, _hinted_calls)
                 result["truncated_tool_calls"] = True
                 record_ai_message(hook, state, response, node_name=EXECUTE_LOOP)
                 log_reasoning_content(response, "Execute loop", count)
@@ -2917,8 +3035,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     # ToolNode), and the issue-time bookkeeping below is
                     # skipped — none of these calls will run.
                     result["messages"] = _hints_for_state + [response] + _gate_answers
-                    if _hint_counts and _hint_counts != (state.get("hint_repeat_counts") or {}):
-                        result["hint_repeat_counts"] = _hint_counts
+                    fold_hint_state(result, state, _hint_counts, _hinted_calls)
                     result["truncated_tool_calls"] = False
                     result["_reconcile_gate_blocked"] = True
                     result["create_reconcile"] = _gate_flag_after
@@ -2931,8 +3048,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     )
                 else:
                     result["messages"] = _hints_for_state + [response]
-                    if _hint_counts and _hint_counts != (state.get("hint_repeat_counts") or {}):
-                        result["hint_repeat_counts"] = _hint_counts
+                    fold_hint_state(result, state, _hint_counts, _hinted_calls)
                     # Clear at the source every non-truncated turn: a flag left set
                     # by a turn that exited via replan/end (bypassing the screener
                     # that consumes it) must not reach a later, healthy batch.

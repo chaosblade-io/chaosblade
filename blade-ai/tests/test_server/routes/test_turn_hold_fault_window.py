@@ -4,9 +4,10 @@ The hold is the evaluation protocol's answer to "the turn must stay
 alive through the approved window and the recovery must be reported
 from THIS stream". These tests pin the behavioural contract:
 
-  - window math from ``injection_window_start_time`` (the verifier-entry
-    stamp = execute-loop end; verify time counts against the window,
-    execute-loop work after blade_create must not);
+  - window math from ``injection_start_time`` (the ISSUED stamp — the
+    same origin the fault's own recovery timer counts from; both
+    post-issue execute-loop work and verify time count against the
+    window, and neither may push the dispatch past the window's end);
   - enter/tick/exit ``fault_window`` events on the SSE stream + the
     jsonl sidewrite with ``source="hold"``;
   - the registry lifecycle the /early-recover endpoint keys on —
@@ -28,7 +29,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 from chaos_agent.server.routes import turn_event_stream as stream_mod
-from chaos_agent.utils.time import BEIJING_TZ, now_iso
+from chaos_agent.utils.time import BEIJING_TZ
 
 
 class RecordingIntentGraph:
@@ -97,7 +98,7 @@ def _window_values(*, duration: float, age: float, task_id: str = "inject-1") ->
     start = datetime.now(BEIJING_TZ) - timedelta(seconds=age)
     return {
         "task_id": task_id,
-        "injection_window_start_time": start.isoformat(),
+        "injection_start_time": start.isoformat(),
         "fault_spec": {"duration_seconds": int(duration)},
     }
 
@@ -249,11 +250,11 @@ async def test_hold_sidewrites_hold_source_rows():
 # ---------------------------------------------------------------------------
 
 async def test_hold_skipped_without_start_time():
-    """No injection_window_start_time (failed inject / chat turn / a
+    """No injection_start_time (failed inject / chat turn / a
     pre-feature pipeline): the hold is a no-op — no events, no flip,
     byte-identical to switch-off."""
     values = _window_values(duration=10, age=0)
-    values.pop("injection_window_start_time")
+    values.pop("injection_start_time")
     pipeline = SnapshotPipelineGraph(values)
     ctx = _ctx()
     ctx.intent_graph = RecordingIntentGraph()
@@ -267,9 +268,10 @@ async def test_hold_skipped_without_start_time():
 
 
 async def test_hold_spent_window_still_flips_recover():
-    """Verify outlasted the contract window (verify time > duration): no
-    SSE hold — nothing left to count down — but the protocol still
-    requires the agent's recovery report, so the recover flip runs."""
+    """Post-injection work + verify outlasted the contract window
+    (loop+verify > duration): no SSE hold — nothing left to count down
+    — but the protocol still requires the agent's recovery report, so
+    the recover flip runs."""
     values = _window_values(duration=5, age=30)  # 25s past the deadline
     pipeline = SnapshotPipelineGraph(values)
     ctx = _ctx()
@@ -306,7 +308,7 @@ async def test_hold_skipped_without_real_task_id():
 
 async def test_hold_skipped_on_unparseable_start_time():
     values = _window_values(duration=10, age=0)
-    values["injection_window_start_time"] = "not-a-timestamp"
+    values["injection_start_time"] = "not-a-timestamp"
     pipeline = SnapshotPipelineGraph(values)
     ctx = _ctx()
     ctx.intent_graph = RecordingIntentGraph()
@@ -316,6 +318,68 @@ async def test_hold_skipped_on_unparseable_start_time():
     )
     assert events == []
     assert ctx.intent_graph.updates == []
+
+
+async def test_hold_ignores_retired_window_origin_key():
+    """Checkpoint upgrade compatibility: an old checkpoint may still
+    carry the retired ``injection_window_start_time`` key. It is DEAD
+    state — the hold reads only the issued stamp. Residual-without-
+    issued → no hold (identical to switch-off); residual-alongside-
+    issued → the window math comes from the ISSUED stamp, the stale
+    key never shifts the origin."""
+    # Residual only: no issued stamp → nothing to hold.
+    values = _window_values(duration=10, age=0)
+    residual = values.pop("injection_start_time")
+    values["injection_window_start_time"] = residual
+    pipeline = SnapshotPipelineGraph(values)
+    ctx = _ctx()
+    ctx.intent_graph = RecordingIntentGraph()
+    events = await _collect(
+        stream_mod._hold_fault_window(ctx, pipeline, {"configurable": {}}, SidewriteRecorder())
+    )
+    assert events == []
+    assert ctx.intent_graph.updates == []
+
+    # Residual + issued: a stale verifier-entry origin (age 1s) sits
+    # next to an issued origin that is already SPENT (age 30 > duration
+    # 5). If the hold still read the retired key it would ENTER a ~4s
+    # countdown; reading the issued stamp it takes the spent branch —
+    # zero SSE events, flip only.
+    values = _window_values(duration=5, age=30)
+    values["injection_window_start_time"] = (
+        _window_values(duration=5, age=1)["injection_start_time"]
+    )
+    pipeline = SnapshotPipelineGraph(values)
+    ctx = _ctx()
+    ctx.intent_graph = RecordingIntentGraph()
+    recorder = SidewriteRecorder()
+    events = await _collect(
+        stream_mod._hold_fault_window(ctx, pipeline, {"configurable": {}}, recorder)
+    )
+    assert events == []
+    assert recorder.rows == []
+    assert len(ctx.intent_graph.updates) == 1
+
+
+async def test_hold_with_issued_but_unverified_state():
+    """The gate is the ISSUED evidence, not a verification verdict: a
+    state where the injection command went out (stamp + duration + real
+    task id) but verify crashed / was cut short STILL holds and flips —
+    the fault is live from issuance, so the recovery obligation exists
+    regardless of what the verifier managed to conclude."""
+    values = _window_values(duration=10, age=9.0)
+    # No verification / result keys at all — issued evidence only.
+    assert "verification" not in values and "result" not in values
+    pipeline = SnapshotPipelineGraph(values)
+    ctx = _ctx()
+    ctx.intent_graph = RecordingIntentGraph()
+
+    events = await _collect(
+        stream_mod._hold_fault_window(ctx, pipeline, {"configurable": {}}, SidewriteRecorder())
+    )
+    assert len(events) == 2  # enter + exit(elapsed)
+    assert len(ctx.intent_graph.updates) == 1
+    assert ctx.intent_graph.updates[0]["values"]["confirmed_intent"] == "recover"
 
 
 # ---------------------------------------------------------------------------
@@ -454,9 +518,13 @@ async def test_early_recover_endpoint_http_contract():
             url = f"/api/v1/sessions/{sid}/turns/{turn_id}/early-recover"
 
             # 1. Happy path: the hold wakes, 200 with the ack body.
+            #    ``turn_id`` is intentionally absent from the body — the
+            #    client keys off the status code only, and not echoing the
+            #    path param removes the reflected-XSS sink the white-box
+            #    scanner flags (see turn.py early_recover).
             r = await client.post(url)
             assert r.status_code == 200
-            assert r.json() == {"ok": True, "turn_id": turn_id, "early_recover": True}
+            assert r.json() == {"ok": True, "early_recover": True}
             assert ev.is_set()
 
             # 2. Cross-session request: another session must not wake

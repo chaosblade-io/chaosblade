@@ -1311,6 +1311,51 @@ class ChaosbladeProvider:
             )
         return None
 
+    def enforce_contract_duration(
+        self, tool_name: str, tool_args: dict, timer_seconds: int
+    ) -> Optional[str]:
+        """Pin ``--timeout`` on this carrier's injection surfaces to the
+        fault's own recovery timer (``D + G``, two-number window contract).
+
+        ``--timeout`` on a blade command IS the experiment's self-destroy
+        bound, so it carries the safety-net window computed once at the
+        registry's single dispatch point (``recovery_timer_seconds``): the
+        approved observation window ``D`` plus the recovery grace ``G``,
+        which lets an actively dispatched framework recovery land before
+        self-recovery expiry. A value differing in either direction breaks
+        the contract — larger leaves the fault resident past ``D+G``,
+        smaller ends it before the framework can actively recover. Both
+        surfaces this provider owns are rewritten in place — the direct
+        ``blade_create`` flags string and the ``kubectl exec ... blade
+        create`` embedded delivery — which also means the executor's
+        config-default fallback (entered only when the command carries NO
+        ``--timeout``) never fires on a contracted run.
+
+        Returns a human-readable note when it rewrote something, else
+        ``None`` (not this carrier, or already pinned)."""
+        from chaos_agent.utils.fault_type import read_timeout_flag, set_timeout_flag
+
+        target_text = ""
+        if tool_name == "blade_create":
+            target_text = tool_args.get("flags", "") or ""
+        elif tool_name == "kubectl" and tool_args.get("subcommand") == "exec":
+            v_args = tool_args.get("v_args", "") or ""
+            if not classify_blade_exec_payload(v_args).has_create:
+                return None
+            target_text = v_args
+        else:
+            return None
+
+        current = read_timeout_flag(target_text)
+        if current == timer_seconds:
+            return None
+        pinned = set_timeout_flag(target_text, timer_seconds)
+        if tool_name == "blade_create":
+            tool_args["flags"] = pinned
+        else:
+            tool_args["v_args"] = pinned
+        return f"blade --timeout {current if current is not None else 'absent'}"
+
     def parse_injection_params(self, tool_name: str, tool_args: dict) -> Optional[dict]:
         """Issue-time key-parameter extraction for this carrier's two
         tool-call forms: the direct ``blade_create`` call and the fallback

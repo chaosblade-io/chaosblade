@@ -414,6 +414,16 @@ class HostShellProvider:
         handle / execution artifacts instead."""
         return None
 
+    def enforce_contract_duration(
+        self, tool_name: str, tool_args: dict, duration_seconds: int
+    ) -> Optional[str]:
+        """No ``--timeout`` carrier on the raw-shell surface: ``host_inject``
+        runs the caller's own command verbatim, and a fault window that
+        command declares is not this backend's to reinterpret. A ChaosBlade
+        injection delivered on the host channel goes through the blade tools
+        (``host_blade``), whose flag the ChaosBlade backend owns."""
+        return None
+
     def issue_time_method(
         self, tool_name: str, tool_args: dict, *, is_host: bool = False
     ) -> Optional[str]:

@@ -1390,20 +1390,18 @@ class AgentState(MessagesState):
     issue_report: Optional[dict] = None      # {"status": str, "issue_url"?, "error"?, "message"?, "archive_path"?}
     created_at: Optional[str] = None         # ISO 8601
     finished_at: Optional[str] = None        # ISO 8601
-    injection_start_time: Optional[str] = None   # ISO 8601, set when blade_create succeeds
-    # ISO 8601, stamped at the VERIFIER entry — i.e. the moment the
-    # execute-loop concluded and the fault is present with execution
-    # wrapped up. This is the fault-window hold's window ORIGIN
-    # (``turn_hold_fault_window``): the contract window covers
-    # "fault present, execute phase over", so verification time and hold
-    # time both count against it. Distinct from ``injection_start_time``
-    # (the blade_create moment): execute-loop work after the create
-    # (UID reconcile, follow-up probes) must not erode the window.
-    # Write-once per attempt — verifier self-loop re-entries keep the
-    # first stamp. Cleared at every replan seam
-    # (``reset_attribution_state``) and re-stamped on the next verifier
-    # entry of the replanned attempt.
-    injection_window_start_time: Optional[str] = None
+    # ISO 8601, written once when the injection command is ISSUED
+    # (blade_create / kubectl-exec embedded create / carrier dispatch).
+    # Doubles as the fault-window hold's window ORIGIN
+    # (``turn_hold_fault_window``): the same origin the fault's own
+    # recovery timer (D+G safety net) counts from, so the hold's
+    # dispatch lands at the observation window's true end. Post-issue
+    # execute-loop work (UID reconcile, probes) and verification time
+    # count against the window — they shrink the hold wait, never push
+    # the dispatch late. (The retired ``injection_window_start_time``
+    # verifier-entry origin shifted dispatch by the whole post-injection
+    # loop time — hold-reanchor-recovery-grace.)
+    injection_start_time: Optional[str] = None
 
     # ── Memory ─────────────────────────────────────────────────────
     compressed_summary: Optional[str] = None

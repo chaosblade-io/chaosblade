@@ -506,6 +506,32 @@ class ChaosbladePythonProvider:
             )
         return None
 
+    def enforce_contract_duration(
+        self, tool_name: str, tool_args: dict, timer_seconds: int
+    ) -> Optional[str]:
+        """Pin ``--timeout`` on ``blade_python_create`` to the fault's own
+        recovery timer (``D + G``, computed at the registry dispatch point).
+
+        Same rule as the blade surfaces: the timeout IS the self-restore
+        bound (the in-process method is restored there), so it carries the
+        safety-net window — observation window plus recovery grace — letting
+        an actively dispatched framework recovery land before expiry.
+        Rewriting the flags string also keeps the executor's config-default
+        fallback off this path — that fallback only serves commands carrying
+        no timeout at all.
+
+        Returns a note when it rewrote, else ``None``."""
+        from chaos_agent.utils.fault_type import read_timeout_flag, set_timeout_flag
+
+        if tool_name != "blade_python_create":
+            return None
+        flags = tool_args.get("flags", "") or ""
+        current = read_timeout_flag(flags)
+        if current == timer_seconds:
+            return None
+        tool_args["flags"] = set_timeout_flag(flags, timer_seconds)
+        return f"blade python --timeout {current if current is not None else 'absent'}"
+
     def parse_injection_params(self, tool_name: str, tool_args: dict) -> Optional[dict]:
         """No issue-time key-parameter extraction: the python tools carry
         structured JVM-level fault parameters (class/method/…) directly, which

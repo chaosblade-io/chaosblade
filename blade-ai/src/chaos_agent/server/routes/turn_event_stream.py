@@ -1749,20 +1749,30 @@ async def _hold_fault_window(ctx, graph, config, sidewrite):
     1. emits ``fault_window`` enter/tick/exit events (the tick doubles as
        the SSE liveness channel and the client's clock-drift correction);
     2. waits out the REMAINING window — measured from
-       ``injection_window_start_time`` (stamped at the VERIFIER entry,
-       i.e. the execute-loop end), never re-armed from verify
-       completion or from the blade_create moment: verification time
-       legitimately counts against the window, while execute-loop work
-       after the create (UID reconcile, follow-up probes) must not erode
-       it. A window already SPENT at verify end (verify outlasted the
-       duration) skips the hold entirely but still dispatches recovery
-       — the protocol wants the agent's recover report either way;
+       ``injection_start_time`` (the ISSUED stamp, written once when the
+       injection command goes out — the same origin the fault's own
+       recovery timer starts from), so the hold's countdown ends where
+       the observation window D actually ends. Execute-loop work after
+       the create (UID reconcile, follow-up probes) and verification
+       time both legitimately count against the window; neither may
+       push the dispatch past the window's end — that was the origin
+       misalignment this anchor fixes (a verifier-entry origin shifted
+       dispatch by the whole post-injection loop time, landing the
+       destroy after the fault had already self-recovered). A window
+       already SPENT at verify end (post-injection loop + verify
+       outlasted the duration) skips the hold entirely but still
+       dispatches recovery — the protocol wants the agent's recover
+       report either way;
     3. wakes early on ``ctx.hold_early_recover`` (the /early-recover
        endpoint, Ctrl+R in the TUI) — the same dual-wait shape as
        ``wait_for_confirmation``;
     4. on either exit, flips the intent graph into a recover intent so
        the step-2.6 ``_run_recover`` drains the recovery — destroy,
        verify, result card, session finalize — on the SAME stream.
+       Dispatch at the window's end is what makes the recovery ACTIVE:
+       the carrier timers are armed to D+G (recovery grace), so the
+       destroy lands before self-recovery expiry and the platform's
+       attribution reads "framework recovered", not "timer expired".
 
     Abort safety: a client disconnect during the hold cancels the wait,
     which lands on the existing user_cancel path verbatim — the fault's
@@ -1781,10 +1791,15 @@ async def _hold_fault_window(ctx, graph, config, sidewrite):
         )
         return
     _v = _final.values if _final else {}
-    # Window origin: the verifier-entry stamp (execute-loop end). Falls
-    # back to nothing — an un-stamped state (old pipeline / never-injected
-    # turn) simply has no window to hold, identical to the switch off.
-    _start_iso = str(_v.get("injection_window_start_time") or "")
+    # Window origin: the ISSUED stamp (injection_start_time, written once
+    # when the injection command goes out — the same origin the fault's
+    # own recovery timer counts from). Falls back to nothing — an
+    # un-stamped state (old pipeline / never-injected turn / issued stamp
+    # that never landed) simply has no window to hold, identical to the
+    # switch off. Issued-but-unverified states DO hold: the fault is
+    # live from issuance, so the recovery obligation exists even when
+    # verify crashed or was cut short.
+    _start_iso = str(_v.get("injection_start_time") or "")
     _spec = _v.get("fault_spec")
     _duration = int((_spec.get("duration_seconds") if isinstance(_spec, dict) else 0) or 0)
     _inject_tid = str(_v.get("task_id") or ctx.pipeline_task_id or "")
@@ -1797,7 +1812,7 @@ async def _hold_fault_window(ctx, graph, config, sidewrite):
         _start_dt = parse_iso_timestamp(_start_iso)
     except (ValueError, TypeError):
         logger.warning(
-            "fault-window hold: unparseable injection_window_start_time %r", _start_iso,
+            "fault-window hold: unparseable injection_start_time %r", _start_iso,
         )
         return
     _until_dt = _start_dt + timedelta(seconds=_duration)

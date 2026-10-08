@@ -14,6 +14,7 @@ from chaos_agent.agent.providers.chaosblade.verify import (
     extract_experiment_uid_from_messages as _extract_blade_uid_from_messages,
 )
 from chaos_agent.config.settings import settings
+from chaos_agent.utils.fault_type import read_timeout_flag, recovery_timer_seconds
 
 
 class TestExecuteLoop:
@@ -435,7 +436,6 @@ class TestResetAttributionState:
             "kubectl_exec_pod_name": "tool-pod",
             "inject_layer1_cache": {"status": "passed"},
             "injection_start_time": 12345.0,
-            "injection_window_start_time": "2026-09-19T10:00:00+08:00",
             "unrelated_field": "keep-me",
         }
 
@@ -452,10 +452,10 @@ class TestResetAttributionState:
         assert result["combo_native_issued"] is None
         assert result["kubectl_exec_pod_name"] is None
         assert result["inject_layer1_cache"] is None
+        # injection_start_time doubles as the fault-window hold origin
+        # (issued stamp): retired with the attribution so the replanned
+        # attempt's window re-anchors at its own issuance.
         assert result["injection_start_time"] is None
-        # Fault-window hold origin: retired with the attribution — the
-        # replanned attempt's window re-anchors at its own execute-loop end.
-        assert result["injection_window_start_time"] is None
         assert result["unrelated_field"] == "keep-me"
 
     def test_keep_experiment_uid_preserves_live_experiment(self):
@@ -472,10 +472,10 @@ class TestResetAttributionState:
         assert result["fault_handle"]["value"] == "a1b2c3d4e5f60718"
         assert result["injection_method"] is None
         assert result["kubectl_exec_pod_name"] is None
-        # The window origin does NOT survive even with a live experiment: a
-        # keep-UID seam is still a replan, and the next attempt's window must
-        # re-anchor at its own verifier entry (execute-loop end).
-        assert result["injection_window_start_time"] is None
+        # The hold origin (issued stamp) does NOT survive even with a
+        # live experiment: a keep-UID seam is still a replan, and the
+        # next attempt's window must re-anchor at its own issuance.
+        assert result["injection_start_time"] is None
 
     def test_keep_experiment_uid_preserves_combo_marker(self):
         """A live experiment keeps its native companion: the combo marker
@@ -1068,6 +1068,397 @@ class TestClassifyIssueTimeMethod:
         assert self._classify("read_skill_resource", {"path": "x"}) is None
 
 
+class TestContractDurationPin:
+    """``_process_response_tool_calls`` pins ``--timeout`` to the contract.
+
+    The approved window (``FaultSpec.duration_seconds``, D) plus the
+    recovery grace (G) is the fault's own recovery timer on the blade
+    carriers, so the issued call must carry exactly ``recovery_timer_seconds(D)``
+    = D+G — rewriting the tool-call args BEFORE dispatch is what keeps the
+    executor's config-default fallback (config ``experiment_timeout``) from
+    ever standing in for the framework's number. The D→D+G arithmetic is the
+    registry's single-source job (covered in test_contract_duration_pin.py +
+    test_fault_type.py); these tests pin the execute-loop SEAM that consults
+    it and rewrites the call.
+    """
+
+    class _StubTracker:
+        """Records interventions so the pin's audit fact can be asserted.
+
+        A no-op here would let the pin pass while emitting nothing — the
+        exact failure Case #64 exposed (the rewrite happened, was logged,
+        and still reached no surface an auditor reads).
+        """
+
+        def __init__(self):
+            self.interventions = []
+
+        def update(self, *args, **kwargs):
+            return None
+
+        def intervention(self, kind, message, detail=None):
+            self.interventions.append((kind, message, detail or {}))
+
+    def _run(self, tool_calls, duration_seconds):
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _process_response_tool_calls,
+        )
+
+        response = AIMessage(content="", tool_calls=tool_calls)
+        state = {
+            "fault_spec": {
+                "namespace": "demo",
+                "scope": "node",
+                "fault_target": "network",
+                "fault_action": "drop",
+                "duration_seconds": duration_seconds,
+            }
+        }
+        result: dict = {}
+        self.tracker = self._StubTracker()
+        _process_response_tool_calls(response, state, result, self.tracker, 1)
+        # Assert on the MESSAGE's tool calls: AIMessage normalises the passed
+        # dicts into its own copies, and that surface is what dispatch (and
+        # every downstream consumer) actually executes.
+        return result, response.tool_calls[0]["args"]
+
+    @staticmethod
+    def _blade_call(flags: str) -> list:
+        return [
+            {
+                "name": "blade_create",
+                "args": {"scope": "node", "flags": flags},
+                "id": "b1",
+            }
+        ]
+
+    def test_absent_timeout_is_filled_from_the_contract(self):
+        _, args = self._run(self._blade_call("--network-traffic out"), 120)
+        assert args["flags"] == (
+            f"--network-traffic out --timeout {recovery_timer_seconds(120)}"
+        )
+
+    def test_inflated_timeout_is_rewritten_to_the_contract(self):
+        # The 8-24 defect shape: contract 120s, call carrying the stale
+        # 600s default — the call must not outlive the safety-net window.
+        _, args = self._run(self._blade_call("--network-traffic out --timeout 600"), 120)
+        assert read_timeout_flag(args["flags"]) == recovery_timer_seconds(120)
+
+    def test_embedded_kubectl_exec_blade_create_is_pinned(self):
+        tcs = [
+            {
+                "name": "kubectl",
+                "args": {
+                    "subcommand": "exec",
+                    "v_args": (
+                        "tool-x -n chaosblade -- blade create mem load --mode ram"
+                    ),
+                },
+                "id": "k1",
+            }
+        ]
+        _, args = self._run(tcs, 90)
+        assert args["v_args"].endswith(
+            f"--mode ram --timeout {recovery_timer_seconds(90)}"
+        )
+
+    def test_zero_contract_leaves_the_call_alone(self):
+        # No approved window → nothing to pin; the executor's own fallback
+        # remains the only writer on that path.
+        _, args = self._run(self._blade_call("--network-traffic out"), 0)
+        assert args["flags"] == "--network-traffic out"
+
+    def test_non_injection_call_is_untouched(self):
+        tcs = [
+            {
+                "name": "kubectl",
+                "args": {"subcommand": "exec", "v_args": "p -n ns -- df -h"},
+                "id": "k1",
+            }
+        ]
+        _, args = self._run(tcs, 90)
+        assert args["v_args"] == "p -n ns -- df -h"
+
+    def test_assembler_window_is_rewritten_to_the_contract(self):
+        # The faultdrill carrier has no ``--timeout``: its window is the
+        # assembler's structured ``duration_seconds`` argument, and a recipe
+        # value that differs from the pinned recovery timer must not survive
+        # to dispatch (the assembler renders it into the carrier's restore
+        # timer, armed to D+G).
+        tcs = [
+            {
+                "name": "faultdrill_assemble_carrier",
+                "args": {
+                    "duration_seconds": 300,
+                    "patches": "[]",
+                    "restore_patches": "[]",
+                },
+                "id": "a1",
+            }
+        ]
+        _, args = self._run(tcs, 600)
+        assert args["duration_seconds"] == recovery_timer_seconds(600)
+
+    def test_pin_emits_an_intervention_fact(self):
+        # Case #64 / W-64-2: the pin rewrote the plan's 300 into the
+        # contract's 420 and recorded it on the logger and the session
+        # ledger — neither of which the ``inject --stream`` surface
+        # renders, so a CORRECT rewrite was audited as an unexplained
+        # drift. The rewrite must reach a surface an auditor reads, and
+        # it must carry the before/after so the two numbers are bridged.
+        _, args = self._run(self._blade_call("--network-traffic out --timeout 600"), 120)
+        pinned = recovery_timer_seconds(120)
+        assert args["flags"].endswith(f"--timeout {pinned}")
+
+        assert len(self.tracker.interventions) == 1
+        kind, message, detail = self.tracker.interventions[0]
+        assert kind == "pin"
+        assert detail["after"] == pinned
+        assert detail["window"] == 120
+        assert detail["before"]
+        # The message is the rendered surface: it has to name the value the
+        # call now carries, or the auditor is back to guessing.
+        assert str(pinned) in message
+
+    def test_no_pin_emits_no_intervention(self):
+        # No rewrite → no intervention fact. Emitting one anyway would make
+        # the channel noise, and noise on an audit channel is how real
+        # interventions get skimmed past.
+        self._run(self._blade_call("--network-traffic out"), 0)
+        assert self.tracker.interventions == []
+
+    def test_non_injection_call_emits_no_intervention(self):
+        self._run(
+            [{"name": "kubectl", "args": {"subcommand": "exec", "v_args": "p -n ns -- df -h"}, "id": "k1"}],
+            90,
+        )
+        assert self.tracker.interventions == []
+
+    class _LedgerStore:
+        """Captures the pin's sidewrite so its wording can be asserted."""
+
+        def __init__(self):
+            self.messages = []
+
+        def append_messages(self, task_id, messages, node_name=None):
+            self.messages.extend(messages)
+
+    def _run_ledger(self, tool_calls, duration_seconds):
+        """``_run`` plus the two preconditions the sidewrite branch needs.
+
+        The ledger write only fires when ``state["task_id"]`` is set AND
+        ``get_global_session_store()`` returns a store. ``_run`` supplies
+        neither, so asserting on the ledger through it would pass vacuously.
+        """
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _process_response_tool_calls,
+        )
+
+        response = AIMessage(content="", tool_calls=tool_calls)
+        state = {
+            "task_id": "inject-ledger-probe",
+            "fault_spec": {
+                "namespace": "demo",
+                "scope": "node",
+                "fault_target": "network",
+                "fault_action": "drop",
+                "duration_seconds": duration_seconds,
+            },
+        }
+        result: dict = {}
+        _process_response_tool_calls(response, state, result, self._StubTracker(), 1)
+        return result, response.tool_calls[0]["args"]
+
+    def _pin_with_ledger(self, caplog, monkeypatch, duration_seconds, flags):
+        """Run the pin seam under an isolated grace, returning (ledger, args)."""
+        import logging
+
+        import chaos_agent.memory.session_store as session_store_mod
+        from chaos_agent.config.settings import blade_ai_context
+
+        store = self._LedgerStore()
+        monkeypatch.setattr(
+            session_store_mod, "get_global_session_store", lambda: store
+        )
+        # set_level, not at_level: at_level only takes effect inside its own
+        # ``with`` block, so calling it bare leaves caplog.text empty and every
+        # log assertion below would pass vacuously.
+        caplog.set_level(logging.INFO)
+        with blade_ai_context(recovery_grace_seconds=120):
+            _, args = self._run_ledger(self._blade_call(flags), duration_seconds)
+        # Branch-reachability self-check: without it every wording assertion
+        # below would pass against an empty ledger.
+        assert len(store.messages) == 1
+        return store.messages[0].content, args
+
+    def test_pin_ledger_renders_the_armed_value_not_the_window(
+        self, caplog, monkeypatch
+    ):
+        """The pin's log + ledger must render D+G — the value it armed.
+
+        Regression guard for the wording distortion caught in review: the
+        registry hook arms the carrier with ``recovery_timer_seconds(D)``,
+        but this call site used to render ``_contract_duration`` (D) as
+        "pinned to the approved window". The ledger then contradicted the
+        number the target guard later reads off the carrier, and — because
+        the sidewrite lands in session history as a HumanMessage — it fed
+        subsequent recover reasoning a window that was never armed.
+        """
+        ledger, args = self._pin_with_ledger(
+            caplog, monkeypatch, 600, "--network-traffic out --timeout 600"
+        )
+
+        pinned = recovery_timer_seconds(600)
+        assert pinned == 720, "grace must be isolated to 120 by blade_ai_context"
+        # The carrier really carries D+G ...
+        carrier = read_timeout_flag(args["flags"])
+        assert carrier == pinned
+        # ... and the ledger renders THAT number, not the observation window.
+        assert f"pinned to {carrier}s" in ledger
+        assert "pinned to 600s" not in ledger
+        assert "duration 600s + recovery grace" in ledger
+        # The rewrite direction stays auditable (from -> to).
+        assert f"--timeout 600 -> {carrier}s" in ledger
+        # The superseded wording must not come back on either surface.
+        assert "pinned to the approved window" not in ledger
+        assert "pinned to the approved window" not in caplog.text
+        # The log line carries both numbers as well.
+        assert "Contract recovery timer pinned" in caplog.text
+        assert f"-> {carrier}s" in caplog.text
+        assert "duration 600s + recovery grace" in caplog.text
+
+    def test_pin_ledger_tracks_grace_hot(self, caplog, monkeypatch):
+        """The ledger value is single-sourced, not a hardcoded 720.
+
+        Same seam under two graces: with G=0 the armed value collapses onto
+        the observation window (D == D+G), and with G=250 it must move to
+        850. A ledger that still read 720 under either would mean the call
+        site stopped consulting ``recovery_timer_seconds``.
+
+        The carrier starts with NO ``--timeout`` on purpose: under G=0 the
+        pinned value is 600, so a fixture already carrying ``--timeout 600``
+        would hit the hook's exact-equality idempotence branch (correctly
+        pinned by test_no_pin_no_ledger_entry) and write no ledger at all.
+        """
+        import logging
+
+        import chaos_agent.memory.session_store as session_store_mod
+        from chaos_agent.config.settings import blade_ai_context
+
+        for grace, expected in ((0, 600), (250, 850)):
+            store = self._LedgerStore()
+            monkeypatch.setattr(
+                session_store_mod, "get_global_session_store", lambda s=store: s
+            )
+            caplog.clear()
+            caplog.set_level(logging.INFO)
+            with blade_ai_context(recovery_grace_seconds=grace):
+                _, args = self._run_ledger(
+                    self._blade_call("--network-traffic out"), 600
+                )
+            assert len(store.messages) == 1, f"grace={grace}"
+            ledger = store.messages[0].content
+            assert read_timeout_flag(args["flags"]) == expected, f"grace={grace}"
+            assert f"pinned to {expected}s" in ledger, f"grace={grace}"
+            assert f"-> {expected}s" in caplog.text, f"grace={grace}"
+
+    def test_no_pin_no_ledger_entry(self, caplog, monkeypatch):
+        """An already-correct call is idempotent: no note, no ledger noise.
+
+        The hook returns ``None`` when the carrier already carries the
+        pinned value, so the wording branch is skipped entirely — pinning
+        must not spam session history on every re-issue of the same call.
+        """
+        import logging
+
+        import chaos_agent.memory.session_store as session_store_mod
+        from chaos_agent.config.settings import blade_ai_context
+
+        store = self._LedgerStore()
+        monkeypatch.setattr(
+            session_store_mod, "get_global_session_store", lambda: store
+        )
+        caplog.set_level(logging.INFO)
+        # Capture-surface self-check first: prove caplog CAN see this logger
+        # under this configuration. Without it the "not in caplog.text"
+        # assertion below passes on a permanently empty buffer.
+        with blade_ai_context(recovery_grace_seconds=120):
+            self._run_ledger(
+                self._blade_call("--network-traffic out --timeout 600"), 600
+            )
+        assert "Contract recovery timer pinned" in caplog.text
+        assert len(store.messages) == 1
+        caplog.clear()
+        store.messages.clear()
+
+        armed = recovery_timer_seconds(600)
+        with blade_ai_context(recovery_grace_seconds=120):
+            _, args = self._run_ledger(
+                self._blade_call(f"--network-traffic out --timeout {armed}"), 600
+            )
+        assert store.messages == []
+        assert "Contract recovery timer pinned" not in caplog.text
+        assert read_timeout_flag(args["flags"]) == armed
+
+
+class TestStructuredParamsHintRecoveryTimer:
+    """The execute prompt's structured_params_hint renders ``recovery_timer_seconds``.
+
+    Two-number window contract (design D4): the hint is the executor's ONLY
+    view of the contracted window in MINIMAL mode, so it must carry BOTH
+    numbers — the observation window ``duration=D`` AND the program-computed
+    safety-net value ``recovery_timer_seconds=D+G`` — so the LLM arms native
+    self-recovery timers (``--on-active=<recovery-seconds>``) with the
+    dispatched integer instead of deriving its own buffer. The value is
+    config-hot (grace read per call), so the assertion pins the arithmetic
+    under an isolated ``recovery_grace_seconds``.
+    """
+
+    def _build_hint(self, duration_seconds: int) -> str:
+        import asyncio
+
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _build_execute_system_prompt,
+        )
+
+        state = {
+            "fault_spec": {
+                "namespace": "demo",
+                "scope": "node",
+                "fault_target": "network",
+                "fault_action": "drop",
+                "duration_seconds": duration_seconds,
+            },
+        }
+        # env_info non-empty → skips the dynamic compute_env_info path;
+        # registry=None → falls back to the (empty) skill_catalog arg.
+        prompt, _ = asyncio.run(
+            _build_execute_system_prompt(
+                state, task_id="", skill_name="", tools=[],
+                skill_catalog="", env_info={"cluster": "test"}, registry=None,
+            )
+        )
+        return prompt
+
+    def test_hint_renders_recovery_timer_seconds(self):
+        from chaos_agent.config.settings import blade_ai_context
+
+        with blade_ai_context(recovery_grace_seconds=120):
+            prompt = self._build_hint(300)
+        # Both numbers ride the hint: the observation window D and the
+        # program-computed safety net D+G (300 + 120 = 420).
+        assert "duration=300s" in prompt
+        assert "recovery_timer_seconds=420s" in prompt
+
+    def test_hint_recovery_timer_tracks_grace_hot(self):
+        from chaos_agent.config.settings import blade_ai_context
+
+        with blade_ai_context(recovery_grace_seconds=0):
+            assert "recovery_timer_seconds=300s" in self._build_hint(300)
+        with blade_ai_context(recovery_grace_seconds=250):
+            assert "recovery_timer_seconds=550s" in self._build_hint(300)
+
+
 class TestIssueTimeRecording:
     """``_process_response_tool_calls`` records native methods at issue time."""
 
@@ -1075,6 +1466,9 @@ class TestIssueTimeRecording:
         """Minimal tracker so debug-mode ``post_invoke_debug`` stays a no-op."""
 
         def update(self, *args, **kwargs):
+            return None
+
+        def intervention(self, *args, **kwargs):
             return None
 
     def _run(self, tool_calls, state=None):
@@ -1336,6 +1730,9 @@ class TestTextOnlyStallGate:
 
     class _StubTracker:
         def update(self, *args, **kwargs):
+            return None
+
+        def intervention(self, *args, **kwargs):
             return None
 
     def _detect(self, state):
@@ -2289,6 +2686,9 @@ class TestComboLivePredicateGate:
 
     class _StubTracker:
         def update(self, *args, **kwargs):
+            return None
+
+        def intervention(self, *args, **kwargs):
             return None
 
     _SCALE_CALLS = [{
@@ -3330,6 +3730,9 @@ class TestZombieReplanLiveGate:
 
     class _StubTracker:
         def update(self, *args, **kwargs):
+            return None
+
+        def intervention(self, *args, **kwargs):
             return None
 
         def fail(self, *args, **kwargs):
