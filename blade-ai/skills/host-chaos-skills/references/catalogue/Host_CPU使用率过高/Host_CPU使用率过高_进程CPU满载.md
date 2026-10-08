@@ -1,15 +1,15 @@
 **用例名称** 进程CPU满载 导致 Host_CPU使用率过高
 
-**故障现象**：
+## 故障现象
 1. 主机 CPU 使用率持续超过 90%
 2. 系统 Load Average 显著升高
 3. 主机上运行的应用响应变慢，出现超时
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认监控系统可观测主机 CPU 指标（如 Prometheus node_exporter、top、vmstat）
 
-**演练步骤**：
+## 演练步骤
 1. 记录当前 CPU 基线：`top -bn1 | head -5` 或 `vmstat 1 3`
 2. 使用 ChaosBlade 注入 CPU 满载
 
@@ -25,27 +25,27 @@ blade create cpu fullload --cpu-percent <percent> --timeout <duration>
 
 3. 观察 CPU 使用率及应用性能变化
 
-**注入验证**：
+## 注入验证
 1. `top` 或 `mpstat -P ALL 1` 确认 CPU 使用率高于目标百分比——单次采样读数高于目标即满载已发生；「持续保持」由机制存活保证（fullload 压测进程在运行即持续满载由构造成立），无需反复采样验证持续
 2. `uptime` 确认 Load Average 显著升高
 3. （可选，仅当演练方提供了应用访问入口时）确认请求延迟增大；无入口时上述 CPU 与 Load 证据成立即可判定
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `top` 确认 CPU 使用率恢复正常水平
 2. （可选，有访问入口时）确认应用请求延迟恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：异常进程大量占用 CPU，导致主机 CPU 使用率过高，影响同主机上所有应用性能
 - **必现现象**：CPU 使用率持续超过目标百分比；Load Average 显著升高；应用响应变慢
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用 `stress-ng` 实现等效 CPU 满载。
 
@@ -68,8 +68,13 @@ ls /usr/bin/stress-ng /usr/sbin/stress-ng /usr/local/bin/stress-ng
 注入命令（探测到 stress-ng 时）：
 ```bash
 # 使用 stress-ng 注入 CPU 压力，--timeout 到期后自动退出
-stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s
+stress-ng --cpu 0 --cpu-load <percent> --timeout <recovery-seconds>s
 ```
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——stress-ng 自停 `--timeout` 以它
+武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；上方 ChaosBlade 形态的
+`--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
 
 恢复命令：
 ```bash

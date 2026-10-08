@@ -1,15 +1,15 @@
 **用例名称** DNS劫持 导致 Host_网络故障
 
-**故障现象**：
+## 故障现象
 1. 域名解析返回错误 IP
 2. 应用访问特定域名失败或被导向错误服务
 3. 网络连接超时或返回非预期响应
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认目标域名及劫持目标 IP
 
-**演练步骤**：
+## 演练步骤
 1. 记录当前 DNS 解析基线：`nslookup <domain>` 或 `dig <domain>`
 2. 使用 ChaosBlade 注入 DNS 劫持
 
@@ -25,26 +25,26 @@ blade create network dns --domain <target-domain> --ip <redirect-ip> --timeout <
 
 3. 观察域名解析结果及应用连通性变化
 
-**注入验证**：
+## 注入验证
 1. `ping <domain>` 确认解析到错误 IP（ping 走完整 resolver、/etc/hosts 优先）。⚠️ 不要用 nslookup 作判据——ChaosBlade network dns 的注入层是 /etc/hosts（与 k8s pod-network dns 同源，`--replace` 即「已有本地解析记录是否覆盖」语义），nslookup 只查 DNS 服务器、不读 hosts，验不出劫持；仅降级方案（iptables DNAT 53 层，DNS 查询本身被重定向到伪造解析器）下 nslookup 才有效
 2. 观察应用访问该域名时是否超时或返回错误
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `ping <domain>` 确认解析回到注入前基线 IP（nslookup 不读 /etc/hosts，注入期间与恢复后返回相同结果，不能作恢复判据）
 2. 确认应用访问该域名恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：DNS 解析被劫持，域名指向错误 IP，导致应用无法正常访问目标服务
 - **必现现象**：域名解析结果为非预期 IP；依赖该域名的服务调用失败或超时
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -54,6 +54,7 @@ blade destroy <experiment-uid>
 ```bash
 # 1) 先武装定时还原（定时器由宿主机 systemd(PID 1) 管理），再注入规则。
 #    三条命令分次独立执行（执行通道不支持 && 串联）；武装成功（输出含 Running timer as unit）后再执行注入
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-dnsnat sh -c \
   'iptables -t nat -D OUTPUT -p udp --dport 53 -j DNAT --to-destination <redirect-dns-ip>:53; \
    iptables -t nat -D OUTPUT -p tcp --dport 53 -j DNAT --to-destination <redirect-dns-ip>:53'

@@ -1,17 +1,17 @@
 **用例名称** 系统时钟漂移 导致 Host_时间偏移
 
-**故障现象**：
+## 故障现象
 1. 系统时间与真实时间不一致
 2. 证书验证失败（SSL/TLS 证书过期判断异常）
 3. 日志时间戳混乱，分布式系统因果序关系错乱
 4. 定时任务触发异常（cron 提前或延迟执行）
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认监控系统可观测时间指标
 3. 确认目标主机上是否运行 NTP 服务
 
-**演练步骤**：
+## 演练步骤
 1. 记录当前系统时间：`date` 和 `timedatectl status`
 2. 使用 ChaosBlade 注入时间偏移
 
@@ -26,29 +26,29 @@ blade create time travel --offset <offset> --timeout <duration>
 
 3. 观察依赖时间的服务和组件的反应
 
-**注入验证**：
+## 注入验证
 1. `date` 确认系统时间已偏移
 2. 尝试建立 HTTPS 连接，观察是否出现证书相关错误
 3. 观察定时任务是否异常触发
 4. 检查分布式系统日志时间戳一致性
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `date` 确认系统时间恢复正常
 2. `timedatectl status` 确认 NTP 同步状态恢复
 3. 确认应用时间相关功能恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：系统时钟发生漂移（NTP 故障、硬件时钟异常等），导致时间敏感的功能异常
 - **必现现象**：系统时间与实际时间不符；TLS 证书可能验证失败；定时任务异常；日志时间戳混乱
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -64,6 +64,7 @@ systemctl is-active chronyd
 # 2) 武装定时恢复（定时器由宿主机 systemd(PID 1) 管理）→ 停服务 → 改时间。
 #    三条命令分次独立执行（执行通道不支持 && 串联）；前一条成功返回（武装以输出含
 #    Running timer as unit 为准）后再执行下一条，武装失败时不得继续
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-ntp \
   sh -c 'systemctl start chronyd; chronyc makestep 2>/dev/null || true'
 systemctl stop chronyd

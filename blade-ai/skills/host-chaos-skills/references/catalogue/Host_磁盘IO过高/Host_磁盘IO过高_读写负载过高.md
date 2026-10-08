@@ -1,15 +1,15 @@
 **用例名称** 读写负载过高 导致 Host_磁盘IO过高
 
-**故障现象**：
+## 故障现象
 1. 磁盘 %util 持续接近 100%
 2. IO Wait（wa）显著升高
 3. 应用读写延迟增大，吞吐下降
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认监控系统可观测磁盘 IO（如 `iostat -xd 1`、Prometheus node_exporter）
 
-**演练步骤**：
+## 演练步骤
 1. 记录当前 IO 基线：`iostat -xd 1 3`（关注 %util、r/s、w/s）
 2. 使用 ChaosBlade 注入磁盘 IO 高负载
 
@@ -26,27 +26,27 @@ blade create disk burn --read --write --path <target-path> --timeout <duration>
 
 3. 观察磁盘 IO 指标及应用性能变化
 
-**注入验证**：
+## 注入验证
 1. `iostat -xd 1` 确认 %util 接近 100%
 2. `top` 确认 wa（IO Wait）显著升高
 3. （可选，仅当演练方提供了应用访问入口时）确认读写延迟增大；无入口时上述 %util 与 iowait 证据成立即可判定
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `iostat -xd 1` 确认 %util 回落到正常水平
 2. （可选，有访问入口时）确认应用读写延迟恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：磁盘被大量读写操作占满，导致 IO 队列堆积，正常应用的 IO 请求被延迟
 - **必现现象**：%util 持续接近 100%；IO Wait 显著升高；应用读写延迟增大
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 

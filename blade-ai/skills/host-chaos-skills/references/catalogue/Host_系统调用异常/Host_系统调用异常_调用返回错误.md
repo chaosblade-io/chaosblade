@@ -1,16 +1,16 @@
 **用例名称** 调用返回错误 导致 Host_系统调用异常
 
-**故障现象**：
+## 故障现象
 1. 特定系统调用返回非预期错误码
 2. 应用出现文件打开失败、内存分配失败等异常
 3. 应用可能崩溃或进入错误处理分支
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认目标进程 PID：`pidof <process>` 或 `ps aux | grep <process>`
 3. 确认目标系统调用名及期望注入的错误返回值
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标进程使用的关键系统调用：`strace -c -p <pid>` 采样
 2. 使用 ChaosBlade 注入系统调用返回值篡改
 
@@ -29,21 +29,21 @@ blade create strace error --pid <pid> --syscall-name <syscall> --return-value <v
 
 3. 观察应用错误处理行为
 
-**注入验证**：
+## 注入验证
 1. `strace -e trace=<syscall> -p <pid>` 确认系统调用返回错误值
 2. 观察应用日志中的错误信息
 3. 确认应用是否正确处理了该错误（优雅降级 vs 崩溃）
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `strace -e trace=<syscall> -p <pid>` 确认系统调用恢复正常返回值
 2. 确认应用恢复正常功能
 
-**基准事实**：
+## 基准事实
 - **根因**：系统调用返回异常错误（如磁盘故障导致 read 返回 -EIO，内存不足导致 mmap 返回 -ENOMEM）
 - **必现现象**：系统调用返回错误码；应用进入错误处理路径；可能触发重试/降级/崩溃
 
@@ -59,7 +59,7 @@ blade destroy <experiment-uid>
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，难以直接实现系统调用返回值篡改。以下为近似方案。
 
@@ -86,6 +86,7 @@ ChaosBlade 不可用时，只有两条路，都不由 Agent 执行：
    pgrep -f <process-name>
    # 先武装定时终止（timer 由宿主机 systemd(PID 1) 管理，到期自动 kill 掉 strace；
    # 详见「调用延迟」case），再 attach。武装成功（输出含 Running timer as unit）后再执行
+   # <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
    systemd-run --on-active=<recovery-seconds>s --unit=blade-kill-strace \
      sh -c 'kill $(pgrep -x strace)'
    strace -p <pid> -e trace=<syscall> -T

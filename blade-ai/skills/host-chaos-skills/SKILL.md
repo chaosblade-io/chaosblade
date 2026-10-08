@@ -29,6 +29,7 @@ scripts:
 - **隔离**：在测试环境或隔离主机上演练，严禁在生产核心主机上注入
 - **最小影响**：精确指定故障目标（进程名、路径、端口），范围尽可能小
 - **可回滚**：注入前明确回滚方案，所有实验必须设置 `--timeout` 确保自动恢复
+- **故障窗口完整 / 恢复定时器值单源（双数窗口契约）**：自恢复定时器倒计时从**武装时刻**起算，武装与注入必须紧邻（间隔 ≤ 60 秒），武装后发生任何修复必须重新武装。窗口有两个数——**观察窗 `D` = `duration_seconds`**（框架在场义务，严禁被调试/计划变更侵蚀，同样严禁擅自延长）与**安全网窗 `D+G` = `recovery_timer_seconds`**（故障自身定时器的武装值，G 为程序立法的恢复宽限）。blade 面的 `--timeout` 由引擎按 `recovery_timer_seconds` 程序钉定；**原生（blade 不可用）fallback 形态**里一切**故障自治恢复点**的武装值——`systemd-run --on-active=<recovery-seconds>s` 的 `<recovery-seconds>`、自停 kill 循环的墙钟寿命——**一律取执行 prompt 下发的 `recovery_timer_seconds=<N>s` 整数值**（`structured_params_hint` 已渲染），**禁止自算缓冲**（"recovery-seconds 取 duration"、裸取 `duration_seconds` 等自推导形一律废止）。这**不是"擅自延长"**：`recovery_timer_seconds` 是程序单源计算、精确相等可守门的立法值——让框架在观察窗终点（onset+D）主动派发的恢复先于故障自治恢复（onset+D+G）落地
 - **有监控**：无监控不演练
 - **仅限已有用例**：只能执行 `references/catalogue/` 中已有的故障注入用例，严禁自行编造、拼凑或即兴发挥用例中未涉及的故障注入操作。无法匹配时必须明确告知用户「当前不支持该场景」并停止
 - **禁止**：对系统关键进程（init/systemd/sshd）注入 kill / 对根分区注入 disk fill 且不设 reserve / 对生产数据库主机注入

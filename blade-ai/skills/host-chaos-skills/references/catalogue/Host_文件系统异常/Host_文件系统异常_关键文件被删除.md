@@ -1,16 +1,16 @@
 **用例名称** 关键文件被删除 导致 Host_文件系统异常
 
-**故障现象**：
+## 故障现象
 1. 关键文件（配置文件/数据文件/日志文件）被意外删除
 2. 应用启动失败或运行异常
 3. 数据丢失
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认目标文件路径：`ls -la <filepath>`
 3. 确认该文件有备份或可重新生成
 
-**演练步骤**：
+## 演练步骤
 1. 记录目标文件信息：`ls -la <filepath>` 和 `md5sum <filepath>`
 2. 使用 ChaosBlade 注入文件删除
 
@@ -25,30 +25,30 @@ blade create file delete --filepath <target-file> --timeout <duration>
 
 3. 观察应用对文件缺失的反应
 
-**注入验证**：
+## 注入验证
 1. `ls <filepath>` 确认文件不存在
 2. 观察应用日志中的 "No such file or directory" 错误
 3. 确认应用行为变化（如无法启动、功能异常）
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
 > 注意：非 --force 模式下，destroy 会恢复被删除的文件
 
-**恢复验证**：
+## 恢复验证
 1. `ls -la <filepath>` 确认文件恢复
 2. `md5sum <filepath>` 确认内容完整性
 3. 确认应用恢复正常运行
 
-**基准事实**：
+## 基准事实
 - **根因**：关键文件被意外删除（人为误操作、恶意攻击等），导致应用无法正常运行
 - **必现现象**：文件不存在；应用报 No such file or directory；服务异常或无法启动
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -58,6 +58,7 @@ blade destroy <experiment-uid>
 # 再移走文件。移走而非删除：原文件即备份，同文件系统内为原子操作，不存在
 # 「备份成功但删除失败」或「备份失败却已删除」的中间态。
 # 两条命令分两次独立执行（执行通道不支持 && 串联）；武装成功（输出含 Running timer as unit）后再执行移走
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-filedel \
   mv <filepath>.orig <filepath>
 mv <filepath> <filepath>.orig

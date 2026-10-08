@@ -1,15 +1,15 @@
 **用例名称** 关键文件被篡改 导致 Host_文件系统异常
 
-**故障现象**：
+## 故障现象
 1. 应用配置文件内容被修改或权限被篡改
 2. 应用读取配置失败（Permission denied 或解析错误）
 3. 服务行为异常或启动失败
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认目标文件路径及当前状态
 
-**演练步骤**：
+## 演练步骤
 1. 记录目标文件当前状态：`ls -la <filepath>` 和 `md5sum <filepath>`
 2. 使用 ChaosBlade 注入文件篡改
 
@@ -38,28 +38,28 @@ blade create file move --filepath <target-file> --target /tmp --timeout <duratio
 
 3. 观察应用对文件变化的反应
 
-**注入验证**：
+## 注入验证
 1. `ls -la <filepath>` 确认权限变化（chmod 方式）
 2. `cat <filepath>` 确认内容变化（append 方式）
 3. `ls <filepath>` 确认文件不存在（move 方式）
 4. 观察应用日志中的错误信息
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `ls -la <filepath>` 确认权限/内容/位置恢复
 2. 确认应用读取配置恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：关键文件被篡改（权限、内容或位置），导致应用无法正常读取
 - **必现现象**：文件状态变化；应用报 Permission denied / 解析错误 / 文件不存在
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -69,6 +69,7 @@ blade destroy <experiment-uid>
 # 各命令独立执行（执行通道不支持 shell 变量与 && 串联）：先用只读 stat 取到
 # 原权限数字，再把数值直接写入下面的 timer 命令；武装成功（输出含 Running timer as unit）后再执行 chmod 000
 stat -c %a <filepath>
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-filemode \
   chmod <stat取到的原权限数字> <filepath>
 chmod 000 <filepath>

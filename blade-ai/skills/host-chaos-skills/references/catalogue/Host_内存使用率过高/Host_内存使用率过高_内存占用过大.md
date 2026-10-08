@@ -1,15 +1,15 @@
 **用例名称** 内存占用过大 导致 Host_内存使用率过高
 
-**故障现象**：
+## 故障现象
 1. 主机物理内存使用率持续超过 90%
 2. 系统 Swap 使用率升高
 3. 可能触发 OOM Killer 杀死进程
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认监控系统可观测主机内存指标（如 `free -m`、Prometheus node_exporter）
 
-**演练步骤**：
+## 演练步骤
 1. 记录当前内存基线：`free -m`
 2. 使用 ChaosBlade 注入内存压力
 
@@ -26,27 +26,27 @@ blade create mem load --mode ram --mem-percent <percent> --timeout <duration>
 
 3. 观察内存使用率及应用运行状态
 
-**注入验证**：
+## 注入验证
 1. `free -m` 确认可用内存显著减少
 2. `vmstat 1` 确认 swap 使用变化
 3. `dmesg | tail` 观察是否有 OOM 相关日志
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `free -m` 确认内存使用率恢复正常
 2. 确认应用进程未被 OOM Kill（`dmesg | grep -i oom`）
 
-**基准事实**：
+## 基准事实
 - **根因**：异常进程大量占用物理内存，导致系统可用内存不足，可能触发 OOM Killer
 - **必现现象**：物理内存使用率持续超过目标百分比；Swap 使用升高；可能出现进程被 OOM Kill
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -60,8 +60,14 @@ cat /proc/meminfo
 # 2) 按增量计算分配量：分配量 = MemTotal × 目标百分比 − (MemTotal − MemAvailable)
 #    例：MemTotal=16000000k、MemAvailable=6000000k、目标 80%：
 #    16000000×0.8 − (16000000−6000000) = 2800000k
-stress-ng --vm 1 --vm-bytes <算出的分配量>k --timeout <duration>s
+stress-ng --vm 1 --vm-bytes <算出的分配量>k --timeout <recovery-seconds>s
 ```
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——stress-ng 自停 `--timeout` 以它
+武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；上方 ChaosBlade 形态的
+`--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
+
 > **严禁直接按「MemTotal × 目标百分比」的绝对值分配**——主机已有基础用量，
 > 绝对值分配会超出目标水位甚至超过总内存，触发 swap 抖动或 OOM Killer。
 

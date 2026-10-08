@@ -1,16 +1,16 @@
 **用例名称** 服务被停止 导致 Host_系统服务异常
 
-**故障现象**：
+## 故障现象
 1. Systemd 管理的服务被意外停止
 2. 服务端口不再监听
 3. 依赖该服务的其他组件报连接失败
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认目标服务名：`systemctl list-units --type=service | grep <service>`
 3. 确认该服务的依赖关系
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标服务当前状态：`systemctl status <service>`
 2. 使用 ChaosBlade 注入服务停止
 
@@ -25,36 +25,37 @@ blade create systemd stop --service <service-name> --timeout <duration>
 
 3. 观察服务停止后的系统状态
 
-**注入验证**：
+## 注入验证
 1. `systemctl status <service>` 确认服务状态为 inactive/dead
 2. `ss -tlnp | grep <port>` 确认端口不再监听（仅适用于有监听端口的服务；无端口服务如 atd/crond 跳过此条，以第 1 条 systemctl 状态为准）
 3. 观察依赖该服务的其他组件是否报错
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
 > destroy 会自动执行 `systemctl start <service>` 恢复服务
 
-**恢复验证**：
+## 恢复验证
 1. `systemctl status <service>` 确认服务状态为 active/running
 2. 确认端口恢复监听
 3. 确认依赖组件恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：关键系统服务被异常停止（人为误操作、资源不足触发自动停止等）
 - **必现现象**：服务状态为 inactive；端口不再监听；依赖组件报连接失败
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
 注入命令（**先武装定时恢复，再注入**；到期自动拉起服务，补齐自恢复能力。
 两条命令分两次独立执行——执行通道不支持 && 串联；武装成功（输出含 Running timer as unit）后再 stop）：
 ```bash
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-<service-name> \
   systemctl start <service-name>
 systemctl stop <service-name>

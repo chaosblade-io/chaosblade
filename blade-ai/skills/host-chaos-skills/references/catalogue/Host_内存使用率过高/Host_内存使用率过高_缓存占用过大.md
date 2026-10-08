@@ -1,15 +1,15 @@
 **用例名称** 缓存占用过大 导致 Host_内存使用率过高
 
-**故障现象**：
+## 故障现象
 1. 主机 Page Cache 持续增长
 2. 可用内存（free）减少，但 buff/cache 指标异常偏高
 3. 系统在内存回收时出现性能抖动
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认监控系统可观测主机内存指标（如 `free -m`、`/proc/meminfo`）
 
-**演练步骤**：
+## 演练步骤
 1. 记录当前内存基线：`free -m`（关注 buff/cache 列）
 2. 使用 ChaosBlade 注入缓存内存压力
 
@@ -24,27 +24,27 @@ blade create mem load --mode cache --mem-percent <percent> --timeout <duration>
 
 3. 观察 buff/cache 增长及系统性能变化
 
-**注入验证**：
+## 注入验证
 1. `free -m` 确认 buff/cache 列显著增长
 2. `cat /proc/meminfo | grep -i cache` 确认 Cached 值升高
 3. 观察是否触发内存回收（`vmstat 1` 关注 si/so 列）
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `free -m` 确认内存恢复正常
 2. 手动回收缓存：`echo 3 > /proc/sys/vm/drop_caches`（如有需要）
 
-**基准事实**：
+## 基准事实
 - **根因**：文件系统缓存异常增长，占用大量可用内存，导致应用可用内存不足
 - **必现现象**：buff/cache 持续升高；free 内存显著减少；可能出现内存回收导致的性能抖动
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -62,8 +62,14 @@ blade destroy <experiment-uid>
 # 效果口径：从「可用内存减少」的应用视角等效；但上方注入验证的 buff/cache
 # 判据在 stress-ng 路径下**不可达**——若监控告警钉在 buff/cache 指标上，
 # 原生路径无法复现该形态（仅人工 dd 路径可填 Page Cache），判读时改看 used。
-stress-ng --vm 1 --vm-bytes <算出的分配量换算的MB数>M --vm-keep --timeout <duration>s
+stress-ng --vm 1 --vm-bytes <算出的分配量换算的MB数>M --vm-keep --timeout <recovery-seconds>s
 ```
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——stress-ng 自停 `--timeout` 以它
+武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；上方 ChaosBlade 形态的
+`--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
+
 > 分配量按**增量**计算：主机已有基础用量，直接按目标百分比的绝对值分配会超量触发 OOM Killer。
 
 > **为什么不用 `dd` 填充文件**：本用例的批准故障族是 `mem`（主路径 `blade create mem load

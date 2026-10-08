@@ -1,16 +1,16 @@
 **用例名称** 调用延迟 导致 Host_系统调用异常
 
-**故障现象**：
+## 故障现象
 1. 特定系统调用执行时间显著增加
 2. 应用 IO 操作、内存分配等变慢
 3. 应用响应延迟增大但不报错
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认目标进程 PID：`pidof <process>` 或 `ps aux | grep <process>`
 3. 确认目标系统调用名（如 read、write、open、mmap 等）
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标进程 PID 和关键系统调用：`strace -c -p <pid> -e trace=<syscall> &`（采样 5 秒后 Ctrl+C）
 2. 使用 ChaosBlade 注入系统调用延迟
 
@@ -29,27 +29,27 @@ blade create strace delay --pid <pid> --syscall-name <syscall> --time <delay> --
 
 3. 观察应用性能变化
 
-**注入验证**：
+## 注入验证
 1. `strace -T -p <pid> -e trace=<syscall>` 确认该系统调用耗时增加
 2. （可选，仅当演练方提供了应用访问入口时）确认响应延迟增大；无入口时上述 strace 耗时证据成立即可判定
 3. 确认延迟是否符合注入的时间值
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `strace -T -p <pid> -e trace=<syscall>` 确认系统调用耗时恢复正常
 2. （可选，有访问入口时）确认应用响应延迟恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：特定系统调用出现异常延迟（如磁盘慢、网络抖动导致的底层延迟）
 - **必现现象**：目标系统调用耗时显著增加；应用响应延迟增大；整体吞吐下降
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，难以直接实现系统调用级别的精确延迟注入。以下为近似方案。
 
@@ -63,6 +63,7 @@ pgrep -f <process-name>
 # 2) 先武装定时终止（定时器由宿主机 systemd(PID 1) 管理，到期自动 kill 掉
 #    strace）。各命令分次独立执行（执行通道不支持 && 串联）；武装成功
 #    （输出含 Running timer as unit）后再执行 attach
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 systemd-run --on-active=<recovery-seconds>s --unit=blade-kill-strace \
   sh -c 'kill $(pgrep -x strace)'
 

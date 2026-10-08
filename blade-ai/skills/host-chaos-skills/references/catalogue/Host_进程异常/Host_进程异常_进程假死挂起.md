@@ -1,15 +1,15 @@
 **用例名称** 进程假死挂起 导致 Host_进程异常
 
-**故障现象**：
+## 故障现象
 1. 目标进程存在但不响应任何请求
 2. 服务端口监听但连接后无响应（超时）
 3. 进程状态显示为 T（Stopped）
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认目标进程名或 PID：`ps aux | grep <process>`
 
-**演练步骤**：
+## 演练步骤
 1. 确认目标进程正在运行：`ps aux | grep <process>`
 2. 使用 ChaosBlade 注入进程假死（SIGSTOP）
 
@@ -26,30 +26,30 @@ blade create process stop --process <process-name> --timeout <duration>
 
 3. 观察进程状态及服务响应情况
 
-**注入验证**：
+## 注入验证
 1. `ps aux | grep <process>` 确认进程状态为 T（Stopped）
 2. `curl --connect-timeout 5 <service-url>` 确认连接后无响应
 3. 健康检查（如 LB 心跳）是否触发报警（报警由 LB 多轮失败检测累积触发，存在传播
    延迟——首查未见报警不构成反证，挂起的直接证据是第 1 条的进程 T 状态）
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
 > destroy 会自动发送 SIGCONT 恢复进程
 
-**恢复验证**：
+## 恢复验证
 1. `ps aux | grep <process>` 确认进程状态恢复为 S/R
 2. 确认服务请求响应恢复正常
 
-**基准事实**：
+## 基准事实
 - **根因**：进程被 SIGSTOP 挂起，虽然进程存在但完全不处理任何请求
 - **必现现象**：进程存在但状态为 T；端口监听但不响应；健康检查超时
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -60,6 +60,7 @@ pgrep -f <process-name>
 
 # 2) 先武装定时 SIGCONT（定时器由宿主机 systemd(PID 1) 管理，到期重新 pgrep 取 PID），再挂起。
 #    两条命令分两次独立执行（执行通道不支持 && 串联）；武装成功（输出含 Running timer as unit）后再执行挂起
+# <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
 systemd-run --on-active=<recovery-seconds>s --unit=blade-cont-<process-name> \
   sh -c 'kill -CONT $(pgrep -f <process-name>)'
 kill -STOP <pid>

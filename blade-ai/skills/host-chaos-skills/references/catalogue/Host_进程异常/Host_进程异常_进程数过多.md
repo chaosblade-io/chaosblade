@@ -1,16 +1,16 @@
 **用例名称** 进程数过多 导致 Host_进程异常
 
-**故障现象**：
+## 故障现象
 1. 系统进程数接近或超过内核限制（pid_max）
 2. 新进程创建失败（fork: Cannot allocate memory）
 3. 系统响应变慢，服务无法启动新线程/进程
 
-**资源准备**：
+## 资源准备
 1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
 2. 确认当前进程数基线：`ps aux | wc -l`
 3. 确认系统进程上限：`cat /proc/sys/kernel/pid_max`
 
-**演练步骤**：
+## 演练步骤
 1. 记录当前进程数：`ps aux | wc -l`
 2. 使用 ChaosBlade 注入进程数飙升
 
@@ -25,27 +25,27 @@ blade create process load --count <count> --timeout <duration>
 
 3. 观察系统进程数变化及服务可用性
 
-**注入验证**：
+## 注入验证
 1. `ps aux | wc -l` 确认进程数显著增加
 2. 尝试执行新命令（如 `ls`）观察是否变慢或失败
 3. `dmesg | tail` 观察是否有 fork 失败日志
 
-**注入恢复**：
+## 注入恢复
 ```bash
 blade destroy <experiment-uid>
 ```
 
-**恢复验证**：
+## 恢复验证
 1. `ps aux | wc -l` 确认进程数回落到正常水平
 2. 确认新命令可正常执行
 
-**基准事实**：
+## 基准事实
 - **根因**：大量进程被创建（类似 fork bomb），耗尽系统进程资源
 - **必现现象**：进程数显著升高；新进程创建变慢或失败；系统响应迟钝
 
 ---
 
-**降级方案（原生命令）**
+## 降级方案（原生命令）
 
 > 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
 
@@ -55,8 +55,13 @@ blade destroy <experiment-uid>
 ```bash
 # 用 stress-ng 的 fork stressor 批量占用进程槽位，自带超时不需人工清理。
 # --fork 是否可用以 `stress-ng --help` 的实际输出为准。
-stress-ng --fork <count> --timeout <duration>s
+stress-ng --fork <count> --timeout <recovery-seconds>s
 ```
+
+`<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
+（= duration + grace，见 SKILL.md 双数窗口契约）——stress-ng 自停 `--timeout` 以它
+武装，让框架在观察窗终点主动派发的恢复先于自治到期落地；上方 ChaosBlade 形态的
+`--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
 
 恢复命令：
 ```bash
