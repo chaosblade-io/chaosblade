@@ -727,3 +727,155 @@ async def test_k8s_native_recover_non_chaosblade_unrecovered():
     assert result.layer1["status"] == "skipped"
     assert any("Non-ChaosBlade" in w for w in result.warnings)
     assert result.failure is not None
+
+
+def _recovery_facts_state(*artifacts: dict) -> dict:
+    return {"execution_artifacts": list(artifacts)}
+
+
+def _armed_carrier_artifact(**overrides) -> dict:
+    """A debug-pod carrier with the #59 armed-rollback ledger fields."""
+    base = {
+        "type": "debug_pod",
+        "name": "node-debugger-n1-abc12",
+        "namespace": "kubewiz",
+        "status": "recovery_armed",
+        "target": {"scope": "node", "name": "n1"},
+        "recovery_fill_path": "/var/tmp/fill.bin",
+        "recovery_form": "host_timer",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_recovery_facts_empty_state_returns_empty():
+    # Contract test parity (test_conformance L432-433): an empty state
+    # renders nothing — the hook is inert when no ledger record exists.
+    assert K8sNativeProvider().recovery_facts_render({}, spec_params={}) == ""
+    assert (
+        K8sNativeProvider().recovery_facts_render(
+            _recovery_facts_state(), spec_params={}
+        )
+        == ""
+    )
+
+
+def test_recovery_facts_void_carrier_names_active_recovery():
+    # #59's terminal shape: the carrier died in-window, the carrier-resident
+    # reversal was stamped void. The render must hand the recovery executor
+    # the two facts nothing else carries (the ledger's path + the void
+    # verdict) — the model waits on a dead timer without them.
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(
+            _armed_carrier_artifact(
+                status="cleaned", recovery_void=True, recovery_form="in_chain",
+            )
+        ),
+    )
+    assert "/var/tmp/fill.bin" in rendered
+    assert "node n1" in rendered
+    assert "VOID" in rendered
+    assert "ACTIVE recovery is required" in rendered
+    assert "truncate -s 0 /var/tmp/fill.bin" in rendered
+
+
+def test_recovery_facts_host_timer_survival_is_stated():
+    # The compliant #59 shape: the timer rides PID 1 and survives the
+    # carrier — the render states that fact so an in-window recovery
+    # verifies after the window instead of re-recovering blindly (and
+    # knows an early truncate is idempotent, which the early-recovery
+    # lane will allow).
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(_armed_carrier_artifact()),
+    )
+    assert "/var/tmp/fill.bin" in rendered
+    assert "PID 1" in rendered
+    assert "idempotent" in rendered
+    assert "VOID" not in rendered
+
+
+def test_recovery_facts_carrier_resident_form_states_the_condition():
+    # A carrier-resident (in-chain) reversal on a still-armed record: the
+    # render states the realm and the death condition — facts, with the
+    # active-recovery path named for the dead-carrier case.
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(
+            _armed_carrier_artifact(recovery_form="in_chain"),
+        ),
+    )
+    assert "CARRIER-RESIDENT" in rendered
+    assert "truncate -s 0 /var/tmp/fill.bin" in rendered
+
+
+def test_recovery_facts_ignores_unrelated_artifacts():
+    # Non-debug-pod artifacts and carriers with no fill record render
+    # nothing: the hook speaks only for the armed-rollback ledger.
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(
+            {"type": "recovery_carrier", "name": "rc-1", "status": "active"},
+            # A debug pod with NO fill record (network fault carrier):
+            {
+                "type": "debug_pod", "name": "net-pod", "status": "active",
+                "target": {"scope": "node", "name": "n2"},
+            },
+        ),
+    )
+    assert rendered == ""
+
+
+def test_recovery_facts_render_dm_mapping_inverse():
+    # The device-mapper face of the same ledger (the IO-error case): the
+    # record names a mapping, and the reversal the recovery executor must
+    # know is a ``dmsetup remove`` of THAT name — never a truncate on a
+    # path this task never filled.
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(
+            _armed_carrier_artifact(
+                recovery_fill_path="",
+                recovery_dm_name="error-device",
+            ),
+        ),
+    )
+    assert "error-device" in rendered
+    assert "dmsetup remove error-device" in rendered
+    assert "truncate" not in rendered
+
+
+def test_recovery_facts_render_dm_void_names_active_recovery():
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(
+            _armed_carrier_artifact(
+                status="cleaned",
+                recovery_void=True,
+                recovery_form="in_chain",
+                recovery_fill_path="",
+                recovery_dm_name="error-device",
+            ),
+        ),
+    )
+    assert "ACTIVE recovery is required" in rendered
+    assert "dmsetup remove error-device" in rendered
+    assert "truncate" not in rendered
+
+
+def test_recovery_facts_render_dm_host_timer_recovery_is_idempotent():
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(
+            _armed_carrier_artifact(
+                recovery_fill_path="",
+                recovery_dm_name="error-device",
+            ),
+        ),
+    )
+    assert "host-managed timer" in rendered
+    assert "dmsetup remove error-device is idempotent" in rendered
+
+
+def test_recovery_facts_render_fill_record_keeps_its_vocabulary():
+    # A fill record still renders the truncate reclaim — the dm branch must
+    # not have changed the fill vocabulary.
+    rendered = K8sNativeProvider().recovery_facts_render(
+        _recovery_facts_state(_armed_carrier_artifact()),
+    )
+    assert "truncate -s 0 /var/tmp/fill.bin" in rendered
+    assert "dmsetup" not in rendered

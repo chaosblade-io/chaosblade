@@ -96,6 +96,17 @@ def project_recipe_handle(
     invalid_secret = recipe.get("invalid_secret")
     if isinstance(invalid_secret, dict) and invalid_secret.get("name"):
         handle["invalid_secret"] = dict(invalid_secret)
+    # The create-domain prop objects the recovery lifecycle deletes (the
+    # assembler timer's ``extra_delete`` inverse). Projected only when
+    # present and well-formed (kind+name), so the recover replay deletes
+    # them on early convergence — symmetric with the timer's TTL deletion.
+    # Object REFERENCES only (no credential material), D5-compliant.
+    extra_delete = [
+        dict(d) for d in (recipe.get("extra_delete") or [])
+        if isinstance(d, dict) and d.get("kind") and d.get("name")
+    ]
+    if extra_delete:
+        handle["extra_delete"] = extra_delete
     deadline = recipe.get("recovery_deadline_epoch")
     if isinstance(deadline, (int, float)):
         handle["recovery_deadline_epoch"] = float(deadline)

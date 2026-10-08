@@ -54,6 +54,7 @@ carrier:
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -76,6 +77,7 @@ from chaos_agent.agent.providers.message_scanning import (
     is_budget_expiry_unknown,
     reached_target,
 )
+from chaos_agent.memory.tool_compactor import is_compaction_artifact
 from chaos_agent.transports import PROFILE_K8S
 
 if TYPE_CHECKING:
@@ -84,6 +86,26 @@ if TYPE_CHECKING:
     from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.result.verdict import Layer1Result
     from chaos_agent.agent.target_guard.types import EffectiveTarget
+
+# Compacted assembler-receipt stubs keep the verdict in their surviving
+# head: the receipt builder (assembler._receipt / the tool's except
+# branches) writes ``status`` FIRST, and every compaction path preserves
+# the head — the 1KB historical head-cut (status sits in the first ~30
+# bytes), the dict-prune re-serialisation (insertion order kept), and
+# strip_large_outputs' head-600. So a stub's status is recoverable even
+# though the whole no longer parses; ``None`` (no match) is the one
+# genuinely unknown shape — the time-based microcompact marker, which
+# replaces the WHOLE content and keeps nothing.
+_STUB_RECEIPT_STATUS_RE = re.compile(
+    r'"status"\s*:\s*"(success|partial|failed)"'
+)
+
+
+def _stub_receipt_status(result: str) -> str | None:
+    """Recover the receipt verdict from a compacted stub, or ``None``
+    when the stub preserves nothing (the cleared-marker shape)."""
+    m = _STUB_RECEIPT_STATUS_RE.search(result)
+    return m.group(1) if m else None
 
 
 class FaultDrillProvider:
@@ -257,20 +279,56 @@ class FaultDrillProvider:
         armed-but-unconfirmed — the fault may be live). The LATEST face
         owns the verdict (the same latest-face rule :meth:`detect`
         arbitrates with): an assembler session with an earlier landed CR
-        keeps the CR evidence out of the judgement, and vice versa."""
+        keeps the CR evidence out of the judgement, and vice versa.
+
+        The unparseable arm has ONE carve-out (2026-09-21
+        inject-2340dac9): a COMPACTED result — a receipt that fell out
+        of the tool compactor's 5-slot recency window and was head-cut
+        to 1KB with a truncation notice — is judged by its SURVIVING
+        head, not by the unparseable whole. The receipt builder writes
+        ``status`` first and every compaction path preserves the head,
+        so the verdict is recoverable: a stub whose status reads
+        ``failed`` still revokes (a late-stack failure's receipt —
+        7-8 steps of detail — is itself over the 1KB budget), a
+        ``success``/``partial`` stub keeps the attribution (the live
+        bug: a landed ``partial`` stub used to read as "never landed"
+        and the task finished with NO injection_method), and a stub
+        that preserves NOTHING (the time-based cleared marker) is
+        unjudgeable — keep, the same posture as the budget-expiry
+        third state below: revocation needs a TRUSTWORTHY verdict."""
         apply_events = _faultdrill_apply_events(messages)
         asm_events = _assembler_call_events(messages)
         if asm_events and (
             not apply_events
             or asm_events[-1]["index"] > apply_events[-1]["index"]
         ):
+            latest_result = asm_events[-1]["result"]
+            latest_stub = is_compaction_artifact(latest_result)
+            if latest_stub:
+                stub_status = _stub_receipt_status(latest_result)
+                if stub_status != "failed":
+                    # landed or unjudgeable — never counter-evidence.
+                    return False
+                # A failed stub keeps its verdict: fall through, the
+                # earlier-scan and the True below revoke exactly like a
+                # fresh failed receipt.
             landed_earlier = any(
                 parse_receipt(e["result"]) is not None
+                # An earlier landed/unjudgeable stub shields the same
+                # way a registerable receipt does; only a stub whose
+                # surviving head reads "failed" (verdict recovered)
+                # stops being a shield — that carrier never existed.
+                or (
+                    is_compaction_artifact(e["result"])
+                    and _stub_receipt_status(e["result"]) != "failed"
+                )
                 for e in asm_events[:-1]
             )
             if landed_earlier:
                 return False
-            return parse_receipt(asm_events[-1]["result"]) is None
+            if latest_stub:
+                return True
+            return parse_receipt(latest_result) is None
         events = apply_events
         if not events:
             return False
@@ -660,10 +718,47 @@ class FaultDrillProvider:
         return result.exit_code == 0
 
     def parse_injection_params(self, tool_name: str, tool_args: dict) -> Optional[dict]:
-        """No issue-time key-parameter extraction: the CR manifest IS the
-        full fault recipe (patches / restorePatches / invalidSecret /
-        durationSeconds), and the readback guard compares it verbatim."""
+        """No issue-time key-parameter extraction: the assembler tool call
+        carries the full fault recipe in its own arguments (the patches,
+        their restores, the window), and the assembler renders, verifies
+        and injects it in one call — there is no command line to lift
+        parameters out of."""
         return None
+
+    def enforce_contract_duration(
+        self, tool_name: str, tool_args: dict, timer_seconds: int
+    ) -> Optional[str]:
+        """Pin the assembler's ``duration_seconds`` argument to the fault's
+        own recovery timer (``D + G``, computed at the registry dispatch
+        point).
+
+        There is no ``--timeout`` flag here, but the window IS a structured
+        tool argument (the assembler renders it into the carrier's own
+        restore timer), so the same exact-equality rule the blade carriers
+        enforce on their flag applies verbatim: the carrier's sleep arms to
+        the safety-net window — observation window ``D`` plus recovery grace
+        ``G`` — so an actively dispatched framework recovery lands before
+        the carrier self-restores. A window differing in either direction
+        breaks the contract. The rewrite lands before dispatch (the caller
+        hands us the very dict the ToolNode will execute), so the assembler
+        builds the carrier with the safety-net window — and its ``max_sleep``
+        bound check fail-closes on an out-of-range contract instead of
+        silently clamping. (The retired CR face carried its window in the
+        manifest's ``durationSeconds``; the readback that compared that
+        field went with the CR channel — M2.)
+
+        Returns a human-readable note when it rewrote something, else
+        ``None`` (not this carrier, or already pinned)."""
+        if tool_name != ASSEMBLER_TOOL_NAME:
+            return None
+        current = tool_args.get("duration_seconds")
+        if current == timer_seconds:
+            return None
+        tool_args["duration_seconds"] = timer_seconds
+        return (
+            "faultdrill duration_seconds "
+            f"{current if current is not None else 'absent'}"
+        )
 
     def issue_time_method(
         self, tool_name: str, tool_args: dict, *, is_host: bool = False
@@ -1118,20 +1213,40 @@ class FaultDrillProvider:
     ) -> str:
         """Post-injection verifier note for the faultdrill carrier.
 
-        Final semantics (not a stub): the CR landing is the RECIPE
-        landing, not the fault landing — 效果即真理 holds unchanged, and
-        the Layer-2 effect judgment stays the verification authority.
+        Final semantics (not a stub), per method face:
+        ``faultdrill_cr`` — the CR landing is the RECIPE landing, not
+        the fault landing (效果即真理 holds; Layer-2 stays the
+        verification authority).
+        ``faultdrill_carrier`` — the four-object carrier set is planned
+        armed scaffolding (false-alarm suppression: it is not stray
+        residue to report), and its settlement rides the recovery path
+        (cleanup-noise suppression: carrier teardown is not a verifier
+        duty); 效果即真理 holds unchanged on this face too.
         """
-        if injection_method != "faultdrill_cr":
-            return ""
-        return (
-            "\n### Injection Method Note\n"
-            "Injection was a declarative FaultDrill CR apply. The CR records the "
-            "recipe (patches / restorePatches / TTL); it is bookkeeping, NOT the "
-            "verification criterion. Judge the fault's effect from cluster "
-            "evidence exactly as for any other carrier — the CR having landed "
-            "does not mean the fault has manifested.\n\n"
-        )
+        if injection_method == "faultdrill_cr":
+            return (
+                "\n### Injection Method Note\n"
+                "Injection was a declarative FaultDrill CR apply. The CR records the "
+                "recipe (patches / restorePatches / TTL); it is bookkeeping, NOT the "
+                "verification criterion. Judge the fault's effect from cluster "
+                "evidence exactly as for any other carrier — the CR having landed "
+                "does not mean the fault has manifested.\n\n"
+            )
+        if injection_method == "faultdrill_carrier":
+            return (
+                "\n### Injection Method Note\n"
+                "Injection was a programmatically assembled recovery carrier: a "
+                "bare sleep-skeleton Pod plus its ServiceAccount/Role/RoleBinding, "
+                "all four sharing one generated carrier name. That set is planned "
+                "armed scaffolding, not stray residue — observing it in the target "
+                "namespace at this stage is expected and is not a leftover-resource "
+                "finding; its settlement (the in-cluster restore timer, then the "
+                "teardown sweep) belongs to the recovery path, not to this "
+                "verification. The assembler receipt (armed / landing verified) is "
+                "bookkeeping, NOT the verification criterion — judge the fault's "
+                "effect from cluster evidence exactly as for any other carrier.\n\n"
+            )
+        return ""
 
     def recover_layer2_context(
         self,
@@ -1297,6 +1412,10 @@ async def _replay_restore_recipe(handle: dict, kubeconfig: str) -> dict:
         if isinstance(op, dict)
     ]
     invalid_secret = dict(handle.get("invalid_secret") or {})
+    extra_delete = [
+        d for d in (handle.get("extra_delete") or [])
+        if isinstance(d, dict)
+    ]
     if not (
         target.get("kind") and target.get("name")
         and (restore or invalid_secret.get("name"))
@@ -1314,6 +1433,7 @@ async def _replay_restore_recipe(handle: dict, kubeconfig: str) -> dict:
             "target_ref": target,
             "restore_patches": restore,
             "invalid_secret": invalid_secret,
+            "extra_delete": extra_delete,
         },
         kubeconfig,
     )

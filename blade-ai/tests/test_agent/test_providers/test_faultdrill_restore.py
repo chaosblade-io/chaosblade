@@ -24,6 +24,7 @@ from chaos_agent.tools.guard import CommandResult
 import chaos_agent.agent.providers.faultdrill.provider as fd_provider
 from chaos_agent.agent.providers.faultdrill.restore import (
     _apply_derived_invalid_secret,
+    _delete_extra_objects,
     _delete_invalid_secret,
     _do_restore,
     _filter_already_applied,
@@ -144,11 +145,12 @@ def test_json_path_exists_object_only():
 # ---------------------------------------------------------------------------
 
 
-def _faulted_state(*, inv: dict | None = None) -> dict:
+def _faulted_state(*, inv: dict | None = None, extra: list | None = None) -> dict:
     return {
         "target_ref": dict(_TARGET),
         "restore_patches": [{"op": "remove", "path": "/spec/paused"}],
         **({"invalid_secret": inv} if inv else {}),
+        **({"extra_delete": extra} if extra is not None else {}),
     }
 
 
@@ -353,3 +355,118 @@ def test_target_namespace_fallback():
     assert _target_namespace(_TARGET) == "cms-demo"
     assert _target_namespace({"kind": "Deployment", "name": "d"}) == "default"
     assert _target_namespace({}) == "default"
+
+
+# ---------------------------------------------------------------------------
+# extra_delete — the create-domain inverse on the early-convergence replay
+#
+# Recovery-completeness: the replay must undo BOTH domains the inject plan
+# wrote — the patch domain (restore_patches, pinned above) AND the create
+# domain (prop objects like a registry Secret built OUTSIDE the target's
+# patch surface). The armed carrier timer folds the same DELETEs into its
+# TTL payload; ``--ignore-not-found`` makes the two executors mutually
+# idempotent (whichever fires first, the other is a clean no-op).
+# ---------------------------------------------------------------------------
+
+_EXTRA = [{"kind": "secret", "name": "registry-cred-rotating",
+           "namespace": "cms-demo"}]
+
+
+async def test_do_restore_deletes_extra_objects(_kube):
+    """A faulted target with a create-domain prop: the patch lands AND the
+    prop Secret is deleted with --ignore-not-found in its own namespace."""
+    _kube.on("get", "deployment", _R(0, json.dumps(_target_json(paused=True))))
+    _kube.on("patch", "deployment", _R(0, "ok"))
+    _kube.on("delete", "secret", _R(0, "deleted"))
+
+    assert await _do_restore(_faulted_state(extra=list(_EXTRA)), "kc") is True
+
+    delete = _kube.calls_matching("delete")[0]
+    assert delete[1] == [
+        "secret", "registry-cred-rotating", "-n", "cms-demo",
+        "--ignore-not-found",
+    ]
+
+
+async def test_do_restore_extra_delete_idempotent_when_absent(_kube):
+    """The timer already fired (target back at baseline, prop already gone):
+    guard 2 drops the restore patch and ``--ignore-not-found`` makes the
+    delete a clean exit-0 no-op — a double recovery is still honest work."""
+    _kube.on("get", "deployment", _R(0, json.dumps(_target_json())))
+    _kube.on("delete", "secret", _R(0, ""))  # kubectl: NotFound → exit 0
+
+    assert await _do_restore(_faulted_state(extra=list(_EXTRA)), "kc") is True
+    assert not _kube.calls_matching("patch")
+    assert len(_kube.calls_matching("delete")) == 1
+
+
+async def test_do_restore_extra_delete_failure_returns_false(_kube):
+    """A rejected delete (RBAC / real error, NOT NotFound) fails the
+    restore — never a fabricated success while a prop object survives."""
+    _kube.on("get", "deployment", _R(0, json.dumps(_target_json(paused=True))))
+    _kube.on("patch", "deployment", _R(0, "ok"))
+    _kube.on("delete", "secret", _R(1, "", "forbidden"))
+
+    assert await _do_restore(_faulted_state(extra=list(_EXTRA)), "kc") is False
+
+
+async def test_do_restore_no_extra_delete_untouched(_kube):
+    """No extra_delete in the recipe → no create-domain delete at all (the
+    default path is byte-for-byte the pre-fix behaviour)."""
+    _kube.on("get", "deployment", _R(0, json.dumps(_target_json(paused=True))))
+    _kube.on("patch", "deployment", _R(0, "ok"))
+
+    assert await _do_restore(_faulted_state(), "kc") is True
+    assert not _kube.calls_matching("delete")
+
+
+async def test_do_restore_extra_and_invalid_secret_coexist(_kube):
+    """Both delete faces fire on one replay: the derived invalid secret AND
+    the create-domain prop are distinct deletions, both --ignore-not-found,
+    and a failure in either fails the whole restore."""
+    _kube.on("get", "deployment", _R(0, json.dumps(_target_json(paused=True))))
+    _kube.on("patch", "deployment", _R(0, "ok"))
+    _kube.on("delete", "secret", _R(0, "deleted"))
+
+    assert await _do_restore(
+        _faulted_state(
+            inv={"name": "inv-cred", "sourceName": "src-cred"},
+            extra=list(_EXTRA),
+        ),
+        "kc",
+    ) is True
+    deleted = sorted(c[1][1] for c in _kube.calls_matching("delete"))
+    assert deleted == ["inv-cred", "registry-cred-rotating"]
+
+
+async def test_delete_extra_objects_skips_malformed_and_defaults_ns(_kube):
+    """Robustness of the delete-only inverse: non-dict entries and entries
+    missing kind/name are skipped (never dispatched as a broken kubectl);
+    a missing namespace falls back to ``default``; each surviving object
+    gets exactly one delete."""
+    _kube.on("delete", "secret", _R(0, "deleted"))
+    _kube.on("delete", "configmap", _R(0, "deleted"))
+
+    extra = [
+        "not-a-dict",                                  # skipped
+        {"kind": "secret"},                            # no name → skipped
+        {"name": "orphan"},                            # no kind → skipped
+        {"kind": "secret", "name": "a", "namespace": "cms-demo"},
+        {"kind": "configmap", "name": "b"},            # ns → default
+    ]
+    assert await _delete_extra_objects(extra, "kc") is True
+
+    deletes = _kube.calls_matching("delete")
+    assert len(deletes) == 2
+    assert deletes[0][1] == [
+        "secret", "a", "-n", "cms-demo", "--ignore-not-found",
+    ]
+    assert deletes[1][1] == [
+        "configmap", "b", "-n", "default", "--ignore-not-found",
+    ]
+
+
+async def test_delete_extra_objects_empty_is_true_noop(_kube):
+    """An empty list is a clean success with zero dispatches."""
+    assert await _delete_extra_objects([], "kc") is True
+    assert not _kube.calls_matching("delete")

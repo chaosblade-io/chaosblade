@@ -79,6 +79,9 @@ from chaos_agent.agent.providers.faultdrill.assembler import (
     build_carrier_artifact,
 )
 from chaos_agent.agent.providers.faultdrill.provider import FaultDrillProvider
+from chaos_agent.agent.providers.faultdrill.recipe_ledger import (
+    project_recipe_handle,
+)
 from chaos_agent.agent.state_mgmt.recovery_state import (
     build_recover_initial_from_checkpoint,
 )
@@ -315,6 +318,7 @@ async def test_cross_task_recover_replays_the_ledger_recipe(_replay_stub):
         "target_ref": _TARGET_REF,
         "restore_patches": _RESTORE_PATCHES,
         "invalid_secret": {},
+        "extra_delete": [],
     }
     assert result.recovered is True
     assert result.level == "recovered"
@@ -542,3 +546,103 @@ async def test_recover_loop_wrapper_hands_the_ledger_to_the_provider(
         "the wrapper did not hand the ledger over — a UID-less carrier's "
         "recipe hydration stays single-sourced on messages"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. extra_delete — the create-domain inverse rides the SAME single
+#    projection. ``project_recipe_handle`` is the one funnel both hydration
+#    rungs (message + ledger) share, so a prop-object delete list must
+#    survive it or the early-convergence replay silently loses the create
+#    domain while the armed timer still deletes it — the exact asymmetry
+#    #51-R5 exposed. Object REFERENCES only (kind+name+namespace), never
+#    credential material (D5).
+# ---------------------------------------------------------------------------
+
+_EXTRA_DELETE = [
+    {"kind": "secret", "name": "registry-cred-rotating",
+     "namespace": _CARRIER_NS},
+]
+
+
+def _recovery_handle_with_extra(extra: list) -> dict:
+    handle = _recovery_handle()
+    handle["extra_delete"] = list(extra)
+    return handle
+
+
+def _carrier_artifact_with_extra(extra: list) -> dict:
+    return build_carrier_artifact(
+        name=_CARRIER_NAME, namespace=_CARRIER_NS, task_id=_INJECT_TASK_ID,
+        rules=[{"kind": "deployment", "verbs": ["patch"]}],
+        duration_seconds=600, deadline_epoch=1_900_000_000.0,
+        recovery_handle=_recovery_handle_with_extra(extra),
+    )
+
+
+def test_project_recipe_handle_projects_extra_delete():
+    """A well-formed extra_delete list rides the projected handle verbatim
+    (kind+name+namespace preserved — the replay deletes exactly these)."""
+    recipe = _recovery_handle_with_extra(_EXTRA_DELETE)
+    handle = project_recipe_handle(recipe)
+    assert handle is not None
+    assert handle["extra_delete"] == _EXTRA_DELETE
+
+
+def test_project_recipe_handle_filters_malformed_extra_delete():
+    """Entries missing kind or name (or non-dict) are dropped — a partial
+    reference could delete the wrong object or none, so the projection
+    refuses to guess. Surviving well-formed entries still ride."""
+    recipe = _recovery_handle_with_extra([
+        "not-a-dict",
+        {"kind": "secret"},                 # no name → dropped
+        {"name": "orphan"},                 # no kind → dropped
+        {"kind": "configmap", "name": "ok", "namespace": _CARRIER_NS},
+    ])
+    handle = project_recipe_handle(recipe)
+    assert handle is not None
+    assert handle["extra_delete"] == [
+        {"kind": "configmap", "name": "ok", "namespace": _CARRIER_NS},
+    ]
+
+
+def test_project_recipe_handle_absent_extra_delete_has_no_key():
+    """No extra_delete in the recipe → no key on the handle (the default
+    path is unchanged; the replay then sees an empty create domain)."""
+    handle = project_recipe_handle(_recovery_handle())
+    assert handle is not None
+    assert "extra_delete" not in handle
+
+
+def test_all_malformed_extra_delete_yields_no_key():
+    """A list that filters down to nothing behaves like an absent one — no
+    empty key is projected."""
+    recipe = _recovery_handle_with_extra(["x", {"kind": "secret"}])
+    handle = project_recipe_handle(recipe)
+    assert handle is not None
+    assert "extra_delete" not in handle
+
+
+async def test_cross_task_recover_replays_extra_delete_from_ledger(
+    _replay_stub,
+):
+    """End-to-end: a create-domain prop in the ledger's recovery_handle is
+    hydrated off ``execution_artifacts`` and reaches the replay's
+    task_state, so an early-convergence recover deletes the prop Secret
+    too — symmetric with the armed timer's TTL DELETE, not narrower."""
+    artifact = _carrier_artifact_with_extra(_EXTRA_DELETE)
+    state = {
+        "task_id": _INJECT_TASK_ID,
+        "injection_method": "faultdrill_carrier",
+        "execution_artifacts": [artifact],
+        "fault_handle": dict(_BARE_HANDLE),
+    }
+
+    result = await FaultDrillProvider().recover(
+        state, state["fault_handle"], kubeconfig="", messages=[],
+    )
+
+    assert _replay_stub["calls"]["restore"] == 1
+    assert _replay_stub["calls"]["restore_state"]["extra_delete"] == (
+        _EXTRA_DELETE
+    )
+    assert result.recovered is True

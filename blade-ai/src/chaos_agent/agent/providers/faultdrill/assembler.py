@@ -49,6 +49,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any, Optional
 
@@ -94,6 +95,17 @@ REST_METHOD_VERBS = {
 #: The json-patch Content-Type the restore curls carry (the recipe is a
 #: json-patch array; merge-patch's array semantics are the B58 trap).
 _JSON_PATCH_CONTENT_TYPE = "application/json-patch+json"
+
+#: Restore-request attribution prefix (B3): the armed curl's User-Agent
+#: reads ``blade-ai-recovery/<carrier>`` so the apiserver's audit log
+#: and managedFields entries attribute the TTL restore PATCH to THIS
+#: drill's carrier, not to an anonymous in-cluster client.
+_RESTORE_USER_AGENT_PREFIX = "blade-ai-recovery"
+
+#: Characters a User-Agent value may keep — the value rides inside a
+#: double-quoted shell string in the armed script, so quotes, ``$`` and
+#: friends are stripped, never escaped.
+_UA_UNSAFE_CHARS_RE = re.compile(r"[^A-Za-z0-9._/-]+")
 
 #: Taints every pod tolerates by default — excluded from the derived
 #: overrides tolerations (admitting them would be noise, not access).
@@ -286,8 +298,11 @@ def build_role_create_v_args(
         by_group.setdefault(group, []).extend(list(rule.get("resources") or []))
     v_args = ["role", name, "-n", namespace, "--verb", verbs]
     for group, resources in by_group.items():
+        # Group-qualified resources take kubectl's ``resource.group`` dot
+        # form (``deployments.apps``) — the slash form is mis-parsed as
+        # resource "apps" and fails live (B86, #43-R3 + #62).
         qualified = (
-            [f"{group}/{res}" for res in resources] if group else list(resources)
+            [f"{res}.{group}" for res in resources] if group else list(resources)
         )
         v_args.extend(["--resource", ",".join(qualified)])
     return v_args
@@ -451,22 +466,55 @@ def _shell_sq(text: str) -> str:
 
 def build_restore_script(
     duration_seconds: int, target_url: str, body: str,
-    *, body_file: str = "",
+    *, body_file: str = "", user_agent: str = "",
+    delete_urls: Optional[list[str]] = None,
 ) -> str:
     """The §4 compact-variable-form timer script (C/T/U assigned INSIDE
     the payload — the standard's approved form; ``body_file`` switches
     the curl data to ``-d @file`` for the §7 oversized-payload landing
     tier). Output lands in ``/tmp/restore.log`` — never ``/dev/null``
     (the §4 form discipline: silent restore failure is the unforgivable
-    mode)."""
+    mode).
+
+    ``user_agent`` (B3): the apiserver records a request's User-Agent in
+    audit logs and managedFields entries, so the armed restore PATCH
+    carries ``blade-ai-recovery/<carrier>`` — apiserver-side attribution
+    to THIS drill's carrier, not just the agent's own receipt trail.
+    Unsuitable characters are stripped (the value rides inside a
+    double-quoted shell string); an empty value falls back to the bare
+    prefix.
+
+    ``delete_urls`` (recovery-completeness inverse): after the patch-
+    domain restore, the timer also DELETEs the create-domain prop objects
+    the inject plan built OUTSIDE the patch domain (``extra_delete``) —
+    a json-patch can only rewrite an existing object's fields, it cannot
+    express "delete an independently created Secret", so without this the
+    prop object would outlive the fault with no autonomous executor (the
+    #51-R5 regression). PATCH runs FIRST (restoring the target — the fault
+    itself — outranks prop hygiene); each DELETE carries no body and uses
+    ``-s`` WITHOUT ``-f``, so a 404 (already gone — the recover replay may
+    have deleted it first) is an idempotent no-op whose response still
+    lands in restore.log. Empty/omitted → the script is byte-identical to
+    the pure-patch form.
+    """
+    ua = _UA_UNSAFE_CHARS_RE.sub("", str(user_agent)) or _RESTORE_USER_AGENT_PREFIX
     data_arg = f"-d @{body_file}" if body_file else f"-d {_shell_sq(body)}"
+    delete_cmds = "".join(
+        f"; curl -s -X DELETE --cacert $C "
+        f'-H "Authorization: Bearer $T" '
+        f'-H "User-Agent: {ua}" '
+        f"{url}"
+        for url in (delete_urls or [])
+    )
     return (
         f"( sleep {int(duration_seconds)}; "
         f"C={_SA_CA_PATH}; T=$(cat {_SA_TOKEN_PATH}); U={target_url}; "
         f"curl -s -X PATCH --cacert $C "
         f'-H "Authorization: Bearer $T" '
         f'-H "Content-Type: {_JSON_PATCH_CONTENT_TYPE}" '
+        f'-H "User-Agent: {ua}" '
         f"{data_arg} $U"
+        f"{delete_cmds}"
         f" ) >/tmp/restore.log 2>&1 & echo armed"
     )
 
@@ -496,7 +544,9 @@ def build_body_landing_scripts(body: str, chunk_size: int = 720) -> list[str]:
 def build_probe_get_script(target_url: str) -> str:
     """§3 step 1 — the SA real-token read-only GET probe (``-w
     %{http_code}`` binary verdict; impersonated ``can-i --as`` is
-    banned by the arming knowledge — it answers the CALLER's view)."""
+    banned by the arming knowledge — it evaluates a simulated identity
+    on the caller's channel, not the carrier's real token request
+    path: SA group memberships do not ride an impersonated request)."""
     return (
         f"T=$(cat {_SA_TOKEN_PATH}); "
         f'curl -s -o /dev/null -w "%{{http_code}}" '
@@ -656,13 +706,104 @@ def verify_restore_baseline(target_json: dict, restore_patches: list) -> list[st
     return violations
 
 
-def verify_patches_landed(target_json: dict, patches: list) -> list[str]:
+def _capture_live_baselines(
+    target_json: dict, restore_patches: list,
+) -> int:
+    """Substitute null/omitted ``value`` on ``replace`` restore ops with
+    the LIVE pre-injection baseline (in place; returns the count).
+
+    The live-capture form removes the LLM from the byte-exact relay
+    path: cluster-state-dependent baselines (a live Corefile, a current
+    selector) are read by the tool itself at assembly time — the same
+    object the baseline guard verifies against — so transcription
+    drift is structurally impossible for captured ops (2026-09-21
+    NXDOMAIN: the plan relay froze a 2-space indent over a 1-space
+    live Corefile; the guard caught it, but the retry cost 118s and a
+    second call). The captured values flow into the timer payload and
+    the receipt verbatim (audit).
+
+    A capture whose path is absent on the live target fails closed:
+    no baseline exists to capture, and a replace fired on an absent
+    path at TTL would strand the fault.
+    """
+    captured = 0
+    for op in restore_patches or []:
+        if not isinstance(op, dict):
+            continue
+        if str(op.get("op") or "") != "replace":
+            continue
+        if op.get("value") is not None:
+            continue
+        path = str(op.get("path") or "")
+        live_value = _resolve_json_path(target_json, path)
+        if live_value is _UNRESOLVED:
+            raise _AssemblyError(
+                f"restore replace {path!r}: value omitted (live-capture "
+                "requested) but the path is absent on the live target — "
+                "no baseline exists to capture"
+            )
+        op["value"] = live_value
+        captured += 1
+    return captured
+
+
+def _ws_normalised(value: Any) -> str:
+    """Collapse every whitespace run to a single space (indentation-
+    normal form) — the comparison shape for config-text targets whose
+    format ignores whitespace (Corefile et al.)."""
+    return " ".join(str(value).split())
+
+
+def _first_diff_window(expected: Any, live: Any, span: int = 48) -> str:
+    """First-divergence window between two values. Diagnosis: an
+    ecosystem controller normalising indentation reads as a whitespace
+    diff at byte N; a real miss diverges semantically — the window
+    tells them apart at a glance (2026-09-21 NXDOMAIN: the valueless
+    miss forced a 60s manual readback round to resolve exactly this
+    question)."""
+    exp_s, live_s = str(expected), str(live)
+    n = min(len(exp_s), len(live_s))
+    for i in range(n):
+        if exp_s[i] != live_s[i]:
+            lo = max(0, i - span)
+            return (
+                f"first diff at byte {i}: expected "
+                f"...{exp_s[lo:i + span]!r} vs live ...{live_s[lo:i + span]!r}"
+            )
+    if len(exp_s) != len(live_s):
+        i = n
+        lo = max(0, i - span)
+        longer = "expected" if len(exp_s) > len(live_s) else "live"
+        return (
+            f"first diff at byte {i} ({longer} is longer): expected "
+            f"...{exp_s[lo:i + span]!r} vs live ...{live_s[lo:i + span]!r}"
+        )
+    return "values stringify equal"
+
+
+def verify_patches_landed(
+    target_json: dict, patches: list, *,
+    whitespace_insensitive: bool = False,
+) -> tuple[list[str], list[str]]:
     """Post-injection landing readback (ND6): every fault patch must be
     visible on the live object — replace/add resolve to the op value,
     remove resolves to absent. Unresolvable paths count as NOT verified
     (reported, not fatal — the patch command's exit code already
-    carries the primary verdict)."""
+    carries the primary verdict).
+
+    Returns ``(misses, notes)``. A miss carries the first-divergence
+    window (expected vs live), so the LLM can distinguish whitespace
+    normalisation by an ecosystem controller from a real miss without
+    a manual readback round.
+
+    ``whitespace_insensitive`` (opt-in per call): for config-text
+    targets whose format ignores whitespace, a whitespace-normalised
+    match counts as LANDED (recorded in notes, not misses). The
+    default exact mode is unchanged — formats where whitespace may
+    carry semantics (e.g. Python in a ConfigMap) must stay exact.
+    """
     misses: list[str] = []
+    notes: list[str] = []
     for op in patches or []:
         if not isinstance(op, dict):
             continue
@@ -671,11 +812,32 @@ def verify_patches_landed(target_json: dict, patches: list) -> list[str]:
         current = _resolve_json_path(target_json, path)
         if kind_op in ("replace", "add"):
             if current is _UNRESOLVED or current != op.get("value"):
-                misses.append(f"{kind_op} {path!r} not visible on the target")
+                if (
+                    whitespace_insensitive
+                    and current is not _UNRESOLVED
+                    and _ws_normalised(current)
+                    == _ws_normalised(op.get("value"))
+                ):
+                    notes.append(
+                        f"{kind_op} {path!r} landed (whitespace-normalised "
+                        "by an ecosystem controller — exact compare "
+                        f"differs: {_first_diff_window(op.get('value'), current)})"
+                    )
+                    continue
+                detail = ""
+                if current is not _UNRESOLVED:
+                    detail = (
+                        " ("
+                        + _first_diff_window(op.get("value"), current)
+                        + ")"
+                    )
+                misses.append(
+                    f"{kind_op} {path!r} not visible on the target{detail}"
+                )
         elif kind_op == "remove":
             if current is not _UNRESOLVED:
                 misses.append(f"remove {path!r}: path still present")
-    return misses
+    return misses, notes
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +864,24 @@ async def _run(subcommand: str, v_args: list[str], kubeconfig: str, *,
     )
 
 
+def _error_text(result, *, limit: int = 200) -> str:
+    """Failure detail from a ``CommandResult`` — stderr AND stdout merged.
+
+    The channel layer now RESTORES the stream split on arrival (sentinel
+    unfold in ``transports.protocol.parse_wiz_output`` — the B86 root
+    fix), so ``result.stderr`` carries the remote error text again. The
+    merge stays as defense in depth: markerless legacy receipts still
+    surface the fold on stdout, and a stderr-only read renders those
+    detail-less (B86 face 2, the original incident). stderr leads,
+    stdout follows (partial output).
+    """
+    parts = (
+        str(result.stderr or "").strip(),
+        str(result.stdout or "").strip(),
+    )
+    return "\n".join(p for p in parts if p)[:limit]
+
+
 async def _exec_in_carrier(
     pod: str, namespace: str, script: str, kubeconfig: str,
 ) -> str:
@@ -715,7 +895,7 @@ async def _exec_in_carrier(
     if result.exit_code != 0:
         raise _AssemblyError(
             f"carrier exec failed (rc={result.exit_code}): "
-            f"{str(result.stderr or '')[:200]}"
+            f"{_error_text(result)}"
         )
     return str(result.stdout or "")
 
@@ -744,7 +924,7 @@ async def _cleanup_stack(name: str, namespace: str, kubeconfig: str) -> list[str
         result = await _run("delete", v_args, kubeconfig)
         if result.exit_code != 0:
             failures.append(
-                f"delete {kind} {name}: {str(result.stderr or '')[:120]}"
+                f"delete {kind} {name}: {_error_text(result, limit=120)}"
             )
     return failures
 
@@ -831,6 +1011,71 @@ def _parse_patch_list(raw: str, field: str) -> list[dict]:
     return parsed
 
 
+def _parse_delete_list(raw: str, field: str) -> list[dict]:
+    """Parse the OPTIONAL ``extra_delete`` recipe (a JSON array of prop
+    objects the recovery lifecycle must DELETE — the create-domain inverse
+    of the inject plan's non-patch writes). Empty/omitted → ``[]`` (a
+    pure-patch fault has no prop objects). Fail closed on malformed JSON,
+    a non-array, or a non-object entry."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return []
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{field} is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, list):
+        raise ValueError(f"{field} must be a JSON array of delete targets")
+    if not all(isinstance(op, dict) for op in parsed):
+        raise ValueError(f"{field} entries must all be JSON objects")
+    return parsed
+
+
+def _normalize_delete_targets(
+    raw_entries: Optional[list], default_namespace: str,
+) -> list[dict]:
+    """Validate + normalize the optional ``extra_delete`` recipe into
+    ``[{"kind", "name", "namespace"}]`` (canonical kind, namespace
+    defaulted to the target's). These are the create-domain prop objects
+    the inject plan built outside the patch domain; their recovery inverse
+    is a DELETE (no baseline exists to restore).
+
+    Fail-closed (before anything is built): an unknown kind, a nameless
+    entry, a cluster-scoped kind, or a cross-namespace target (the
+    namespaced carrier Role cannot authorize a delete outside its own
+    namespace — a ClusterRole variant is out of M1 scope) all abort.
+    """
+    normalized: list[dict] = []
+    for entry in raw_entries or []:
+        if not isinstance(entry, dict):
+            raise _AssemblyError(
+                f"extra_delete entries must be JSON objects, got {entry!r}"
+            )
+        try:
+            kind = canonical_kind(str(entry.get("kind") or ""))
+        except ValueError as exc:
+            raise _AssemblyError(f"extra_delete: {exc}") from exc
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            raise _AssemblyError(
+                f"extra_delete entry for kind {kind!r} carries no name"
+            )
+        if _KIND_REST_MAP[kind][3] is False:
+            raise _AssemblyError(
+                f"extra_delete kind {kind!r} is cluster-scoped — the M1 "
+                "namespaced carrier Role cannot authorize its deletion"
+            )
+        ns = str(entry.get("namespace") or "").strip() or default_namespace
+        if ns != default_namespace:
+            raise _AssemblyError(
+                f"extra_delete target {kind}/{name} is in namespace {ns!r}, "
+                f"but the carrier Role is namespaced to {default_namespace!r} "
+                "— a cross-namespace delete needs a ClusterRole (out of M1 "
+                "scope)"
+            )
+        normalized.append({"kind": kind, "name": name, "namespace": ns})
+    return normalized
+
+
 def build_carrier_artifact(
     *, name: str, namespace: str, task_id: str, rules: list[dict],
     duration_seconds: int, deadline_epoch: float,
@@ -892,6 +1137,8 @@ async def assemble_recovery_carrier(
     kubeconfig: str = "",
     task_id: str = "",
     carrier_image: str = "",
+    readback_compare: str = "auto",
+    extra_delete: Optional[list[dict]] = None,
 ) -> dict:
     """Assemble + arm + inject. Returns the receipt dict (see the tool
     docstring). Every fail-closed abort cleans the built stack first
@@ -903,11 +1150,34 @@ async def assemble_recovery_carrier(
     (configured ∪ auto-discovered — the same seam the classifier
     legislates); anything outside is fail-closed BEFORE the stack is
     built (allowlist semantics are never relaxed). Empty → the
-    pool-local ``select_carrier_image`` fallback decides alone."""
+    pool-local ``select_carrier_image`` fallback decides alone.
+
+    ``readback_compare`` (B4): "auto" (default — ConfigMap resolves to
+    whitespace-insensitive, everything else exact), or an explicit
+    "exact" / "whitespace_insensitive" override."""
     from chaos_agent.config.settings import settings
 
     # ---- 0. Input validation (fail before anything is built) --------
+    raw_readback = str(readback_compare or "auto").strip().lower()
+    if raw_readback not in ("auto", "exact", "whitespace_insensitive"):
+        raise _AssemblyError(
+            f"readback_compare {readback_compare!r} must be 'auto', 'exact' "
+            "or 'whitespace_insensitive'"
+        )
     kind = canonical_kind(target_kind)
+    # B4 'auto' resolution per target kind: ConfigMap is the config-text
+    # family whose ecosystem controllers rewrite whitespace (Corefile
+    # re-indentation etc.), so a whitespace-normalised match counts as
+    # landed; every other kind keeps exact — whitespace may carry
+    # semantics (e.g. Python) and leniency there would mask true misses.
+    if raw_readback == "auto":
+        readback_mode = (
+            "whitespace_insensitive" if kind == "configmap" else "exact"
+        )
+        readback_label = f"auto->{readback_mode}"
+    else:
+        readback_mode = raw_readback
+        readback_label = readback_mode
     name = str(target_name or "").strip()
     namespace = str(target_namespace or "").strip() or "default"
     if not name:
@@ -923,6 +1193,9 @@ async def assemble_recovery_carrier(
         or _MAX_SLEEP_SECONDS
     )
     duration = int(duration_seconds)
+    # ``duration`` arriving here IS the fault's own recovery timer (D+G —
+    # pinned at the registry dispatch point under the two-number window
+    # contract; the carrier's restore sleep arms to this value verbatim).
     # The skeleton is capped at ``max_sleep`` (a conservative carrier
     # lifetime bound), so the window must leave the restore timer the
     # FULL forensics buffer after its fire: duration + buffer ≤ max_sleep.
@@ -958,6 +1231,17 @@ async def assemble_recovery_carrier(
         image = select_carrier_image()
     target = {"kind": kind, "name": name, "namespace": namespace}
     target_url = rest_url_for(kind, name, namespace)
+    # Recovery-completeness inverse: the create-domain prop objects the
+    # inject plan builds OUTSIDE the patch domain (frontmatter
+    # mechanism_writes) have no baseline to restore — their inverse is a
+    # DELETE. Normalized here (fail-closed before anything is built) so
+    # the RBAC derivation, the per-family SSAR and the timer payload all
+    # draw on ONE validated list.
+    delete_targets = _normalize_delete_targets(extra_delete, namespace)
+    delete_urls = [
+        rest_url_for(d["kind"], d["name"], d["namespace"])
+        for d in delete_targets
+    ]
 
     steps: list[dict] = []
 
@@ -965,7 +1249,14 @@ async def assemble_recovery_carrier(
         steps.append({"step": label, "ok": bool(ok), "detail": detail[:300]})
 
     # ---- 1. Recipe → RBAC (same-source derivation) ------------------
+    # The Role carries the target's restore PATCH ∪ every extra_delete
+    # prop object's DELETE — one rule per resource family (derive_role_
+    # rules unions verbs within a family), so a multi-family set renders
+    # through the two-step construction (create + json-patch append).
     writes = [{"kind": kind, "methods": ["PATCH"]}]
+    writes.extend(
+        {"kind": d["kind"], "methods": ["DELETE"]} for d in delete_targets
+    )
     rules = derive_role_rules(writes)
 
     # ---- 2. Baseline precheck (before the stack: an early fail
@@ -976,19 +1267,28 @@ async def assemble_recovery_carrier(
     if result.exit_code != 0:
         raise _AssemblyError(
             f"target read for baseline precheck failed: "
-            f"{str(result.stderr or '')[:200]}"
+            f"{_error_text(result)}"
         )
     try:
         target_json = json.loads(result.stdout)
     except (ValueError, TypeError):
         raise _AssemblyError("target read returned unparseable JSON") from None
+    # Null-value replace restore ops capture the live baseline HERE —
+    # deterministic bytes must not round-trip through LLM tokens (the
+    # captured values ride the timer body and the receipt verbatim).
+    captured_count = _capture_live_baselines(target_json, restore_patches)
     violations = verify_restore_baseline(target_json, restore_patches)
     if violations:
         raise _AssemblyError(
             "restore recipe is not baseline-consistent (armed timer would "
             "mutate the target, not restore it): " + "; ".join(violations)
         )
-    _step("baseline_precheck", True)
+    _step(
+        "baseline_precheck", True,
+        (f"live-captured {captured_count} replace baseline value(s) "
+         f"(readback={readback_label})") if captured_count else
+        f"readback={readback_label}",
+    )
 
     # ---- 3. Stack build (SA → Role → RoleBinding → Pod) -------------
     carrier = carrier_name(task_id, target, salt=str(time.time()))
@@ -1013,7 +1313,7 @@ async def assemble_recovery_carrier(
     )
     if sa_result.exit_code != 0:
         return await _fail_closed(
-            f"create serviceaccount failed: {str(sa_result.stderr or '')[:200]}"
+            f"create serviceaccount failed: {_error_text(sa_result)}"
         )
     built.append("serviceaccount")
     _step("create_serviceaccount", True)
@@ -1023,7 +1323,7 @@ async def assemble_recovery_carrier(
         if role_result.exit_code != 0:
             return await _fail_closed(
                 f"role construction ({sub}) failed: "
-                f"{str(role_result.stderr or '')[:200]}"
+                f"{_error_text(role_result)}"
             )
         _step(f"role_{sub}", True)
     built.append("role")
@@ -1036,7 +1336,7 @@ async def assemble_recovery_carrier(
     )
     if rb_result.exit_code != 0:
         return await _fail_closed(
-            f"create rolebinding failed: {str(rb_result.stderr or '')[:200]}"
+            f"create rolebinding failed: {_error_text(rb_result)}"
         )
     built.append("rolebinding")
     _step("create_rolebinding", True)
@@ -1051,7 +1351,7 @@ async def assemble_recovery_carrier(
     run_result = await _run("run", run_v_args, kubeconfig)
     if run_result.exit_code != 0:
         return await _fail_closed(
-            f"carrier pod run failed: {str(run_result.stderr or '')[:200]}"
+            f"carrier pod run failed: {_error_text(run_result)}"
         )
     _step("run_carrier", True, f"image={image} skeleton={skeleton}s")
 
@@ -1070,37 +1370,72 @@ async def assemble_recovery_carrier(
                 "(403 = missing permission; anything else = channel/target "
                 "unreachable) — aborting before arming"
             )
-        _step("probe_get", True, f"http {code}")
+        # The step already records the outcome; name the TRANSPORT too.
+        # This probe is a curl issued from inside the carrier pod to the
+        # in-cluster apiserver ClusterIP URL — a completed pod-side
+        # ClusterIP round trip, which is a connectivity fact about the
+        # cluster at that moment, not just an RBAC check. Case #64: the
+        # verifier concluded "ClusterIP egress from pods is broken
+        # environment-wide" while this receipt sat in its context saying
+        # only "http 200", so nothing told it a pod had reached a
+        # ClusterIP successfully. Stating where the request came from and
+        # what it hit is the fact the program already has and was dropping.
+        _step(
+            "probe_get", True,
+            f"http {code} — in-carrier curl from pod {carrier} to "
+            f"in-cluster apiserver ClusterIP {target_url}",
+        )
 
-        group, _, plural, _ = _KIND_REST_MAP[kind]
-        for verb in sorted(
-            v for r in rules for v in (r.get("verbs") or []) if v != "get"
-        ):
-            receipt_raw = await _exec_in_carrier(
-                carrier, namespace,
-                build_ssar_script(verb, group, plural, namespace), kubeconfig,
-            )
-            try:
-                receipt = json.loads(receipt_raw)
-            except (ValueError, TypeError):
-                return await _fail_closed(
-                    f"SSAR receipt for verb {verb!r} is not JSON: "
-                    f"{receipt_raw[:120]!r}"
+        # Per-family write-verb verification (§3 step 2): EVERY rule's
+        # non-get verbs are SSAR-checked against THAT rule's own
+        # group/plural — a multi-family Role (target PATCH + extra_delete
+        # DELETE on a prop kind) verifies each family independently, so a
+        # delete the Role does not grant fails closed HERE, before arming
+        # (the B85 lesson: a write verb discovered unauthorized only at
+        # fire time is a silent partial recovery).
+        for rule in rules:
+            r_group = str((rule.get("apiGroups") or [""])[0])
+            r_plural = str((rule.get("resources") or [""])[0])
+            # Single-family keeps the historic ``ssar_{verb}`` label; a
+            # multi-family Role (target PATCH + extra_delete DELETE) needs
+            # the plural to disambiguate two families sharing a verb.
+            label_prefix = "" if len(rules) == 1 else f"{r_plural}_"
+            for verb in sorted(
+                v for v in (rule.get("verbs") or []) if v != "get"
+            ):
+                receipt_raw = await _exec_in_carrier(
+                    carrier, namespace,
+                    build_ssar_script(verb, r_group, r_plural, namespace),
+                    kubeconfig,
                 )
-            verdict, detail = ssar_verdict(
-                receipt, verb, group, plural, namespace,
-            )
-            if verdict != "allowed":
-                return await _fail_closed(
-                    f"SSAR {verdict} for write verb {verb!r} on "
-                    f"{plural!r}: {detail} — all write verbs must be "
-                    "allowed before arming"
+                try:
+                    receipt = json.loads(receipt_raw)
+                except (ValueError, TypeError):
+                    return await _fail_closed(
+                        f"SSAR receipt for verb {verb!r} on {r_plural!r} "
+                        f"is not JSON: {receipt_raw[:120]!r}"
+                    )
+                verdict, detail = ssar_verdict(
+                    receipt, verb, r_group, r_plural, namespace,
                 )
-            _step(f"ssar_{verb}", True)
+                if verdict != "allowed":
+                    return await _fail_closed(
+                        f"SSAR {verdict} for write verb {verb!r} on "
+                        f"{r_plural!r}: {detail} — all write verbs must be "
+                        "allowed before arming"
+                    )
+                _step(f"ssar_{label_prefix}{verb}", True)
 
         # ---- 5. Arm (two-step exec; §4 + §7 budget tiers) ------------
         body = json.dumps(restore_patches, separators=(",", ":"))
-        arm_script = build_restore_script(duration, target_url, body)
+        # B3: the restore curl's User-Agent names THIS carrier, so the
+        # apiserver's audit log / managedFields attribute the TTL PATCH
+        # to the drill, not to an anonymous in-cluster client.
+        _ua = f"{_RESTORE_USER_AGENT_PREFIX}/{carrier}"
+        arm_script = build_restore_script(
+            duration, target_url, body, user_agent=_ua,
+            delete_urls=delete_urls,
+        )
         landing: list[str] = []
         if len(arm_script) > _ARM_PAYLOAD_SAFE_LINE:
             landing = build_body_landing_scripts(body)
@@ -1108,6 +1443,7 @@ async def assemble_recovery_carrier(
                 await _exec_in_carrier(carrier, namespace, script, kubeconfig)
             arm_script = build_restore_script(
                 duration, target_url, body, body_file="/tmp/restore.json",
+                user_agent=_ua, delete_urls=delete_urls,
             )
             if len(arm_script) > _ARM_PAYLOAD_BUDGET:
                 return await _fail_closed(
@@ -1134,17 +1470,16 @@ async def assemble_recovery_carrier(
             # POST-arming: the carrier STAYS (timer armed; a timed-out
             # patch may have landed — dropping the timer could strand
             # the fault; firing on an unpatched target is a no-op).
-            _step("inject_patch", False,
-                  str(inject_result.stderr or "")[:200])
+            _step("inject_patch", False, _error_text(inject_result))
             return _receipt(
                 status="partial",
                 error=f"injection patch failed (carrier stays armed until "
-                      f"{deadline:.0f}): {str(inject_result.stderr or '')[:200]}",
+                      f"{deadline:.0f}): {_error_text(inject_result)}",
                 carrier=carrier, namespace=namespace, image=image,
                 task_id=task_id, rules=rules, duration=duration,
                 deadline=deadline, steps=steps, target=target,
                 patches=patches, restore_patches=restore_patches,
-                landing_verified=False,
+                landing_verified=False, extra_delete=delete_targets,
             )
         _step("inject_patch", True)
 
@@ -1156,14 +1491,19 @@ async def assemble_recovery_carrier(
         if readback.exit_code == 0:
             try:
                 live = json.loads(readback.stdout)
-                misses = verify_patches_landed(live, patches)
+                misses, notes = verify_patches_landed(
+                    live, patches,
+                    whitespace_insensitive=(
+                        readback_mode == "whitespace_insensitive"
+                    ),
+                )
                 landing_ok = not misses
-                _step("landing_readback", landing_ok, "; ".join(misses))
+                _step("landing_readback", landing_ok,
+                      "; ".join(misses + notes))
             except (ValueError, TypeError):
                 _step("landing_readback", False, "unparseable readback")
         else:
-            _step("landing_readback", False,
-                  str(readback.stderr or "")[:120])
+            _step("landing_readback", False, _error_text(readback, limit=120))
 
         return _receipt(
             status="success" if landing_ok else "partial",
@@ -1172,7 +1512,7 @@ async def assemble_recovery_carrier(
             task_id=task_id, rules=rules, duration=duration,
             deadline=deadline, steps=steps, target=target,
             patches=patches, restore_patches=restore_patches,
-            landing_verified=landing_ok,
+            landing_verified=landing_ok, extra_delete=delete_targets,
         )
     except _AssemblyError as exc:
         return await _fail_closed(str(exc))
@@ -1182,7 +1522,7 @@ def _receipt(
     *, status: str, error: str, carrier: str, namespace: str, image: str,
     task_id: str, rules: list, duration: int, deadline: float,
     steps: list, target: dict, patches: list, restore_patches: list,
-    landing_verified: bool,
+    landing_verified: bool, extra_delete: Optional[list] = None,
 ) -> dict:
     """Success/partial receipt: the carrier is armed, so the artifact
     and recovery handle ride along (the receipt branch moves them into
@@ -1194,6 +1534,10 @@ def _receipt(
         "target_ref": dict(target),
         "patches": list(patches),
         "restore_patches": list(restore_patches),
+        # The create-domain prop objects the recovery lifecycle deletes
+        # (timer + recover replay); rides the durable recipe so BOTH
+        # hydration rungs (message / ledger) can replay the deletion.
+        "extra_delete": list(extra_delete or []),
         "duration_seconds": int(duration),
         "recovery_deadline_epoch": float(deadline),
         "carrier": {"name": carrier, "namespace": namespace, "image": image},
@@ -1235,6 +1579,8 @@ async def faultdrill_assemble_carrier(
     kubeconfig: str = "",
     task_id: str = "",
     carrier_image: str = "",
+    readback_compare: str = "auto",
+    extra_delete: str = "",
 ) -> str:
     """Phase 2 ONLY — mutating: assemble the one-shot recovery carrier
     for an apiserver-write fault and inject it synchronously
@@ -1248,9 +1594,13 @@ async def faultdrill_assemble_carrier(
       - target_kind/target_name/target_namespace: the fault target
         (namespaced kinds only; e.g. Service, Deployment, ConfigMap).
       - patches: JSON array of json-patch ops to INJECT (the fault).
-      - restore_patches: JSON array of json-patch ops to RESTORE at TTL
-        — values MUST be the captured pre-injection baseline (verified
-        against the live object before anything is built).
+      - restore_patches: JSON array of json-patch ops to RESTORE at TTL.
+        ``replace`` with ``"value": null`` (or value omitted) =
+        live-capture: the tool captures the live pre-injection baseline
+        itself, byte-exact — no LLM transcription; the captured value
+        rides the receipt verbatim. Prefer it for cluster-state-dependent
+        baselines: relaying live bytes through the plan risks
+        baseline-guard fail-closed aborts.
       - duration_seconds: fault window (countdown starts at arm time;
         the skeleton self-expires at window + 1800s forensics buffer,
         so the window is bounded at max_sleep − 1800).
@@ -1259,6 +1609,21 @@ async def faultdrill_assemble_carrier(
         first hit). Must already be inside the task's carrier allowlist
         (configured ∪ discovered — probe candidates are auto-added);
         outside → fail-closed. Omitted → the tool picks from the pools.
+      - readback_compare: "auto" (default: ConfigMap targets compare
+        whitespace-insensitive — their ecosystem controllers rewrite
+        indentation, e.g. Corefile; every other kind stays exact),
+        or explicit "exact" / "whitespace_insensitive" — insensitive
+        treats a whitespace-normalised match as landed (a true miss
+        still reports the first-divergence window); keep "exact"
+        wherever whitespace may carry semantics.
+      - extra_delete: OPTIONAL JSON array of create-domain prop objects to
+        DELETE at recovery — the inverse of non-patch inject writes outside
+        the patch domain (e.g. a fault-prop Secret from the case
+        frontmatter's mechanism_writes). Entry ``{"kind","name","namespace"?}``
+        (namespace defaults to the target's; cross-namespace / cluster-scoped
+        refused — the namespaced Role cannot authorize it). Rides both the
+        armed timer and the recover replay, idempotent (404 = no-op). Omit
+        for a pure-patch fault.
 
     Output: JSON receipt {status: success|partial|failed, error,
     carrier{name,namespace,image,armed,recovery_deadline_epoch},
@@ -1272,12 +1637,16 @@ async def faultdrill_assemble_carrier(
         stale baseline aborts with nothing built (re-capture first).
       - 403 / SSAR denied / non-Running pod / oversized recipe →
         fail-closed: stack cleaned, honest failure, no injection.
-      - NEVER call twice for one task window; the carrier is the single
-        recovery point (early recovery = blade-ai recover).
+      - One ARMING per task window: a PRE-ARMING fail-closed abort
+        (nothing built, nothing armed — e.g. a stale baseline caught
+        by the precheck) may be retried with corrected parameters;
+        once the carrier is ARMED never build a second one (early
+        convergence = blade-ai recover).
     """
     try:
         fault_ops = _parse_patch_list(patches, "patches")
         restore_ops = _parse_patch_list(restore_patches, "restore_patches")
+        delete_ops = _parse_delete_list(extra_delete, "extra_delete")
     except ValueError as exc:
         return json.dumps({
             "status": "failed", "error": str(exc),
@@ -1294,6 +1663,8 @@ async def faultdrill_assemble_carrier(
             kubeconfig=kubeconfig,
             task_id=task_id,
             carrier_image=carrier_image,
+            readback_compare=readback_compare,
+            extra_delete=delete_ops,
         )
     except _AssemblyError as exc:
         return json.dumps({

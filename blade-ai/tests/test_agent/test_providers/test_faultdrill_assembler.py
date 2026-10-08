@@ -57,6 +57,12 @@ from chaos_agent.agent.providers.faultdrill.assembler import (
     verb_sets_uniform,
     verify_patches_landed,
     verify_restore_baseline,
+    _capture_live_baselines,
+    _error_text,
+    _first_diff_window,
+    _normalize_delete_targets,
+    _parse_delete_list,
+    _ws_normalised,
 )
 from chaos_agent.agent.providers.faultdrill.provider import (
     FaultDrillProvider,
@@ -242,12 +248,14 @@ def _wire_happy(router: _Router, *, exec_router=None, patch_result=None) -> dict
 async def _assemble(
     router=None, *, patches=_PATCHES, restore=_RESTORE, duration=600,
     kind="Service", name="svc-x", ns="cms-demo", carrier_image="",
+    readback_compare="exact", extra_delete=None,
 ):
     return await assemble_recovery_carrier(
         target_kind=kind, target_name=name, target_namespace=ns,
         patches=patches, restore_patches=restore,
         duration_seconds=duration, kubeconfig="/kc", task_id="task-1",
-        carrier_image=carrier_image,
+        carrier_image=carrier_image, readback_compare=readback_compare,
+        extra_delete=extra_delete,
     )
 
 
@@ -391,10 +399,11 @@ def test_uniform_set_renders_one_create_command():
     assert v_args[v_args.index("-n") + 1] == "ns1"
     # the shared verb set travels in ONE --verb flag
     assert v_args[v_args.index("--verb") + 1] == "get,patch"
-    # per-group --resource lists (kubectl broadcasts the shared verbs
+    # per-group --resource lists, group-qualified in kubectl's
+    # ``resource.group`` dot form (kubectl broadcasts the shared verbs
     # into each — exact, not over-granting)
     joined = " ".join(v_args)
-    assert "apps/deployments" in joined and "configmaps" in joined
+    assert "deployments.apps" in joined and "configmaps" in joined
 
 
 def test_non_uniform_two_step_union_broadcast_counterexample():
@@ -418,7 +427,7 @@ def test_non_uniform_two_step_union_broadcast_counterexample():
     # union (delete riding the deployments create would be the
     # over-grant the two-step form exists to prevent)
     assert v1[v1.index("--verb") + 1] == "get,patch"
-    assert v1[v1.index("--resource") + 1] == "apps/deployments"
+    assert v1[v1.index("--resource") + 1] == "deployments.apps"
 
     sub2, v2, _ = plan[1]
     assert sub2 == "patch" and v2[0] == "role" and v2[1] == "drill-rc-x"
@@ -468,6 +477,30 @@ def test_verb_sets_uniform_boundaries():
     assert verb_sets_uniform([
         {"verbs": ["get", "delete"]}, {"verbs": ["get", "patch"]},
     ]) is False
+
+
+# ---------------------------------------------------------------------------
+# Failure diagnostics — merged stderr/stdout error text (B86 face 2)
+# ---------------------------------------------------------------------------
+
+
+def test_error_text_surfaces_folded_stderr_on_stdout():
+    # The wiz channel folds the remote stderr into stdout on non-zero
+    # exit, so a stderr-only read renders a detail-less failure — the
+    # merged helper must surface the stdout-side text.
+    folded = _R(1, stdout='error: the server doesn\'t have a resource '
+                         'type "apps"')
+    assert _error_text(folded) == (
+        'error: the server doesn\'t have a resource type "apps"'
+    )
+    # local channels keep the streams separate: stderr leads, partial
+    # stdout follows
+    assert _error_text(_R(1, stdout="partial", stderr="real-error")) == (
+        "real-error\npartial"
+    )
+    # the limit applies to the merged view
+    assert len(_error_text(_R(1, stderr="x" * 500))) == 200
+    assert _error_text(_R(1, stderr="x" * 500), limit=120) == "x" * 120
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +693,121 @@ async def test_carrier_image_empty_falls_back_to_selector(_kube):
     assert _run_image(_kube) == "curlimages/curl:8.8.0"
 
 
+async def test_assemble_null_value_restore_captures_baseline_e2e(_kube):
+    # 2026-09-21 NXDOMAIN post-mortem, end to end: the transcription-
+    # drift channel is REMOVED, not guarded. A null-value replace
+    # restore op never round-trips through the plan — the tool captures
+    # the live baseline ("accounting") at assembly, the timer body and
+    # the receipt carry it verbatim (audit), and the precheck step
+    # records the capture.
+    _wire_happy(_kube)
+    receipt = await _assemble(
+        restore=[{"op": "replace", "path": "/spec/selector/app",
+                  "value": None}],
+    )
+    assert receipt["status"] == "success"
+    assert (receipt["recovery_handle"]["restore_patches"][0]["value"]
+            == "accounting")
+    pre = [s for s in receipt["steps"] if s["step"] == "baseline_precheck"]
+    assert pre and "live-captured 1" in pre[0]["detail"]
+
+
+async def test_assemble_readback_whitespace_insensitive_e2e(_kube):
+    # 2026-09-21 NXDOMAIN post-mortem, end to end: an ecosystem
+    # controller normalises the written value's indentation between
+    # inject and readback (2-space submission → 1-space live). Exact
+    # mode → false partial; opt-in → landed with an auditable note.
+    baseline_doc = {"data": {"Corefile": ".:53 {\n lameduck 15s\n}\n"}}
+    submitted = ".:53 {\n  lameduck 15s\n}\n"
+    normalised_live = {"data": {"Corefile": ".:53 {\n lameduck 15s\n}\n"}}
+    patches = [{"op": "replace", "path": "/data/Corefile",
+                "value": submitted}]
+    restore = [{"op": "replace", "path": "/data/Corefile", "value": None}]
+
+    def _rewire():
+        _kube.on("get", "configmap", _seq(
+            _R(0, json.dumps(baseline_doc)),
+            _R(0, json.dumps(normalised_live)),
+        ))
+        _kube.on("get", "pod",
+                 _R(0, json.dumps({"status": {"phase": "Running"}})))
+        _kube.on_any("exec", _ok_exec_router({}))
+
+    _rewire()
+    r1 = await _assemble(_kube, patches=patches, restore=restore,
+                         kind="ConfigMap", name="cm-x")
+    assert r1["status"] == "partial"
+    assert r1["carrier"]["landing_verified"] is False
+    step1 = [s for s in r1["steps"] if s["step"] == "landing_readback"][0]
+    assert "first diff at byte" in step1["detail"]
+
+    _rewire()
+    r2 = await _assemble(_kube, patches=patches, restore=restore,
+                         kind="ConfigMap", name="cm-x",
+                         readback_compare="whitespace_insensitive")
+    assert r2["status"] == "success"
+    assert r2["carrier"]["landing_verified"] is True
+    step2 = [s for s in r2["steps"] if s["step"] == "landing_readback"][0]
+    assert "whitespace-normalised" in step2["detail"]
+
+
+async def test_assemble_readback_auto_default_resolves_by_kind(_kube):
+    # B4: "auto" (the NEW default) resolves per target kind — the
+    # ConfigMap config-text family gets whitespace-insensitivity without
+    # the caller asking (the false-partial above was the default's own
+    # blind spot); a Service target stays exact (whitespace leniency
+    # there would mask true misses).
+    baseline_doc = {"data": {"Corefile": ".:53 {\n lameduck 15s\n}\n"}}
+    submitted = ".:53 {\n  lameduck 15s\n}\n"
+    normalised_live = {"data": {"Corefile": ".:53 {\n lameduck 15s\n}\n"}}
+    cm_patches = [{"op": "replace", "path": "/data/Corefile",
+                   "value": submitted}]
+    cm_restore = [{"op": "replace", "path": "/data/Corefile", "value": None}]
+
+    _kube.on("get", "configmap", _seq(
+        _R(0, json.dumps(baseline_doc)),
+        _R(0, json.dumps(normalised_live)),
+    ))
+    _kube.on("get", "pod", _R(0, json.dumps({"status": {"phase": "Running"}})))
+    _kube.on_any("exec", _ok_exec_router({}))
+    r = await _assemble(_kube, patches=cm_patches, restore=cm_restore,
+                        kind="ConfigMap", name="cm-y",
+                        readback_compare="auto")
+    assert r["status"] == "success"
+    # The step log shows the RESOLUTION, not the raw mode — auditable
+    # which policy actually judged the landing.
+    pre = [s for s in r["steps"] if s["step"] == "baseline_precheck"][0]
+    assert "auto->whitespace_insensitive" in pre["detail"]
+
+    # Service under auto keeps exact: a whitespace-only divergence on a
+    # non-config-text target is a REAL miss, not a normalisation.
+    svc_baseline = {"spec": {"externalName": "a.example"}}
+    svc_live = {"spec": {"externalName": "a.example "}}
+    svc_patches = [{"op": "replace", "path": "/spec/externalName",
+                    "value": "a.example"}]
+    svc_restore = [{"op": "replace", "path": "/spec/externalName",
+                    "value": None}]
+    _kube.on("get", "service", _seq(
+        _R(0, json.dumps(svc_baseline)),
+        _R(0, json.dumps(svc_live)),
+    ))
+    r_svc = await _assemble(_kube, patches=svc_patches, restore=svc_restore,
+                            kind="Service", name="svc-y",
+                            readback_compare="auto")
+    assert r_svc["status"] == "partial"
+    pre_svc = [
+        s for s in r_svc["steps"] if s["step"] == "baseline_precheck"
+    ][0]
+    assert "auto->exact" in pre_svc["detail"]
+
+
+async def test_assemble_readback_invalid_mode_fail_closed(_kube):
+    # Closed vocabulary: anything outside auto/exact/whitespace_insensitive
+    # aborts BEFORE the stack is built (B4 message includes 'auto').
+    with pytest.raises(Exception, match="must be 'auto', 'exact'"):
+        await _assemble(_kube, readback_compare="loose")
+
+
 # ---------------------------------------------------------------------------
 # §3/§4/§7 payload script shapes
 # ---------------------------------------------------------------------------
@@ -709,8 +857,28 @@ def test_restore_script_compact_variable_form():
     assert "U=https://u" in s
     assert "-X PATCH" in s
     assert "application/json-patch+json" in s
+    # B3: an identifying User-Agent rides the restore curl (empty value
+    # falls back to the bare prefix) — apiserver-side attribution.
+    assert '-H "User-Agent: blade-ai-recovery"' in s
     assert " >/tmp/restore.log 2>&1 & echo armed" in s
     assert "/dev/null" not in s
+
+
+def test_restore_script_user_agent_attribution_and_sanitization():
+    # B3: the caller names THIS carrier for apiserver attribution; the
+    # value rides inside a double-quoted shell string, so unsafe
+    # characters are stripped, never escaped.
+    s = build_restore_script(
+        60, "https://u", "[]", user_agent="blade-ai-recovery/drill-rc-a1b2c3d4",
+    )
+    assert '-H "User-Agent: blade-ai-recovery/drill-rc-a1b2c3d4"' in s
+    dirty = build_restore_script(
+        60, "https://u", "[]", user_agent='blade" $x; rm -rf /',
+    )
+    # Unsafe runs collapse to nothing; alphanumerics survive: the
+    # injected shell metacharacters are gone but "x" stays.
+    assert '"$' not in dirty and "`" not in dirty
+    assert '-H "User-Agent: bladexrm-rf/"' in dirty
 
 
 def test_restore_script_body_file_variant():
@@ -906,17 +1074,94 @@ def test_landing_readback_misses():
     doc = {"spec": {"paused": True}}
     assert verify_patches_landed(
         doc, [{"op": "add", "path": "/spec/paused", "value": True}],
-    ) == []
-    assert verify_patches_landed(
+    ) == ([], [])
+    misses, notes = verify_patches_landed(
         doc, [{"op": "replace", "path": "/spec/paused", "value": False}],
     )
+    assert misses and notes == []
     # a remove is verified by absence
     assert verify_patches_landed(
         {"spec": {}}, [{"op": "remove", "path": "/spec/paused"}],
-    ) == []
-    assert verify_patches_landed(
+    ) == ([], [])
+    misses, _ = verify_patches_landed(
         doc, [{"op": "remove", "path": "/spec/paused"}],
     )
+    assert misses
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-21 NXDOMAIN run post-mortem fixes: null-value live capture
+# (transcription-drift channel removed), first-diff miss windows
+# (diagnosis without a manual readback round), whitespace-insensitive
+# readback opt-in (ecosystem controller normalisation).
+# ---------------------------------------------------------------------------
+
+
+def test_capture_live_baselines_substitutes_null_value_in_place():
+    # the 2026-09-21 incident shape: a live Corefile at 1-space indent
+    doc = {"data": {"Corefile": ".:53 {\n lameduck 15s\n}\n"}}
+    ops = [{"op": "replace", "path": "/data/Corefile", "value": None}]
+    assert _capture_live_baselines(doc, ops) == 1
+    assert ops[0]["value"] == ".:53 {\n lameduck 15s\n}\n"
+    # captured value is baseline-consistent BY CONSTRUCTION — the
+    # precheck that once caught a 2-space transcription now passes
+    assert verify_restore_baseline(doc, ops) == []
+
+
+def test_capture_live_baselines_absent_path_fails_closed():
+    with pytest.raises(_AssemblyError):
+        _capture_live_baselines({"data": {}}, [
+            {"op": "replace", "path": "/data/Corefile", "value": None},
+        ])
+
+
+def test_capture_live_baselines_explicit_values_untouched():
+    ops = [{"op": "replace", "path": "/spec/paused", "value": False},
+           {"op": "remove", "path": "/spec/x"}]
+    assert _capture_live_baselines({"spec": {"paused": False}}, ops) == 0
+    assert ops[0]["value"] is False
+
+
+def test_readback_miss_carries_first_diff_window():
+    # the ACK-controller normalisation shape: submitted 2-space indent,
+    # live value normalised to the file's uniform 1-space
+    doc = {"data": {"Corefile": "template {\n rcode NXDOMAIN\n}"}}
+    misses, _ = verify_patches_landed(doc, [
+        {"op": "replace", "path": "/data/Corefile",
+         "value": "template {\n  rcode NXDOMAIN\n}"},
+    ])
+    assert misses and "first diff at byte" in misses[0]
+    assert "expected" in misses[0] and "live" in misses[0]
+    # and the window actually localises the divergence
+    assert _first_diff_window("a  b", "a b") .startswith("first diff at byte 2")
+
+
+def test_readback_whitespace_insensitive_normalised_match_lands():
+    doc = {"data": {"Corefile": "template {\n rcode NXDOMAIN\n}"}}
+    patch = {"op": "replace", "path": "/data/Corefile",
+             "value": "template {\n  rcode NXDOMAIN\n}"}
+    # exact mode (default): the 2-space submission misses — the false
+    # partial of the 2026-09-21 run
+    misses, notes = verify_patches_landed(doc, [patch])
+    assert misses and notes == []
+    # opt-in: the same pair lands, with an auditable normalisation note
+    misses, notes = verify_patches_landed(
+        doc, [patch], whitespace_insensitive=True,
+    )
+    assert misses == []
+    assert notes and "whitespace-normalised" in notes[0]
+    # a SEMANTIC miss is still a miss under the insensitive mode
+    misses, notes = verify_patches_landed(
+        doc, [{"op": "replace", "path": "/data/Corefile",
+               "value": "template {\n  rcode REFUSED\n}"}],
+        whitespace_insensitive=True,
+    )
+    assert misses and notes == []
+
+
+def test_ws_normalised_shape():
+    assert _ws_normalised("a\n  b   c") == "a b c"
+    assert _ws_normalised(5) == "5"
 
 
 # ---------------------------------------------------------------------------
@@ -1034,6 +1279,33 @@ async def test_assemble_success_full_chain(_kube):
     assert handle["patches"] == _PATCHES
     assert handle["restore_patches"] == _RESTORE
     assert handle["duration_seconds"] == 600
+
+
+async def test_probe_get_step_names_its_transport(_kube):
+    """The receipt must say WHERE the 200 came from, not just that it came.
+
+    Case #64: the verifier concluded "ClusterIP egress from pods is broken
+    environment-wide" and downgraded a verified injection to partial, while
+    this very probe — a curl issued from inside the carrier pod to the
+    in-cluster apiserver ClusterIP — had already returned 200. The step read
+    ``http 200`` and nothing else, so the connectivity fact the program held
+    never reached the model. Naming the transport is not a judgement about
+    what it proves; it is the fact that was being dropped.
+    """
+    _wire_happy(_kube)
+    receipt = await _assemble()
+
+    step = next(s for s in receipt["steps"] if s["step"] == "probe_get")
+    assert step["ok"] is True
+    detail = step["detail"]
+    assert "http 200" in detail
+    # the in-cluster apiserver ClusterIP it actually reached, and the pod it
+    # was reached from — both must survive the step's 300-char cap intact
+    assert "kubernetes.default.svc" in detail
+    assert "svc-x" in detail
+    assert receipt["carrier"]["name"] in detail
+    assert len(detail) <= 300
+    assert not detail.endswith("\u2026")
 
 
 async def test_armed_before_inject_hard_order(_kube):
@@ -1617,3 +1889,272 @@ def test_registry_dispatch_reaches_the_assembler_claim():
         raw_command="",
     )
     assert target is not None and target.scope == "service"
+
+
+# ---------------------------------------------------------------------------
+# extra_delete — the create-domain recovery inverse (#51-R5 regression)
+#
+# The assembler main path restored ONLY the patch domain (restore_patches
+# onto the target); a prop object the inject plan created OUTSIDE the patch
+# domain (a fault-prop Secret) had no autonomous deleter — the old manual
+# timer folded a DELETE in, the programmatic assembler dropped it. The
+# recovery-completeness invariant: recovery = the FULL inverse of injection,
+# autonomously — patch domain AND create domain, on BOTH executors (the
+# armed timer + the recover replay). extra_delete is that inverse; these
+# pins hold it to the legislated behaviour at every贯穿 point.
+# ---------------------------------------------------------------------------
+
+_DELETE_TARGET = {"kind": "secret", "name": "registry-cred-rotating"}
+_DELETE_URL = (
+    "https://kubernetes.default.svc/api/v1/namespaces/cms-demo"
+    "/secrets/registry-cred-rotating"
+)
+
+
+def _selective_ssar_router(deny_verbs=frozenset()):
+    """An exec router that denies ONLY the named SSAR verbs (the others
+    stay allowed) — so a test can fail the delete family while the target's
+    patch family passes, isolating the per-family SSAR gate."""
+
+    def _route(sub, v_args, stdin_data):
+        script = _exec_script(v_args)
+        if "http_code" in script:
+            return _R(0, "200")
+        if "selfsubjectaccessreviews" in script:
+            body = re.search(r"-d '(\{.*\})'", script).group(1)
+            attrs = json.loads(body)["spec"]["resourceAttributes"]
+            allowed = attrs.get("verb") not in deny_verbs
+            return _R(0, json.dumps(_echoed_ssar(script, allowed=allowed)))
+        if "echo armed" in script:
+            return _R(0, "armed")
+        return _R(0, "")
+
+    return _route
+
+
+def test_parse_delete_list_optional_and_malformed():
+    # OPTIONAL: empty/omitted → [] (a pure-patch fault has no prop objects)
+    assert _parse_delete_list("", "extra_delete") == []
+    assert _parse_delete_list(None, "extra_delete") == []
+    assert _parse_delete_list("   ", "extra_delete") == []
+    assert _parse_delete_list("[]", "extra_delete") == []
+    assert _parse_delete_list(
+        '[{"kind":"secret","name":"s"}]', "extra_delete",
+    ) == [{"kind": "secret", "name": "s"}]
+    # malformed → fail closed (never a guessed deletion)
+    with pytest.raises(ValueError, match="not valid JSON"):
+        _parse_delete_list("{not json", "extra_delete")
+    with pytest.raises(ValueError, match="JSON array"):
+        _parse_delete_list('{"kind":"secret"}', "extra_delete")
+    with pytest.raises(ValueError, match="JSON objects"):
+        _parse_delete_list('["secret"]', "extra_delete")
+
+
+def test_normalize_delete_targets_defaults_and_fail_closed():
+    # namespace defaults to the target's; kind canonicalized
+    assert _normalize_delete_targets(
+        [{"kind": "Secret", "name": "s"}], "cms-demo",
+    ) == [{"kind": "secret", "name": "s", "namespace": "cms-demo"}]
+    assert _normalize_delete_targets(None, "cms-demo") == []
+    assert _normalize_delete_targets([], "cms-demo") == []
+    # nameless → fail closed
+    with pytest.raises(_AssemblyError, match="carries no name"):
+        _normalize_delete_targets([{"kind": "secret"}], "cms-demo")
+    # unknown kind → fail closed (no REST mapping → no delete URL)
+    with pytest.raises(_AssemblyError, match="no REST mapping"):
+        _normalize_delete_targets([{"kind": "Widget", "name": "w"}], "cms-demo")
+    # cluster-scoped → fail closed (the namespaced Role cannot authorize it)
+    with pytest.raises(_AssemblyError, match="cluster-scoped"):
+        _normalize_delete_targets([{"kind": "node", "name": "n1"}], "cms-demo")
+    # cross-namespace → fail closed (a ClusterRole variant is out of M1)
+    with pytest.raises(_AssemblyError, match="cross-namespace"):
+        _normalize_delete_targets(
+            [{"kind": "secret", "name": "s", "namespace": "other"}], "cms-demo",
+        )
+    # non-object entry → fail closed
+    with pytest.raises(_AssemblyError, match="must be JSON objects"):
+        _normalize_delete_targets(["secret"], "cms-demo")
+
+
+def test_derive_role_rules_patch_plus_delete_is_two_families():
+    # target PATCH + prop DELETE → one rule per family (verbs ∪ get),
+    # non-uniform ⇒ the two-step Role construction's trigger
+    rules = derive_role_rules([
+        {"kind": "Service", "methods": ["PATCH"]},
+        {"kind": "secret", "methods": ["DELETE"]},
+    ])
+    assert rules == [
+        {"apiGroups": [""], "resources": ["secrets"],
+         "verbs": ["delete", "get"]},
+        {"apiGroups": [""], "resources": ["services"],
+         "verbs": ["get", "patch"]},
+    ]
+    assert verb_sets_uniform(rules) is False
+
+
+def test_build_restore_script_folds_delete_after_patch():
+    body = json.dumps([{"op": "replace", "path": "/spec/x", "value": "a"}])
+    s = build_restore_script(
+        600, "https://target", body,
+        delete_urls=["https://del1", "https://del2"],
+    )
+    # PATCH FIRST, then the DELETEs (restoring the target — the fault itself
+    # — outranks prop hygiene)
+    assert s.index("-X PATCH") < s.index("-X DELETE")
+    assert s.count("-X DELETE") == 2
+    assert "https://del1" in s and "https://del2" in s
+    # DELETE carries no -f: a 404 (already gone) is an idempotent no-op
+    assert "-f" not in s[s.index("-X DELETE"):]
+    # one armed subshell, everything lands in restore.log
+    assert s.count(" >/tmp/restore.log 2>&1 & echo armed") == 1
+
+
+def test_build_restore_script_no_delete_is_byte_identical():
+    # regression anchor: omitting delete_urls reproduces the pure-patch
+    # script EXACTLY — the fix is additive, never a rewrite of the armed form
+    body = json.dumps([{"op": "remove", "path": "/spec/paused"}])
+    baseline = build_restore_script(600, "https://u", body)
+    assert build_restore_script(
+        600, "https://u", body, delete_urls=None,
+    ) == baseline
+    assert build_restore_script(
+        600, "https://u", body, delete_urls=[],
+    ) == baseline
+    assert "-X DELETE" not in baseline
+
+
+async def test_assemble_extra_delete_role_covers_both_families(_kube):
+    # the derived Role carries the target's get,patch AND the prop Secret's
+    # get,delete — non-uniform ⇒ the two-step construction (create the
+    # first family + json-patch append the second)
+    _wire_happy(_kube)
+    receipt = await _assemble(extra_delete=[dict(_DELETE_TARGET)])
+    assert receipt["status"] == "success"
+    role_calls = [
+        (s, v) for s, v, _ in _kube.calls
+        if v and v[0] == "role" and s in ("create", "patch")
+    ]
+    assert [s for s, _ in role_calls] == ["create", "patch"], (
+        "a two-family derivation (delete×secrets + patch×services) must "
+        "render through the two-step construction"
+    )
+    _, create_v = role_calls[0]
+    # secrets sorts before services → the create command carries delete
+    assert create_v[create_v.index("--verb") + 1] == "delete,get"
+    assert "secrets" in create_v
+    _, patch_v = role_calls[1]
+    appended = json.loads(patch_v[patch_v.index("-p") + 1])
+    assert appended == [{
+        "op": "add", "path": "/rules/-",
+        "value": {"apiGroups": [""], "resources": ["services"],
+                  "verbs": ["get", "patch"]},
+    }]
+    # the artifact's rbac_family role mirrors the UNION of both families
+    fam = {m["kind"]: m for m in receipt["artifact"]["rbac_family"]}
+    assert fam["role"]["verbs"] == ["delete", "get", "patch"]
+
+
+async def test_assemble_extra_delete_ssar_verifies_delete_family(_kube):
+    # §3 per-family: the delete verb on the secrets family is SSAR-checked
+    # before arming (B85: a write verb unauthorized only at fire time is a
+    # silent partial recovery — it must fail closed at build time)
+    _wire_happy(_kube)
+    receipt = await _assemble(extra_delete=[dict(_DELETE_TARGET)])
+    assert receipt["status"] == "success"
+    ssar_requests = []
+    for sub, v_args, _ in _kube.calls:
+        if sub != "exec":
+            continue
+        script = _exec_script(v_args)
+        if "selfsubjectaccessreviews" not in script:
+            continue
+        body = re.search(r"-d '(\{.*\})'", script).group(1)
+        attrs = json.loads(body)["spec"]["resourceAttributes"]
+        ssar_requests.append((attrs["verb"], attrs["resource"]))
+    assert ("patch", "services") in ssar_requests
+    assert ("delete", "secrets") in ssar_requests
+    steps = {s["step"] for s in receipt["steps"]}
+    assert "ssar_secrets_delete" in steps
+    assert "ssar_services_patch" in steps
+
+
+async def test_assemble_extra_delete_ssar_denied_fails_closed(_kube):
+    # delete on secrets denied (patch allowed) → abort before arming, the
+    # four-object stack cleaned, nothing injected
+    _wire_happy(_kube, exec_router=_selective_ssar_router(
+        deny_verbs=frozenset({"delete"}),
+    ))
+    receipt = await _assemble(extra_delete=[dict(_DELETE_TARGET)])
+    assert receipt["status"] == "failed"
+    assert "denied" in receipt["error"]
+    assert "secrets" in receipt["error"]
+    assert receipt["carrier"]["armed"] is False
+    deletes = [v[0] for s, v, _ in _kube.calls if s == "delete"]
+    assert deletes == ["pod", "rolebinding", "role", "serviceaccount"]
+    # No INJECTION patch on the target Service. (A ``patch role`` json-
+    # append from the two-family Role construction is legitimate and fires
+    # before SSAR — the abort must precede the target mutation, not RBAC.)
+    assert not any(
+        s == "patch" and v and v[0] == "service" for s, v, _ in _kube.calls
+    )
+
+
+async def test_assemble_extra_delete_timer_payload_folds_delete(_kube):
+    # the armed timer script carries the prop Secret's DELETE curl AFTER the
+    # restore PATCH — the autonomous TTL cleanup #51-R5 was missing
+    _wire_happy(_kube)
+    receipt = await _assemble(extra_delete=[dict(_DELETE_TARGET)])
+    assert receipt["status"] == "success"
+    arm_scripts = [
+        _exec_script(v) for s, v, _ in _kube.calls
+        if s == "exec" and "echo armed" in _exec_script(v)
+    ]
+    assert arm_scripts
+    armed = arm_scripts[-1]
+    assert "-X PATCH" in armed and "-X DELETE" in armed
+    assert armed.index("-X PATCH") < armed.index("-X DELETE")
+    assert _DELETE_URL in armed
+
+
+async def test_assemble_extra_delete_receipt_carries_handle(_kube):
+    # the durable recipe (artifact.recovery_handle) carries extra_delete so
+    # BOTH hydration rungs (message / ledger) can replay the deletion on
+    # early convergence — normalized to kind/name/namespace
+    _wire_happy(_kube)
+    receipt = await _assemble(extra_delete=[dict(_DELETE_TARGET)])
+    assert receipt["status"] == "success"
+    handle = receipt["artifact"]["recovery_handle"]
+    assert handle["extra_delete"] == [
+        {"kind": "secret", "name": "registry-cred-rotating",
+         "namespace": "cms-demo"},
+    ]
+
+
+async def test_assemble_extra_delete_cross_namespace_fails_closed(_kube):
+    # a prop object outside the carrier's namespace cannot be authorized by
+    # the namespaced Role → fail closed before anything is built
+    with pytest.raises(_AssemblyError, match="cross-namespace"):
+        await _assemble(extra_delete=[
+            {"kind": "secret", "name": "s", "namespace": "other"},
+        ])
+    assert _kube.calls == []
+
+
+async def test_assemble_no_extra_delete_is_unchanged(_kube):
+    # regression: a pure-patch fault carries an empty extra_delete and the
+    # single-family uniform Role (the two-step path is NOT reached), exactly
+    # as before the fix
+    _wire_happy(_kube)
+    receipt = await _assemble()
+    assert receipt["status"] == "success"
+    assert receipt["artifact"]["recovery_handle"]["extra_delete"] == []
+    role_calls = [
+        s for s, v, _ in _kube.calls
+        if v and v[0] == "role" and s in ("create", "patch")
+    ]
+    assert role_calls == ["create"]
+    arm_scripts = [
+        _exec_script(v) for s, v, _ in _kube.calls
+        if s == "exec" and "echo armed" in _exec_script(v)
+    ]
+    assert "-X DELETE" not in arm_scripts[-1]

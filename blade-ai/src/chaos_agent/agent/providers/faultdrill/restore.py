@@ -55,6 +55,13 @@ async def _do_restore(task_state: dict, kubeconfig: str) -> bool:
     """Revert the target to baseline. Guard 2 (pre-restore readback):
     ``remove`` ops whose path is already absent are dropped (json-remove
     on a missing path errors; the experiment's "已回基线 → 跳过").
+
+    Recovery-completeness: the inverse covers BOTH domains — the patch
+    domain (restore_patches onto the target) AND the create domain
+    (extra_delete prop objects the inject plan built outside the patch
+    domain, deleted here so an early-convergence recover is as complete
+    as the armed timer's TTL fire; idempotent — ``--ignore-not-found``
+    makes a timer that already deleted them a clean no-op).
     """
     target = task_state.get("target_ref") or {}
     restore = list(task_state.get("restore_patches") or [])
@@ -72,7 +79,15 @@ async def _do_restore(task_state: dict, kubeconfig: str) -> bool:
     del_ok = True
     if inv.get("name"):
         del_ok = await _delete_invalid_secret(inv, target, kubeconfig)
-    return patch_ok and del_ok
+
+    extra = [
+        d for d in (task_state.get("extra_delete") or [])
+        if isinstance(d, dict)
+    ]
+    extra_ok = True
+    if extra:
+        extra_ok = await _delete_extra_objects(extra, kubeconfig)
+    return patch_ok and del_ok and extra_ok
 
 
 async def _apply_derived_invalid_secret(
@@ -164,6 +179,32 @@ async def _delete_invalid_secret(
         kubeconfig,
     )
     return r.exit_code == 0
+
+
+async def _delete_extra_objects(extra: list, kubeconfig: str) -> bool:
+    """Delete the create-domain prop objects the inject plan built outside
+    the patch domain (``extra_delete`` — the general delete-only inverse of
+    create-type mechanism writes; the assembler timer folds the same
+    DELETEs into its TTL payload, so this replay is mutually idempotent
+    with it). ``--ignore-not-found`` makes an already-deleted object — a
+    timer that fired first, or a double replay — a clean no-op. Each entry
+    carries its own kind/name/namespace (normalized + RBAC-verified by the
+    assembler before arming)."""
+    ok = True
+    for obj in extra or []:
+        if not isinstance(obj, dict):
+            continue
+        kind = str(obj.get("kind") or "").lower()
+        name = str(obj.get("name") or "")
+        ns = str(obj.get("namespace") or "default")
+        if not (kind and name):
+            continue
+        r = await _provider_mod._kubectl(
+            "delete", [kind, name, "-n", ns, "--ignore-not-found"],
+            kubeconfig,
+        )
+        ok = ok and r.exit_code == 0
+    return ok
 
 
 # ---------------------------------------------------------------------------

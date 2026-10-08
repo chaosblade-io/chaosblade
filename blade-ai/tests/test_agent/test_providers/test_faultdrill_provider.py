@@ -53,10 +53,7 @@ carrier's explicit conformance home, pinning:
 
 from __future__ import annotations
 
-import base64
 import json
-import re
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -618,6 +615,7 @@ def test_apiserver_notfound_apply_still_attributed():
 
 from chaos_agent.agent.providers.faultdrill.assembler import (  # noqa: E402
     ASSEMBLER_TOOL_NAME,
+    parse_receipt,
 )
 
 
@@ -854,6 +852,179 @@ def test_issue_disproven_assembler_face():
     # No assembler evidence at all → the CR face's judgement stands
     # untouched (pinned above in test_issue_disproven_rules).
     assert p.issue_disproven([]) is False
+
+
+def test_issue_disproven_compacted_stub_is_unjudgeable():
+    """inject-2340dac9 regression: the LANDED ``partial`` receipt (a big
+    restore recipe) fell out of the tool compactor's 5-slot recency
+    window, was head-cut to the 1KB historical budget with a tail
+    notice, and the stub then read as "never landed" through
+    ``parse_receipt`` — revoking a LIVE attribution (the task finished
+    with NO injection_method; only the ledger's execution_artifacts
+    kept the recovery knowledge). A compaction stub is an unjudgeable
+    third state, the same keep-the-attribution posture as the
+    budget-expiry-unknown carve-out: revocation needs a TRUSTWORTHY
+    verdict, and the stub's bytes are by construction not the
+    receipt's."""
+    from chaos_agent.memory.tool_compactor import (
+        ToolResultCompactor,
+        is_compaction_artifact,
+    )
+
+    p = FaultDrillProvider()
+    big_restore = [{
+        "op": "replace", "path": "/data/Corefile",
+        "value": "health {\n  lameduck 15s\n}\n" * 60,
+    }]
+    receipt = _asm_receipt_content(status="partial", restore=big_restore)
+    assert len(receipt.encode("utf-8")) > 1024  # over the historical budget
+
+    # Reproduce the live pipeline's compaction: five subsequent tool
+    # results push the receipt out of the 5-slot recency window, so the
+    # compactor applies the 1KB historical budget to it in place.
+    msgs = [
+        _asm_call("a1"),
+        ToolMessage(content=receipt, tool_call_id="a1"),
+    ]
+    for i in range(5):
+        msgs.append(AIMessage(content="", tool_calls=[{
+            "id": f"k{i}", "name": "kubectl_read", "args": {},
+        }]))
+        msgs.append(ToolMessage(content="ok", tool_call_id=f"k{i}"))
+    ToolResultCompactor(cache_dir=None).compact(msgs)
+    stub = msgs[1].content
+    # The compaction actually bit: a marked stub that no longer parses.
+    assert is_compaction_artifact(stub) is True
+    assert parse_receipt(stub) is None
+    # THE regression pin: the stub must not read as counter-evidence.
+    assert p.issue_disproven(msgs) is False
+
+    # An earlier stub shields a later explicit failure the same way a
+    # registerable earlier receipt does (both are possibly-landed).
+    earlier_stub = [
+        _asm_call("a1"),
+        ToolMessage(content=stub, tool_call_id="a1"),
+        _asm_call("a2"),
+        ToolMessage(
+            content=json.dumps({
+                "status": "failed", "error": "boom",
+                "carrier": {"armed": False}, "steps": [],
+            }),
+            tool_call_id="a2",
+        ),
+    ]
+    assert p.issue_disproven(earlier_stub) is False
+
+    # Controls: without a stub the same shapes stay revocable — the
+    # carve-out must not swallow the two-state verdict.
+    failed_only = [
+        _asm_call("a1"),
+        ToolMessage(
+            content=json.dumps({
+                "status": "failed", "error": "boom",
+                "carrier": {"armed": False}, "steps": [],
+            }),
+            tool_call_id="a1",
+        ),
+    ]
+    assert p.issue_disproven(failed_only) is True
+    assert is_compaction_artifact(_asm_receipt_content()) is False
+    assert is_compaction_artifact("") is False
+
+
+def _big_failed_receipt() -> str:
+    """A failed receipt over the historical compaction budget — a
+    late-stack failure (SSAR denial after a full build) carries every
+    step's 300-char detail, easily past 1KB."""
+    steps = [
+        {"step": f"step_{i}", "ok": True,
+         "detail": "d" * 300}
+        for i in range(5)
+    ]
+    return json.dumps({
+        "status": "failed", "error": "SSAR denied for verb 'patch'",
+        "carrier": {"armed": False}, "steps": steps,
+    })
+
+
+def test_issue_disproven_failed_stub_keeps_the_verdict():
+    """The stub carve-out is THREE-state, not blanket: the receipt
+    builder writes ``status`` first and every compaction path preserves
+    the head, so a stub whose surviving head reads ``failed`` still
+    revokes — the carve-out must not swallow a provable failure."""
+    from chaos_agent.agent.providers.faultdrill.provider import (
+        _stub_receipt_status,
+    )
+    from chaos_agent.memory.tool_compactor import (
+        ToolResultCompactor,
+        is_compaction_artifact,
+    )
+
+    p = FaultDrillProvider()
+    receipt = _big_failed_receipt()
+    assert len(receipt.encode("utf-8")) > 1024
+
+    msgs = [
+        _asm_call("a1"),
+        ToolMessage(content=receipt, tool_call_id="a1"),
+    ]
+    for i in range(5):
+        msgs.append(AIMessage(content="", tool_calls=[{
+            "id": f"k{i}", "name": "kubectl_read", "args": {},
+        }]))
+        msgs.append(ToolMessage(content="ok", tool_call_id=f"k{i}"))
+    ToolResultCompactor(cache_dir=None).compact(msgs)
+    stub = msgs[1].content
+    assert is_compaction_artifact(stub) is True
+    # The verdict survives the head-cut.
+    assert _stub_receipt_status(stub) == "failed"
+    assert parse_receipt(stub) is None
+    # THE pin: a failed stub still revokes.
+    assert p.issue_disproven(msgs) is True
+
+    # An earlier FAILED stub is not a shield — that carrier never
+    # existed, so a later explicit failure still revokes.
+    earlier_failed_stub = [
+        _asm_call("a1"),
+        ToolMessage(content=stub, tool_call_id="a1"),
+        _asm_call("a2"),
+        ToolMessage(
+            content=json.dumps({
+                "status": "failed", "error": "boom",
+                "carrier": {"armed": False}, "steps": [],
+            }),
+            tool_call_id="a2",
+        ),
+    ]
+    assert p.issue_disproven(earlier_failed_stub) is True
+
+
+def test_issue_disproven_cleared_marker_stub_is_unjudgeable():
+    """The time-based microcompact replaces the WHOLE content with the
+    cleared marker — nothing survives, the verdict is unrecoverable:
+    the one genuinely unknown stub shape, kept (never counter-evidence)."""
+    from chaos_agent.memory.tool_compactor import CLEARED_MARKER
+
+    p = FaultDrillProvider()
+    msgs = [
+        _asm_call("a1"),
+        ToolMessage(content=CLEARED_MARKER, tool_call_id="a1"),
+    ]
+    assert p.issue_disproven(msgs) is False
+    # And it still shields a later explicit failure (possibly-landed).
+    shield = [
+        _asm_call("a1"),
+        ToolMessage(content=CLEARED_MARKER, tool_call_id="a1"),
+        _asm_call("a2"),
+        ToolMessage(
+            content=json.dumps({
+                "status": "failed", "error": "boom",
+                "carrier": {"armed": False}, "steps": [],
+            }),
+            tool_call_id="a2",
+        ),
+    ]
+    assert p.issue_disproven(shield) is False
 
 
 @pytest.fixture()
@@ -1211,6 +1382,7 @@ async def test_recover_cr_face_replays_the_manifest_recipe(_recover_stub):
         },
         "restore_patches": [{"op": "replace", "path": "/spec/x", "value": "z"}],
         "invalid_secret": {},
+        "extra_delete": [],
     }
     assert "idempotent" in result.warnings[0]
 
@@ -1338,6 +1510,16 @@ def test_verify_prompt_note_final_semantics():
     # 效果即真理: the CR landing is NOT the fault landing — Layer-2 stays
     # the verification authority.
     assert "does not mean the fault has manifested" in note
+    # Carrier face (B1): the four-object set is planned armed scaffolding
+    # (false-alarm suppression — not stray residue to report) and its
+    # settlement rides the recovery path (cleanup-noise suppression);
+    # 效果即真理 holds unchanged on this face too.
+    carrier_note = p.verify_prompt_note("faultdrill_carrier")
+    assert carrier_note
+    assert "scaffolding, not stray residue" in carrier_note
+    assert "not a leftover-resource finding" in carrier_note
+    assert "belongs to the recovery path, not to this verification" in carrier_note
+    assert "NOT the verification criterion" in carrier_note
     assert p.verify_prompt_note("kubectl_native") == ""
     assert p.verify_prompt_note("chaosblade") == ""
 
