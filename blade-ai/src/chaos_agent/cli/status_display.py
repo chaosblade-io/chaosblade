@@ -46,7 +46,7 @@ def format_status_event(event: StatusEvent) -> str:
 
     color = _PHASE_COLORS.get(event.phase, "")
     icon = _PHASE_ICONS.get(event.phase, "·")
-    duration = f" ({event.duration_ms:.0f}ms)" if event.duration_ms > 0 else ""
+    duration = _format_duration(event)
 
     if "\n" in event.message:
         header, rest = event.message.split("\n", 1)
@@ -79,12 +79,38 @@ def format_status_event(event: StatusEvent) -> str:
 
     if settings.is_debug and event.detail.get("debug") and event.detail:
         import json
-        detail = {k: v for k, v in event.detail.items() if k not in ("debug", "tool_calls", "stdout_preview")}
+        detail = {
+            k: v for k, v in event.detail.items()
+            # ``segments`` is rendered inline by _format_duration; repeating
+            # the same numbers as raw JSON is noise, not information.
+            if k not in ("debug", "tool_calls", "stdout_preview", "segments")
+        }
         if detail:
             detail_str = json.dumps(detail, ensure_ascii=False)
             line += f"\n    → detail: {detail_str}"
 
     return line
+
+
+def _format_duration(event: StatusEvent) -> str:
+    """Render elapsed time so the number states what it measures.
+
+    ``duration_ms`` on a NODE event is the whole span from ``tracker.start``
+    to this event, while the message beside it usually names one phase. A bare
+    ``(71751ms)`` after ``Iteration 1 LLM response:`` therefore reads as
+    "the model took 71.7s" — which is how inject-6ebf341c's turn 1 came to be
+    audited as model latency when the model was only part of it. When the
+    producer marked sub-spans, print them: the parts sum to the total (the
+    tracker appends the un-instrumented remainder as ``other``), so the reader
+    can see both the whole and where it went.
+    """
+    segments = event.detail.get("segments") or []
+    if segments:
+        parts = " ".join(
+            f"{s.get('label')}={float(s.get('ms') or 0):.0f}ms" for s in segments
+        )
+        return f" (node {event.duration_ms:.0f}ms: {parts})"
+    return f" ({event.duration_ms:.0f}ms)" if event.duration_ms > 0 else ""
 
 
 async def _status_printer(queue: asyncio.Queue[StatusEvent], done_event: asyncio.Event):

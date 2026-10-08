@@ -95,3 +95,82 @@ def test_missing_fields_degrade_gracefully():
     line = format_experiment_line(3, {})
     assert "3." in line
     assert "task_id=?" in line
+
+
+# -- carrier fact line (Plan A presentation: facts, never a verdict) --------
+
+def test_carrier_line_renders_cleaned_recovery_carrier():
+    line = _line({
+        "task_id": "t1",
+        "fault_type": "pod-process-kill",
+        "target": {"namespace": "default", "names": ["api-0"]},
+        "execution_artifacts": [
+            {"type": "recovery_carrier", "status": "cleaned"},
+        ],
+    })
+    assert "carrier: recovery_carrier=cleaned" in line
+    # states observation only — no verdict words
+    assert "cleared" not in line.lower() or "recovery_void" in line
+
+
+def test_carrier_line_flags_recovery_void():
+    line = _line({
+        "task_id": "t1",
+        "fault_type": "pod-network-loss",
+        "target": {"namespace": "default", "names": ["api-0"]},
+        "execution_artifacts": [
+            {"type": "recovery_carrier", "status": "cleaned", "recovery_void": True},
+        ],
+    })
+    assert "recovery_void" in line
+
+
+def test_carrier_line_labels_probe_only_channel():
+    """A debug_pod is a probe, not a reversal carrier — the line must say so
+    rather than imply the fault was torn down."""
+    line = _line({
+        "task_id": "t1",
+        "fault_type": "pod-mem-load",
+        "target": {"namespace": "default", "names": ["api-0"]},
+        "execution_artifacts": [
+            {"type": "debug_pod", "status": "cleaned"},
+        ],
+    })
+    assert "probe channel" in line
+    assert "no teardown" in line
+
+
+def test_carrier_line_none_registered():
+    line = _line({
+        "task_id": "t1",
+        "fault_type": "pod-network-drop",
+        "target": {"namespace": "kube-system", "names": ["coredns-x"]},
+        "execution_artifacts": [],
+    })
+    assert "carrier: none registered" in line
+
+
+def test_carrier_line_host_timer_deadline_state():
+    import time as _time
+    passed = _line({
+        "task_id": "t1",
+        "fault_type": "pod-network-delay",
+        "target": {"namespace": "default", "names": ["api-0"]},
+        "execution_artifacts": [{
+            "type": "recovery_carrier", "status": "cleaned",
+            "recovery_form": "host_timer",
+            "recovery_deadline_epoch": _time.time() - 10,
+        }],
+    })
+    assert "host_timer deadline passed" in passed
+    pending = _line({
+        "task_id": "t1",
+        "fault_type": "pod-network-delay",
+        "target": {"namespace": "default", "names": ["api-0"]},
+        "execution_artifacts": [{
+            "type": "recovery_carrier", "status": "cleaned",
+            "recovery_form": "host_timer",
+            "recovery_deadline_epoch": _time.time() + 3600,
+        }],
+    })
+    assert "host_timer deadline pending" in pending

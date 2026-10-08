@@ -6,8 +6,10 @@ to recover. They must show the *same* discriminating fields — injection time,
 target resource, real fault type, plan summary — so this single formatter is
 their shared source of truth.
 
-Presentation only: depends on nothing beyond ``utils.time`` and degrades
-gracefully on any missing field (never raises).
+Presentation only: its only imports are ``utils.time`` plus deferred,
+exception-guarded reads of ``execution_artifacts.RECOVERY_CARRIER_TYPES`` and
+the stdlib clock, and it degrades gracefully on any missing field (never
+raises).
 """
 
 from __future__ import annotations
@@ -31,6 +33,63 @@ def _target_descriptor(experiment: dict) -> str:
     if tname:
         return f"{namespace}/{tname}"
     return namespace
+
+
+def _carrier_fact_line(experiment: dict) -> str:
+    """One FACTUAL line about the recovery-bearing carriers on this row.
+
+    States only what the framework OBSERVED — carrier form, last recorded
+    status, whether the reversal was voided, whether a detached timer's
+    deadline has passed, or that no reversal carrier was ever registered. It
+    renders NO verdict (never "live" / "cleared" / "recover this"): combining
+    these facts with a live cluster probe is the LLM's call, not the
+    presenter's. Returns "" when there is nothing factual to add.
+
+    Degrades gracefully on any missing/malformed field (never raises), per
+    this module's presentation-only contract.
+    """
+    arts = experiment.get("execution_artifacts")
+    if not isinstance(arts, list):
+        return ""
+    try:
+        from chaos_agent.agent.execution_artifacts import RECOVERY_CARRIER_TYPES
+    except Exception:  # pragma: no cover — import must never break rendering
+        return ""
+
+    carriers = [
+        a for a in arts
+        if isinstance(a, dict) and a.get("type") in RECOVERY_CARRIER_TYPES
+    ]
+    if not carriers:
+        # No reversal carrier registered. Either a bare native mutation (no
+        # vehicle at all) or only a probe channel rode along — either way the
+        # framework recorded NO teardown of the fault itself.
+        has_probe = any(
+            isinstance(a, dict) and a.get("type") == "debug_pod" for a in arts
+        )
+        if has_probe:
+            return (
+                "carrier: only a probe channel (debug_pod) registered — not a "
+                "reversal carrier; no teardown of the fault itself observed"
+            )
+        return "carrier: none registered — no teardown of the fault observed"
+
+    import time as _time
+    now = _time.time()
+    segs = []
+    for a in carriers:
+        seg = f"{a.get('type') or '?'}={a.get('status') or '?'}"
+        if a.get("recovery_void"):
+            seg += ",recovery_void(reversal died with carrier)"
+        if a.get("recovery_form") == "host_timer":
+            deadline = a.get("recovery_deadline_epoch")
+            try:
+                state = "passed" if float(deadline) <= now else "pending"
+            except (TypeError, ValueError):
+                state = "unknown"
+            seg += f",host_timer deadline {state}"
+        segs.append(seg)
+    return "carrier: " + "; ".join(segs)
 
 
 def format_experiment_line(idx: int, experiment: dict) -> str:
@@ -62,4 +121,7 @@ def format_experiment_line(idx: int, experiment: dict) -> str:
         first_line = summary.splitlines()[0][:80]
         if first_line:
             head += f"\n      description: {first_line}"
+    carrier_fact = _carrier_fact_line(experiment)
+    if carrier_fact:
+        head += f"\n      {carrier_fact}"
     return head
