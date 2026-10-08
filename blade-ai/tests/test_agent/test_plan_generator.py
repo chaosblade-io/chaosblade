@@ -30,7 +30,15 @@ class TestSectionBaselinePreviewK8s:
         # No unrendered template variables leak into the preview.
         assert "{node_name}" not in out
 
-    def test_pod_process_kill_renders_namespace_and_label_selector(self):
+    def test_pod_process_kill_renders_by_pod_name_not_label_selector(self):
+        # Pod-scope baseline entries are by-name reachable (P1 contract,
+        # commit feaad6f2): pod scope always carries names[0], so registry
+        # commands must anchor on {pod_name}, never {label_selector}. The
+        # old ``-l app=api`` / ``get endpoints {label_selector}`` form was a
+        # defect fossil — labels={} is a legal spec and a label-only command
+        # is unresolvable, which killed the entry and forced scope_fallback.
+        # This test used to assert that removed form; it now locks its
+        # absence so the by-name contract cannot silently regress.
         spec = FaultSpec(
             scope="pod",
             fault_target="process",
@@ -41,8 +49,10 @@ class TestSectionBaselinePreviewK8s:
         )
         out = _section_baseline_preview(spec)
         assert "-n prod" in out
-        # {label_selector} must render as "-l app=api", not bare "app=api".
-        assert "-l app=api" in out
+        # by-name anchoring: the pod name is the locator.
+        assert "kubectl get pod api-0" in out
+        # the label-selector form must NOT come back.
+        assert "-l app=api" not in out
         assert "{namespace}" not in out
         assert "{label_selector}" not in out
 

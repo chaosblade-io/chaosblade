@@ -10,7 +10,10 @@ that outranks every probe: a node the user named themselves.
 from types import SimpleNamespace
 
 from chaos_agent.agent.spec.fault_spec import FaultSpec
-from chaos_agent.agent.spec.intent_anchor import extract_explicit_node_anchor
+from chaos_agent.agent.spec.intent_anchor import (
+    extract_explicit_namespace_anchor,
+    extract_explicit_node_anchor,
+)
 
 # The verbatim intent of the failing run — must anchor exactly one node.
 _R4_INTENT = (
@@ -135,3 +138,114 @@ def test_http_half_structured_request_keeps_explicit_fields():
     spec = FaultSpec.from_http_request(half)
     assert spec.names == ("some-other-node",)
     assert spec.source == "http_nl"
+
+
+# ══ inject-b6b02ebd — namespace anchor (维度2: ns 权威锚定) ══════════════
+#
+# The node anchor pins the victim NAME the user typed. The namespace anchor
+# pins the victim NAMESPACE — the one identity dimension a MECHANISM case
+# states explicitly ("drill-lb 命名空间里应用 Pod …") but which lazy
+# derivation otherwise reverse-engineers from probe ORDER. Pre-filling it
+# gives the write-once derivation an authoritative ns to lock FIRST, so
+# agent_loop's namespace-consistency gate can then reject a mechanism
+# target's name (kube-proxy in kube-system) probed under a drill-lb victim.
+
+# The verbatim intent of the failing run — a mechanism case naming TWO
+# same-kind pods (victim app Pod in drill-lb, mechanism kube-proxy in
+# kube-system). Only the VICTIM namespace is stated, and it must anchor.
+_MECH_INTENT = (
+    "演练：让 drill-lb 命名空间里应用 Pod 所在节点上的 kube-proxy 异常，"
+    "导致该 Pod 通过 ClusterIP 访问 drill-lb-svc 时调用失败。持续 300 秒。"
+)
+
+
+def test_anchors_verbatim_mechanism_victim_namespace():
+    # The victim ns is "drill-lb"; "drill-lb-svc" (a Service) must NOT be
+    # mistaken for a second namespace — it is not followed by 命名空间.
+    assert extract_explicit_namespace_anchor(_MECH_INTENT) == "drill-lb"
+
+
+def test_anchors_chinese_and_english_explicit_forms():
+    assert extract_explicit_namespace_anchor("在 prod-1 命名空间注入 CPU 满载") == "prod-1"
+    # CJK boundary with no whitespace still anchors (real intents vary).
+    assert extract_explicit_namespace_anchor("在prod-1命名空间注入") == "prod-1"
+    assert extract_explicit_namespace_anchor(
+        "restart pods in namespace prod-1 now",
+    ) == "prod-1"
+
+
+def test_anchors_kubectl_flag_forms_pasted_into_intent():
+    assert extract_explicit_namespace_anchor("kill -n prod-1 foo") == "prod-1"
+    assert extract_explicit_namespace_anchor("get pods --namespace prod-1") == "prod-1"
+    assert extract_explicit_namespace_anchor("get pods --namespace=prod-1") == "prod-1"
+
+
+def test_two_distinct_namespaces_fail_safe_to_no_anchor():
+    # AMBIGUITY IS THE SAFETY CONDITION: when the text names two distinct
+    # namespaces the victim's cannot be told from the mechanism's, so no
+    # anchor is returned — the ns is left to the derivation path rather than
+    # guessed. Guessing wrong would re-open the franken-target race.
+    assert extract_explicit_namespace_anchor(
+        "drill-lb 命名空间的应用，重启 kube-system 命名空间的 kube-proxy",
+    ) == ""
+
+
+def test_repeated_same_namespace_still_anchors():
+    # Dedupe preserves the single distinct ns — repetition is not ambiguity.
+    assert extract_explicit_namespace_anchor(
+        "prod-1 命名空间的应用，再看 prod-1 命名空间的负载",
+    ) == "prod-1"
+
+
+def test_rejects_non_label_and_partial_token_shapes():
+    # A bare "跨命名空间" captures 跨 (not an ascii label) → no anchor.
+    assert extract_explicit_namespace_anchor("跨命名空间的演练") == ""
+    # WHOLE-TOKEN discipline: a malformed adjacent token must NOT donate its
+    # trailing ascii run (would anchor a valid-looking but WRONG namespace).
+    assert extract_explicit_namespace_anchor("Prod-1 命名空间注入") == ""  # not "rod-1"
+    assert extract_explicit_namespace_anchor("my.ns 命名空间注入") == ""  # not "ns"
+    # RFC1123 LABEL caps at 63 chars.
+    assert extract_explicit_namespace_anchor("a" * 64 + " 命名空间") == ""
+
+
+def test_empty_or_missing_text_yields_no_namespace_anchor():
+    assert extract_explicit_namespace_anchor("") == ""
+    assert extract_explicit_namespace_anchor(None) == ""  # type: ignore[arg-type]
+
+
+# ── from_cli_nl / from_http_request namespace prefill ─────────────────
+
+
+def test_from_cli_nl_prefills_namespace_from_anchor():
+    spec = FaultSpec.from_cli_nl(input_text=_MECH_INTENT)
+    # The ns anchor fires independently of the node anchor: this text names
+    # no "在节点 X 上" form, so scope/names stay lazy — but the victim ns is
+    # now authoritative instead of probe-order-derived.
+    assert spec.namespace == "drill-lb"
+    assert spec.scope == ""
+    assert spec.names == ()
+
+
+def test_from_cli_nl_without_namespace_anchor_stays_empty():
+    spec = FaultSpec.from_cli_nl(input_text="观察集群整体压力下的表现")
+    assert spec.namespace == ""
+
+
+def test_http_nl_prefills_same_namespace_as_cli_nl():
+    # Parity: the anchor is a property of the TEXT, not the transport — an
+    # HTTP NL request feeds the same lazy-derivation path, so a CLI-only ns
+    # anchor would leave the HTTP channel racing probe order.
+    cli_spec = FaultSpec.from_cli_nl(input_text=_MECH_INTENT)
+    http_spec = FaultSpec.from_http_request(_http_nl_request(_MECH_INTENT))
+    assert http_spec.namespace == cli_spec.namespace == "drill-lb"
+
+
+def test_http_request_namespace_gap_fill_never_overrides_stated():
+    # "fills gaps, never overrides a stated choice": an explicit request
+    # namespace wins over whatever the input text names.
+    req = SimpleNamespace(
+        input="在 prod-1 命名空间注入", scope="", target_name="",
+        labels=None, namespace="stated-ns",  # ← explicit, must be kept
+        target="", action="", params=None, params_flags=None, duration=0,
+    )
+    assert FaultSpec.from_http_request(req).namespace == "stated-ns"

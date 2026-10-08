@@ -62,6 +62,72 @@ _MAX_NAME_LEN = 253
 _TRAILING_PUNCT_RE = re.compile(r"[.,;:!?)'\"\u201d\u2019]+$")
 
 
+# ---------------------------------------------------------------------------
+# Namespace anchor — same discipline as the node anchor, one dimension over.
+#
+# Why this exists (inject-b6b02ebd root cause): in CLI NL mode the victim's
+# concrete identity (namespace + name) has NO authoritative source and is
+# reverse-engineered from probe ORDER by agent_loop's per-field write-once
+# derivation. For a MECHANISM case the plan probes TWO same-kind pods — the
+# victim (app pod) and the mechanism target (e.g. kube-proxy in kube-system).
+# Whichever is probed by name first wins the ``names`` slot, and because
+# ``namespace`` locks independently it can come from a DIFFERENT probe, freezing
+# a self-contradictory franken target (name from kube-system, namespace from
+# drill-lb). Its victim_node bridge then collapses and every node/host write
+# REJECT_DRIFTs into a ~28-minute slow death.
+#
+# The victim NAMESPACE, unlike the victim name, IS stated explicitly in the
+# user's text ("drill-lb 命名空间里应用 Pod" / "in namespace drill-lb") and is a
+# property of the FIXED input text — so parsing it is a pure, order-independent
+# function, exactly like the node anchor. Pre-filling ``spec.namespace`` gives
+# the write-once derivation an authoritative namespace to lock first, after
+# which agent_loop's namespace-consistency gate can reject any name probed in a
+# DIFFERENT namespace (the mechanism target) — probe order no longer decides
+# the victim.
+#
+# Narrow by design, mirroring the node anchor:
+# - Only an explicit mention anchors: a DNS-label token immediately before
+#   "命名空间", or after "namespace" / "-n" / "--namespace". A bare "跨命名空间"
+#   captures "跨", which fails the label shape and is rejected.
+# - Candidates must be a valid k8s namespace (RFC1123 LABEL: lowercase alnum +
+#   '-', NO dots — stricter than the node subdomain shape, max 63 chars).
+# - AMBIGUITY FAILS SAFE: if the text names two or more DISTINCT namespaces
+#   ("drill-lb 命名空间的应用，重启 kube-system 命名空间的 kube-proxy"), no
+#   anchor is returned — the victim ns is left to the existing derivation path
+#   rather than guessing which of the two is the victim's.
+# ---------------------------------------------------------------------------
+
+_NAMESPACE_ANCHOR_RES: tuple[re.Pattern[str], ...] = (
+    # Chinese: "<ns> 命名空间" (the label token immediately precedes 命名空间).
+    # The leading ``(?<![A-Za-z0-9._-])`` enforces WHOLE-TOKEN capture, the
+    # same discipline the node anchor gets from its ``\S+?`` group: without
+    # it a malformed adjacent token donates its trailing ascii run —
+    # "Prod-1 命名空间" would anchor "rod-1", "my.ns 命名空间" would anchor
+    # "ns" — a valid-looking but WRONG namespace. A CJK/space/start boundary
+    # still matches ("让drill-lb命名空间" / " drill-lb 命名空间"), so real
+    # intents are unaffected; only ascii-identifier continuation is refused.
+    # (The English/flag forms below are already left-anchored by their literal
+    # ``namespace`` / ``-n`` / ``--namespace`` prefix and need no lookbehind.)
+    re.compile(r"(?<![A-Za-z0-9._-])([a-z0-9][-a-z0-9]*)\s*命名空间"),
+    # English: "namespace <ns>" / "in namespace <ns>".
+    re.compile(r"\bnamespace\s+([a-z0-9][-a-z0-9]*)", re.IGNORECASE),
+    # kubectl flag forms pasted into the intent: "-n <ns>" / "--namespace <ns>"
+    # / "--namespace=<ns>".
+    re.compile(r"(?:^|\s)-n\s+([a-z0-9][-a-z0-9]*)"),
+    re.compile(r"--namespace[=\s]+([a-z0-9][-a-z0-9]*)"),
+)
+
+# K8s namespace = RFC1123 LABEL (no dots, unlike a node's subdomain name).
+_NAMESPACE_LABEL_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+_MAX_NAMESPACE_LEN = 63
+
+
+def _is_valid_namespace(candidate: str) -> bool:
+    if not candidate or len(candidate) > _MAX_NAMESPACE_LEN:
+        return False
+    return bool(_NAMESPACE_LABEL_RE.match(candidate))
+
+
 def _is_valid_node_name(candidate: str) -> bool:
     if not candidate or len(candidate) > _MAX_NAME_LEN:
         return False
@@ -84,3 +150,26 @@ def extract_explicit_node_anchor(text: str) -> tuple[str, ...]:
             if _is_valid_node_name(candidate) and candidate not in found:
                 found.append(candidate)
     return tuple(found)
+
+
+def extract_explicit_namespace_anchor(text: str) -> str:
+    """Return the single explicitly named victim namespace, or ``""``.
+
+    Same authority model as :func:`extract_explicit_node_anchor` — the user's
+    own text outranks every probe — but returns ONE namespace (``spec.namespace``
+    is a scalar, not a tuple). Deduplicates while preserving first-mention
+    order; if the text names two or more DISTINCT namespaces the anchor is
+    AMBIGUOUS and ``""`` is returned (fail safe: leave the victim ns to the
+    existing derivation path rather than guess which mention is the victim's).
+    Callers must treat ``""`` as "no anchor".
+    """
+    if not text:
+        return ""
+    found: list[str] = []
+    for pattern in _NAMESPACE_ANCHOR_RES:
+        for match in pattern.finditer(text):
+            candidate = _TRAILING_PUNCT_RE.sub("", match.group(1))
+            if _is_valid_namespace(candidate) and candidate not in found:
+                found.append(candidate)
+    # Uniqueness is the safety condition: exactly one distinct namespace named.
+    return found[0] if len(found) == 1 else ""

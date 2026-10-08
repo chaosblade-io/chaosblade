@@ -77,7 +77,10 @@ from chaos_agent.agent.spec.fault_registry import (
 # complete aggregate at import time. This import is what lets fault_registry
 # itself stay free of provider imports — assembly is triggered here, by the
 # spec layer that needs the vocabulary, not embedded in the registry.
-from chaos_agent.agent.spec.intent_anchor import extract_explicit_node_anchor
+from chaos_agent.agent.spec.intent_anchor import (
+    extract_explicit_namespace_anchor,
+    extract_explicit_node_anchor,
+)
 import chaos_agent.agent.providers  # noqa: F401  (assembly side effect)
 from chaos_agent.utils.coerce import (
     coerce_to_dict,
@@ -359,7 +362,16 @@ class FaultSpec:
         params = _normalise_params(kwargs.get("params"))
         _reject_timeout_param(params, "Use the --duration option instead.")
         anchor_scope, anchor_names = _anchored_node_identity(input_text)
+        # Namespace anchor (inject-b6b02ebd): the victim's namespace, unlike
+        # its name, is stated explicitly in the user's text and is a property
+        # of the FIXED input — pre-fill it so lazy derivation locks an
+        # authoritative victim ns FIRST, after which agent_loop's
+        # namespace-consistency gate rejects any name probed in a different ns
+        # (e.g. a kube-proxy mechanism target in kube-system under a drill-lb
+        # victim). "" when the text names no unique namespace (no anchor).
+        anchor_namespace = extract_explicit_namespace_anchor(input_text)
         return cls(
+            namespace=anchor_namespace,
             scope=anchor_scope,
             names=anchor_names,
             params=params,
@@ -412,8 +424,17 @@ class FaultSpec:
             scope, names = _anchored_node_identity(
                 coerce_to_str(getattr(request, "input", ""), default=""),
             )
+        # Namespace anchor parity (inject-b6b02ebd): same as ``from_cli_nl`` —
+        # the anchor is a property of the TEXT, not the transport. Fill the ns
+        # gap only; never override a stated namespace ("fills gaps, never
+        # overrides a stated choice").
+        req_namespace = coerce_to_str(getattr(request, "namespace", ""), default="")
+        if not is_structured and not req_namespace:
+            req_namespace = extract_explicit_namespace_anchor(
+                coerce_to_str(getattr(request, "input", ""), default=""),
+            )
         spec = cls(
-            namespace=coerce_to_str(getattr(request, "namespace", ""), default=""),
+            namespace=req_namespace,
             scope=coerce_to_str(scope, default=""),
             names=names,
             labels=_normalise_labels(labels),
