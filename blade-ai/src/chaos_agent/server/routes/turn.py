@@ -215,4 +215,11 @@ async def early_recover(sid: str, turn_id: str, req: Request):
         raise HTTPException(404, "No fault-window hold active for this turn")
     ctx.hold_early_recover.set()
     logger.info("early-recover sid=%s turn=%s", sid, turn_id)
-    return {"ok": True, "turn_id": turn_id, "early_recover": True}
+    # ``turn_id`` is deliberately NOT echoed back. The only caller
+    # (core/src/api/client.ts ``earlyRecover`` → useStream ``triggerEarlyRecover``
+    # → tui Composer Ctrl+R) keys off the HTTP status alone and never reads
+    # the body, so reflecting the path param is dead payload that only adds a
+    # reflected-XSS surface — white-box scanners flag the source→sink flow even
+    # though ``_sanitize_id``'s ``^[\w\-]{1,128}$`` whitelist already makes the
+    # value inert and the response is application/json (no HTML context).
+    return {"ok": True, "early_recover": True}

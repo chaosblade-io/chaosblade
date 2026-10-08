@@ -1130,7 +1130,6 @@ class TestHookFanOutToTuiTracker:
         from chaos_agent.memory.hook import PreReasoningHook
         from chaos_agent.observability.status_tracker import (
             _trackers,
-            get_tracker,
             subscribe,
             unsubscribe,
         )
