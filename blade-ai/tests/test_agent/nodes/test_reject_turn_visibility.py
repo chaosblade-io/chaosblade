@@ -24,7 +24,6 @@ import inspect
 import textwrap
 from unittest.mock import patch
 
-import pytest
 
 from chaos_agent.agent.nodes.planning import intent_clarification as ic
 

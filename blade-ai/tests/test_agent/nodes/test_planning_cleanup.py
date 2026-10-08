@@ -91,7 +91,7 @@ async def test_cleanup_skips_already_cleaned(monkeypatch):
         "messages": [_debug_tool_message("node-debugger-abc", "default")],
         "cleaned_debug_pods": ["node-debugger-abc"],
     }
-    update = await _planning_cleanup.cleanup_planning_debug_pods(state)
+    await _planning_cleanup.cleanup_planning_debug_pods(state)
 
     assert deleted == []
 
