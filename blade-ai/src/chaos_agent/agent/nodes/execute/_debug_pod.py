@@ -20,6 +20,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
+from chaos_agent.agent.execution_artifacts import debug_meta_scope
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
 from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
@@ -49,6 +50,105 @@ _DETERMINISTIC_FAILURE_REASONS = frozenset({
     "ImagePullBackOff", "ErrImagePull", "InvalidImageName",
     "CrashLoopBackOff", "CreateContainerConfigError", "CreateContainerError",
 })
+
+# ---------------------------------------------------------------------------
+# Carrier-creation failure reasons
+# ---------------------------------------------------------------------------
+#
+# ``create_and_wait_debug_pod`` retries over an IMAGE candidate chain, so that
+# retry dimension can only cure failures whose cause IS the image. Case #67
+# (W-67-1) aimed the carrier at a pod name instead of a node name: the API
+# answered ``Error from server (NotFound): nodes "<POD>" not found`` and the
+# loop rotated every candidate, reporting the identical rejection once per
+# image, because each non-zero exit took an unconditional ``continue``.
+#
+# The "image-INDEPENDENT → stop the chain" principle already existed in that
+# loop for parse failures; it was simply never generalized. These constants are
+# the generalization, and they carry a second duty: telling the CALLER which
+# fact was disproven, so a fallback resting on the same fact can be skipped
+# instead of independently "confirming" it.
+
+#: Success — no failure to report.
+CARRIER_OK = ""
+#: The node the carrier anchors on does not exist (or no longer does). No
+#: image can fix this, and no pod can ever carry ``spec.nodeName == <it>``
+#: either, so node-scoped fallbacks are provably futile and MUST be skipped:
+#: running them turns one wrong name into a confident-looking second opinion
+#: (``discover_tool_pod_state_on_node`` would answer ABSENT, which its
+#: contract marks as safe to BLOCK on).
+CARRIER_TARGET_MISSING = "target_missing"
+#: The API rejected the caller or the verb (Forbidden / Unauthorized /
+#: MethodNotSupported). Image-independent — stop the chain — but the target is
+#: real, so a fallback using a different verb (``get pods`` instead of creating
+#: an ephemeral container) may still be permitted and is worth trying.
+CARRIER_REQUEST_REJECTED = "request_rejected"
+#: Every image candidate was tried; none yielded a usable carrier.
+CARRIER_IMAGE_EXHAUSTED = "image_exhausted"
+#: ``kubectl debug`` succeeded but its output did not parse into a pod name.
+#: Image-independent (output shape) — retrying leaks one uncleanable pod per
+#: candidate.
+CARRIER_PARSE_FAILURE = "parse_failure"
+#: No namespace was available to create in; the request never reached a node.
+CARRIER_NO_NAMESPACE = "no_namespace"
+#: Transport-level failure (guard rejection, timeout, unexpected exception),
+#: an empty target, or an unrecognized stderr shape. The historic retryable
+#: bucket: an unclassified failure keeps the chain going, so this fix can only
+#: ever stop retries that are provably useless.
+CARRIER_RETRYABLE = "retryable"
+
+# kubectl renders every API-status rejection as
+# ``Error from server (<Reason>): <message>``. The reason token comes from
+# apimachinery's fixed StatusReason vocabulary, so matching it is stable across
+# kubectl versions and resource kinds — it is not a per-case string.
+_API_STATUS_RE = re.compile(r"error from server \(([A-Za-z]+)\)")
+
+_TARGET_MISSING_REASONS = frozenset({"notfound"})
+_REQUEST_REJECTED_REASONS = frozenset({
+    "forbidden", "unauthorized", "methodnotsupported",
+})
+
+# Bare ``<kind> "<name>" not found`` shape, for stderr that lost the
+# ``Error from server (...)`` prefix (wrapped transports, older clients).
+# Anchored on a QUOTED object name immediately followed by the phrase, so a
+# container-runtime image error cannot match — those read
+# ``failed to resolve reference "repo/img:tag": not found`` (colon in between).
+_OBJECT_NOT_FOUND_RE = re.compile(r'\b[a-z]+ "[^"]+" not found\b')
+
+# An explicit image complaint stays retryable even when it arrives wearing a
+# rejection-shaped prefix: swapping the candidate is precisely the cure.
+_IMAGE_COMPLAINT_MARKERS = (
+    "image", "manifest", "registry", "pull access", "imagepullbackoff",
+)
+
+
+def _classify_debug_create_failure(stderr: str, stdout: str = "") -> str:
+    """Map a failed ``kubectl debug`` create call onto a carrier reason.
+
+    Structural evidence is weighed before keyword evidence: an object name
+    that merely happens to contain ``image``/``registry`` (a pod called
+    ``image-cache-0``, a node in the ``registry`` pool) must not downgrade a
+    NotFound rejection into "keep rotating candidates".
+    """
+    text = f"{stderr or ''}\n{stdout or ''}"
+    low = text.lower()
+    if not low.strip():
+        return CARRIER_RETRYABLE
+
+    api_status = _API_STATUS_RE.search(low)
+    if api_status:
+        reason = api_status.group(1)
+        if reason in _TARGET_MISSING_REASONS:
+            return CARRIER_TARGET_MISSING
+        if reason in _REQUEST_REJECTED_REASONS:
+            return CARRIER_REQUEST_REJECTED
+    elif _OBJECT_NOT_FOUND_RE.search(low):
+        return CARRIER_TARGET_MISSING
+
+    if any(m in low for m in _IMAGE_COMPLAINT_MARKERS):
+        return CARRIER_RETRYABLE
+    if "forbidden" in low or "unauthorized" in low:
+        return CARRIER_REQUEST_REJECTED
+    return CARRIER_RETRYABLE
 
 
 def _resolve_debug_pod_images() -> list[str]:
@@ -223,11 +323,13 @@ def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str, bool]:
         # yet the meta tag still carries the target pod's name/namespace.
         # Treating it as a probe pod made both cleanup paths
         # (planning cleanup + verifier finalize) delete the FAULT TARGET.
-        # Mirrors the ephemeral skip in ``execution_artifacts``
-        # (artifact collection). Returning empty here is safe: the
-        # name-pattern fallback below cannot match (ephemeral debug emits no
-        # "Creating debugging pod" banner).
-        if metadata.get("ephemeral_container"):
+        # Classification comes from the shared semantic authority
+        # (debug_meta_scope) so this guard cannot drift from its siblings
+        # in execution_artifacts (artifact collection / vehicle screening).
+        # Returning empty here is safe: the name-pattern fallback below
+        # cannot match (ephemeral debug emits no "Creating debugging pod"
+        # banner).
+        if debug_meta_scope(metadata) == "pod":
             return ("", "", False)
         pod_name = str(metadata.get("name") or "")
         namespace = str(metadata.get("namespace") or "")
@@ -410,11 +512,43 @@ async def create_and_wait_debug_pod(
 
     Returns (pod_name, namespace) tuple or None if creation failed.
     Host filesystem is mounted at /host/ inside the pod.
+
+    Carrier-only view over ``create_and_wait_debug_pod_with_reason`` — the
+    failure reason is dropped. Callers that have a fallback path resting on
+    the SAME node name must use the reason-aware variant instead, or they
+    will re-ask a question the API server just answered.
     """
+    carrier, _reason = await create_and_wait_debug_pod_with_reason(
+        node_name, kubeconfig, task_id, namespace=namespace,
+    )
+    return carrier
+
+
+async def create_and_wait_debug_pod_with_reason(
+    node_name: str, kubeconfig: str, task_id: str,
+    namespace: str = "",
+) -> tuple[tuple[str, str] | None, str]:
+    """Same as ``create_and_wait_debug_pod``, plus WHY it failed.
+
+    Returns ``(carrier, reason)`` where ``carrier`` is ``(pod_name,
+    namespace)`` or ``None``, and ``reason`` is one of the ``CARRIER_*``
+    constants (``CARRIER_OK`` on success). The reason is the single authority
+    on whether the failure was image-dependent — the only dimension this
+    function retries over — so callers can decide whether THEIR fallback is
+    still worth an API round.
+    """
+    if not (node_name or "").strip():
+        # An empty target is definitionally missing. Bail before spending an
+        # API round on ``kubectl debug node/`` (which the server rejects with
+        # a shape that varies by version) and before letting a caller run a
+        # node-scoped fallback against "".
+        logger.warning("Cannot create a debug pod without a node name")
+        return (None, CARRIER_TARGET_MISSING)
+
     ns = namespace or await _find_available_namespace(kubeconfig, task_id)
     if not ns:
         logger.warning("No accessible namespace found for debug pod creation")
-        return None
+        return (None, CARRIER_NO_NAMESPACE)
 
     # Try image candidates in order (explicit config > discovered > busybox)
     # with fast-fail readiness detection: a candidate that cannot host the
@@ -455,10 +589,24 @@ async def create_and_wait_debug_pod(
             continue
 
         if debug_result.exit_code != 0:
-            logger.warning(
-                "Failed to create debug pod with image %s on node %s: %s",
-                image, node_name, debug_result.stderr[:200],
+            # Classify before deciding to rotate: the candidate chain is an
+            # IMAGE retry, so it may only absorb image-shaped failures. A
+            # rejection of the TARGET or of the CALLER repeats verbatim for
+            # every remaining candidate (case #67: ten identical
+            # ``nodes "<POD>" not found`` lines), and the reason is what lets
+            # the caller skip a fallback built on that same disproven name.
+            reason = _classify_debug_create_failure(
+                debug_result.stderr, debug_result.stdout,
             )
+            logger.warning(
+                "Failed to create debug pod with image %s on node %s "
+                "(reason=%s): %s",
+                image, node_name, reason, debug_result.stderr[:200],
+            )
+            if reason in (CARRIER_TARGET_MISSING, CARRIER_REQUEST_REJECTED):
+                # Image-INDEPENDENT: another candidate cannot change the
+                # outcome, and each attempt is a real API mutation request.
+                return (None, reason)
             continue
 
         pod_name = parse_debug_pod_name(debug_result.stdout)
@@ -471,7 +619,7 @@ async def create_and_wait_debug_pod(
                 "Failed to parse debug pod name from: %s",
                 debug_result.stdout[:200],
             )
-            break
+            return (None, CARRIER_PARSE_FAILURE)
 
         # A created but unready pod is not an execution carrier. Clean it up
         # so callers cannot accidentally exec into a dead artifact, then try
@@ -480,7 +628,7 @@ async def create_and_wait_debug_pod(
             pod_name, kubeconfig, task_id, namespace=ns,
         )
         if ready:
-            return (pod_name, ns)
+            return ((pod_name, ns), CARRIER_OK)
         await delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
         logger.warning(
             "Debug pod image %s not ready on node %s, trying next candidate",
@@ -490,7 +638,7 @@ async def create_and_wait_debug_pod(
         "No debug pod image candidate could host the sleep skeleton on node %s",
         node_name,
     )
-    return None
+    return (None, CARRIER_IMAGE_EXHAUSTED)
 
 
 async def delete_debug_pod(

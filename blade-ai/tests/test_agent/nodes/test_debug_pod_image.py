@@ -9,6 +9,9 @@ expose an ordered candidate chain (explicit > all discovered > busybox)
 and ``create_and_wait_debug_pod`` must abandon a doomed candidate in
 seconds (deterministic failure reasons / restartCount on the sleep-only
 skeleton) and try the next one.
+
+The chain retries over IMAGES, so it may only absorb image-shaped failures:
+see the W-67-1 section at the bottom for the classification pins.
 """
 
 from types import SimpleNamespace
@@ -17,8 +20,15 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from chaos_agent.agent.nodes.execute._debug_pod import (
+    CARRIER_IMAGE_EXHAUSTED,
+    CARRIER_PARSE_FAILURE,
+    CARRIER_REQUEST_REJECTED,
+    CARRIER_RETRYABLE,
+    CARRIER_TARGET_MISSING,
+    _classify_debug_create_failure,
     _resolve_debug_pod_images,
     create_and_wait_debug_pod,
+    create_and_wait_debug_pod_with_reason,
     wait_for_debug_pod_ready,
 )
 
@@ -361,3 +371,217 @@ def test_b49_debug_pod_creation_argv_passes_the_real_guard():
         "deliberately, update the creation shape in _debug_pod.py together "
         "with this pin: " + feedback.render_for_llm()[:200]
     )
+
+
+# ── W-67-1: the retry dimension must match the failure dimension ────────────
+#
+# ``create_and_wait_debug_pod`` retries over IMAGE candidates. Case #67 fed it
+# a pod name where a node name belonged, so the API answered
+# ``Error from server (NotFound): nodes "<POD>" not found`` and the loop
+# rotated every candidate — ten identical rejections, ten mutation requests,
+# and a caller that could not tell "no image worked" from "that node does not
+# exist". These pins lock the classification, not the case: the strings below
+# are kubectl's standard rendering of apimachinery StatusReasons, so the
+# behaviour they assert holds for any resource kind and any target name.
+
+
+@pytest.mark.parametrize("stderr,expected", [
+    # Canonical API-status renderings.
+    ('Error from server (NotFound): nodes "n1" not found',
+     CARRIER_TARGET_MISSING),
+    ('Error from server (NotFound): pods "victim-0" not found',
+     CARRIER_TARGET_MISSING),
+    ('Error from server (Forbidden): pods is forbidden: user "u" cannot '
+     'create resource "pods" in API group "" in the namespace "default"',
+     CARRIER_REQUEST_REJECTED),
+    ('Error from server (Unauthorized): Unauthorized',
+     CARRIER_REQUEST_REJECTED),
+    ('Error from server (MethodNotSupported): delete not supported',
+     CARRIER_REQUEST_REJECTED),
+    # Prefix stripped by a wrapping transport — same fact, bare shape.
+    ('nodes "n1" not found', CARRIER_TARGET_MISSING),
+    # Image-shaped complaints stay retryable: swapping the candidate IS the
+    # cure, whatever prefix they arrive under.
+    ('pull access denied for img-a, repository does not exist',
+     CARRIER_RETRYABLE),
+    ('failed to resolve reference "registry.io/lib/busybox:latest": '
+     'manifest unknown', CARRIER_RETRYABLE),
+    ('Error from server (Invalid): spec.containers[0].image: Invalid value',
+     CARRIER_RETRYABLE),
+    # Structural evidence outranks keywords: an object NAME that merely
+    # contains an image vocabulary word must not mask a missing target.
+    ('Error from server (NotFound): nodes "image-cache-0" not found',
+     CARRIER_TARGET_MISSING),
+    ('Error from server (NotFound): nodes "registry-pool-1" not found',
+     CARRIER_TARGET_MISSING),
+    # Transport / connectivity hiccups and unrecognized shapes stay in the
+    # historic retryable bucket — the fix may only ever STOP useless retries.
+    ('Unable to connect to the server: connection refused',
+     CARRIER_RETRYABLE),
+    ('etcdserver: request timed out', CARRIER_RETRYABLE),
+    ('nope', CARRIER_RETRYABLE),
+    ('', CARRIER_RETRYABLE),
+])
+def test_create_failure_classification(stderr, expected):
+    """The classifier decides whether another --image value could help."""
+    assert _classify_debug_create_failure(stderr) == expected
+
+
+async def _attempted_images(create_stderr, create_exit=1, discovered="img-a,img-b"):
+    """Run the chain against a fixed create-call rejection; return the images
+    it actually attempted."""
+    attempted = []
+
+    async def fake_xport(cmd, *_a, **_kw):
+        argv = " ".join(cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+        if "debug" in argv and "node/" in argv:
+            image = next(a for a in argv.split() if a.startswith("--image="))
+            attempted.append(image.split("=", 1)[1])
+            return _result(exit_code=create_exit, stderr=create_stderr)
+        return _result(exit_code=1, stderr="unexpected")
+
+    with patch(_XPORT, new=AsyncMock(side_effect=fake_xport)), \
+            patch(_SLEEP, new=AsyncMock()), \
+            _cfg(discovered=discovered):
+        carrier, reason = await create_and_wait_debug_pod_with_reason(
+            "n1", "/kc", "t", namespace="default",
+        )
+    return attempted, carrier, reason
+
+
+@pytest.mark.asyncio
+async def test_missing_node_stops_the_chain_after_one_attempt():
+    """The exact W-67-1 shape: one rejection, not one per candidate."""
+    attempted, carrier, reason = await _attempted_images(
+        'Error from server (NotFound): nodes "drill-sts-pvc-target-0" '
+        'not found',
+    )
+    assert carrier is None
+    assert reason == CARRIER_TARGET_MISSING
+    assert attempted == ["img-a"]
+
+
+@pytest.mark.asyncio
+async def test_forbidden_caller_stops_the_chain_after_one_attempt():
+    """RBAC is image-independent too — and unlike a missing target it leaves
+    the node real, which is why the reason is distinct."""
+    attempted, carrier, reason = await _attempted_images(
+        'Error from server (Forbidden): pods is forbidden',
+    )
+    assert carrier is None
+    assert reason == CARRIER_REQUEST_REJECTED
+    assert attempted == ["img-a"]
+
+
+@pytest.mark.asyncio
+async def test_image_shaped_rejection_still_rotates_every_candidate():
+    """Non-degradation pin: a rejection that names the image must keep the
+    chain alive — that is the only failure the chain can cure."""
+    attempted, carrier, reason = await _attempted_images(
+        'pull access denied for img-a, manifest unknown',
+    )
+    assert carrier is None
+    assert reason == CARRIER_IMAGE_EXHAUSTED
+    # img-a, img-b, then the busybox tail.
+    assert attempted == ["img-a", "img-b", "busybox"]
+
+
+@pytest.mark.asyncio
+async def test_unclassified_rejection_keeps_the_historic_rotation():
+    """Unknown stderr keeps rotating (the pre-fix behaviour), so this change
+    can never turn a survivable failure into a dead end."""
+    attempted, carrier, reason = await _attempted_images("nope")
+    assert carrier is None
+    assert reason == CARRIER_IMAGE_EXHAUSTED
+    assert attempted == ["img-a", "img-b", "busybox"]
+
+
+@pytest.mark.asyncio
+async def test_object_name_containing_an_image_word_is_still_a_missing_target():
+    """Keyword-only matching would misread ``nodes "image-cache-0" not found``
+    as an image problem and burn the whole chain. Structural evidence wins."""
+    attempted, _carrier, reason = await _attempted_images(
+        'Error from server (NotFound): nodes "image-cache-0" not found',
+    )
+    assert reason == CARRIER_TARGET_MISSING
+    assert attempted == ["img-a"]
+
+
+@pytest.mark.asyncio
+async def test_empty_node_name_never_reaches_the_api_server():
+    """An empty target is definitionally missing — do not spend a mutation
+    request discovering that, and do not let a caller fall back on ""."""
+    calls = []
+
+    async def fake_xport(cmd, *_a, **_kw):
+        calls.append(cmd)
+        return _result()
+
+    with patch(_XPORT, new=AsyncMock(side_effect=fake_xport)), \
+            patch(_SLEEP, new=AsyncMock()), \
+            _cfg(discovered="img-a,img-b"):
+        carrier, reason = await create_and_wait_debug_pod_with_reason(
+            "", "/kc", "t", namespace="default",
+        )
+    assert carrier is None
+    assert reason == CARRIER_TARGET_MISSING
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_carrier_only_wrapper_contract_is_unchanged():
+    """The public wrapper still returns a bare carrier tuple, so every
+    consumer that does not need the reason keeps its old shape."""
+    rejected = _result(
+        exit_code=1,
+        stderr='Error from server (NotFound): nodes "n1" not found',
+    )
+    with patch(_XPORT, new=AsyncMock(return_value=rejected)), \
+            patch(_SLEEP, new=AsyncMock()), \
+            _cfg(discovered="img-a"):
+        carrier = await create_and_wait_debug_pod(
+            "n1", "/kc", "t", namespace="default")
+    assert carrier is None
+
+
+# ── W-67-1(b): a fallback may not re-ask what the API just answered ────────
+
+
+@pytest.mark.parametrize("reason,fallback_expected", [
+    (CARRIER_TARGET_MISSING, False),
+    (CARRIER_REQUEST_REJECTED, True),
+    (CARRIER_IMAGE_EXHAUSTED, True),
+    (CARRIER_PARSE_FAILURE, True),
+    (CARRIER_RETRYABLE, True),
+])
+@pytest.mark.asyncio
+async def test_tool_pod_fallback_runs_unless_the_node_itself_is_missing(
+    reason, fallback_expected,
+):
+    """The tool-pod fallback filters candidates by ``spec.nodeName ==
+    node_name``. When the node does not exist that filter can never match, so
+    the fallback is provably futile — and worse, its ABSENT answer would dress
+    up one unresolved name as two independent confirmations. Every other
+    reason leaves the node real, so the fallback stays available."""
+    from chaos_agent.agent.nodes.baseline import _executors
+
+    commands = [{
+        "description": "host iostat",
+        "command": "kubectl exec {debug_pod} -- iostat -xd 1",
+        "mode": "debug_two_step",
+        "_node_name": "ghost-node",
+        # Skip the per-command loop: this pin is about the carrier decision.
+        "_unresolved": True,
+        "_extractors": [],
+    }]
+
+    create = AsyncMock(return_value=(None, reason))
+    discover = AsyncMock(return_value=None)
+    with patch.object(_executors, "_create_and_wait_debug_pod_with_reason",
+                      new=create), \
+            patch.object(_executors, "discover_tool_pod_on_node",
+                         new=discover):
+        await _executors._execute_observations(commands, "/kc", "t-fb")
+
+    create.assert_awaited_once_with("ghost-node", "/kc", "t-fb")
+    assert discover.await_count == (1 if fallback_expected else 0)

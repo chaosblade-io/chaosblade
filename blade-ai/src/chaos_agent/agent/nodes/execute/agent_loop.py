@@ -24,6 +24,7 @@ from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store
 from chaos_agent.agent.nodes.execute.llm_step_helpers import (
     filter_stagnant_tool,
+    fold_hint_state,
     persist_corrective_hint,
     persist_replaceable_hint,
     post_invoke_debug,
@@ -311,6 +312,27 @@ def _derive_spec_fields_from_kubectl_get(
     return updates
 
 
+def _probe_raw_namespace(v_args: str) -> str:
+    """The namespace a probe command explicitly carries, RAW (pre-blacklist).
+
+    ``_derive_spec_fields_from_kubectl_get`` filters a blacklisted namespace
+    out of its ``updates`` dict, so the caller cannot read the probe's true
+    ``-n`` value from there. The namespace-consistency gate below needs the
+    RAW value: a mechanism-target probe (``kubectl get pod kube-proxy-xxx -n
+    kube-system``) must be recognised as foreign-ns even if ``kube-system``
+    happens to be blacklisted — otherwise its name would slip into the victim
+    ``names`` slot (inject-b6b02ebd). Returns ``""`` when the command carries
+    no explicit namespace flag.
+    """
+    parts = _split_args(v_args)
+    for i, p in enumerate(parts):
+        if p in ("-n", "--namespace") and i + 1 < len(parts):
+            return parts[i + 1]
+        if p.startswith("--namespace="):
+            return p.split("=", 1)[1]
+    return ""
+
+
 def _drop_vehicle_names(updates: dict, state: dict, v_args: str) -> None:
     """Strip vehicle names from lazy-derived spec updates in place.
 
@@ -494,6 +516,10 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         hook_updates = {}
         if hook:
             hook_updates = await hook(state)
+        # Sub-span boundary: everything from node start to here is hook work
+        # (compaction can call the model, so it is not free and must not be
+        # folded silently into the LLM number).
+        tracker.mark("hook")
 
         # 2b. Emit ToolMessage results from previous iteration (debug only)
         emit_debug_tool_messages(tracker, state)
@@ -503,6 +529,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         # Counts live on state; compaction may summarise the hint
         # messages away but must not reset the number.
         _hint_counts = dict(state.get("hint_repeat_counts") or {})
+        _hinted_calls = dict(state.get("hinted_error_calls") or {})
         if llm is not None:
             messages = list(state.get("messages", []))
 
@@ -730,11 +757,20 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 ))
 
             # --- Tool error introspection (runtime feedback > static docs) ---
-            error_hint = detect_tool_error_hint(messages)
-            if error_hint:
+            # The key is the FAILING TOOL, produced by the detector — the only
+            # layer that knows which tool errored. Keying by phase merged
+            # unrelated tools into one counter and one message slot, which made
+            # the accumulated "the previous N did not change the outcome" text a
+            # false claim (see detect_tool_error_hint).
+            _err = detect_tool_error_hint(messages, hinted_calls=_hinted_calls)
+            if _err:
+                error_hint, error_tool, error_call = _err
+                _err_key = error_tool or "planning"
+                if error_call:
+                    _hinted_calls[error_call] = f"tool_error:{_err_key}"
                 messages.append(persist_corrective_hint(
                     _injections_for_state, state.get("messages", []),
-                    "tool_error", "planning", error_hint,
+                    "tool_error", _err_key, error_hint,
                     counts=_hint_counts, counts_out=_hint_counts,
                 ))
 
@@ -822,10 +858,16 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
 
             # Record system prompt to session store (dedup handles repeated prompts)
             record_system_prompt(hook, state, system_prompt, node_name=AGENT_LOOP)
+            # Sub-span boundary: prompt assembly (env info, skill/knowledge
+            # loading, hint injection, system-prompt build) is its own cost
+            # centre and the prime suspect for any non-generation latency.
+            tracker.mark("prompt-build")
 
             response = await llm_with_tools.ainvoke(
                 [SystemMessage(content=system_prompt)] + messages
             )
+            # Sub-span boundary: this interval alone is model time.
+            tracker.mark("llm-call")
         else:
             response = None
 
@@ -858,8 +900,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             sync_kubewiz_runtime(state)
 
             result["messages"] = _injections_for_state + [response]
-            if _hint_counts != (state.get("hint_repeat_counts") or {}):
-                result["hint_repeat_counts"] = _hint_counts
+            fold_hint_state(result, state, _hint_counts, _hinted_calls)
 
             # Output-limit truncation: this response's tool calls may carry
             # silently incomplete arguments. Parseable calls get a synthetic
@@ -1023,6 +1064,71 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                                         _spec_now.scope,
                                     )
                                     continue
+                                if k == "names":
+                                    _probe_ns = _probe_raw_namespace(
+                                        tc_args.get("v_args", ""),
+                                    )
+                                    # Blacklist backstop (inject-b6b02ebd F2): a
+                                    # resource in a system/infra namespace is
+                                    # NEVER a drill victim (safety_check rejects
+                                    # any blacklisted-ns target outright), so its
+                                    # name must not lock even while the victim ns
+                                    # is still UNANCHORED. Without this, a
+                                    # mechanism case whose mechanism-target probe
+                                    # lands BEFORE any ns-anchoring probe — and
+                                    # whose user text names no unique ns, so the
+                                    # t2 anchor leaves namespace="" and the
+                                    # ns-consistency gate below is inactive —
+                                    # freezes the mechanism name (kube-proxy)
+                                    # into ``names``; the victim ns is anchored
+                                    # later by write-once, producing the franken
+                                    # target that safety_check then fail-fast
+                                    # rejects — a false rejection of a plannable
+                                    # drill (verified by _probe_f2_unanchored.py).
+                                    # The raw ``-n`` is used so a blacklisted ns
+                                    # is caught even though the derive filter
+                                    # dropped it from ``derived``.
+                                    if (
+                                        _probe_ns
+                                        and _probe_ns in settings.blacklist_namespaces
+                                    ):
+                                        logger.info(
+                                            "spec-write blocked: writer=agent_loop "
+                                            "lazy derivation names %s rejected — "
+                                            "probe ns=%s is a blacklisted "
+                                            "system/infra namespace (never a "
+                                            "victim)",
+                                            list(v), _probe_ns,
+                                        )
+                                        continue
+                                    # Name-namespace consistency (extends B31
+                                    # from kind to kind+namespace, root fix for
+                                    # inject-b6b02ebd): the per-field write-once
+                                    # derivation locks ``namespace`` and
+                                    # ``names`` INDEPENDENTLY, so a mechanism
+                                    # case that probes two same-kind pods can
+                                    # freeze a franken target — the victim
+                                    # namespace from one probe, a MECHANISM
+                                    # target's name (e.g. kube-proxy in
+                                    # kube-system) from another. The kind guard
+                                    # above cannot catch it (both are pods).
+                                    # A probe naming a resource in a DIFFERENT
+                                    # namespace than the locked victim ns is
+                                    # probing a foreign-ns resource and must not
+                                    # donate the victim name.
+                                    if (
+                                        _spec_now.namespace
+                                        and _probe_ns
+                                        and _probe_ns != _spec_now.namespace
+                                    ):
+                                        logger.info(
+                                            "spec-write blocked: writer=agent_loop "
+                                            "lazy derivation names %s rejected — "
+                                            "namespace mismatch (probe ns=%s, "
+                                            "locked victim ns=%s)",
+                                            list(v), _probe_ns, _spec_now.namespace,
+                                        )
+                                        continue
                                 updates[k] = v
                         if "names" in updates:
                             _drop_vehicle_names(updates, state, tc_args.get("v_args", ""))

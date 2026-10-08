@@ -942,3 +942,204 @@ class TestPlanningLedgerTailMigration:
         seen = bound_llm.ainvoke.call_args[0][0]
         assert not self._ledger_tails(seen)
         assert not self._ledger_tails(result.get("messages", []))
+
+
+# ══ inject-b6b02ebd — namespace-consistency gate (维度2: name 的 ns 一致性门) ══
+#
+# The per-field write-once derivation locks ``namespace`` and ``names``
+# INDEPENDENTLY, so a MECHANISM case that probes two same-kind pods can freeze
+# a franken target — the victim ns from one probe, a mechanism target's NAME
+# (kube-proxy in kube-system) from another. The B31 kind guard cannot catch it
+# (both are pods). agent_loop now extends B31 to kind+NAMESPACE: a probe naming
+# a resource in a DIFFERENT ns than the locked victim ns must not donate the
+# victim name. ``_probe_raw_namespace`` reads the probe's true ``-n`` value
+# even when the derive function filtered a blacklisted ns out of its updates.
+
+from chaos_agent.agent.nodes.execute.agent_loop import (  # noqa: E402
+    _derive_spec_fields_from_kubectl_get,
+    _probe_raw_namespace,
+)
+
+# The two probes of the failing mechanism case: the mechanism target
+# (kube-proxy in kube-system) and the real victim (a drill-lb pod).
+_MECH_PROBE = "pod kube-proxy-worker-r5mg9 -n kube-system -o wide"
+_VICTIM_PROBE = "pod drill-lb-target-6c9d -n drill-lb -o wide"
+_NO_NS_PROBE = "pod drill-lb-target-6c9d -o wide"   # same kind, no explicit -n
+_VICTIM_NS = "drill-lb"      # the authoritatively anchored victim namespace
+_MECH_NAME = "kube-proxy-worker-r5mg9"
+_VICTIM_NAME = "drill-lb-target-6c9d"
+
+
+# These gate tests drive the REAL ``make_agent_loop`` node. The previous
+# versions asserted against a locally re-implemented predicate
+# (``_gate_allows_name``) that mirrored the gate's condition — so they stayed
+# GREEN even when the production gate was disabled (mutation-verified: forcing
+# agent_loop's ``if _probe_ns and _probe_ns != _spec_now.namespace`` to False
+# left all of them passing, while the real node then wrote the mechanism
+# name). A gate test that never reaches the gate cannot catch its regression.
+def _anchored_pod_spec(*, names=(), duration=0):
+    """pod-scope spec with the victim ns anchored. duration=0 keeps
+    ``is_complete`` False so the lazy-derivation block — and therefore the
+    ns-consistency gate — actually runs on the probe turn."""
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
+    return FaultSpec(
+        source="cli_nl", scope="pod", namespace=_VICTIM_NS, names=tuple(names),
+        fault_target="process", fault_action="kill", duration_seconds=duration,
+    ).to_dict()
+
+
+# The realistic UNANCHORED CLI NL entry (inject-b6b02ebd F2): from_cli_nl on an
+# intent that names no unique namespace, so the t2 anchor leaves namespace=""
+# (and no node anchor, so scope=""/names=()). This is the F2 precondition — the
+# ns-consistency gate is written ``if ... and _spec_now.namespace`` so it is
+# INACTIVE while namespace is empty; only the blacklist backstop can refuse a
+# mechanism name here.
+_NO_NS_INTENT = "kill the kube-proxy process to simulate a cluster DNS outage"
+
+
+def _unanchored_cli_nl_spec():
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
+    return FaultSpec.from_cli_nl(input_text=_NO_NS_INTENT).to_dict()
+
+
+def _probe_node(probe_v_args):
+    """A REAL agent_loop node whose mock LLM emits ONE ``kubectl get`` probe."""
+    response = AIMessage(
+        content="probing the target",
+        tool_calls=[{
+            "name": "kubectl_read",
+            "args": {"subcommand": "get", "v_args": probe_v_args},
+            "id": "tc-probe-1",
+        }],
+    )
+    bound = MagicMock()
+    bound.ainvoke = AsyncMock(return_value=response)
+    llm = MagicMock()
+    llm.bind_tools = MagicMock(return_value=bound)
+    tool = MagicMock()
+    tool.name = "kubectl_read"
+    return make_agent_loop(llm=llm, tools=[tool], skill_catalog="test")
+
+
+async def _derive_names(probe_v_args, spec_dict, monkeypatch):
+    """Run ONE real agent_loop turn on a single probe; return the surviving
+    ``names`` and the (possibly updated) spec dict, so a caller can thread a
+    second probe through the write-once accumulation."""
+    from unittest.mock import patch
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
+    monkeypatch.setattr(settings, "safety_blacklist_namespaces", "kube-system")
+    node = _probe_node(probe_v_args)
+    state = {
+        "task_id": "gate-test", "operation": "inject", "agent_loop_count": 0,
+        "skill_name": "k8s-chaos-skills", "messages": [],
+        "fault_spec": spec_dict,
+        "replan_context": None, "replan_history": None, "replan_count": 0,
+        "verify_replan_count": 0, "target": {"namespace": _VICTIM_NS},
+    }
+    with patch(
+        "chaos_agent.agent.nodes.execute.agent_loop.compute_env_info",
+        AsyncMock(return_value=""),
+    ), patch(
+        "chaos_agent.agent.nodes.execute.agent_loop.sync_to_store",
+        AsyncMock(),
+    ):
+        result = await node(state)
+    raw = result.get("fault_spec", state["fault_spec"])
+    return tuple(FaultSpec.from_dict(raw).names), raw
+
+
+def test_probe_raw_namespace_reads_all_flag_forms():
+    assert _probe_raw_namespace("pod x -n kube-system") == "kube-system"
+    assert _probe_raw_namespace("pod x --namespace kube-system") == "kube-system"
+    assert _probe_raw_namespace("pod x --namespace=kube-system") == "kube-system"
+    assert _probe_raw_namespace("nodes my-node") == ""  # no explicit ns
+
+
+def test_probe_raw_namespace_ignores_blacklist_derive_filters():
+    # WHY the helper exists: the derive function filters a blacklisted ns out
+    # of its updates, so the caller cannot read the probe's true ``-n`` there.
+    # The RAW helper still returns it, so a blacklisted mechanism ns (the
+    # common kube-system case) is STILL caught by the gate.
+    derived = _derive_spec_fields_from_kubectl_get(
+        _MECH_PROBE, blacklist=["kube-system"],
+    )
+    assert "namespace" not in derived  # filtered by the blacklist
+    assert derived.get("names") == ("kube-proxy-worker-r5mg9",)  # name survives
+    assert _probe_raw_namespace(_MECH_PROBE) == "kube-system"  # RAW, unfiltered
+
+
+@pytest.mark.asyncio
+async def test_real_gate_blocks_foreign_ns_mechanism_name(monkeypatch):
+    # The mechanism target's name is foreign-ns (kube-proxy in kube-system):
+    # the REAL agent_loop gate must refuse to let it donate the victim name,
+    # so the locked spec's names stays empty (the franken target cannot form).
+    names, _ = await _derive_names(_MECH_PROBE, _anchored_pod_spec(), monkeypatch)
+    assert names == ()
+    assert _MECH_NAME not in names
+
+
+@pytest.mark.asyncio
+async def test_real_gate_allows_own_ns_victim_name(monkeypatch):
+    # Control: the victim's own-ns name passes the gate and is written.
+    names, _ = await _derive_names(_VICTIM_PROBE, _anchored_pod_spec(), monkeypatch)
+    assert names == (_VICTIM_NAME,)
+
+
+@pytest.mark.asyncio
+async def test_real_gate_is_probe_order_independent(monkeypatch):
+    # The whole point of the fix: victim identity no longer depends on WHICH
+    # probe ran first. Thread two sequential real-node turns through the
+    # write-once accumulation — in BOTH orders the mechanism name is never
+    # donated and the victim name always wins. (Pre-fix, whichever name was
+    # probed first won the slot.)
+    for order in (
+        (_MECH_PROBE, _VICTIM_PROBE),
+        (_VICTIM_PROBE, _MECH_PROBE),
+    ):
+        spec = _anchored_pod_spec()
+        names: tuple = ()
+        for probe in order:
+            names, spec = await _derive_names(probe, spec, monkeypatch)
+        assert names == (_VICTIM_NAME,), (
+            f"order {order} must converge on the victim name, got {names}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_gate_allows_name_when_probe_carries_no_namespace(monkeypatch):
+    # A same-kind probe with no explicit ``-n`` carries no foreign-ns evidence,
+    # so the ns gate must NOT block it — only an explicit mismatch blocks.
+    names, _ = await _derive_names(_NO_NS_PROBE, _anchored_pod_spec(), monkeypatch)
+    assert names == (_VICTIM_NAME,)
+
+
+@pytest.mark.asyncio
+async def test_real_gate_blocks_blacklisted_ns_name_when_unanchored(monkeypatch):
+    # F2 (inject-b6b02ebd): while the victim ns is UNANCHORED (namespace=""),
+    # the ns-consistency gate is inactive, so pre-fix a mechanism-target probe
+    # in a BLACKLISTED ns (kube-proxy in kube-system) froze its name into the
+    # victim slot. The blacklist backstop must refuse it regardless of anchor
+    # state — a blacklisted-ns resource is never a victim (safety_check rejects
+    # any blacklisted-ns target outright).
+    names, _ = await _derive_names(
+        _MECH_PROBE, _unanchored_cli_nl_spec(), monkeypatch,
+    )
+    assert names == ()
+    assert _MECH_NAME not in names
+
+
+@pytest.mark.asyncio
+async def test_unanchored_mech_first_converges_on_victim_name(monkeypatch):
+    # F2 end-to-end regression: from the realistic unanchored entry, a
+    # MECHANISM-FIRST probe sequence must still converge on the victim name.
+    # Pre-fix it froze the franken target (victim ns + mechanism name), which
+    # safety_check then fail-fast rejected — a false rejection of a plannable
+    # drill (verified end-to-end by _probe_f2_unanchored.py).
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
+    spec = _unanchored_cli_nl_spec()
+    names: tuple = ()
+    for probe in (_MECH_PROBE, _VICTIM_PROBE):
+        names, spec = await _derive_names(probe, spec, monkeypatch)
+    assert names == (_VICTIM_NAME,)
+    assert _MECH_NAME not in names
+    assert FaultSpec.from_dict(spec).namespace == _VICTIM_NS
