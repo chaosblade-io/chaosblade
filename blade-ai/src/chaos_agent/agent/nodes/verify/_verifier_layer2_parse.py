@@ -32,6 +32,7 @@ from chaos_agent.agent.result.verdict import (
     VerificationResult,
     WarningCode,
 )
+from chaos_agent.utils.skill_case_section import find_section, has_section
 
 logger = logging.getLogger(__name__)
 
@@ -488,32 +489,27 @@ def _count_verification_steps_in_skill_case(content: str) -> int:
     Counts top-level numbered items in the 注入验证 section, falling back
     to bullet sub-items if no numbered steps are found.
     """
-    if "注入验证" not in content:
+    section = find_section(content, "注入验证")
+    if section is None:
         return 0
 
-    start = content.index("注入验证")
-    remainder = content[start:]
-    # Find next section header (**) or end of content
-    next_section = re.search(r'\n\*\*[^*]+\*\*', remainder[3:])
-    section_content = remainder[:3 + next_section.start()] if next_section else remainder
-
     # Count top-level numbered steps (1., 2., 3., etc.)
-    step_matches = re.findall(r'^\s*(\d+)\.\s', section_content, re.MULTILINE)
+    step_matches = re.findall(r'^\s*(\d+)\.\s', section, re.MULTILINE)
     if step_matches:
         return len(set(step_matches))
 
     # Fallback: count bullet sub-items
-    return len(re.findall(r'^\s*[-*]\s', section_content, re.MULTILINE))
+    return len(re.findall(r'^\s*[-*]\s', section, re.MULTILINE))
 
 
 def _has_injection_verification_section(content: str) -> bool:
-    """Check if skill case content contains an 注入验证 section.
+    """Check if skill case content contains an 注入验证 section heading.
 
-    Unlike _count_verification_steps, this is purely structural —
-    returns True even if the section has only prose paragraphs
-    without numbered or bullet steps.
+    Purely structural — returns True even if the section has only prose
+    paragraphs without numbered or bullet steps. A mere in-text mention of
+    the word (「见注入验证」) does NOT count as the section existing.
     """
-    return "注入验证" in content
+    return has_section(content, "注入验证")
 
 
 _CANDIDATE_SPLIT_RE = re.compile(r'^---\s*Candidate\s+\d+\s*:.*?---\s*$', re.MULTILINE)
@@ -544,14 +540,15 @@ def _extract_verification_step_descriptions(content: str) -> list[str]:
     Returns a list of description strings in order, e.g.:
     ["查看 Pod CPU 使用率监控，确认持续高于阈值", "进入容器查看 CPU 占用进程", ...]
     Returns empty list if no 注入验证 section or steps can't be parsed.
-    """
-    if "注入验证" not in content:
-        return []
 
-    start = content.index("注入验证")
-    remainder = content[start:]
-    next_section = re.search(r'\n\*\*[^*]+\*\*', remainder[3:])
-    section = remainder[:3 + next_section.start()] if next_section else remainder
+    Section located via ``skill_case_section`` (heading-anchored). A bare
+    substring anchor would be hijacked by the first in-text mention of
+    「注入验证」 (e.g. 「2. 注入验证探针的查询目标…」), which happened on
+    12 of 105 skill files before the fix.
+    """
+    section = find_section(content, "注入验证")
+    if section is None:
+        return []
 
     # Extract numbered step descriptions: "N. description text..."
     numbered = re.findall(r'^\s*\d+\.\s+(.+)', section, re.MULTILINE)

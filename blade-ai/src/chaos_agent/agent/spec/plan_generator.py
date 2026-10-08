@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage
 from chaos_agent.agent.spec.fault_registry import command_preview_for
 from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.state import AgentState
+from chaos_agent.utils.skill_case_section import find_section
 
 
 def generate_injection_plan(state: AgentState) -> str:
@@ -231,15 +232,22 @@ def _extract_section(skill_case: str, section_name: str) -> list[str]:
     """Extract the item list of a named section from ``skill_case_content``.
 
     ``section_name`` is a heading in the (Chinese) skill-case markdown, so it
-    is passed through verbatim as a literal to match against.
+    is passed through verbatim as a literal to match against. Section located
+    via ``skill_case_section`` (heading-anchored) — the previous
+    ``**name**：\n`` pattern required the colon to be followed immediately by
+    a newline, so the qualified form ``**name**（限定语）：`` yielded no items
+    on 57 sections (演练步骤 20 / 注入恢复 19 / 注入验证 12 / 恢复验证 6).
+
+    Both numbered items and ``-`` bullets are collected — the section bodies
+    interleave the steps with their parameter notes, and the plan preview
+    renders them as one flat list.
     """
     if not skill_case:
         return []
-    pattern = rf"\*\*{re.escape(section_name)}\*\*[：:]\s*\n(.*?)(?=\n\*\*|\n---|\Z)"
-    match = re.search(pattern, skill_case, re.DOTALL)
-    if not match:
+    section = find_section(skill_case, section_name)
+    if section is None:
         return []
-    block = match.group(1).strip()
+    block = section.strip()
     items = []
     for line in block.splitlines():
         line = line.strip()

@@ -14,6 +14,8 @@ This module must not import a concrete provider module (AST-audited by
 import logging
 import re
 
+from chaos_agent.utils.skill_case_section import find_section
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,18 +78,13 @@ def _was_kubectl_injection_attempted(messages: list) -> bool:
 def _extract_drill_steps(skill_case: str) -> list[str]:
     """Extract 演练步骤 from skill case content.
 
-    Returns the text of each numbered step.
+    Returns the text of each numbered step. Section located via
+    ``skill_case_section`` (heading-anchored) — a bare substring anchor is
+    hijacked by in-text mentions such as 「演练步骤 4/7 的参数依据」.
     """
-    if "演练步骤" not in skill_case:
+    section = find_section(skill_case, "演练步骤")
+    if section is None:
         return []
-    start = skill_case.index("演练步骤")
-    remainder = skill_case[start:]
-    header_end = remainder.find('\n')
-    if header_end < 0:
-        return []
-    body = remainder[header_end:]
-    next_section = re.search(r'\n\*\*[^*]+\*\*', body)
-    section = body[:next_section.start()] if next_section else body
     steps = re.findall(r'^\s*\d+\.\s+(.+)', section, re.MULTILINE)
     return [s.split('\n')[0].strip() for s in steps if s.strip()]
 

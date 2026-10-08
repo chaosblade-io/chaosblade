@@ -16,6 +16,7 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
     parse_checklist_items,
 )
 from chaos_agent.agent.result.verdict import ChecklistItemStatus
+from chaos_agent.utils.skill_case_section import find_section
 
 logger = logging.getLogger(__name__)
 
@@ -138,20 +139,20 @@ def _count_recovery_steps_in_skill_case(content: str) -> int:
 
     Counts top-level numbered items in the 恢复验证 section, falling back
     to bullet sub-items if no numbered steps are found.
+
+    Section located via ``skill_case_section`` (heading-anchored) — a bare
+    substring anchor is hijacked by in-text mentions such as
+    「判据见恢复验证第 1 条」 (16 of 105 skill files before the fix).
     """
-    if "恢复验证" not in content:
+    section = find_section(content, "恢复验证")
+    if section is None:
         return 0
 
-    start = content.index("恢复验证")
-    remainder = content[start:]
-    next_section = re.search(r'\n\*\*[^*]+\*\*', remainder[3:])
-    section_content = remainder[:3 + next_section.start()] if next_section else remainder
-
-    step_matches = re.findall(r'^\s*(\d+)\.\s', section_content, re.MULTILINE)
+    step_matches = re.findall(r'^\s*(\d+)\.\s', section, re.MULTILINE)
     if step_matches:
         return len(set(step_matches))
 
-    return len(re.findall(r'^\s*[-*]\s', section_content, re.MULTILINE))
+    return len(re.findall(r'^\s*[-*]\s', section, re.MULTILINE))
 
 
 def _extract_recovery_verification_section(content: str) -> str:
@@ -162,47 +163,36 @@ def _extract_recovery_verification_section(content: str) -> str:
     cross-referenced 注入验证 steps. This reduces HumanMessage size by
     70-75% while preserving all actionable recovery verification content.
 
-    Section delimiter is always: `**恢复验证**：` (verified across all 19 files).
-    End boundary: next `**...**：` heading or end of file.
+    Section heading is ``## 恢复验证`` / ``## 恢复验证（限定语）`` — with the
+    legacy bold form ``**恢复验证**：`` still matched as fallback (all
+    resolved by ``skill_case_section``, which superseded the old literal
+    ``**恢复验证**：`` match that missed the qualified form on 6 skill
+    files). End boundary: next wordlist section heading, ``---`` rule, or
+    end of file.
     Cross-references detected: "同注入验证", "再次执行", "注入验证中的", "Pod 级验证方法中的".
     """
-    if "恢复验证" not in content:
+    section = find_section(content, "恢复验证")
+    if section is None:
         return ""
-
-    # Find start: **恢复验证**：
-    start_match = re.search(r'\*\*恢复验证\*\*[：:]', content)
-    if not start_match:
-        return ""
-    start_pos = start_match.end()
-
-    # Find end: next **...**： heading
-    end_match = re.search(r'\n\*\*[^*]+\*\*[：:]', content[start_pos:])
-    if end_match:
-        section = content[start_pos:start_pos + end_match.start()].strip()
-    else:
-        section = content[start_pos:].strip()
+    section = section.strip()
 
     # Detect cross-references and extract referenced 注入验证 steps
     cross_ref_keywords = ["同注入验证", "再次执行", "注入验证中的", "Pod 级验证方法中的"]
     referenced_steps = ""
     for kw in cross_ref_keywords:
-        if kw in section:
-            # Extract 注入验证 section
-            inject_match = re.search(r'\*\*注入验证\*\*[：:]', content)
-            if inject_match:
-                inject_start = inject_match.end()
-                inject_end = re.search(r'\n\*\*[^*]+\*\*[：:]', content[inject_start:])
-                if inject_end:
-                    inject_section = content[inject_start:inject_start + inject_end.start()].strip()
-                else:
-                    inject_section = content[inject_start:].strip()
-                referenced_steps = (
-                    "\n\n**Injection-verification reference** "
-                    f"(the 恢复验证 section cross-references this block):\n{inject_section}"
-                )
-                break  # Only add once, even if multiple keywords match
+        if kw not in section:
+            continue
+        # Extract 注入验证 section
+        inject_section = find_section(content, "注入验证")
+        if inject_section is None:
+            continue
+        referenced_steps = (
+            "\n\n**Injection-verification reference** "
+            f"(the 恢复验证 section cross-references this block):\n{inject_section.strip()}"
+        )
+        break  # Only add once, even if multiple keywords match
 
-    return f"**恢复验证**：\n{section}{referenced_steps}"
+    return f"## 恢复验证\n{section}{referenced_steps}"
 
 
 def _detect_recovery_checklist_inconsistency(
