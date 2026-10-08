@@ -1,13 +1,21 @@
 """Tests for CLI inject command — Fix E: node-scope namespace validation."""
 
+import logging
 from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
 
 from chaos_agent.cli.main import app
+from chaos_agent.config.settings import blade_ai_context
 
 runner = CliRunner()
+
+# run_command is patched so the CLI stops before real preflight network
+# probes (which would hang against a nonexistent cluster). The duration
+# resolution under test happens before that call, and the value it echoes
+# is the same variable later placed in request_data["duration"].
+_SKIPPED = {"code": 1, "message": "injection skipped in test", "data": {}}
 
 
 class TestInjectNodeScopeNamespace:
@@ -76,3 +84,79 @@ class TestInjectNodeScopeNamespace:
             pytest.fail(
                 f"Node-scope should not require --namespace, but got: {output}"
             )
+
+
+class TestInjectDurationResolution:
+    """Structured mode resolves an unset --duration from operator config.
+
+    Pins the removal of the hardcoded ``duration = 300`` pre-fill. A literal
+    default made ``experiment_timeout`` dead in this channel: a positive
+    value reads as an explicit pin, so ensure_min_duration took its verbatim
+    branch and the configured default never applied. The CLI now passes
+    "unspecified" through to the single policy point.
+    """
+
+    _NODE_ARGS = [
+        "inject",
+        "--scope", "node",
+        "--target", "cpu",
+        "--action", "fullload",
+        "-n", "node-1",
+        "-p", "cpu-percent=90",
+        "--kubeconfig", "/nonexistent/kubeconfig",
+    ]
+
+    def test_unset_duration_uses_configured_default(self):
+        with blade_ai_context(experiment_timeout=900):
+            with patch(
+                "chaos_agent.cli.commands.inject.run_command",
+                return_value=_SKIPPED,
+            ):
+                result = runner.invoke(app, self._NODE_ARGS)
+        # The echoed value is the same variable written to
+        # request_data["duration"], so this asserts the payload too.
+        assert "Using the configured default 900s" in result.output
+
+    def test_unset_duration_below_floor_is_not_raised(self):
+        """A configured default below the empirical floor stays verbatim."""
+        with blade_ai_context(experiment_timeout=60):
+            with patch(
+                "chaos_agent.cli.commands.inject.run_command",
+                return_value=_SKIPPED,
+            ):
+                result = runner.invoke(app, self._NODE_ARGS)
+        assert "Using the configured default 60s" in result.output
+        assert "Using the configured default 300s" not in result.output
+
+    def test_combined_input_mode_leaves_duration_unset(self):
+        """``-i`` PLUS structured flags is still an NL run.
+
+        The resolution below the guard is documented as structured-mode only:
+        writing the resolved default back in a combined call would make it an
+        explicit pin that overrules the duration stated in the description.
+        """
+        with blade_ai_context(experiment_timeout=900):
+            with patch(
+                "chaos_agent.cli.commands.inject.run_command",
+                return_value=_SKIPPED,
+            ):
+                result = runner.invoke(
+                    app, [*self._NODE_ARGS, "-i", "注入 CPU 满载，持续 60 秒"]
+                )
+        assert "Using the configured default" not in result.output
+
+    def test_explicit_duration_below_floor_honoured_verbatim(self, caplog):
+        """-d wins over both the configured default and the floor."""
+        with caplog.at_level(
+            logging.WARNING, logger="chaos_agent.utils.fault_type"
+        ):
+            with blade_ai_context(experiment_timeout=900):
+                with patch(
+                    "chaos_agent.cli.commands.inject.run_command",
+                    return_value=_SKIPPED,
+                ):
+                    result = runner.invoke(app, [*self._NODE_ARGS, "-d", "60"])
+        # No configured-default substitution happened ...
+        assert "Using the configured default" not in result.output
+        # ... and the explicit 60 reached the policy point untouched.
+        assert "applying the requested 60s verbatim" in caplog.text

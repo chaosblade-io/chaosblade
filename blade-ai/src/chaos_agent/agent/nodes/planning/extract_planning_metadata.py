@@ -23,6 +23,7 @@ from chaos_agent.agent.node_names import TOOL_RESULT
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.spec.skill_identity import has_active_skill
 from chaos_agent.agent.state import AgentState
+from chaos_agent.utils.skill_case_section import is_case_document
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +37,72 @@ _CB_SCOPE_TARGET_ACTION_RE = re.compile(
 
 # ── Use-case content markers ──
 # ToolMessages from read_skill_resource that contain actual use-case
-# content (not directory listings) will have at least one of these.
-_USE_CASE_MARKERS = ("**故障现象**", "**注入验证**", "**恢复验证**")
+# content (not directory listings) are detected by
+# ``skill_case_section.is_case_document``. It is heading-anchored, because
+# a bare ``**故障现象**`` also occurs in the intent-extraction table of
+# both SKILL.md files — a document this tool is allowed to return.
 
 _CASE_NAME_RE = re.compile(r"\*\*用例名称\*\*\s*(.+?)\s*$", re.MULTILINE)
+
+# ── User-stated duration vocabulary (diagnostic only) ──
+# The backfill below can only ever see a DECLARED window (a hard-pinned entry
+# value or the planner's finish_planning arg). When neither carries one, the
+# resolved value comes from the operator default, and nothing recorded that
+# the task description may have asked for something else — this vocabulary
+# makes that silent fall back visible in the logs. Narrow by design: every
+# phrase carries a duration WORD, so fault PARAMETERS that merely contain a
+# number (``delay 3000ms``, ``percent=80``, a port) cannot trip it. A miss
+# keeps today's behaviour; a false alarm would nag on well-formed
+# descriptions and erode trust in the warning.
+#
+# Keyword list calibrated against the CLI-NL corpus in the durable task
+# store (``~/.blade-ai/memory/tasks``): 窗口/故障窗口 and 倒计时 are the two
+# most common carriers there and were the first version's real misses;
+# ``duration 契约：`` and a 约 modifier between keyword and number are the
+# two remaining carriers the second pass found. Documented boundaries —
+# shapes deliberately NOT matched, because a hit would be a false alarm
+# more often than a catch: a bare ``\d+s`` with no keyword ("契约】1200s"),
+# a jargon phrase ("武装 600 秒定时器"), a discipline interval
+# ("武装与注入间隔 ≤60 秒"), an observation cost ("收敛（45 秒）"), and
+# values carrying no unit at all (``--timeout 600``, a command fragment
+# rather than prose). Two false alarms survive by design, because closing
+# them would cost more real catches than it saves: a comparison clause
+# ("总窗口 15 秒远小于 150 秒") and an SLO clause ("30 秒内可恢复").
+_DURATION_PHRASE_RES = (
+    # Keyword-prefixed form. The keyword axis (Chinese or English) and the
+    # unit axis (Chinese or English) are independent, because real
+    # descriptions mix them: "duration 600 秒".
+    # 持续 120 秒 / 故障持续 300 秒 / 故障窗口 600 秒 / 故障窗口约 300 秒
+    # / 倒计时 900 秒 / duration 600 秒 / duration 契约：600 秒
+    # / duration of 10 minutes / for 5 minutes
+    re.compile(
+        r"(?:持续|维持|保持|运行|时长|窗口|倒计时|"
+        r"\bduration\b(?:\s+(?:of|契约))?|\b(?:for|lasting|within)\b)"
+        r"\s*(?:约|大约|≈)?\s*[:：=]?\s*"
+        r"(\d{1,5})\s*"
+        r"(seconds?|secs?|minutes?|mins?|hours?|hrs?|秒|秒钟|分钟|小时)",
+        re.IGNORECASE,
+    ),
+    # Chinese suffix form: 300 秒后自动恢复
+    re.compile(r"(\d{1,5})\s*(秒|秒钟|分钟|小时)\s*(?:后|内|之后)"),
+    # English suffix form: 600 seconds later, auto-recover
+    re.compile(
+        r"(\d{1,5})\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\s+"
+        r"(?:later\s+)?(?:auto[- ]?)?(?:recover|destroy|expire|end)",
+        re.IGNORECASE,
+    ),
+)
+
+_DURATION_UNIT_SECONDS = {
+    "秒": 1, "秒钟": 1, "分钟": 60, "小时": 3600,
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+}
+
+# A number implying a window longer than a day is likelier to be a parameter
+# (a probe timeout, an id, a byte count) than an injection window.
+_MAX_PLAUSIBLE_DURATION_SECONDS = 86400
 
 
 def _extract_chosen_skill_case_path(messages: list) -> str:
@@ -85,6 +148,29 @@ def _extract_planning_duration(messages: list) -> int:
     return 0
 
 
+def _user_stated_duration_hint(text: str) -> str:
+    """The verbatim span where the task description appears to state a window.
+
+    Diagnostic only — this never writes a value into the contract. It exists
+    so the backfill below can WARN about the silent case: a description that
+    seems to carry a duration while neither the entry value nor the planner's
+    declaration delivered one, leaving the contract on the operator default
+    and the drill window different from what the user asked for. Returns ""
+    when nothing plausible is found — including numbers implying a window
+    longer than a day.
+    """
+    if not text:
+        return ""
+    for pattern in _DURATION_PHRASE_RES:
+        for match in pattern.finditer(text):
+            seconds = int(match.group(1)) * _DURATION_UNIT_SECONDS.get(
+                match.group(2).lower(), 0
+            )
+            if 0 < seconds <= _MAX_PLAUSIBLE_DURATION_SECONDS:
+                return match.group(0)
+    return ""
+
+
 def _extract_last_skill_resource_path(messages: list) -> str:
     """Extract the resource_path from the last read_skill_resource tool call.
 
@@ -120,7 +206,7 @@ def _find_skill_case_by_path(messages: list, resource_path: str) -> str:
                         if (isinstance(resp, ToolMessage)
                                 and getattr(resp, "tool_call_id", "") == tc_id):
                             content = resp.content if isinstance(resp.content, str) else ""
-                            if content and any(m in content for m in _USE_CASE_MARKERS):
+                            if is_case_document(content):
                                 return content
     return ""
 
@@ -147,7 +233,7 @@ def _extract_skill_case_from_messages(messages: list, plan: str = "") -> str:
         stripped = content.strip()
         if stripped.startswith("Directory:") or stripped.startswith("Contents:"):
             continue
-        if any(marker in content for marker in _USE_CASE_MARKERS):
+        if is_case_document(content):
             candidates.append(content)
 
     if not candidates:
@@ -363,6 +449,86 @@ def _extract_plan_verification_slices(plan: str) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+# ---------------------------------------------------------------------------
+# Plan/guard compatibility pre-check (#59)
+#
+# The execute-phase carrier gate rejects EVERY host command carrying a
+# banned verb (rm/systemctl/...) — word-level, fail-closed. Case #59's
+# prescription embedded exactly those verbs (a ``systemd-run ... rm -f``
+# timer payload and a ``systemctl stop`` early recovery), the plan copied
+# them verbatim, and the collision was discovered only mid-execution:
+# three guard rejections, ~894s of a 1212.7s execute phase, plus a
+# confirmed plan that was structurally undeliverable. This seam runs the
+# SAME static legislation (banned-verb face + readonly exemption) over
+# the plan's host-command lines at PLANNING time, so the rewrite happens
+# before confirmation — the execute guard stays the final arbiter; this
+# is the early, cheap, once-only version of it.
+# ---------------------------------------------------------------------------
+
+
+# Host-entry vocabulary for the plan pre-check: the same four forms the
+# execute gate recognises (``_HOST_ENTRY`` + the ``/host/<binary>``
+# absolute form). The first draft judged only the ``chroot /host``
+# spelling, so a plan spelled its entry as ``nsenter -t 1 ...`` or
+# ``/host/systemctl ...`` sailed through planning and rediscovered the
+# ban mid-execution — #59's exact cost pattern through a side door.
+_PLAN_HOST_ENTRY_RE = re.compile(r"\b(?:chroot|nsenter|unshare)\b")
+
+
+def _plan_host_entry_start(line: str) -> int:
+    """Index of the line's first host-entry marker, or ``-1``.
+
+    Judged from the marker onward: the kubectl wrapper never reaches the
+    readonly judge (which expects a host command), while the banned-verb
+    face stays word-level over the payload — the same text split the
+    execute gate sees after the exec's ``--`` separator.
+    """
+    best = -1
+    match = _PLAN_HOST_ENTRY_RE.search(line)
+    if match:
+        best = match.start()
+    path_idx = line.find("/host/")
+    if path_idx >= 0 and (best < 0 or path_idx < best):
+        best = path_idx
+    return best
+
+
+def _plan_banned_verb_findings(plan: str) -> list[tuple[str, tuple[str, ...]]]:
+    """(command line, banned verbs) for host-mutation lines in the plan.
+
+    Only fenced-code-block lines that enter the host (``chroot /host``,
+    ``nsenter``/``unshare``, or a ``/host/<binary>`` absolute form) are
+    judged — prose quoting a banned verb ("never use rm") is not a
+    prescription. The readonly face is honoured exactly as the execute
+    gate honours it: a banned verb in a genuine probe's ARGUMENT position
+    (``which systemctl``) passes, while the BINARY position stays banned
+    on host entry whatever guarded form it takes (``systemctl status``
+    included) — so the two legislations cannot drift on the same text.
+    """
+    from chaos_agent.agent.target_guard.carriers import (
+        find_banned_host_verbs,
+        is_readonly_host_probe,
+    )
+
+    findings: list[tuple[str, tuple[str, ...]]] = []
+    in_fence = False
+    for line in (plan or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            continue
+        start = _plan_host_entry_start(line)
+        if start < 0:
+            continue
+        segment = line[start:]
+        verbs = find_banned_host_verbs(segment)
+        if verbs and not is_readonly_host_probe(segment):
+            findings.append((segment.strip(), verbs))
+    return findings
+
+
 async def extract_planning_metadata(state: AgentState) -> dict:
     """Extract planning metadata from agent_loop messages into State.
 
@@ -561,6 +727,63 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         ))]
         return result
 
+    # 1c. Guard (#59): the plan's host commands must not carry banned
+    # verbs — the execute-phase carrier gate rejects them word-level, so a
+    # plan that prescribes one is structurally undeliverable and burns the
+    # confirmation + execute phases discovering it live. Nudge ONCE with
+    # the same compliant-form guidance the carrier gate would give; after
+    # the nudge the plan proceeds (the execute guard remains the final
+    # arbiter, and a deliberately-shaped command the model insists on
+    # still faces it there).
+    if messages and not state.get("_plan_banned_verb_nudged"):
+        _plan_for_scan = result.get("plan") or state.get("plan") or ""
+        _findings = _plan_banned_verb_findings(_plan_for_scan)
+        if _findings:
+            from chaos_agent.agent.target_guard.carriers import (
+                _banned_verb_suggestion,
+                _normalise_family,
+            )
+
+            _verbs_hit: tuple[str, ...] = ()
+            for _, verbs in _findings:
+                for verb in verbs:
+                    if verb not in _verbs_hit:
+                        _verbs_hit += (verb,)
+            _spec_scan = read_fault_spec(state)
+            _family_hint = _normalise_family(
+                _spec_scan.fault_target if _spec_scan else "",
+            )
+            _lines_cited = "\n".join(
+                f"- {cmd[:200]}" for cmd, _ in _findings[:5]
+            )
+            result["planning_rejected"] = True
+            result["_plan_banned_verb_nudged"] = True
+            # The plan must re-open for round 2 (same seam the identity
+            # nudges use): finish_planning's writes are write-once, so
+            # without the reset the corrected plan would never land.
+            result.update(_identity_nudge_plan_family_reset())
+            result["messages"] = [HumanMessage(content=wrap_system_reminder(
+                "**PLAN/GUARD INCOMPATIBILITY**: the plan's host commands "
+                "carry banned verb(s) "
+                f"{', '.join(repr(v) for v in _verbs_hit)}. The "
+                "execute-phase carrier gate rejects EVERY host command "
+                "containing these verbs — word-level, fail-closed — so this "
+                "plan is structurally undeliverable as written; confirming "
+                "it would only move the rejection into the execute phase "
+                "(case #59: three rejections, ~15 minutes, mid-execution "
+                "rewrite).\n\n"
+                f"Offending step(s):\n{_lines_cited}\n\n"
+                "Rewrite the offending steps NOW:\n"
+                f"{_banned_verb_suggestion(_verbs_hit, _family_hint)}\n\n"
+                "Then re-run `finish_planning` with the corrected plan."
+            ))]
+            logger.warning(
+                "extract_planning_metadata: plan carries banned verb(s) %s "
+                "in %d host command(s); nudging rewrite before confirmation",
+                _verbs_hit, len(_findings),
+            )
+            return result
+
     # 2. fault_spec identity resolution (B83/B84, #49 post-mortem).
     #
     # The planner is the only actor that knows which mechanism the plan
@@ -702,13 +925,20 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         # recorded window at all (#8/#9 evidence: user-asked 300s executed
         # as 300s, invisible to the contract). The planner's
         # finish_planning now carries an explicit duration_seconds
-        # declaration; combine it with any hard-pinned entry value (CLI
-        # --duration) monotonically and apply ensure_min_duration
-        # (unspecified → configured default; declared values verbatim),
-        # so every entry path lands the same contract the structured/TUI
-        # constructors already apply.
+        # declaration, and ensure_min_duration (unspecified → configured
+        # default; stated values verbatim) is applied so every entry path
+        # lands the same contract the structured/TUI constructors already
+        # apply.
+        #
+        # Precedence: a hard-pinned entry value (CLI --duration) wins, and
+        # the declaration only FILLS an empty contract. The former
+        # max(declared, pinned) lifted a pinned 60 to a declared 300 —
+        # amending a contract-stated duration, the one thing
+        # ensure_min_duration forbids in either direction — which silently
+        # widened the approved exposure window and pushed the recovery
+        # timer that rides on duration_seconds out with it.
         declared_duration = _extract_planning_duration(messages)
-        _dur_candidate = max(declared_duration, spec.duration_seconds)
+        _dur_candidate = spec.duration_seconds or declared_duration
         _floor_scope = updates.get("scope") or spec.scope
         _floor_target = updates.get("fault_target") or spec.fault_target
         _floor_action = updates.get("fault_action") or spec.fault_action
@@ -724,6 +954,27 @@ async def extract_planning_metadata(state: AgentState) -> dict:
                 "ensure_min_duration)",
                 declared_duration, spec.duration_seconds, effective_duration,
             )
+
+        if not declared_duration and not spec.duration_seconds:
+            # Neither source declared a window, so the contract above runs on
+            # the operator default. If the description itself reads like it
+            # stated one, say so out loud: the planner's declaration is the
+            # only duration carrier NL mode has, so a forgotten declaration
+            # is exactly the case this node cannot repair on its own.
+            _stated_hint = _user_stated_duration_hint(
+                spec.user_description or ""
+            )
+            if _stated_hint:
+                logger.warning(
+                    "extract_planning_metadata: task description appears to "
+                    "state a duration (%r) but neither the entry value nor "
+                    "finish_planning(duration_seconds) declared one — the "
+                    "contract falls back to the configured default %ss, so "
+                    "the drill window will NOT match the stated value. Pass "
+                    "an explicit --duration, or have the planner declare "
+                    "duration_seconds.",
+                    _stated_hint, effective_duration,
+                )
 
         # 2c. case_resource_path backfill (same spec-backfill family as 2b):
         # the planner already hands the chosen case path to

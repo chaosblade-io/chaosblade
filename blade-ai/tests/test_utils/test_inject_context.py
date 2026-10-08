@@ -7,7 +7,6 @@ Verifies that build_inject_context() produces abstracts that:
   4. Handle various kubectl output formats correctly
 """
 
-import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from chaos_agent.utils.inject_context import (

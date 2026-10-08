@@ -6,6 +6,8 @@ filling the State gap that causes baseline_capture to produce
 source="none" in NL mode.
 """
 
+import logging
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -15,6 +17,7 @@ from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
     _extract_plan_verification_slices,
     _find_saved_plan,
     _has_browsed_catalogue,
+    _user_stated_duration_hint,
     extract_planning_metadata,
 )
 from chaos_agent.agent.state import AgentState
@@ -178,6 +181,46 @@ class TestExtractSkillCaseFromMessages:
         ]
         result = _extract_skill_case_from_messages(messages)
         assert result == ""
+
+    def test_skips_skill_md_intent_table(self):
+        """A SKILL.md read must not be taken for a use case.
+
+        ``read_skill_resource`` only rejects paths escaping the skill dir, so
+        "SKILL.md" is returnable. Both k8s-chaos-skills and host-chaos-skills
+        SKILL.md carry the intent-extraction table below, whose 故障现象 row
+        used to satisfy the bare-substring marker test and made a capability
+        table the source of truth for every layer-2 extractor.
+        """
+        skill_md = """从用户输入中提取四个**语义维度**（只关心「注入什么故障」）：
+
+| 维度 | 说明 | 示例 |
+|------|------|------|
+| **故障层级** | 作用在哪个层面 | Pod / Workload / Service / Node |
+| **故障现象** | 期望模拟的表现 | Pending、OOM、CPU 高 |
+| **故障原因** | 具体根因 | 资源不足、配置错误 |
+"""
+        messages = [
+            ToolMessage(
+                content=skill_md,
+                name="read_skill_resource",
+                tool_call_id="tc_1",
+            ),
+        ]
+        result = _extract_skill_case_from_messages(messages)
+        assert result == ""
+
+    def test_keeps_real_case_alongside_skill_md(self):
+        """A SKILL.md read must not shadow the use case read in the same batch."""
+        messages = [
+            ToolMessage(
+                content="| **故障现象** | 期望模拟的表现 | Pending、OOM |\n",
+                name="read_skill_resource",
+                tool_call_id="tc_md",
+            ),
+            _make_tool_msg_read_skill(SAMPLE_SKILL_CASE, tool_call_id="tc_1"),
+        ]
+        result = _extract_skill_case_from_messages(messages)
+        assert result == SAMPLE_SKILL_CASE
 
 
 # ── _derive_scope_target_action ──
@@ -402,6 +445,183 @@ class TestExtractPlanningMetadataNode:
         result = await extract_planning_metadata(state)
         assert result.get("planning_rejected") is not True
         assert result.get("skill_case_content") == SAMPLE_SKILL_CASE
+
+
+# ---------------------------------------------------------------------------
+# User-stated duration hint — vocabulary behind the B14 fallback warning
+# ---------------------------------------------------------------------------
+
+_NODE_LOGGER = "chaos_agent.agent.nodes.planning.extract_planning_metadata"
+
+
+class TestUserStatedDurationHint:
+    """``_user_stated_duration_hint`` gates a WARNING, never a write. Narrow
+    by design: a miss keeps today's behaviour, while a false alarm would nag
+    on well-formed descriptions and erode trust in the warning."""
+
+    def test_chinese_prefix_form(self):
+        hint = _user_stated_duration_hint("注入 CPU 满载故障，持续 120 秒，到期自动恢复")
+        assert hint == "持续 120 秒"
+
+    def test_chinese_suffix_form(self):
+        hint = _user_stated_duration_hint("注入磁盘 IO 故障，300 秒后自动恢复")
+        assert hint == "300 秒后"
+
+    def test_chinese_minutes(self):
+        hint = _user_stated_duration_hint("对节点注入 CPU 满载，时长：10 分钟")
+        assert hint == "时长：10 分钟"
+
+    def test_english_prefix_form(self):
+        hint = _user_stated_duration_hint("inject cpu fullload for 5 minutes")
+        assert hint == "for 5 minutes"
+
+    def test_english_suffix_form(self):
+        hint = _user_stated_duration_hint(
+            "blade create k8s pod-cpu fullload, 600 seconds later auto-recover"
+        )
+        assert hint == "600 seconds later auto-recover"
+
+    # ── Carriers the CLI-NL corpus actually uses (the first version missed
+    # these: 窗口/倒计时 as keyword, and an English keyword with a Chinese
+    # unit) ──
+
+    def test_chinese_window_keyword(self):
+        hint = _user_stated_duration_hint(
+            "注入「Sidecar 网络中断 → 网络丢包」故障，窗口 600 秒。"
+        )
+        assert hint == "窗口 600 秒"
+
+    def test_chinese_countdown_keyword(self):
+        hint = _user_stated_duration_hint(
+            "返还 PV 返回 200 后先武装定时恢复再注入——倒计时 900 秒，与注入紧邻"
+        )
+        assert hint == "倒计时 900 秒"
+
+    def test_mixed_english_keyword_chinese_unit(self):
+        """Real descriptions mix the axes: English keyword, Chinese unit."""
+        hint = _user_stated_duration_hint(
+            "注入「资源饱和导致 HPA 副本达到上限」故障（kubectl-native 路径），"
+            "duration 600 秒，到期容器内定时器自动恢复。"
+        )
+        assert hint == "duration 600 秒"
+
+    def test_duration_contract_header_form(self):
+        hint = _user_stated_duration_hint("duration 契约：600 秒（系统地板）")
+        assert hint == "duration 契约：600 秒"
+
+    def test_approximation_modifier_between_keyword_and_number(self):
+        hint = _user_stated_duration_hint("duration 契约：实际故障窗口约 300 秒（注入→观察）")
+        assert hint == "窗口约 300 秒"
+
+    def test_fault_parameters_do_not_trip_it(self):
+        """A number inside a fault parameter is not a duration statement."""
+        assert _user_stated_duration_hint("注入网络延迟故障：delay 3000ms，比例 30%") == ""
+
+    def test_port_and_percent_do_not_trip_it(self):
+        assert _user_stated_duration_hint("Pod 监听端口 3306，cpu-percent=80") == ""
+
+    def test_beyond_a_day_is_not_a_window(self):
+        assert _user_stated_duration_hint("持续 99999 秒") == ""
+
+    def test_keyword_inside_a_longer_word_is_not_a_keyword(self):
+        """``\\b`` keeps the English keyword axis honest: the "for" inside
+        "before" is not a duration keyword."""
+        assert _user_stated_duration_hint("观察 Pod 状态 before 300 秒, then stop") == ""
+
+    def test_discipline_interval_is_not_a_window(self):
+        """Documented boundary: the arm/inject gap is a discipline, not the
+        window, and it carries a symbol no keyword form allows."""
+        assert _user_stated_duration_hint("武装与注入间隔 ≤60 秒，注入序列不插入其他操作") == ""
+
+    def test_observation_cost_is_not_a_window(self):
+        """Documented boundary: a cost of waiting is not a stated window."""
+        assert _user_stated_duration_hint("STS 停在 1/2 需人工删 Pod 才收敛（45 秒）") == ""
+
+    def test_empty_text(self):
+        assert _user_stated_duration_hint("") == ""
+
+
+class TestStatedDurationFallbackWarning:
+    """B14's silent case made audible: nothing declared a window while the
+    description reads like it stated one. The warning reports the fallback,
+    it never invents a value."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_experiment_timeout(self):
+        from chaos_agent.config.settings import blade_ai_context
+
+        with blade_ai_context(experiment_timeout=300):
+            yield
+
+    @staticmethod
+    def _state(description: str, messages: list | None = None, **spec_overrides):
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
+
+        spec = FaultSpec(
+            scope="pod",
+            fault_target="cpu",
+            fault_action="fullload",
+            source="cli_nl",
+            user_description=description,
+            **spec_overrides,
+        )
+        return AgentState(
+            task_id="test-task",
+            skill_case_content="already loaded",
+            fault_spec=spec.to_dict(),
+            messages=messages or [],
+        )
+
+    @pytest.mark.asyncio
+    async def test_warns_when_description_states_a_window_nobody_declared(self, caplog):
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = self._state("对 Pod 注入 CPU 满载，持续 120 秒，到期自动恢复")
+        with caplog.at_level(logging.WARNING, logger=_NODE_LOGGER):
+            result = await extract_planning_metadata(state)
+        assert "appears to state a duration" in caplog.text
+        assert "持续 120 秒" in caplog.text
+        # The contract still lands on the operator default — the warning
+        # reports the mismatch instead of amending the value.
+        assert read_fault_spec({**state, **result}).duration_seconds == 300
+
+    @pytest.mark.asyncio
+    async def test_silent_when_the_planner_declares(self, caplog):
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        declared = AIMessage(content="", tool_calls=[
+            {
+                "name": "finish_planning",
+                "args": {"summary": "plan", "duration_seconds": 120},
+                "id": "tc_fp",
+            },
+        ])
+        state = self._state("对 Pod 注入 CPU 满载，持续 120 秒", messages=[declared])
+        with caplog.at_level(logging.WARNING, logger=_NODE_LOGGER):
+            result = await extract_planning_metadata(state)
+        assert "appears to state a duration" not in caplog.text
+        assert read_fault_spec({**state, **result}).duration_seconds == 120
+
+    @pytest.mark.asyncio
+    async def test_silent_when_description_states_nothing(self, caplog):
+        state = self._state("对 Pod 注入 CPU 满载故障")
+        with caplog.at_level(logging.WARNING, logger=_NODE_LOGGER):
+            await extract_planning_metadata(state)
+        assert "appears to state a duration" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_silent_when_the_entry_value_is_pinned(self, caplog):
+        """A hard-pinned entry value owns the contract: the statement in the
+        description cannot overrule it, so there is nothing to warn about."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = self._state(
+            "对 Pod 注入 CPU 满载，持续 120 秒", duration_seconds=600
+        )
+        with caplog.at_level(logging.WARNING, logger=_NODE_LOGGER):
+            result = await extract_planning_metadata(state)
+        assert "appears to state a duration" not in caplog.text
+        assert read_fault_spec({**state, **result}).duration_seconds == 600
 
 # ---------------------------------------------------------------------------
 # _has_browsed_catalogue — catalogue browse detection
@@ -1353,3 +1573,389 @@ class TestExtractPlanningFaultIdentityHelper:
             },
         }])]
         assert _extract_planning_fault_identity(msgs) == ("", "", "")
+
+
+class TestDurationBackfillPrecedence:
+    """Pin the precedence at the B14 duration backfill site.
+
+    A hard-pinned contract value (CLI ``--duration``) wins; the planner's
+    ``finish_planning`` declaration only FILLS an empty contract. The former
+    ``max(declared_duration, spec.duration_seconds)`` lifted a pinned 60 to a
+    declared 300 — amending a contract-stated duration, the one thing
+    ``ensure_min_duration`` forbids in either direction
+    (l4-contract-faithfulness) — which silently widened the approved exposure
+    window and pushed the recovery timer riding on ``duration_seconds`` out
+    with it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_experiment_timeout(self):
+        from chaos_agent.config.settings import blade_ai_context
+        from chaos_agent.utils.fault_type import _DEFAULT_MIN_DURATION
+
+        with blade_ai_context(experiment_timeout=_DEFAULT_MIN_DURATION):
+            yield
+
+    @staticmethod
+    async def _resolve(pinned: int, declared: int) -> int:
+        """Run the node and return the duration it lands on."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = AgentState(
+            task_id="t-dur-prec",
+            skill_case_content=_WEAK_CASE_NO_BLADE,
+            fault_spec=_cli_nl_spec(
+                duration_seconds=pinned,
+                scope="pod",
+                fault_target="cpu",
+                fault_action="fullload",
+            ).to_dict(),
+            messages=[
+                _make_finish_call(
+                    {
+                        "fault_scope": "pod",
+                        "fault_target": "cpu",
+                        "fault_action": "fullload",
+                    },
+                    duration_seconds=declared,
+                ),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        spec = read_fault_spec({**state, **result})
+        assert spec is not None
+        return spec.duration_seconds
+
+    @pytest.mark.asyncio
+    async def test_unpinned_spec_takes_declared_value(self):
+        """B14 primary purpose: an empty contract adopts the declaration."""
+        assert await self._resolve(pinned=0, declared=300) == 300
+
+    @pytest.mark.asyncio
+    async def test_declared_shorter_than_pinned_never_lowers_it(self):
+        """A pinned value is never shrunk by a shorter declaration."""
+        assert await self._resolve(pinned=600, declared=300) == 600
+
+    @pytest.mark.asyncio
+    async def test_pinned_value_wins_over_longer_declaration(self):
+        """A pinned 60 stays 60 even when the planner declares 300.
+
+        The regression this guards: ``max(declared, pinned)`` used to lift
+        the pinned value, silently widening the approved exposure window
+        from 60s to 300s and deferring the recovery timer with it.
+        """
+        assert await self._resolve(pinned=60, declared=300) == 60
+
+    @pytest.mark.asyncio
+    async def test_pinned_below_floor_not_raised_by_backfill(self):
+        """Neither a declaration nor the empirical floor lifts a pin."""
+        assert await self._resolve(pinned=60, declared=0) == 60
+
+
+# ---------------------------------------------------------------------------
+# Guard 1c (#59): plan-prescribed banned verbs are caught at PLANNING time
+# ---------------------------------------------------------------------------
+
+
+class TestPlanBannedVerbGuard:
+    """Case #59 (Pod_被驱逐重建_DiskPressure): the case doc prescribed a
+    timer payload built from ``rm`` and a recovery through ``systemctl`` —
+    both banned verbs. The execute-phase carrier gate rejected them
+    word-level, but only AFTER confirmation, burning ~15 minutes of
+    mid-execution rewrites. Guard 1c runs the SAME static legislation over
+    the plan's host-command lines before confirmation, so the rewrite
+    happens while the plan is still open.
+    """
+
+    # The #59 shape: a disk fill whose timer payload used ``rm`` — the
+    # exact prescription the guard would reject in execute.
+    PLAN_WITH_RM_PAYLOAD = (
+        "## Execution Steps\n"
+        "1. Create debug pod and fill node disk:\n"
+        "```\n"
+        "kubectl exec node-debugger-x -- chroot /host sh -c "
+        "'dd if=/dev/zero of=/var/tmp/fill.bin bs=1M count=4096 && "
+        "systemd-run --on-active=600s --unit=drill-reclaim-x "
+        "rm -f /var/tmp/fill.bin'\n"
+        "```\n"
+    )
+
+    # The compliant #59 rewrite: timer payload is the family inverse.
+    PLAN_WITH_TRUNCATE_PAYLOAD = (
+        "## Execution Steps\n"
+        "1. Create debug pod and fill node disk:\n"
+        "```\n"
+        "kubectl exec node-debugger-x -- chroot /host sh -c "
+        "'dd if=/dev/zero of=/var/tmp/fill.bin bs=1M count=4096 && "
+        "systemd-run --on-active=600s --unit=drill-reclaim-x "
+        "truncate -s 0 /var/tmp/fill.bin'\n"
+        "```\n"
+    )
+
+    @staticmethod
+    def _state_with_plan(plan: str, **overrides):
+        return AgentState(
+            task_id="t-g1c",
+            skill_case_content=SAMPLE_SKILL_CASE,
+            plan=plan,
+            messages=[
+                AIMessage(content="", tool_calls=[{
+                    "name": "finish_planning", "id": "fp1", "type": "tool_call",
+                    "args": {"summary": "node disk fill"},
+                }]),
+                ToolMessage(
+                    content="Planning finalized. Summary: node disk fill",
+                    tool_call_id="fp1", name="finish_planning",
+                ),
+            ],
+            **overrides,
+        )
+
+    @pytest.mark.asyncio
+    async def test_rm_payload_plan_is_rejected_with_rewrite_nudge(self):
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _plan_banned_verb_findings,
+        )
+
+        state = self._state_with_plan(self.PLAN_WITH_RM_PAYLOAD)
+        # The scan itself: the fenced chroot /host line carries 'rm'.
+        findings = _plan_banned_verb_findings(self.PLAN_WITH_RM_PAYLOAD)
+        assert findings, "rm payload line must be flagged"
+        assert "rm" in findings[0][1]
+
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        assert result.get("_plan_banned_verb_nudged") is True
+        # The plan family re-opens so round 2 can land its OWN plan
+        # (finish_planning's writes are write-once).
+        assert result.get("plan") is None
+        assert result.get("plan_summary") is None
+        assert result.get("skill_case_content") is None
+        # The nudge names the verb and carries the compliant-form guidance.
+        nudge = str(result["messages"][0].content)
+        assert "PLAN/GUARD INCOMPATIBILITY" in nudge
+        assert "'rm'" in nudge
+        assert "truncate" in nudge
+        # Case-doc context: the cited line is the offending command.
+        assert "rm -f" in nudge
+
+    @pytest.mark.asyncio
+    async def test_systemctl_recovery_step_is_flagged_too(self):
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _plan_banned_verb_findings,
+        )
+
+        plan = (
+            "## Execution Steps\n"
+            "2. Recover the timer:\n"
+            "```\n"
+            "kubectl exec node-debugger-x -- chroot /host systemctl "
+            "stop drill-reclaim-x\n"
+            "```\n"
+        )
+        findings = _plan_banned_verb_findings(plan)
+        assert findings
+        assert "systemctl" in findings[0][1]
+
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        nudge = str(result["messages"][0].content)
+        assert "'systemctl'" in nudge
+
+    @pytest.mark.asyncio
+    async def test_compliant_truncate_payload_plan_passes(self):
+        state = self._state_with_plan(self.PLAN_WITH_TRUNCATE_PAYLOAD)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        assert "_plan_banned_verb_nudged" not in result
+        assert "messages" not in result or not [
+            m for m in result.get("messages", [])
+            if "PLAN/GUARD INCOMPATIBILITY" in str(getattr(m, "content", ""))
+        ]
+
+    @pytest.mark.asyncio
+    async def test_nudge_fires_only_once(self):
+        # After the nudge the plan proceeds: the execute guard remains the
+        # final arbiter, and a model that insists still faces it there.
+        state = self._state_with_plan(
+            self.PLAN_WITH_RM_PAYLOAD, _plan_banned_verb_nudged=True,
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        assert "messages" not in result or not [
+            m for m in result.get("messages", [])
+            if "PLAN/GUARD INCOMPATIBILITY" in str(getattr(m, "content", ""))
+        ]
+
+    @pytest.mark.asyncio
+    async def test_readonly_probe_with_argument_position_verb_is_exempt(self):
+        # The readonly face is honoured exactly as the execute gate honours
+        # it: ``systemctl`` in a genuine probe's ARGUMENT position
+        # (``which systemctl``) passes the readonly judge, so the word-level
+        # verb hit is exempted. The BINARY position stays banned on host
+        # entry (``systemctl status`` included) — checked next.
+        plan = (
+            "## Execution Steps\n"
+            "3. Probe for the timer binary:\n"
+            "```\n"
+            "kubectl exec node-debugger-x -- chroot /host sh -c "
+            "'which systemctl'\n"
+            "```\n"
+        )
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+
+    @pytest.mark.asyncio
+    async def test_systemctl_binary_position_stays_banned_even_readonly(self):
+        # Host entry bans the systemctl BINARY at word level — benign and
+        # hostile forms are indistinguishable there, so even ``systemctl
+        # is-active`` (a guarded read-only form) is flagged. This is the
+        # execute gate's own rule (the probe face's overlay); Guard 1c
+        # must not be wider than it.
+        plan = (
+            "## Execution Steps\n"
+            "3. Probe the timer:\n"
+            "```\n"
+            "kubectl exec node-debugger-x -- chroot /host systemctl "
+            "is-active drill-reclaim-x\n"
+            "```\n"
+        )
+        from chaos_agent.agent.target_guard.carriers import (
+            find_banned_host_verbs,
+            is_readonly_host_probe,
+        )
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _plan_banned_verb_findings,
+        )
+
+        segment = plan.split("```\n")[1].strip()
+        assert find_banned_host_verbs(segment) == ("systemctl",)
+        assert is_readonly_host_probe(segment) is False
+        assert _plan_banned_verb_findings(plan)
+
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+
+    @pytest.mark.asyncio
+    async def test_prose_mention_outside_a_fence_is_exempt(self):
+        # Prose ("never use rm to clean up") is not a prescription; only
+        # fenced host-entering command lines are judged.
+        plan = (
+            "## Execution Steps\n"
+            "1. Fill the node disk via dd. (Do NOT use rm; prefer truncate.)\n"
+        )
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+
+    @pytest.mark.asyncio
+    async def test_unfenced_command_line_is_exempt(self):
+        # Same rule from the other side: a bare (unfenced) line mentioning
+        # chroot /host is prose-shaped to this guard — the execute gate
+        # still judges the real exec when it is issued.
+        plan = (
+            "## Execution Steps\n"
+            "1. Run `chroot /host rm -f /var/tmp/fill.bin` on the node.\n"
+        )
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _plan_banned_verb_findings,
+        )
+
+        assert _plan_banned_verb_findings(plan) == []
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+
+    @pytest.mark.asyncio
+    async def test_nsenter_entry_form_is_flagged(self):
+        # The entry vocabulary is the execute gate's, not just the
+        # ``chroot /host`` spelling: a plan spelled ``nsenter -t 1 ...``
+        # with a banned verb sailed through the chroot-only scan and
+        # rediscovered the ban mid-execution — #59's cost pattern through
+        # a side door (adversarial self-review of the #59 fix).
+        plan = (
+            "## Execution Steps\n"
+            "2. Stop the timer:\n"
+            "```\n"
+            "kubectl exec node-debugger-x -- nsenter -t 1 -m -- "
+            "systemctl stop drill-reclaim-x\n"
+            "```\n"
+        )
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _plan_banned_verb_findings,
+        )
+
+        findings = _plan_banned_verb_findings(plan)
+        assert findings
+        assert "systemctl" in findings[0][1]
+
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+
+    @pytest.mark.asyncio
+    async def test_host_binary_absolute_form_is_flagged(self):
+        # The ``/host/<binary>`` absolute form: the banned verb rides the
+        # binary path itself — the execute gate's word-level face matches
+        # it (the leading ``/`` is in the verb regex's boundary class), so
+        # the plan pre-check must see it too.
+        plan = (
+            "## Execution Steps\n"
+            "2. Check the timer:\n"
+            "```\n"
+            "kubectl exec node-debugger-x -- /host/systemctl "
+            "is-active drill-reclaim-x\n"
+            "```\n"
+        )
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _plan_banned_verb_findings,
+        )
+
+        findings = _plan_banned_verb_findings(plan)
+        assert findings
+        assert "systemctl" in findings[0][1]
+
+    @pytest.mark.asyncio
+    async def test_nsenter_argument_position_verb_is_exempt(self):
+        # Parity with the readonly face behind the widened entry forms:
+        # ``which systemctl`` behind nsenter is a genuine probe's ARGUMENT
+        # position — exempt, the same way it is behind chroot (the readonly
+        # judge handles the nsenter wrapper natively; verified by probe).
+        plan = (
+            "## Execution Steps\n"
+            "3. Probe for the binary:\n"
+            "```\n"
+            "kubectl exec node-debugger-x -- nsenter -t 1 -m -- "
+            "which systemctl\n"
+            "```\n"
+        )
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+
+    @pytest.mark.asyncio
+    async def test_host_entry_line_without_banned_verb_is_not_flagged(self):
+        # The widened entry match must not become a blanket flag on every
+        # host command: a probe with no banned verb (df behind chroot,
+        # df behind nsenter) produces no finding.
+        plan = (
+            "## Execution Steps\n"
+            "3. Read host disk usage:\n"
+            "```\n"
+            "kubectl exec node-debugger-x -- chroot /host df -h /var\n"
+            "kubectl exec node-debugger-x -- nsenter -t 1 -m -- df -h /var\n"
+            "```\n"
+        )
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _plan_banned_verb_findings,
+        )
+
+        assert _plan_banned_verb_findings(plan) == []
+        state = self._state_with_plan(plan)
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True

@@ -34,30 +34,40 @@ def inject_command(
     Provide either --input/-i for natural language mode, or all structured params
     (--scope, --target, --action, --target-name, --namespace).
     """
-    # Duration pre-fill: the TOP layer of the three-layer duration guarantee.
-    # Structured mode only: in -i NL mode an unset duration must reach the
-    # intent node as 0 so the value stated in natural language is extracted
-    # there — a hardcoded CLI default would masquerade as a user-pinned
-    # hard-pin and contradict the description (observed: "持续 300 秒"
-    # intent arriving as duration_seconds=600).
-    if scope and target and action:
-        if duration is None:
-            duration = 300
+    # Duration resolution: the TOP layer of the three-layer duration guarantee.
+    # Structured mode only: in -i NL mode an unset duration must stay 0 all the
+    # way into planning, so the window stated in the description can be declared
+    # by the planner (finish_planning.duration_seconds) and backfilled into the
+    # contract by extract_planning_metadata. CLI never visits
+    # intent_clarification — that node is TUI-only (runner.py: "CLI skips
+    # intent_clarification") — so nothing downstream could re-derive a value
+    # pinned here. A hardcoded CLI default would masquerade as a user pin and
+    # overrule the description (observed: "持续 300 秒" intent arriving as
+    # duration_seconds=600, the then-configured experiment_timeout).
+    #
+    # An unset --duration stays unset here too and is resolved by the single
+    # policy point (ensure_min_duration → experiment_timeout). Pre-filling a
+    # literal 300 made that knob dead in this channel: a positive value reads
+    # as an explicit pin and takes the verbatim branch, so the operator's
+    # configured default never applied.
+    # ``not input`` is load-bearing: a combined call (``-i`` PLUS structured
+    # flags) is still an NL run, so the resolved default must NOT be written
+    # back as if the caller had pinned it — that hard pin would then overrule
+    # the duration stated in the description.
+    if scope and target and action and not input:
         from chaos_agent.utils.fault_type import ensure_min_duration
-        effective = ensure_min_duration(duration, scope, target, action)
-        if effective != duration:
-            # Reachable only for a non-positive --duration (treated as
-            # unspecified): ensure_min_duration injects the recommended
-            # default. Explicit positive values pass through verbatim
-            # (l4-contract-faithfulness) — a below-floor request is
-            # honoured as-is with a warning inside ensure_min_duration,
-            # so it never lands here.
+        # Short-circuit keeps `duration <= 0` off the None case.
+        _unspecified = duration is None or duration <= 0
+        duration = ensure_min_duration(duration, scope, target, action)
+        if _unspecified:
+            # Surface the resolved window: with the pre-fill gone the value
+            # comes from operator config, which the caller cannot see here.
             typer.echo(
-                f"No --duration specified. Auto-setting to {effective}s "
-                f"for {scope}-{target}-{action} (ensures verification window).",
+                f"No --duration specified. Using the configured default "
+                f"{duration}s for {scope}-{target}-{action} "
+                f"(experiment_timeout).",
                 err=True,
             )
-            duration = effective
     # Validate: NL mode or structured mode, not both missing
     has_input = bool(input)
     # Cluster-scoped faults (node / host …) are namespace-less — derive from the
