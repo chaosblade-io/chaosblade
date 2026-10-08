@@ -638,6 +638,14 @@ _PHASE11_PROVIDER_IMPORT_ALLOWLIST = {
     # 入册。
     ("agent/providers/registry.py",
      "chaos_agent.agent.providers.k8s_native.classifier"),
+    # apply-native-fault-attribution（2026-09，#65 NetworkPolicy误配 根因级
+    # 修复）：armed-before-inject 门对「apply/create 持久故障对象」的判定委托
+    # canonical classifier（is_apply_native_fault_injection）——归因层与 armed
+    # 门共用同一规范谓词、永不漂移是显式设计决策（注入判定词汇表必须复用规范
+    # 判据、禁手写硬编码名单），lazy、call-time-only，与 tools/guard.py →
+    # classifier 委托（L611）同型入册。
+    ("agent/nodes/planning/tool_screener.py",
+     "chaos_agent.agent.providers.k8s_native.classifier"),
 }
 
 #: providers 目录下的平铺通用文件（通用仲裁 + 载体中立扫描原语）——
