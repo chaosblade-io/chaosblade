@@ -171,6 +171,15 @@ BANNED_KUBECTL_SUBS: frozenset[str] = frozenset(
 # definition object itself (CustomResourceDefinition kind) is
 # deliberately NOT here: it installs programmatically (D2 — the LLM
 # face never sees an admissible CRD install).
+#
+# ``networkpolicy`` (expand-k8s-case-coverage 1.8, NetworkPolicy误配):
+# the config-plane drill's INJECTION object itself — the fault is a
+# freshly created deny policy rather than a mutation of an existing
+# target (data-plane drop cases ride the chaosblade channel instead).
+# It satisfies the same non-workload predicate as the rest of this set:
+# the object runs no containers; its blast radius is bounded by the
+# podSelector pre-check the case document legislates, and the identity
+# anchors below still hold it to exactly one namespace/name.
 ALLOWED_MANIFEST_KINDS: frozenset[str] = frozenset(
     {
         "persistentvolumeclaim",
@@ -181,8 +190,71 @@ ALLOWED_MANIFEST_KINDS: frozenset[str] = frozenset(
         "secret",
         "namespace",
         "faultdrill",
+        "networkpolicy",
     }
 )
+
+
+# The apply/create-native unbounded-fault signal — a SEPARATE attribution
+# signal from the mutation verbs in ``KUBECTL_WRITE_SUBCOMMANDS``. That
+# vocabulary is shared by four parties (drift guard, injection attribution,
+# teardown recognition, verb audit) and MUST stay mutation-only: an ``apply``
+# is attributed by its MANIFEST KIND, never by the verb (a plain ``kubectl
+# apply`` of a Deployment/ConfigMap is a resource action, not a fault
+# injection; test_apply_verb_is_not_claimed pins this). What turns an
+# apply/create into a FAULT injection is the KIND it writes: a persistent
+# (non-self-timed) manifest fault object lives exactly as long as the object
+# — no UID, no ``activeDeadlineSeconds``, no self-timeout — the same
+# bounded-recovery concern as a mutation verb (``patch``/``delete``).
+# ``ALLOWED_MANIFEST_KINDS`` is precisely that family; minus ``faultdrill``
+# (its CR carries the controller's ``activeDeadlineSeconds`` self-expiry and
+# is claimed by the faultdrill provider, which is registered AFTER k8s_native
+# — so this predicate must NOT steal a FaultDrill-doc apply). Carrier
+# scaffolding is excluded BY CONSTRUCTION: the RBAC family
+# (serviceaccount/role/rolebinding/...) and the workload kinds
+# (pod/deployment/...) are not in ``ALLOWED_MANIFEST_KINDS``, so building a
+# recovery vehicle or arming its timer never reads as a fault injection (which
+# would otherwise deadlock the armed-before-inject gate: the vehicle that must
+# arm first is itself built by an apply).
+PERSISTENT_FAULT_MANIFEST_KINDS: frozenset[str] = ALLOWED_MANIFEST_KINDS - {
+    "faultdrill"
+}
+
+
+def is_apply_native_fault_injection(tool_name: str, tool_args: dict) -> bool:
+    """Whether a kubectl ``apply``/``create -f`` writes a persistent fault object.
+
+    The apply/create-native counterpart to the mutation verbs: it recognises
+    the fault by the MANIFEST KIND written (``PERSISTENT_FAULT_MANIFEST_KINDS``),
+    never by the verb. Returns ``False`` for the faultdrill CR (self-expiring,
+    claimed by the faultdrill provider), for carrier scaffolding (RBAC/workload
+    kinds are outside the allowed family), for file-only ``-f <path>`` applies
+    (no inline manifest to read — the same visibility boundary the stdin
+    manifest classifier honours), and for any non-kubectl call.
+
+    A PURE function of ``(tool_name, tool_args)`` so every attribution
+    mechanism (issue-time, resume detect, disproof revocation, recency, step
+    self-check) AND the armed-before-inject gate share ONE signal instead of
+    each re-deriving it from the mutation-verb table — that shared-table
+    borrowing is exactly the conflation this predicate removes.
+    """
+    if tool_name != "kubectl":
+        return False
+    sub = (tool_args.get("subcommand") or "").strip().lower()
+    if sub not in ("apply", "create"):
+        return False
+    stdin_data = tool_args.get("stdin_data")
+    if not (isinstance(stdin_data, str) and stdin_data):
+        return False
+    kinds = _extract_all_kinds_from_yaml(stdin_data)
+    if not kinds:
+        return False
+    canon = {canonicalise_kind(k) for k in kinds if k}
+    # EVERY document must be a persistent fault kind: a mixed manifest is not a
+    # clean fault injection (the classifier BANS multi-kind shapes anyway, and
+    # a faultdrill doc mixed in must defer to the faultdrill provider).
+    return bool(canon) and canon <= PERSISTENT_FAULT_MANIFEST_KINDS
+
 
 # Workload kinds — every kind that starts containers — on the IMPERATIVE
 # create channel (``kubectl create KIND NAME --image=...`` without -f).
@@ -607,21 +679,24 @@ def _classify_kubectl(
         )
 
     # Dispatch on destructive sub
-    if sub == "exec":
-        # Face-4 facts line: the exec branch judges the RAW inner text.
-        # Production tool calls carry it as ``v_args`` (``POD -- INNER``);
-        # a nested exec recursion receives the peeled inner line from its
-        # parent. Synthetic arg shapes (list / command-string) have no raw
-        # text to recover — their tokens ARE the argv, no quoting remains
-        # to misread — so they stay on the token path under either engine.
+    if sub == "exec" or sub == "debug":
+        # Face-4 facts line: the exec/debug branch judges the RAW inner text.
+        # Production tool calls carry it as ``v_args`` (``POD -- INNER`` /
+        # ``node/N -- INNER``); a nested exec recursion receives the peeled
+        # inner line from its parent. Synthetic arg shapes (list /
+        # command-string) have no raw text to recover — their tokens ARE the
+        # argv, no quoting remains to misread — so they stay on the token
+        # path under either engine. The debug face needs the SAME raw line so
+        # its inner host-escape ruling (P4) uses the facts judge, not the
+        # over-strict token fallback, on a production-shaped call.
         cmdline = _cmdline_raw
         if cmdline is None and raw_args is not None:
             v_args = raw_args.get("v_args")
             if isinstance(v_args, str) and v_args.strip():
                 cmdline = v_args
-        return _classify_kubectl_exec(rest, raw_command, _cmdline_raw=cmdline)
-    if sub == "debug":
-        return _classify_kubectl_debug(rest, raw_command)
+        if sub == "exec":
+            return _classify_kubectl_exec(rest, raw_command, _cmdline_raw=cmdline)
+        return _classify_kubectl_debug(rest, raw_command, _cmdline_raw=cmdline)
     if sub == "scale":
         return _classify_kubectl_resource(rest, raw_command, default_kind=None)
     if sub in ("cordon", "uncordon", "drain"):
@@ -1995,6 +2070,160 @@ def _escape_primitive_in_payload_segments(
     return None
 
 
+def _host_escape_probe_and_verdict(
+    inner: list[str],
+    facts_line: str | None,
+    raw_command: str,
+    *,
+    escape_subject: str = "the exec",
+) -> tuple[list[str], EffectiveTarget | None]:
+    """Unwrap one shell layer to ``escape_probe`` and rule on a host escape.
+
+    Container escape attempts via nsenter/chroot/unshare pivot the mount/PID
+    namespace to the host. Default-deny, but distinguish from SCOPE_UNKNOWN so
+    the guard can tell the LLM the *real* reason (security policy, not
+    "unrecognised command"). A single ``sh -c "<script>"`` wrapper must not
+    hide the escape primitive: peek one layer deeper before deciding,
+    otherwise a wrapped ``chroot`` would be misread as a benign pod command.
+
+    Returns ``(escape_probe, verdict)``:
+      * ``verdict`` is a SCOPE_ESCAPE rejection when the inner reaches the
+        host (a head primitive, or one riding past a ``;``/``&&`` segment)
+        and is NOT a read-only probe;
+      * otherwise ``verdict`` is ``None`` and the caller continues to its own
+        branches. ``escape_probe`` (the one-layer-unwrapped argv) is handed
+        back because the exec face's fault-binary branch reads its head.
+
+    SINGLE SOURCE for both faces that can carry a host-reaching inner command:
+    ``kubectl exec POD -- INNER`` (rides a REGISTERED, gated carrier) and
+    one-shot ``kubectl debug node/N -- INNER`` (an EPHEMERAL pod never
+    registered as a carrier, so the carrier gate's ownership / family /
+    bounded-recovery review — which fires only on ``exec`` — never sees its
+    inner). Before the debug face was wired here it was an ungated
+    host-mutation hole (P4): ``kubectl debug node/N -- chroot /host systemctl
+    stop kubelet`` classified as scope=node/HIGH and sailed through.
+    """
+    if not inner:
+        return inner, None
+    escape_probe = inner
+    if facts_line is not None:
+        probed = _peek_escape_tokens_facts(facts_line)
+        if probed:
+            escape_probe = probed
+    elif (
+        inner[0] in ("sh", "bash", "ash", "dash", "/bin/sh", "/bin/bash")
+        and "-c" in inner
+    ):
+        c_idx = inner.index("-c")
+        if c_idx + 1 < len(inner):
+            try:
+                nested_tokens = shlex.split(inner[c_idx + 1])
+            except ValueError:
+                nested_tokens = []
+            if nested_tokens:
+                escape_probe = nested_tokens
+    escape_segment_hit = _escape_primitive_in_payload_segments(facts_line, inner)
+    if not (
+        (escape_probe and escape_probe[0] in ("nsenter", "chroot", "unshare"))
+        # R26/G-10: the head-only peek cannot see an escape primitive
+        # riding PAST a ``;``/``&&`` inside a script or wrapper — check
+        # at SEGMENT level so the compound forms reach this branch's
+        # readonly ruling (the shared judge is already segment-level,
+        # B46: an all-readonly compound stays READONLY, an escape stage
+        # that mutates lands in SCOPE_ESCAPE).
+        or escape_segment_hit is not None
+    ):
+        return escape_probe, None
+    # R27/G-11c: the reject message names the primitive the branch
+    # actually CAUGHT — for a compound payload the head-only probe
+    # holds the innocent head, and the message is the model's repair
+    # guidance (naming 'cat' sends the repair in the wrong direction).
+    escape_trigger = (
+        escape_probe[0]
+        if escape_probe and escape_probe[0] in ("nsenter", "chroot", "unshare")
+        else escape_segment_hit
+    )
+    # A READ-ONLY probe through the escape primitive is not a mutation:
+    # from a privileged debug pod, ``chroot /host cat /etc/os-release`` is
+    # the only way to inspect the node, and Phase 1 must be able to verify
+    # host preconditions before committing to a plan. Delegate to the shared
+    # read-only judge, which unwraps the primitive and rules on the command
+    # actually being run (so ``chroot /host iptables -A ...`` still lands in
+    # SCOPE_ESCAPE below). Mirrors the read-only exemption the fault-binary
+    # branch already grants.
+    from chaos_agent.tools.readonly import (
+        is_readonly_inner_tokens,
+        kubectl_exec_rejection_reason,
+    )
+
+    if facts_line is not None:
+        # Facts judge: rules on the raw inner text sliced after this
+        # level's ``--`` (the kubectl-exec prefix before it is inert),
+        # so quoted literals and structure are classified exactly.
+        escape_readonly = kubectl_exec_rejection_reason(facts_line) is None
+    else:
+        escape_readonly = is_readonly_inner_tokens(inner)
+    if escape_readonly:
+        return escape_probe, None
+    return escape_probe, EffectiveTarget(
+        scope=SCOPE_ESCAPE,
+        namespace="",
+        raw_command=raw_command,
+        confidence=ConfidenceLevel.UNKNOWN,
+        reject_detail=(
+            f"{escape_subject} runs a host-escape primitive "
+            f"('{escape_trigger}'); "
+            "it must go through an approved, current, privileged debug pod "
+            "on the approved node and be self-recovering"
+        ),
+        reject_suggestion=_FIX_ESCAPE_VIA_CARRIER,
+    )
+
+
+def _one_shot_debug_inner_self_recovers(after: list[str]) -> bool:
+    """Whether a one-shot ``kubectl debug -- <host mutation>`` inner self-recovers.
+
+    A one-shot debug pod is ephemeral and never registered as a carrier, so the
+    exec carrier gate (``carriers._resolve_carrier_from_artifact``, which fires
+    only on ``exec``) never reviews what it runs against the host. This applies
+    that gate's OWN判据 inline — ``classify_host_operation`` (family) then
+    ``host_operation_has_bounded_recovery`` (bounded reversal) — so the two
+    faces cannot drift:
+
+    * a self-recovering family mutation (the documented node-level injection
+      shape ``systemd-run --on-active=<N>s --unit=<u> <inverse> && <mutation>``)
+      → True, the escape verdict is suppressed and the call stays a node-scoped
+      operation (its pre-P4 behaviour, which the verified cases rely on);
+    * a family-less / banned-verb mutation (a bare ``systemctl stop``, ``rm``)
+      or a family mutation with no bounded reversal → False (fail-closed), the
+      SCOPE_ESCAPE rejection stands — this is the P4 hole being closed.
+
+    ``after`` is the token slice past the true ``--`` separator; ``shlex.join``
+    re-quotes it into the command string the判据 expect (a ``sh -c`` compound is
+    restored to a single quoted argument, so ``_surfaced_text`` sees the
+    timer payload). It is used rather than ``_cmdline_raw`` because it is
+    available on both the production (raw v_args) and synthetic (argv list)
+    shapes.
+    """
+    from chaos_agent.agent.target_guard.carriers import (
+        classify_host_operation,
+        host_operation_has_bounded_recovery,
+    )
+
+    try:
+        inner_text = shlex.join(after)
+    except (TypeError, ValueError):
+        # Unjoinable tokens (a lone surrogate) — cannot prove self-recovery.
+        return False
+    family = classify_host_operation(inner_text)
+    if not family:
+        # No fault family: a banned verb (``systemctl``) or a family-less
+        # mutation (``rm``). The exec gate rejects these as FAMILY_MISMATCH;
+        # this face fails closed the same way.
+        return False
+    return host_operation_has_bounded_recovery(inner_text, family)
+
+
 def _classify_kubectl_exec(
     args: list[str],
     raw_command: str,
@@ -2163,85 +2392,16 @@ def _classify_kubectl_exec(
             )
         return nested
 
-    # Container escape attempts via nsenter/chroot/unshare — these
-    # pivot the mount/PID namespace to the host. Default-deny, but
-    # distinguish from SCOPE_UNKNOWN so the guard can tell the LLM the
-    # *real* reason (security policy, not "unrecognised command").
-    #
-    # A single ``sh -c "<script>"`` wrapper must not hide the escape
-    # primitive: peek one layer deeper before deciding, otherwise a
-    # wrapped ``chroot`` would be misread as a benign pod command.
-    escape_probe = inner
-    if facts_line is not None:
-        probed = _peek_escape_tokens_facts(facts_line)
-        if probed:
-            escape_probe = probed
-    elif (
-        inner[0] in ("sh", "bash", "ash", "dash", "/bin/sh", "/bin/bash")
-        and "-c" in inner
-    ):
-        c_idx = inner.index("-c")
-        if c_idx + 1 < len(inner):
-            try:
-                nested_tokens = shlex.split(inner[c_idx + 1])
-            except ValueError:
-                nested_tokens = []
-            if nested_tokens:
-                escape_probe = nested_tokens
-    escape_segment_hit = _escape_primitive_in_payload_segments(facts_line, inner)
-    if (
-        escape_probe[0] in ("nsenter", "chroot", "unshare")
-        # R26/G-10: the head-only peek cannot see an escape primitive
-        # riding PAST a ``;``/``&&`` inside a script or wrapper — check
-        # at SEGMENT level so the compound forms reach this branch's
-        # readonly ruling (the shared judge is already segment-level,
-        # B46: an all-readonly compound stays READONLY, an escape stage
-        # that mutates lands in SCOPE_ESCAPE).
-        or escape_segment_hit is not None
-    ):
-        # R27/G-11c: the reject message names the primitive the branch
-        # actually CAUGHT — for a compound payload the head-only probe
-        # holds the innocent head, and the message is the model's repair
-        # guidance (naming 'cat' sends the repair in the wrong direction).
-        escape_trigger = (
-            escape_probe[0]
-            if escape_probe[0] in ("nsenter", "chroot", "unshare")
-            else escape_segment_hit
-        )
-        # A READ-ONLY probe through the escape primitive is not a mutation:
-        # from a privileged debug pod, ``chroot /host cat /etc/os-release`` is
-        # the only way to inspect the node, and Phase 1 must be able to verify
-        # host preconditions before committing to a plan. Delegate to the shared
-        # read-only judge, which unwraps the primitive and rules on the command
-        # actually being run (so ``chroot /host iptables -A ...`` still lands in
-        # SCOPE_ESCAPE below). Mirrors the read-only exemption the fault-binary
-        # branch already grants.
-        from chaos_agent.tools.readonly import (
-            is_readonly_inner_tokens,
-            kubectl_exec_rejection_reason,
-        )
-
-        if facts_line is not None:
-            # Facts judge: rules on the raw inner text sliced after this
-            # level's ``--`` (the kubectl-exec prefix before it is inert),
-            # so quoted literals and structure are classified exactly.
-            escape_readonly = kubectl_exec_rejection_reason(facts_line) is None
-        else:
-            escape_readonly = is_readonly_inner_tokens(inner)
-        if not escape_readonly:
-            return EffectiveTarget(
-                scope=SCOPE_ESCAPE,
-                namespace="",
-                raw_command=raw_command,
-                confidence=ConfidenceLevel.UNKNOWN,
-                reject_detail=(
-                    f"the exec runs a host-escape primitive "
-                    f"('{escape_trigger}'); "
-                    "it must go through an approved, current, privileged debug pod "
-                    "on the approved node and be self-recovering"
-                ),
-                reject_suggestion=_FIX_ESCAPE_VIA_CARRIER,
-            )
+    # Container escape attempts via nsenter/chroot/unshare pivot to the host.
+    # Single-sourced with the one-shot ``kubectl debug`` face (P4) — see
+    # ``_host_escape_probe_and_verdict``. ``escape_probe`` (one ``sh -c`` layer
+    # unwrapped) is handed back because the fault-binary branch below reads
+    # its head.
+    escape_probe, _escape_verdict = _host_escape_probe_and_verdict(
+        inner, facts_line, raw_command,
+    )
+    if _escape_verdict is not None:
+        return _escape_verdict
 
     # Fault-binary mutations (iptables/nft/tc/stress/dd/etc) inside a
     # kubectl exec.
@@ -2368,12 +2528,25 @@ def _classify_kubectl_exec(
 # ---------------------------------------------------------------------------
 
 
-def _classify_kubectl_debug(args: list[str], raw_command: str) -> EffectiveTarget:
+def _classify_kubectl_debug(
+    args: list[str],
+    raw_command: str,
+    *,
+    _cmdline_raw: str | None = None,
+) -> EffectiveTarget:
     """``kubectl debug node/NODE`` or ``kubectl debug POD``.
 
     Both creates a debug pod that EXECUTES against the target. The
     target itself is what matters (the node or the pod being
     debugged), not the ephemeral debug pod.
+
+    The ``-- <cmd>`` inner is NOT inert (P4): a one-shot debug pod is
+    EPHEMERAL and never registered as a carrier, so the carrier gate (which
+    fires only on ``exec``) never reviews what it runs on the host. Judge the
+    inner through the SAME host-escape lens the exec face uses — a
+    host-reaching mutation must ride a registered, self-recovering carrier,
+    not a one-shot debug. Read-only host probes, pod-local commands, and the
+    ``-- sleep N`` carrier-creation keepalive are unaffected (verdict None).
     """
     first = _first_positional(args)
     if not first:
@@ -2397,7 +2570,7 @@ def _classify_kubectl_debug(args: list[str], raw_command: str) -> EffectiveTarge
     # never counts as one.
     from chaos_agent.tools._readonly_facts import exec_separator_shape
 
-    positionals, _after = exec_separator_shape(args)
+    positionals, after = exec_separator_shape(args)
     if len(positionals) > 1:
         extras = positionals[1:]
         shown = " ".join(extras[:8]) + (" ..." if len(extras) > 8 else "")
@@ -2414,6 +2587,29 @@ def _classify_kubectl_debug(args: list[str], raw_command: str) -> EffectiveTarge
             ),
             reject_suggestion=_FIX_DEBUG_ONE_TARGET,
         )
+    # P4: scrutinize the ``-- <cmd>`` inner for a host-escape mutation — the
+    # ungated face the exec-only carrier review never saw. A one-shot debug
+    # pod is ephemeral and never registered as a carrier, so a host mutation
+    # through it bypasses the ownership / bounded-recovery review entirely.
+    # ``_cmdline_raw`` (this debug line's v_args) drives the facts judge;
+    # None → the over-strict token path (fail-closed, never an escape-miss).
+    #
+    # The escape verdict is SUPPRESSED when the inner self-recovers: the
+    # documented node-level injection shape rides a one-shot debug with its
+    # own bounded reversal (``systemd-run --on-active=<N>s --unit=<u> <inverse>
+    # && <mutation>``), and there is no registered carrier to gate it, so this
+    # face applies the exec carrier gate's OWN判据 inline (see
+    # ``_one_shot_debug_inner_self_recovers``). A non-self-recovering mutation
+    # (a bare ``systemctl stop`` / ``rm``) keeps the rejection — the P4 hole.
+    if after:
+        _probe, _escape_verdict = _host_escape_probe_and_verdict(
+            list(after), _cmdline_raw, raw_command,
+            escape_subject="the one-shot `kubectl debug`",
+        )
+        if _escape_verdict is not None and not _one_shot_debug_inner_self_recovers(
+            list(after),
+        ):
+            return _escape_verdict
     kind, name = _split_kind_name(first)
     canonical = canonicalise_kind(kind) if kind else "pod"
     ns = parse_namespace(args, default="" if canonical == "node" else "default")

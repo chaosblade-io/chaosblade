@@ -303,6 +303,7 @@ class K8sNativeProvider:
         from chaos_agent.agent.providers.message_scanning import (
             scan_kubectl_mutation_index,
         )
+        from .classifier import is_apply_native_fault_injection
 
         idx = scan_kubectl_mutation_index(
             messages,
@@ -310,6 +311,7 @@ class K8sNativeProvider:
             command_subcommands=self.inject_command_subcommands,
             is_mutating_command=exec_inner_command_mutates,
             is_teardown=is_teardown,
+            is_native_injection=is_apply_native_fault_injection,
         )
         return "kubectl_native" if idx >= 0 else None
 
@@ -329,6 +331,7 @@ class K8sNativeProvider:
             scan_native_issue_disproven,
         )
         from chaos_agent.agent.providers.registry import FaultProviderRegistry
+        from .classifier import is_apply_native_fault_injection
 
         return scan_native_issue_disproven(
             messages,
@@ -339,6 +342,7 @@ class K8sNativeProvider:
                 FaultProviderRegistry.is_blade_exec_create_delivery
             ),
             is_teardown=is_teardown,
+            is_native_injection=is_apply_native_fault_injection,
         )
 
     def injection_recency(
@@ -350,6 +354,7 @@ class K8sNativeProvider:
         from chaos_agent.agent.providers.message_scanning import (
             scan_kubectl_mutation_index,
         )
+        from .classifier import is_apply_native_fault_injection
 
         return scan_kubectl_mutation_index(
             messages,
@@ -357,6 +362,7 @@ class K8sNativeProvider:
             command_subcommands=self.inject_command_subcommands,
             is_mutating_command=exec_inner_command_mutates,
             is_teardown=is_teardown,
+            is_native_injection=is_apply_native_fault_injection,
         )
 
     def build_fault_handle(self, values: dict) -> Optional[dict]:
@@ -429,11 +435,24 @@ class K8sNativeProvider:
         neutral fault spec, which the verifier already renders."""
         return None
 
+    def enforce_contract_duration(
+        self, tool_name: str, tool_args: dict, duration_seconds: int
+    ) -> Optional[str]:
+        """No ``--timeout`` carrier on the native surface: this backend issues
+        object writes (``kubectl patch/scale/apply``), whose recovery window
+        lives in the object or manifest it writes — not in a flag. The
+        ``kubectl exec ... blade create`` shape it shares with the ChaosBlade
+        backend is that backend's flag to pin (it claims the call first)."""
+        return None
+
     def issue_time_method(
         self, tool_name: str, tool_args: dict, *, is_host: bool = False
     ) -> Optional[str]:
         """Issue-time attribution for the kubectl-native carrier: an
-        object-write verb IS the mutation (``kubectl_native``); a command-mode
+        object-write verb IS the mutation (``kubectl_native``); an
+        ``apply``/``create -f`` of a PERSISTENT fault object is too (the
+        apply/create-native counterpart, recognised by MANIFEST KIND, never by
+        the verb — see ``is_apply_native_fault_injection``); a command-mode
         ``exec``/``debug`` only when the inner command mutates (the shared
         fail-safe classifier). An embedded ChaosBlade delivery
         (``kubectl exec ... blade create``) is claimed EARLIER by the
@@ -446,6 +465,20 @@ class K8sNativeProvider:
         v_args = tool_args.get("v_args", "") or ""
         if subcommand in self.inject_kubectl_subcommands:
             return "kubectl_native"
+        if subcommand in ("apply", "create"):
+            # apply/create-native unbounded fault: a persistent manifest fault
+            # object (networkpolicy/configmap/secret/pvc/...) lives exactly as
+            # long as the object — no UID, no self-timeout — so it attributes
+            # like a mutation verb. Recognised by KIND, not by verb (the verb
+            # table stays mutation-only; test_apply_verb_is_not_claimed pins
+            # that a plain Deployment/ConfigMap apply is NOT claimed here —
+            # only the persistent fault family is). The faultdrill CR defers to
+            # the faultdrill provider; carrier scaffolding (RBAC/workload) is
+            # outside the family. Lazy import — see the NOTE near file top.
+            from .classifier import is_apply_native_fault_injection
+
+            if is_apply_native_fault_injection(tool_name, tool_args):
+                return "kubectl_native"
         if (
             subcommand in self.inject_command_subcommands
             and isinstance(v_args, str)
@@ -524,11 +557,13 @@ class K8sNativeProvider:
     def was_injection_attempted(self, messages: list, *, is_teardown=None) -> bool:
         """Form B hook (phase-8 T3): back-scan for a kubectl-native
         alternative injection after a ``blade_create`` attempt —
-        object-write verbs, or exec/debug whose inner command mutates.
+        object-write verbs, an ``apply``/``create -f`` of a persistent fault
+        object, or exec/debug whose inner command mutates.
         Delegates to the shared scan primitive with THIS class's
         vocabulary (formerly the generic layer's read-through wrapper
         ``_was_kubectl_injection_attempted``)."""
         from chaos_agent.agent.providers.registry import FaultProviderRegistry
+        from .classifier import is_apply_native_fault_injection
 
         return scan_kubectl_injection_after_blade(
             messages,
@@ -539,6 +574,7 @@ class K8sNativeProvider:
                 FaultProviderRegistry.is_blade_exec_create_delivery
             ),
             is_teardown=is_teardown,
+            is_native_injection=is_apply_native_fault_injection,
         )
 
     async def layer1_verify(self, state: dict, **kwargs) -> "Layer1Result":
@@ -607,8 +643,83 @@ class K8sNativeProvider:
     def recovery_facts_render(
         self, state: dict, *, spec_params: dict | None = None
     ) -> str:
-        """UID-less carrier: no carrier-owned injection facts to render."""
-        return ""
+        """Armed-rollback ledger facts for the recovery executor (#59).
+
+        The debug-pod ledger records what a host fault armed a rollback for
+        (``recovery_fill_path`` for disk fills, ``recovery_dm_name`` for
+        device-mapper mappings) and which realm the reversal lives in
+        (``recovery_form``) — but NOTHING else hands those facts to the
+        recovery LLM: the injection context is abstracted past any path
+        (``build_inject_context`` drops tool-call arguments), the skill
+        case's recovery-verification slice carries verification criteria
+        only, and Layer 1 never reads the skill case at all. Without these
+        lines a carrier-resident reversal whose carrier died mid-drill is
+        indistinguishable from a pending self-recovery — the model waits on
+        a timer that will never fire while the ledger already knows it is
+        void and names the exact path to reclaim.
+
+        Facts only, no rules: each line states what the ledger recorded
+        and what realm the reversal lives in; the executor decides what to
+        do with it.
+        """
+        from chaos_agent.agent.target_guard.carriers import RECOVERY_FAMILIES
+
+        lines: list[str] = []
+        for artifact in state.get("execution_artifacts") or []:
+            if not isinstance(artifact, dict):
+                continue
+            if artifact.get("type") != "debug_pod":
+                continue
+            # The recovery registry is the single source for which ledger key is
+            # a reclaim fingerprint and how it reads back — the same enumeration
+            # the ledger writes and the carrier gate's early-recovery lane
+            # admits (W-67-8: the network face was missing from all of them
+            # until it gained a registry record). Pick the present face with the
+            # highest precedence, preserving the historical dm > network >
+            # disk-fill one-line-per-artifact priority.
+            present = [
+                face for face in RECOVERY_FAMILIES
+                if artifact.get(face.ledger_key)
+            ]
+            if not present:
+                continue
+            face = min(present, key=lambda f: f.render_precedence)
+            what, inverse = face.render(artifact.get(face.ledger_key))
+            node = str((artifact.get("target") or {}).get("name") or "")
+            where = f" on node {node}" if node else ""
+            if artifact.get("recovery_void"):
+                lines.append(
+                    f"- Armed rollback for {what}"
+                    f"{where}: the carrier died in-window and the "
+                    "carrier-resident reversal is VOID — no self-recovery "
+                    "will fire. ACTIVE recovery is required: "
+                    f"{inverse} on that node (idempotent)."
+                )
+            elif artifact.get("status") == "recovery_armed":
+                form = str(artifact.get("recovery_form") or "")
+                if form == "host_timer":
+                    lines.append(
+                        f"- Armed rollback for {what}"
+                        f"{where}: a host-managed timer under PID 1 — it "
+                        "survives the carrier and fires on its own; verify "
+                        "after its window, and an early re-recovery via "
+                        f"{inverse} is idempotent."
+                    )
+                else:
+                    lines.append(
+                        f"- Armed rollback for {what}"
+                        f"{where}: a CARRIER-RESIDENT reversal — it fires "
+                        "only if the carrier pod is alive. If the carrier "
+                        "is gone, treat it as void and recover actively "
+                        f"({inverse})."
+                    )
+        if not lines:
+            return ""
+        return (
+            "## Armed Rollback (recorded at injection time)\n"
+            + "\n".join(lines)
+            + "\n"
+        )
 
     def merge_deterministic_recover_verdict(
         self, layer1, state: dict, part_override: dict | None = None

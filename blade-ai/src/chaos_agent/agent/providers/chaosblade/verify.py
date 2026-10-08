@@ -1325,11 +1325,32 @@ def was_blade_create_attempted(
         return False
 
     # If kubectl-native injection was used as alternative after blade_create
-    # failed, treat as non-ChaosBlade fault (Layer 1 = "skipped"). The
+    # failed, treat as non-ChaosBlade fault (Layer1 = "skipped"). The
     # vocabulary is kubectl tool-domain knowledge
     # (``providers.message_scanning``, phase-14 G2: the "did native take over
     # after blade failed" judgement is boundary knowledge and lives with the
     # blade domain, but the word lists it consumes belong to the tool).
+    #
+    # ``is_native_injection`` (the SAME canonical ``is_apply_native_fault_
+    # injection`` predicate the issue-time attribution and the armed-before-
+    # inject gate borrow): an ``apply``/``create -f`` of a PERSISTENT fault
+    # object (networkpolicy/configmap/...) is a native takeover too, but the
+    # verb is absent from ``KUBECTL_WRITE_SUBCOMMANDS`` — without threading it,
+    # a state-less restored session (no durable ``injection_method``) whose
+    # blade_create failed and was taken over by an apply-native fault would
+    # fall through to the ``blade_create`` ToolMessage loop below and mis-route
+    # a live, recoverable fault into the terminal "attempted-and-failed".
+    #
+    # The predicate is k8s-native vocabulary, so this blade carrier reaches it
+    # through the registry's domain-routing seam (phase-14 G3: no carrier
+    # sub-package reaches sideways into another — the same seam pattern the
+    # registry already exposes for classify_inline_blade /
+    # recovery_carrier_allowed_images). Lazy import — registry is the providers
+    # package's generic arbitration point (not a carrier prefix), so this is a
+    # legal carrier→generic direction, and it keeps the registration-time
+    # import order untouched.
+    from chaos_agent.agent.providers.registry import FaultProviderRegistry
+
     if scan_kubectl_injection_after_blade(
         messages,
         KUBECTL_WRITE_SUBCOMMANDS,
@@ -1337,6 +1358,7 @@ def was_blade_create_attempted(
         is_mutating_command=exec_inner_command_mutates,
         is_blade_create_delivery=_is_blade_create_delivery,
         is_teardown=is_teardown,
+        is_native_injection=FaultProviderRegistry.is_apply_native_fault_injection,
     ):
         return False
 

@@ -87,6 +87,36 @@ class TestScanNativeIssueDisproven:
         ]
         assert scan_native_issue_disproven(msgs, WRITE_SUBS) is True
 
+    def test_preexec_rejected_object_write_is_disproven(self):
+        """#65-R anchor pollution: the armed-before-inject gate intercepts an
+        object-write BEFORE dispatch and renders ``[target_guard] REJECT_BANNED``
+        — no ``Error:`` prefix (the write never reached the API server). It is
+        counter-evidence exactly like an ``Error:`` (``reached_target`` False),
+        so the issue-time attribution AND its write-once ``injection_start_time``
+        stamp are revoked, letting the real later landing re-stamp T0. Mirrors
+        the faultdrill provider's ``issue_disproven`` pre-exec-rejection face."""
+        msgs = [
+            _attempt("patch", "role drill-rc-np300 -n default --type=json -p []"),
+            _result(
+                "tc1",
+                "[target_guard] REJECT_BANNED — armed-before-inject: this "
+                "object-write injection has no ARMED recovery vehicle",
+            ),
+        ]
+        assert scan_native_issue_disproven(msgs, WRITE_SUBS) is True
+
+    def test_preexec_rejection_does_not_confirm_but_a_real_landing_does(self):
+        """The confirmation pre-pass must not read a pre-execution rejection as
+        'a write landed' — but a genuinely landed sibling write still confirms
+        the attribution irrevocably (the live fault must not be orphaned)."""
+        msgs = [
+            _attempt("patch", "role drill-rc-np300 --type=json -p []", tc_id="t1"),
+            _result("t1", "[target_guard] REJECT_BANNED — armed-before-inject"),
+            _attempt("scale", "deployment/app --replicas=0", tc_id="t2"),
+            _result("t2", "deployment.apps/app scaled"),
+        ]
+        assert scan_native_issue_disproven(msgs, WRITE_SUBS) is False
+
     def test_successful_object_write_stands(self):
         msgs = [
             _attempt("scale", "deployment/app --replicas=0"),

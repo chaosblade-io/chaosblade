@@ -152,6 +152,17 @@ def is_budget_expiry_unknown(content: object) -> bool:
 #: ``tests/test_agent/test_teardown_vocab_sentinel.py`` (the threaded
 #: parameter name ``is_teardown`` is an exemption marker) and pinned by
 #: the family teeth (``TestIssueTimeTeardownAttribution``).
+#:
+#: NAME DISAMBIGUATION (root cause II, proxy conflation): this is the
+#: OBJECT-WRITE ATTRIBUTION vocabulary (8 members) — "does the verb alone
+#: prove an object write?" — and is DELIBERATELY NARROWER than the
+#: injection-window anchor set ``tools.progress._KUBECTL_INJECTION_SUBCOMMANDS``
+#: (13 members). ``apply``/``create`` are EXCLUDED here on purpose:
+#: apply-native fault attribution is content-judged by
+#: ``k8s_native.classifier.is_apply_native_fault_injection``, never by the
+#: bare verb, so admitting them here would misattribute benign ``apply``s.
+#: The anchor set includes them because an apply-native carrier DOES open
+#: the injection window. Two concepts, two names — do not "unify" them.
 KUBECTL_WRITE_SUBCOMMANDS = frozenset(
     {
         "scale",
@@ -943,6 +954,7 @@ def scan_kubectl_injection_after_blade(
     is_mutating_command=None,
     is_blade_create_delivery=None,
     is_teardown=None,
+    is_native_injection=None,
 ) -> bool:
     """True if a kubectl-native injection followed a ``blade_create`` attempt.
 
@@ -951,7 +963,9 @@ def scan_kubectl_injection_after_blade(
     don't count. Two attempt shapes are recognised:
 
     - **Object-write** — a ``subcommand`` in ``subcommands``
-      (scale/patch/cordon/...) that SUCCEEDED. The verb itself IS the
+      (scale/patch/cordon/...) that SUCCEEDED, or (via the optional
+      ``is_native_injection`` callable) an ``apply``/``create -f`` of a
+      persistent fault object that SUCCEEDED. The verb itself IS the
       mutation and its result is trustworthy, so failed calls don't count.
     - **Command-mode** — a ``subcommand`` in ``command_subcommands``
       (``exec``/``debug``) whose inner command mutates (judgement delegated
@@ -1003,7 +1017,10 @@ def scan_kubectl_injection_after_blade(
                 if is_teardown is not None and is_teardown("kubectl", args):
                     continue
                 subcommand = args.get("subcommand", "")
-                if subcommand in subcommands:
+                if subcommand in subcommands or (
+                    is_native_injection is not None
+                    and is_native_injection("kubectl", args)
+                ):
                     content = msg.content or ""
                     if not content.startswith("Error:"):
                         return True
@@ -1047,6 +1064,7 @@ def scan_native_issue_disproven(
     is_mutating_command=None,
     is_blade_create_delivery=None,
     is_teardown=None,
+    is_native_injection=None,
 ) -> bool:
     """True when the MOST RECENT kubectl-native attempt's result explicitly
     DISPROVES the mutation — an explicit counter-evidence scan for revoking
@@ -1059,7 +1077,16 @@ def scan_native_issue_disproven(
 
     - **Object-write** (``subcommand`` in ``write_subcommands``): the verb
       itself is the mutation and the API-server result is trustworthy — an
-      ``Error:`` result proves the write never landed (returns True).
+      ``Error:`` result proves the write never landed (returns True). So does
+      a PRE-EXECUTION rejection (``reached_target`` False — the tool_screener
+      / target_guard intercepted the call BEFORE dispatch and rendered e.g.
+      ``[target_guard] REJECT_BANNED``): the write never reached the cluster,
+      exactly like an ``Error:``. This face is load-bearing and mirrors the
+      faultdrill provider's ``issue_disproven`` — without it a guard-rejected
+      object-write keeps its issue-time attribution AND its write-once
+      ``injection_start_time`` stamp (the #65-R anchor pollution: a rejected
+      carrier-scaffolding ``patch role`` froze T0 ~4min before the real
+      netpol apply, and the later landing could not re-stamp it).
     - **Command-mode** (``subcommand`` in ``command_subcommands`` with a
       mutating inner command): never judgeable — its error results may be
       the fault severing its own feedback channel (the forensic paradox),
@@ -1076,11 +1103,14 @@ def scan_native_issue_disproven(
     severed channel), and absence of result is never counter-evidence.
 
     RESULT-BORN CONFIRMATION GUARD: if ANY object-write attempt in the epoch
-    has a present, non-error result, the attribution is CONFIRMED — a mutation
-    provably landed on the cluster. A LATER failed write (a multi-step skill's
-    second step failing, or a self-undo retry failing) must not revoke it:
-    revocation would orphan the still-live fault from the successful write.
-    Counter-evidence only exists while NO write ever landed.
+    has a present result that both is non-error AND reached the target
+    (``reached_target``), the attribution is CONFIRMED — a mutation provably
+    landed on the cluster. A pre-execution rejection is NOT a landing (the
+    write never reached the API server), so it never confirms. A LATER failed
+    write (a multi-step skill's second step failing, or a self-undo retry
+    failing) must not revoke it: revocation would orphan the still-live fault
+    from the successful write. Counter-evidence only exists while NO write
+    ever landed.
 
     CALLER CONTRACT (teardown≠mutation, P3): thread the ``is_teardown``
     matcher and the confirmation pre-pass + the judge loop BOTH skip
@@ -1088,6 +1118,14 @@ def scan_native_issue_disproven(
     delete's SUCCESS receipt no longer masquerades as "a write landed"
     (the O-2 defect) even inside a mixed batch. ``None`` (the default) is
     RAW evidence (see the contract note on ``KUBECTL_WRITE_SUBCOMMANDS``).
+
+    ``is_native_injection`` (optional callable ``(name, args) -> bool``)
+    widens the object-write recognition beyond ``write_subcommands`` to the
+    apply/create-native persistent faults — an ``apply`` of a networkpolicy /
+    configmap / ... IS an object write whose API-server result is just as
+    trustworthy, so a failed one revokes and a landed one confirms exactly
+    like a mutation verb. ``None`` (the default) keeps the verb-only
+    recognition byte-identical.
     """
     results = {
         getattr(msg, "tool_call_id", ""): msg
@@ -1112,7 +1150,10 @@ def scan_native_issue_disproven(
                 continue
             if is_teardown is not None and is_teardown(name, args):
                 continue
-            if args.get("subcommand", "") not in write_subcommands:
+            if args.get("subcommand", "") not in write_subcommands and not (
+                is_native_injection is not None
+                and is_native_injection(name, args)
+            ):
                 continue
             result_msg = results.get(tc_id or "")
             if result_msg is None:
@@ -1120,7 +1161,7 @@ def scan_native_issue_disproven(
             content = result_msg.content if isinstance(
                 result_msg.content, str
             ) else str(result_msg.content)
-            if not content.startswith("Error:"):
+            if not content.startswith("Error:") and reached_target(content):
                 return False  # a write landed — attribution confirmed
     for msg in reversed(messages):
         if not isinstance(msg, AIMessage):
@@ -1139,7 +1180,10 @@ def scan_native_issue_disproven(
             if is_teardown is not None and is_teardown(name, args):
                 continue
             subcommand = args.get("subcommand", "")
-            if subcommand in write_subcommands:
+            if subcommand in write_subcommands or (
+                is_native_injection is not None
+                and is_native_injection(name, args)
+            ):
                 # Latest attempt found — judge its result only.
                 result_msg = results.get(tc_id or "")
                 if result_msg is None:
@@ -1156,7 +1200,12 @@ def scan_native_issue_disproven(
                     # carrier): never counter-evidence. Direction and
                     # wording rationale live on the predicate.
                     return False
-                return content.startswith("Error:")
+                # ``Error:`` (API-server-proved failure) OR a pre-execution
+                # rejection (``reached_target`` False — guard/screener
+                # intercepted before dispatch): either proves the write never
+                # landed. The #65-R face — a ``[target_guard]``-rejected
+                # carrier-scaffolding patch carries no ``Error:`` prefix.
+                return content.startswith("Error:") or not reached_target(content)
             if (
                 subcommand in command_subcommands
                 and is_mutating_command is not None
@@ -1179,6 +1228,7 @@ def scan_kubectl_mutation_index(
     command_subcommands: set[str] | frozenset[str] = frozenset(),
     is_mutating_command=None,
     is_teardown=None,
+    is_native_injection=None,
 ) -> int:
     """Index of the most-recent AIMessage carrying a mutating kubectl attempt.
 
@@ -1193,6 +1243,11 @@ def scan_kubectl_mutation_index(
     returned (it is not mutation evidence — the R6-1/R8-1 ghost doors);
     ``None`` (the default) is RAW evidence (see the contract note on
     ``KUBECTL_WRITE_SUBCOMMANDS``).
+
+    ``is_native_injection`` (optional callable ``(name, args) -> bool``)
+    widens the mutation recognition to apply/create-native persistent faults
+    so an ``apply`` of a fault object indexes as the injection it is;
+    ``None`` (the default) keeps verb-only recognition byte-identical.
     """
     last = -1
     for i, msg in enumerate(messages):
@@ -1210,7 +1265,10 @@ def scan_kubectl_mutation_index(
             if is_teardown is not None and is_teardown(name, args):
                 continue
             subcommand = args.get("subcommand", "")
-            if subcommand in write_subcommands:
+            if subcommand in write_subcommands or (
+                is_native_injection is not None
+                and is_native_injection(name, args)
+            ):
                 last = i
                 break
             if subcommand in command_subcommands and is_mutating_command is not None:
