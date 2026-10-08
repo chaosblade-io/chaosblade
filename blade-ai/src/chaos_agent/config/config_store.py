@@ -70,6 +70,7 @@ _INT_KEYS = {
     "llm_read_timeout",
     "timeout_default",
     "timeout_skill_script",
+    "recovery_grace_seconds",
 }
 # Float keys.
 _FLOAT_KEYS = {

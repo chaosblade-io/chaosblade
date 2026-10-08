@@ -13,6 +13,7 @@ extraction, and K8s quantity parsing.
 from __future__ import annotations
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,56 @@ def normalize_timeout_flag(argv: list[str]) -> str | None:
     return value
 
 
+# ``--timeout`` inside a COMMAND STRING (``--timeout 300`` / ``--timeout=300``
+# / ``--timeout 300s``). The lookbehind keeps a token boundary so a flag like
+# ``--timeout-x`` is never matched; the value stops at whitespace and is
+# unquoted by the readers below.
+_TIMEOUT_FLAG_RE = re.compile(r"(?<!\S)--timeout(?:=|\s+)(?P<value>[^\s]+)")
+
+
+def read_timeout_flag(text: str) -> int | None:
+    """The ``--timeout`` value in SECONDS carried by a command string.
+
+    String-level sibling of :func:`normalize_timeout_flag` for the carriers
+    that hand their flags over as one free-form string (the ``blade_create``
+    flags field and the ``kubectl exec ... blade create`` v_args). Last-wins,
+    matching blade's pflag precedence — the same value the executor honours.
+    ``None`` when the text carries no ``--timeout`` or its value is not an
+    integer.
+    """
+    matches = list(_TIMEOUT_FLAG_RE.finditer(text or ""))
+    if not matches:
+        return None
+    try:
+        return int(matches[-1].group("value").strip("\"'").rstrip("sS"))
+    except (TypeError, ValueError):
+        return None
+
+
+def set_timeout_flag(text: str, seconds: int) -> str:
+    """Rewrite ``text`` so it carries exactly one ``--timeout <seconds>``.
+
+    The FIRST occurrence is rewritten in place and every later spelling is
+    dropped, so all other bytes of the command stay untouched — matchers,
+    quoting and flag order are never re-rendered. ``--timeout`` is the
+    fault's own duration for both blade surfaces, so this function is how a
+    command is pinned to the one window the user approved.
+    """
+    canonical = f"--timeout {int(seconds)}"
+    matches = list(_TIMEOUT_FLAG_RE.finditer(text or ""))
+    if not matches:
+        return f"{text} {canonical}".strip() if text else canonical
+    pieces: list[str] = []
+    cursor = 0
+    for index, match in enumerate(matches):
+        pieces.append(text[cursor:match.start()])
+        if index == 0:
+            pieces.append(canonical)
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 # Minimum recommended duration per fault type (scope, target, action)
 # All values >= 300s per requirement. Based on empirical measurement of
 # Layer1 + Layer2 verification latency + ChaosBlade scheduling delay.
@@ -83,9 +134,17 @@ _FAULT_TYPE_MIN_DURATION: dict[tuple[str, str, str], int] = {
     ("container", "network", "drop"): 300,
 }
 
-# Default minimum duration when fault type is not in the table
-# Must be >= 300s per requirement. This is the ABSOLUTE safety floor:
-# the operator-configured ``experiment_timeout`` is clamped up to it.
+# Fallback used when the operator-configured ``experiment_timeout`` is
+# missing, non-positive, or unparseable, and the recommended floor for a
+# fault type absent from ``_FAULT_TYPE_MIN_DURATION``. Must be >= 300s per
+# requirement.
+#
+# ADVISORY, not absolute: neither a configured default nor an explicit
+# per-injection duration is ever raised to it. A below-floor value is
+# honoured verbatim with a warning (l4-contract-faithfulness). The
+# empirical basis — Layer1+Layer2 verification latency plus ChaosBlade
+# scheduling delay — still explains why a too-tight window tends to exit
+# honestly as unverified/partial rather than produce a false verdict.
 _DEFAULT_MIN_DURATION = 300
 
 
@@ -94,15 +153,27 @@ def _configured_experiment_timeout() -> int:
 
     Reads ``settings.experiment_timeout`` (config.json / env override).
     Imported lazily so this carrier-agnostic utility module stays
-    import-light. Values below ``_DEFAULT_MIN_DURATION`` are clamped
-    up: the empirical verification-latency floor always wins.
+    import-light.
+
+    The configured value is returned verbatim: it *is* the operator's
+    stated default, so lifting it to the empirical floor would be the same
+    defect as amending a per-injection explicit duration. Only a
+    non-positive or unparseable value counts as "not configured" and falls
+    back to ``_DEFAULT_MIN_DURATION``.
     """
     try:
         from chaos_agent.config.settings import settings
         configured = int(settings.experiment_timeout)
     except (ImportError, ValueError, TypeError):
-        configured = _DEFAULT_MIN_DURATION
-    return max(configured, _DEFAULT_MIN_DURATION)
+        return _DEFAULT_MIN_DURATION
+    if configured <= 0:
+        logger.warning(
+            "experiment_timeout=%ss is not a usable duration (must be "
+            "positive); falling back to the %ss default.",
+            configured, _DEFAULT_MIN_DURATION,
+        )
+        return _DEFAULT_MIN_DURATION
+    return configured
 
 
 def get_recommended_duration(scope: str, target: str, action: str) -> int:
@@ -124,11 +195,11 @@ def ensure_min_duration(
     Called from the blade_create tool and CLI.
 
     When no timeout is specified, the operator-configured
-    ``experiment_timeout`` (see settings) is the injected default,
-    never below the per-fault-type empirical floor. Explicit timeouts
-    pass through untouched — an explicitly requested duration below the
-    floor is honoured verbatim with a warning (the executor must not
-    unilaterally amend a contract-stated duration, in either direction).
+    ``experiment_timeout`` (see settings) is the injected default. A
+    configured default and an explicit timeout are treated by one rule:
+    both pass through untouched, and a value below the per-fault-type
+    empirical floor is honoured verbatim with a warning (the executor must
+    not unilaterally amend a stated duration, in either direction).
 
     Args:
         timeout_value: Current --timeout value (0, None, or a positive int/string).
@@ -149,8 +220,21 @@ def ensure_min_duration(
         current = 0
 
     if current <= 0:
-        # Unspecified: inject the configured default, clamped to the floor.
-        return max(_configured_experiment_timeout(), floor)
+        # Unspecified: inject the operator-configured default verbatim.
+        # One rule for both sources — the floor warns, it does not lift.
+        # Silently raising a configured value hides the knob's real range
+        # and makes the setting untrustworthy.
+        configured = _configured_experiment_timeout()
+        if configured < floor:
+            logger.warning(
+                "Configured experiment_timeout %ss is below the recommended "
+                "%ss floor for fault type (%s, %s, %s); applying the "
+                "configured %ss verbatim. A window this tight may close "
+                "before verification can observe the fault — such a run "
+                "exits as unverified/partial rather than being extended.",
+                configured, floor, scope, target, action, configured,
+            )
+        return configured
     if current < floor:
         # Explicit but below floor: honour the caller's value verbatim and
         # make the requested-vs-recommended gap visible. Raising it would
@@ -163,6 +247,53 @@ def ensure_min_duration(
         )
         return current
     return current
+
+
+# Fallback grace when settings is unreachable/misconfigured. Mirrors the
+# settings.recovery_grace_seconds default so the two never disagree even
+# in import-light contexts.
+_DEFAULT_RECOVERY_GRACE_SECONDS = 120
+
+
+def recovery_timer_seconds(duration_seconds: int | str | None) -> int:
+    """Return the fault's own recovery-timer seconds (single source of truth).
+
+    Two-number window contract:
+    - observation window D = the approved ``duration_seconds`` — the
+      framework's presence obligation; hold dispatch is anchored to its end;
+    - safety-net timer D + G — what the fault's own timer must be armed with
+      (blade ``--timeout`` / carrier ``sleep`` / ``systemd-run --on-active``),
+      G = ``settings.recovery_grace_seconds`` (hot-reloadable, read per
+      call). The grace makes an actively dispatched framework recovery
+      (landing = D + recover latency) fire *before* self-recovery expiry,
+      so only the framework-death branch ever touches D+G.
+
+    Non-positive / unparseable durations are rejected: the registry's
+    contract rejection still fires first on the injection path, but this
+    helper never fabricates a timer out of a broken D. A negative grace is
+    clamped to 0 (safety net == observation window) with a warning.
+    """
+    try:
+        duration = int(str(duration_seconds).strip()) if duration_seconds else 0
+    except (ValueError, TypeError):
+        duration = 0
+    if duration <= 0:
+        raise ValueError(
+            "recovery_timer_seconds requires a positive contract duration, "
+            f"got {duration_seconds!r}"
+        )
+    try:
+        from chaos_agent.config.settings import settings
+        grace = int(settings.recovery_grace_seconds)
+    except (ImportError, ValueError, TypeError):
+        grace = _DEFAULT_RECOVERY_GRACE_SECONDS
+    if grace < 0:
+        logger.warning(
+            "recovery_grace_seconds=%s is negative; clamping to 0 (safety "
+            "net collapses onto the observation window).", grace,
+        )
+        grace = 0
+    return duration + grace
 
 
 def extract_fault_type(category: str) -> str:

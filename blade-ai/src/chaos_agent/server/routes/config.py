@@ -52,6 +52,8 @@ _WRITABLE_KEYS: frozenset[str] = frozenset(
         "log_level",
         # Turn-channel fault-window hold (evaluation protocol opt-in).
         "turn_hold_fault_window",
+        # Recovery safety-net grace (second number of the D / D+G contract).
+        "recovery_grace_seconds",
         # K8s targeting.
         "kubeconfig_path",
         "kube_context",

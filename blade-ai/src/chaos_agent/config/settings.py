@@ -472,6 +472,16 @@ class Settings(BaseSettings):
     # 既有的 blade --timeout / 载体定时器兜底，不新增泄漏面。
     turn_hold_fault_window: bool = False      # BLADE_AI_TURN_HOLD_FAULT_WINDOW
 
+    # 恢复安全网宽限（秒）——双数窗口契约的第二数
+    # 观察窗 D = 批准的 duration_seconds（框架在场义务，hold 派发锚定其
+    # 终点）；故障自身安全网定时器 = D + recovery_grace_seconds（blade
+    # --timeout / 载体 sleep / systemd-run --on-active 三面同钉）。宽限
+    # 使"框架主动恢复"（hold 到点派发 destroy，落地 = D + recover 延迟）
+    # 恒落在自恢复 expiry 之前；只有框架死亡分支才触达 D+G 兜底清偿。
+    # 单源入口：utils/fault_type.py::recovery_timer_seconds（程序计算，
+    # LLM 零自算）。默认 120s（覆盖 hold 同 turn 直销毁延迟实测 ≤60s）。
+    recovery_grace_seconds: int = 120         # BLADE_AI_RECOVERY_GRACE_SECONDS
+
     # 经验自进化开关
     self_evolution: bool = False              # BLADE_AI_SELF_EVOLUTION
 
@@ -596,8 +606,9 @@ class Settings(BaseSettings):
     timeout_skill_script: int = 60           # BLADE_AI_TIMEOUT_SKILL_SCRIPT，skill 脚本执行超时
 
     # 实验级默认时长(秒) — blade create 无 --timeout 时作为默认时长注入
-    # 已接线 fault_type.ensure_min_duration：未指定时取本配置与
-    # _DEFAULT_MIN_DURATION(300) 的较大者；显式声明的值 verbatim 执行
+    # 已接线 fault_type.ensure_min_duration：未指定注入时长时用本配置的值，
+    # 显式声明的值 verbatim 执行。两者同一条规则——本配置不会被抬到经验下限
+    # (300)，低于下限时只告警不抬升；非正值视为未配置，回落到 300。
     experiment_timeout: int = 300            # BLADE_AI_EXPERIMENT_TIMEOUT
 
     # Confirm gate 等待用户决策的最大秒数 — 超过则服务端礼貌中断 turn，避免用户离开后未回收 future

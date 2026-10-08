@@ -18,11 +18,11 @@ def _isolate_experiment_timeout():
     """Pin the operator-configured default to the code default.
 
     Floor assertions must not depend on the host machine's
-    ~/.blade-ai/config.json: an installed config carrying a stale
-    experiment_timeout would win over the code default in every
-    unspecified-duration path (max(configured, floor)) and break
-    these tests on that machine only. TestExperimentTimeoutWiring
-    re-overrides inside its own context, which nests correctly.
+    ~/.blade-ai/config.json: the configured value is returned verbatim on
+    every unspecified-duration path, so a stale experiment_timeout there
+    would flow straight into these assertions and break them on that
+    machine only. TestExperimentTimeoutWiring re-overrides inside its own
+    context, which nests correctly.
     """
     with blade_ai_context(experiment_timeout=_DEFAULT_MIN_DURATION):
         yield
@@ -109,10 +109,42 @@ class TestExperimentTimeoutWiring:
         with blade_ai_context(experiment_timeout=1800):
             assert ensure_min_duration(0, None, None, None) == 1800
 
-    def test_configured_below_floor_clamped_to_300(self):
-        with blade_ai_context(experiment_timeout=60):
-            assert ensure_min_duration(None, "pod", "cpu", "fullload") == 300
-            assert ensure_min_duration(0, None, None, None) == 300
+    def test_configured_below_floor_honoured_verbatim_with_warning(self, caplog):
+        """A configured default is the operator's stated value — never lifted.
+
+        Reverses the former clamp-to-floor (``max(configured, 300)``): the
+        rule that keeps an explicit per-injection duration verbatim
+        (l4-contract-faithfulness) now covers the configured default too.
+        One rule, two sources. The gap against the empirical floor is
+        surfaced as a warning instead of a silent raise, so the knob's real
+        range stays visible to whoever set it.
+        """
+        with caplog.at_level(logging.WARNING, logger="chaos_agent.utils.fault_type"):
+            with blade_ai_context(experiment_timeout=60):
+                assert ensure_min_duration(None, "pod", "cpu", "fullload") == 60
+                assert ensure_min_duration(0, "pod", "cpu", "fullload") == 60
+        assert (
+            "Configured experiment_timeout 60s is below the recommended 300s floor"
+            in caplog.text
+        )
+        assert "applying the configured 60s verbatim" in caplog.text
+
+    def test_configured_below_floor_applies_to_unknown_fault_type(self):
+        """No scope/target/action → floor is _DEFAULT_MIN_DURATION, still advisory."""
+        with blade_ai_context(experiment_timeout=120):
+            assert ensure_min_duration(0, None, None, None) == 120
+
+    def test_configured_non_positive_falls_back_to_default(self):
+        """0 / negative config is not a usable duration → code default.
+
+        The only case where the configured value is overridden: it fails the
+        "must be positive" precondition rather than being a stated duration.
+        """
+        for bad in (0, -30):
+            with blade_ai_context(experiment_timeout=bad):
+                assert ensure_min_duration(
+                    None, "pod", "cpu", "fullload"
+                ) == _DEFAULT_MIN_DURATION
 
     def test_explicit_timeout_unaffected_by_configured_default(self):
         with blade_ai_context(experiment_timeout=1800):
@@ -121,3 +153,43 @@ class TestExperimentTimeoutWiring:
             # Explicit value below the floor stays at the requested value —
             # neither the floor nor the configured default lifts it.
             assert ensure_min_duration(60, "pod", "cpu", "fullload") == 60
+
+
+class TestRecoveryTimerSeconds:
+    """recovery_timer_seconds: 双数窗口契约（观察窗 D / 安全网窗 D+G）单源算术。"""
+
+    def test_arithmetic_default_grace(self):
+        from chaos_agent.utils.fault_type import recovery_timer_seconds
+        with blade_ai_context(recovery_grace_seconds=120):
+            assert recovery_timer_seconds(300) == 420
+            assert recovery_timer_seconds("300") == 420
+
+    def test_grace_hot_read_per_call(self):
+        """grace 每次调用现读 settings（热更配置生效，无缓存）。"""
+        from chaos_agent.utils.fault_type import recovery_timer_seconds
+        with blade_ai_context(recovery_grace_seconds=0):
+            assert recovery_timer_seconds(300) == 300
+        with blade_ai_context(recovery_grace_seconds=250):
+            assert recovery_timer_seconds(300) == 550
+
+    def test_non_positive_duration_rejected(self):
+        """非正/不可解析 D 一律 ValueError——绝不用坏 D 造定时器。
+
+        registry 的契约拒绝仍在注入路径先 fire；这里是 helper 自身防御。
+        """
+        from chaos_agent.utils.fault_type import recovery_timer_seconds
+        for bad in (0, -5, None, "", "abc"):
+            with pytest.raises(ValueError):
+                recovery_timer_seconds(bad)
+
+    def test_negative_grace_clamped_to_zero(self):
+        from chaos_agent.utils.fault_type import recovery_timer_seconds
+        with blade_ai_context(recovery_grace_seconds=-30):
+            assert recovery_timer_seconds(300) == 300
+
+
+def test_recovery_grace_seconds_int_cast():
+    """配置面：字符串写入被 cast 成 int（_INT_KEYS 名单 + Settings 自省双保险）。"""
+    from chaos_agent.config.config_store import ConfigStore
+    assert ConfigStore._target_type("recovery_grace_seconds") is int
+    assert ConfigStore._coerce("recovery_grace_seconds", "90") == 90
