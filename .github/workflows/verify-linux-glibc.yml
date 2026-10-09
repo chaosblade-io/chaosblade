@@ -6,6 +6,11 @@ name: Verify Linux glibc baseline
 #
 # This workflow deliberately contains NO release, tagging, or artifact
 # publishing step: it can only ever report a number and pass/fail.
+#
+# The push trigger is scoped to the throwaway verification branch because
+# GitHub will not dispatch a workflow that is absent from the default
+# branch; it lets us run this without touching master. Drop it if this
+# file is ever promoted into a permanent CI gate.
 on:
   workflow_dispatch:
     inputs:
@@ -17,6 +22,8 @@ on:
         description: 'Highest acceptable GLIBC symbol version in the bundle'
         required: true
         default: '2.31'
+  push:
+    branches: [ci/verify-linux-glibc]
 
 permissions:
   contents: read
@@ -97,7 +104,9 @@ jobs:
       # the run block) so a crafted input cannot inject commands.
       - name: Build with PyInstaller in the selected base image
         env:
-          BASE_IMAGE: ${{ inputs.base_image }}
+          # || supplies the default for push-triggered runs, where the
+          # dispatch inputs do not exist.
+          BASE_IMAGE: ${{ inputs.base_image || 'python:3.11-slim-bullseye' }}
         run: |
           set -euo pipefail
           IMG="$BASE_IMAGE"
@@ -136,7 +145,7 @@ jobs:
       # just libpython — so scan them all and name the top offenders.
       - name: Inspect the glibc floor of the bundle
         env:
-          MAX_GLIBC: ${{ inputs.max_glibc }}
+          MAX_GLIBC: ${{ inputs.max_glibc || '2.31' }}
         run: |
           set -euo pipefail
           BUNDLE="blade-ai/dist/blade-ai"
