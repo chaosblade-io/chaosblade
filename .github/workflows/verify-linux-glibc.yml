@@ -125,7 +125,9 @@ jobs:
           docker run --rm -v "$PWD/blade-ai:/src" -w /src "$IMG" bash -c '
             set -euo pipefail
             echo "=== container glibc ==="
-            ldd --version | head -1
+            # sed -n 1p, not head -1: head closes the pipe early and
+            # SIGPIPEs ldd, which set -o pipefail turns into exit 141.
+            ldd --version 2>&1 | sed -n 1p
             python --version
             apt-get update -qq
             apt-get install -y curl build-essential pkg-config
@@ -157,26 +159,44 @@ jobs:
           set -euo pipefail
           BUNDLE="blade-ai/dist/blade-ai"
           MAX="$MAX_GLIBC"
+          # Exact two-digit match. A trailing glob (2.[0-9]*) would accept
+          # "2.31; rm -rf /" — harmless here since MAX is only ever
+          # compared as data, but a validator should validate.
           case "$MAX" in
-            2.[0-9]*) : ;;
+            2.[0-9][0-9]) : ;;
             *) echo "ERROR: MAX_GLIBC must look like 2.NN" >&2; exit 1 ;;
           esac
           test -x "$BUNDLE/blade-ai" || { echo "ERROR: bundle launcher missing"; exit 1; }
           echo "=== libpython shipped in bundle ==="
-          find "$BUNDLE" -name 'libpython*.so*' -exec ls -la {} \;
+          LIBPY=$(find "$BUNDLE" -name 'libpython*.so*' 2>/dev/null | sed -n 1p)
+          if [ -z "$LIBPY" ]; then
+            echo "ERROR: no libpython found inside $BUNDLE" >&2; exit 1
+          fi
+          ls -la "$LIBPY"
           {
-            find "$BUNDLE" -type f \( -name '*.so' -o -name '*.so.*' \)
+            find "$BUNDLE" -type f \( -name '*.so' -o -name '*.so.*' \) 2>/dev/null
             echo "$BUNDLE/blade-ai"
             echo "blade-ai/vendor/node/node"
-          } > /tmp/elfs.txt
+          } > /tmp/elfs.txt || true
+          [ -s /tmp/elfs.txt ] || { echo "ERROR: no ELF files enumerated" >&2; exit 1; }
+          echo "ELF files to scan: $(wc -l < /tmp/elfs.txt)"
           : > /tmp/nodes.txt
           while IFS= read -r f; do
             [ -f "$f" ] || continue
             n=$(objdump -T "$f" 2>/dev/null | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1 || true)
-            [ -n "$n" ] && echo "$n|$f" >> /tmp/nodes.txt
+            # if/fi, not `[ -n "$n" ] && echo`: a bare AND-list whose test
+            # fails returns non-zero and set -e aborts the whole step on
+            # the first .so that references no versioned glibc symbol.
+            if [ -n "$n" ]; then echo "$n|$f" >> /tmp/nodes.txt; fi
           done < /tmp/elfs.txt
+          [ -s /tmp/nodes.txt ] || { echo "ERROR: no GLIBC symbol nodes found" >&2; exit 1; }
           echo "=== top 15 offenders (highest GLIBC node first) ==="
-          sort -t'|' -k1,1V -r /tmp/nodes.txt | head -15
+          # sed, not head: same SIGPIPE-under-pipefail hazard as above.
+          # -k1,1 -V -r, NOT -k1,1V -r: attaching V as a key-specific flag
+          # makes sort ignore the global -r, silently printing ASCENDING
+          # order — which would truncate away exactly the highest (most
+          # interesting) entries once the bundle ships more than 15 ELFs.
+          sort -t'|' -k1,1 -V -r /tmp/nodes.txt | sed -n '1,15p'
           HIGH=$(cut -d'|' -f1 /tmp/nodes.txt | sed 's/GLIBC_//' | sort -uV | tail -1)
           echo "=== bundle glibc floor: GLIBC_$HIGH (configured limit: GLIBC_$MAX) ==="
           if [ "$HIGH" != "$MAX" ] && [ "$(printf '%s\n%s\n' "$MAX" "$HIGH" | sort -V | tail -1)" = "$HIGH" ]; then
