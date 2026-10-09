@@ -26,6 +26,10 @@ concurrency:
   group: test-blade-ai-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default: test jobs only read the repo.
+permissions:
+  contents: read
+
 jobs:
   # ── TS TUI: typecheck + build + smoke + vitest ─────────────────────
   tui:

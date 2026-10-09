@@ -23,6 +23,11 @@ on:
 env:
   GO_VERSION: '1.25'
 
+# Least-privilege default: CI jobs only read the repo (compile + test),
+# so no write scopes are needed at workflow or job level.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test on Linux AMD64

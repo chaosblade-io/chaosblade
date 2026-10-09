@@ -28,8 +28,10 @@ on:
         required: true
         default: ''
 
+# Least-privilege default: read-only at workflow level; the release job
+# that publishes elevates below.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CHAOSBLADE_VERSION: '1.8.0'
@@ -383,6 +385,9 @@ jobs:
   release:
     needs: [verify-versions, build]
     runs-on: ubuntu-latest
+    # Create the GitHub Release + upload assets.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v7
         with:
