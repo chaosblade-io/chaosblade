@@ -16,6 +16,9 @@ on:
   workflow_dispatch:
   push:
     branches: [ci/verify-linux-glibc]
+    # Scoped so the two diagnostic workflows on this branch do not
+    # re-trigger each other on every commit.
+    paths: ['.github/workflows/verify-node-abi.yml']
 
 permissions:
   contents: read

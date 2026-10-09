@@ -24,6 +24,10 @@ on:
         default: '2.31'
   push:
     branches: [ci/verify-linux-glibc]
+    # Only re-run this (25-minute) full build when this file itself
+    # changes; other commits on the branch carry no new information for
+    # it and would just burn a runner.
+    paths: ['.github/workflows/verify-linux-glibc.yml']
 
 permissions:
   contents: read
