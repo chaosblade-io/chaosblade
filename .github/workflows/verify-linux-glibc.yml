@@ -129,7 +129,21 @@ jobs:
             # SIGPIPEs ldd, which set -o pipefail turns into exit 141.
             ldd --version 2>&1 | sed -n 1p
             python --version
-            apt-get update -qq
+            # Debian 11 left LTS on 2026-08-31. deb.debian.org still serves
+            # the bullseye Packages indexes, so apt-get update succeeds and
+            # resolves real version numbers, but the security pool has been
+            # drained: every .deb then 404s and apt-get install dies with
+            # exit 100 (reproduced in run 37901900896). archive.debian.org
+            # keeps the retired suites, and its frozen Release files need
+            # Check-Valid-Until disabled. Guarded by codename so passing a
+            # supported image (bookworm, manylinux) leaves apt alone.
+            if grep -q bullseye /etc/os-release; then
+              echo "=== EOL suite: repointing apt at archive.debian.org ==="
+              sed -i "s|deb.debian.org|archive.debian.org|g" /etc/apt/sources.list
+              apt-get -o Acquire::Check-Valid-Until=false update -qq
+            else
+              apt-get update -qq
+            fi
             apt-get install -y curl build-essential pkg-config
             PY_LIBDIR="$(python -c "import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))")"
             PY_LDLIB="$(python -c "import sysconfig; print(sysconfig.get_config_var(\"LDLIBRARY\"))")"
