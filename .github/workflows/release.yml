@@ -36,9 +36,10 @@ env:
   REGISTRY: 'ghcr.io'
   IMAGE_NAME: 'chaosblade-io/chaosblade'
 
+# Least-privilege default: read-only at workflow level; the jobs that
+# publish (push images / create the release) elevate below.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   # 多平台构建任务 - 在对应原生平台编译
@@ -214,6 +215,10 @@ jobs:
     name: Build Docker Images
     runs-on: ubuntu-latest
     needs: [ build-multi-platform ]
+    # Push images to ghcr.io (needs packages:write) + read repo.
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout code
@@ -312,6 +317,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [ build-multi-platform, build-images ]
     if: github.event_name == 'push' || github.event.inputs.version
+    # Create the GitHub Release + upload assets.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout code
