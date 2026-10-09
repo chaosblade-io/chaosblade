@@ -1,0 +1,165 @@
+name: Verify Node ABI and libstdc++ strategies
+
+# Diagnostic workflow — answers one question raised by run 37905088237:
+# the Linux bundle's real glibc floor was GLIBC_2.38, contributed not by
+# libpython (2.30 under bullseye) but by _internal/vendor/node/lib/
+# libstdc++.so.6, which release-blade-ai.yml copies from the ubuntu-latest
+# RUNNER host rather than from the build container.
+#
+# Deciding between the candidate strategies needs only ABI facts, not
+# another PyInstaller run: the bundle floor is the max over its ELFs, and
+# everything except libstdc++/libgcc_s was already measured. So this
+# workflow just measures each candidate libstdc++ and Node's own demands.
+#
+# Contains NO release, tagging, or publishing step.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/verify-linux-glibc]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24.16.0'
+
+jobs:
+  abi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # objdump -T splits the two things we must not confuse:
+      #   *UND*  entries = versions this ELF DEMANDS from the host
+      #   non-UND entries = versions this ELF PROVIDES to others
+      # Strategy A (ship no libstdc++) works only if the target distro's
+      # own libstdc++ PROVIDES every GLIBCXX/CXXABI that Node DEMANDS.
+      # Strategy B (copy from the build container) works only if that
+      # container's libstdc++ both provides enough and demands little.
+      - name: Write the ABI probe helper
+        run: |
+          set -euo pipefail
+          cat > /tmp/probe.sh <<'PROBE'
+          #!/bin/bash
+          # usage: probe.sh <label> <file>...
+          set -uo pipefail
+          label="$1"; shift
+          echo "=================================================="
+          echo "### $label"
+          echo "    host glibc: $(ldd --version 2>&1 | sed -n 1p)"
+          for f in "$@"; do
+            if [ ! -f "$f" ]; then echo "    MISSING: $f"; continue; fi
+            echo "  -- $f"
+            for p in GLIBC GLIBCXX CXXABI; do
+              need=$(objdump -T "$f" 2>/dev/null | grep '\*UND\*' | grep -oE "${p}_[0-9]+(\.[0-9]+)*" | sort -uV | tail -1)
+              if [ -z "$need" ]; then need="(none)"; fi
+              echo "       needs  ${p}: $need"
+            done
+            for p in GLIBCXX CXXABI; do
+              have=$(objdump -T "$f" 2>/dev/null | grep -v '\*UND\*' | grep -oE "${p}_[0-9]+(\.[0-9]+)*" | sort -uV | tail -1)
+              if [ -z "$have" ]; then have="(none)"; fi
+              echo "       offers ${p}: $have"
+            done
+          done
+          PROBE
+          chmod +x /tmp/probe.sh
+          bash -n /tmp/probe.sh && echo "probe.sh syntax OK"
+
+      - name: Download Node.js runtime (linux-x64)
+        run: |
+          set -euo pipefail
+          VER="${NODE_VERSION}"
+          BASENAME="node-v${VER}-linux-x64"
+          curl -fSL --retry 3 --retry-delay 2 -o /tmp/node.tar.xz \
+            "https://nodejs.org/dist/v${VER}/${BASENAME}.tar.xz"
+          tar -xJf /tmp/node.tar.xz -C /tmp
+          mkdir -p blade-ai/vendor/node/lib
+          cp "/tmp/${BASENAME}/bin/node" blade-ai/vendor/node/node
+          chmod +x blade-ai/vendor/node/node
+          ls -la blade-ai/vendor/node/node
+
+      # What release-blade-ai.yml ships today: `ldd node` resolves against
+      # the RUNNER's libstdc++, so the bundle inherits Ubuntu 24.04's
+      # GCC 14 runtime despite being built in a Debian container.
+      - name: Probe Node itself and the runner libs (strategy C, current)
+        run: |
+          set -euo pipefail
+          echo "runner: $(lsb_release -ds 2>/dev/null || cat /etc/os-release | sed -n 2p)"
+          bash /tmp/probe.sh "NODE binary (demand side)" blade-ai/vendor/node/node
+          libs=$(ldd blade-ai/vendor/node/node 2>/dev/null | grep -oP '/\S+lib(stdc\+\+|gcc_s)\S+' || true)
+          if [ -z "$libs" ]; then
+            echo "NOTE: node does not dynamically link libstdc++/libgcc_s"
+          else
+            for lib in $libs; do
+              bash /tmp/probe.sh "RUNNER host lib (strategy C = shipped today)" "$lib"
+            done
+          fi
+
+      # Strategy B1: copy libstdc++ from the Debian 11 build container.
+      # Debian 11 is EOL, so apt must go to archive.debian.org (the 404
+      # failure documented in run 37901900896).
+      - name: Probe bullseye container libstdc++ (strategy B1)
+        run: |
+          set -euo pipefail
+          docker run --rm -v /tmp/probe.sh:/probe.sh python:3.11-slim-bullseye bash -c '
+            set -uo pipefail
+            sed -i "s|deb.debian.org|archive.debian.org|g" /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update -qq >/dev/null 2>&1
+            apt-get install -y -qq binutils >/dev/null 2>&1
+            for L in /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libgcc_s.so.1; do
+              bash /probe.sh "BULLSEYE container lib (strategy B1)" "$L"
+            done
+          '
+
+      # Strategy B2: manylinux_2_28 (AlmaLinux 8) carries gcc-toolset
+      # compilers, so it may offer a NEW libstdc++ that still only
+      # demands glibc 2.28 — the combination we actually want.
+      - name: Probe manylinux_2_28 libstdc++ (strategy B2)
+        run: |
+          set -euo pipefail
+          docker run --rm -v /tmp/probe.sh:/probe.sh quay.io/pypa/manylinux_2_28 bash -c '
+            set -uo pipefail
+            command -v objdump >/dev/null 2>&1 || dnf install -y -q binutils >/dev/null 2>&1
+            found=0
+            for L in $(ls -1 /usr/lib64/libstdc++.so.6* /opt/rh/*/root/usr/lib64/libstdc++.so.6* /opt/rh/*/root/usr/lib/gcc/*/*/libstdc++.so 2>/dev/null); do
+              bash /probe.sh "MANYLINUX_2_28 lib (strategy B2)" "$L"
+              found=1
+            done
+            if [ "$found" = "0" ]; then echo "no libstdc++ found in manylinux_2_28"; fi
+          '
+
+      # Strategy A sanity check: if we ship NO libstdc++, does the target
+      # distro's own copy satisfy Node? AlmaLinux 8/9 stand in for
+      # RHEL/CentOS 8/9; EulerOS 2.0 tracks RHEL 9 closely (glibc 2.34).
+      - name: Probe AlmaLinux 8 and 9 system libstdc++ (strategy A target side)
+        run: |
+          set -euo pipefail
+          for v in 8 9; do
+            docker run --rm -v /tmp/probe.sh:/probe.sh "almalinux:${v}" bash -c '
+              set -uo pipefail
+              command -v objdump >/dev/null 2>&1 || dnf install -y -q binutils >/dev/null 2>&1
+              bash /probe.sh "ALMALINUX '"$v"' system libstdc++ (strategy A target)" /usr/lib64/libstdc++.so.6
+            '
+          done
+
+      - name: Summary of what each strategy implies
+        run: |
+          set -euo pipefail
+          cat <<'TXT'
+          Read the tables above as follows:
+
+          * NODE's "needs GLIBCXX/CXXABI" is the hard requirement every
+            strategy must satisfy.
+          * Strategy C (current) = runner lib. Its "needs GLIBC" is the
+            floor it forces on the whole bundle (measured 2.38 in run
+            37905088237).
+          * Strategy B1/B2 = container lib. Viable only if its "offers
+            GLIBCXX/CXXABI" >= Node's need AND its "needs GLIBC" is low.
+          * Strategy A (ship nothing) = viable only if the AlmaLinux 8/9
+            "offers" lines already cover Node's need; otherwise Node
+            fails at load time on those hosts.
+
+          The bundle's other ELFs top out at GLIBC_2.30 (libpython under
+          bullseye) and GLIBC_2.28 (node, tiktoken, cryptography), so
+          whichever libstdc++ strategy wins sets the final floor.
+          TXT
