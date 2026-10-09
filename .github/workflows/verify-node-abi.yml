@@ -210,6 +210,56 @@ jobs:
             bash /probe.sh "OPENEULER 22.03" /usr/lib64/libstdc++.so.6 /usr/lib64/libgcc_s.so.1
           ' || echo "(openeuler:22.03 unavailable)"
 
+      # Gap 1: the earlier bullseye probe ran on the bare slim image, where
+      # libgcc_s.so.1 does not exist yet. Strategy B1 would copy these libs
+      # AFTER the build installs build-essential, so measure them at that point.
+      - name: BULLSEYE after build-essential - what strategy B1 would actually ship
+        run: |
+          set -uo pipefail
+          docker run --rm -v /tmp/probe.sh:/probe.sh python:3.11-slim-bullseye bash -c '
+            set -uo pipefail
+            if grep -q bullseye /etc/os-release; then
+              echo "(EOL suite: repointing apt at archive.debian.org)"
+              sed -i "s|deb.debian.org|archive.debian.org|g" /etc/apt/sources.list
+              apt-get -o Acquire::Check-Valid-Until=false update -qq >/dev/null 2>&1
+            else
+              apt-get update -qq >/dev/null 2>&1
+            fi
+            apt-get install -y -qq build-essential binutils >/dev/null 2>&1
+            echo "--- toolchain now present ---"
+            gcc --version 2>&1 | sed -n 1p
+            echo "--- libs B1 would copy ---"
+            found=0
+            for L in $(ls -1 /usr/lib/x86_64-linux-gnu/libstdc++.so.6* /usr/lib/x86_64-linux-gnu/libgcc_s.so.1* 2>/dev/null); do
+              bash /probe.sh "BULLSEYE post-build-essential (what B1 ships)" "$L"
+              found=1
+            done
+            if [ "$found" = "0" ]; then echo "NEITHER libstdc++ NOR libgcc_s present"; fi
+            echo "--- does the bundled libpython still sit at 2.30? ---"
+            LP=$(find / -xdev -name "libpython3.11.so*" 2>/dev/null | sed -n 1p)
+            if [ -n "$LP" ]; then bash /probe.sh "BULLSEYE libpython (bundle floor)" "$LP"; else echo "no shared libpython3.11"; fi
+          ' || echo "(bullseye step failed)"
+
+      # Gap 2: strategy C hinges on obtaining a SHARED libpython3.11 in a
+      # glibc-2.28 image. Enumerate every conceivable source before ruling it out.
+      - name: MANYLINUX_2_28 python3.11 sources (last hope for strategy C)
+        run: |
+          set -uo pipefail
+          docker run --rm quay.io/pypa/manylinux_2_28_x86_64 bash -c '
+            echo "--- cp311 lib dir, full listing ---"
+            ls -l /opt/python/cp311-cp311/lib/ 2>&1 | sed -n "1,30p"
+            echo "--- any libpython3.11 artifact at all (incl. static .a)? ---"
+            find / -xdev -name "libpython3.11*" 2>/dev/null | sed -n "1,20p"
+            echo "--- dnf: python3.11 packages ---"
+            dnf -q list available "python3.11*" 2>&1 | sed -n "1,20p"
+            echo "--- dnf: every python3* package ---"
+            dnf -q list available "python3*" 2>&1 | sed -n "1,40p"
+            echo "--- dnf: python modules ---"
+            dnf -q module list "python*" 2>&1 | sed -n "1,30p"
+            echo "--- the shared 3.12 lib that IS present (for contrast) ---"
+            ls -l /usr/lib64/libpython3.12.so.1.0 2>&1
+          ' || echo "(manylinux python probe failed)"
+
       - name: Summary of what each strategy implies
         run: |
           set -euo pipefail
