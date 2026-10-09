@@ -1,0 +1,170 @@
+name: Verify Linux glibc baseline
+
+# Diagnostic workflow — verifies that the Linux PyInstaller bundle can be
+# built inside a given base image AND reports the glibc floor the resulting
+# bundle actually requires (chaosblade#1349).
+#
+# This workflow deliberately contains NO release, tagging, or artifact
+# publishing step: it can only ever report a number and pass/fail.
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Docker image used for the Linux PyInstaller build'
+        required: true
+        default: 'python:3.11-slim-bullseye'
+      max_glibc:
+        description: 'Highest acceptable GLIBC symbol version in the bundle'
+        required: true
+        default: '2.31'
+
+permissions:
+  contents: read
+
+env:
+  CHAOSBLADE_VERSION: '1.9.0-alpha'
+  NODE_VERSION: '24.16.0'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: blade-ai/package-lock.json
+
+      # The frontend bundles are real build inputs: blade-ai.spec embeds
+      # tui/dist/cli.js as _tui_assets and web/dist as _web_assets, and
+      # hatchling's editable install validates the web/dist force-include.
+      # Typecheck/vitest are skipped on purpose — they cannot affect the
+      # glibc floor and would only add unrelated failure modes here.
+      - name: Build frontend bundles
+        working-directory: blade-ai
+        run: |
+          set -euo pipefail
+          npm install -g npm@10.9.2 || true
+          npm --version
+          npm ci --ignore-scripts --prefer-offline --no-audit --no-fund \
+            || npm install --ignore-scripts --no-audit --no-fund
+          ./node_modules/.bin/patch-package --patch-dir tui/patches
+          (cd tui && npm run build)
+          (cd web && npm run build)
+          ls -la tui/dist/cli.js web/dist/index.html
+
+      - name: Download ChaosBlade tool
+        run: |
+          set -euo pipefail
+          VER="${CHAOSBLADE_VERSION}"
+          URL="https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/${VER}/chaosblade-${VER}-linux_amd64.tar.gz"
+          echo "Fetching $URL"
+          curl -fSL --retry 3 --retry-delay 2 -o /tmp/chaosblade.tar.gz "$URL"
+          rm -rf blade-ai/vendor/chaosblade
+          mkdir -p blade-ai/vendor
+          tar -xzf /tmp/chaosblade.tar.gz -C /tmp
+          mv "/tmp/chaosblade-${VER}-linux_amd64" blade-ai/vendor/chaosblade
+          file blade-ai/vendor/chaosblade/blade || true
+
+      # Mirrors release-blade-ai.yml's linux_amd64 arm (node_arch=linux-x64,
+      # node_ext=tar.xz) including the libstdc++/libgcc_s side-car copy, so
+      # the bundle contents match what a real release would ship.
+      - name: Download Node.js runtime
+        run: |
+          set -euo pipefail
+          VER="${NODE_VERSION}"
+          BASENAME="node-v${VER}-linux-x64"
+          URL="https://nodejs.org/dist/v${VER}/${BASENAME}.tar.xz"
+          echo "Fetching $URL"
+          curl -fSL --retry 3 --retry-delay 2 -o /tmp/node-archive.tar.xz "$URL"
+          rm -rf blade-ai/vendor/node
+          mkdir -p blade-ai/vendor/node
+          tar -xJf /tmp/node-archive.tar.xz -C /tmp
+          cp "/tmp/${BASENAME}/bin/node" blade-ai/vendor/node/node
+          chmod +x blade-ai/vendor/node/node
+          mkdir -p blade-ai/vendor/node/lib
+          for lib in $(ldd blade-ai/vendor/node/node 2>/dev/null | grep -oP '/\S+lib(stdc\+\+|gcc_s)\S+' || true); do
+            [ -f "$lib" ] && cp -L "$lib" blade-ai/vendor/node/lib/ && echo "Bundled: $lib"
+          done
+          file blade-ai/vendor/node/node
+
+      # Same in-container sequence as release-blade-ai.yml's
+      # "Build with PyInstaller (Debian Bullseye Docker)" step, with the
+      # image taken from the dispatch input instead of the matrix.
+      # Dispatch inputs reach the shell via env (never interpolated into
+      # the run block) so a crafted input cannot inject commands.
+      - name: Build with PyInstaller in the selected base image
+        env:
+          BASE_IMAGE: ${{ inputs.base_image }}
+        run: |
+          set -euo pipefail
+          IMG="$BASE_IMAGE"
+          case "$IMG" in
+            */*) : ;;
+            *) echo "ERROR: BASE_IMAGE must look like a docker image ref" >&2; exit 1 ;;
+          esac
+          echo "=== base image: $IMG ==="
+          docker run --rm -v "$PWD/blade-ai:/src" -w /src "$IMG" bash -c '
+            set -euo pipefail
+            echo "=== container glibc ==="
+            ldd --version | head -1
+            python --version
+            apt-get update -qq
+            apt-get install -y curl build-essential pkg-config
+            PY_LIBDIR="$(python -c "import sysconfig; print(sysconfig.get_config_var(\"LIBDIR\"))")"
+            PY_LDLIB="$(python -c "import sysconfig; print(sysconfig.get_config_var(\"LDLIBRARY\"))")"
+            if ! ls "$PY_LIBDIR"/libpython*.so* 1>/dev/null 2>&1; then
+              echo "ERROR: No shared libpython found in $PY_LIBDIR" >&2
+              exit 1
+            fi
+            echo "=== shared libpython present: $PY_LDLIB ==="
+            if ! command -v cargo &> /dev/null; then
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              export PATH="$HOME/.cargo/bin:$PATH"
+            fi
+            cargo --version && rustc --version
+            pip install --no-cache-dir -e ".[dev]"
+            python -c "import sysconfig; v=sysconfig.get_config_var(\"LDLIBRARY\"); print(v); assert v and v.startswith(\"libpython\") and v.endswith(\".so\"), \"Need shared libpython\"; print(\"Python shared library check passed\")"
+            python -m PyInstaller blade-ai.spec --noconfirm
+          '
+          echo "=== dist/ ==="
+          ls -la blade-ai/dist/
+
+      # The bundle's glibc floor is the MAX over every ELF it ships, not
+      # just libpython — so scan them all and name the top offenders.
+      - name: Inspect the glibc floor of the bundle
+        env:
+          MAX_GLIBC: ${{ inputs.max_glibc }}
+        run: |
+          set -euo pipefail
+          BUNDLE="blade-ai/dist/blade-ai"
+          MAX="$MAX_GLIBC"
+          case "$MAX" in
+            2.[0-9]*) : ;;
+            *) echo "ERROR: MAX_GLIBC must look like 2.NN" >&2; exit 1 ;;
+          esac
+          test -x "$BUNDLE/blade-ai" || { echo "ERROR: bundle launcher missing"; exit 1; }
+          echo "=== libpython shipped in bundle ==="
+          find "$BUNDLE" -name 'libpython*.so*' -exec ls -la {} \;
+          {
+            find "$BUNDLE" -type f \( -name '*.so' -o -name '*.so.*' \)
+            echo "$BUNDLE/blade-ai"
+            echo "blade-ai/vendor/node/node"
+          } > /tmp/elfs.txt
+          : > /tmp/nodes.txt
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            n=$(objdump -T "$f" 2>/dev/null | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1 || true)
+            [ -n "$n" ] && echo "$n|$f" >> /tmp/nodes.txt
+          done < /tmp/elfs.txt
+          echo "=== top 15 offenders (highest GLIBC node first) ==="
+          sort -t'|' -k1,1V -r /tmp/nodes.txt | head -15
+          HIGH=$(cut -d'|' -f1 /tmp/nodes.txt | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "=== bundle glibc floor: GLIBC_$HIGH (configured limit: GLIBC_$MAX) ==="
+          if [ "$HIGH" != "$MAX" ] && [ "$(printf '%s\n%s\n' "$MAX" "$HIGH" | sort -V | tail -1)" = "$HIGH" ]; then
+            echo "FAIL: bundle requires GLIBC_$HIGH, above the GLIBC_$MAX limit"
+            exit 1
+          fi
+          echo "PASS: bundle loads on any host with glibc >= $HIGH"
