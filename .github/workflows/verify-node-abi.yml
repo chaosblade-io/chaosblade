@@ -145,6 +145,71 @@ jobs:
             '
           done
 
+      # Make-or-break for strategy C: PyInstaller cannot link against a static
+      # libpython, which is exactly why manylinux2014 was abandoned on
+      # 2026-06-03. Check whether manylinux_2_28 is any different.
+      - name: MANYLINUX_2_28 - is there a SHARED libpython at all?
+        run: |
+          set -uo pipefail
+          docker run --rm quay.io/pypa/manylinux_2_28_x86_64 bash -c '
+            echo "--- preinstalled CPython builds ---"
+            ls -d /opt/python/cp31* 2>/dev/null || echo "(none)"
+            echo "--- cp311 version ---"
+            /opt/python/cp311-cp311/bin/python -V 2>&1 || echo "NO cp311-cp311"
+            echo "--- shared libpython anywhere on the image? ---"
+            found=$(find / -xdev -name "libpython3*.so*" 2>/dev/null)
+            if [ -z "$found" ]; then
+              echo "NONE FOUND -> PyInstaller unusable with the preinstalled CPython"
+            else
+              echo "$found" | sed -n "1,20p"
+            fi
+            echo "--- what cp311 lib dir holds ---"
+            ls -l /opt/python/cp311-cp311/lib/ 2>/dev/null | grep -i python || echo "(no libpython* entries)"
+            echo "--- shared-libpython python3.11 installable via dnf? ---"
+            dnf list --available "python3.11*" 2>/dev/null | sed -n "1,25p" || echo "(dnf query failed)"
+          ' || echo "(manylinux_2_28 unavailable)"
+
+      - name: MANYLINUX_2_28 build deps via dnf (strategy C feasibility)
+        run: |
+          set -uo pipefail
+          docker run --rm quay.io/pypa/manylinux_2_28_x86_64 bash -c '
+            dnf install -y -q gcc-c++ pkgconfig curl which 2>&1 | sed -n "1,25p"
+            echo "--- resulting toolchain ---"
+            gcc --version 2>&1 | sed -n 1p
+            g++ --version 2>&1 | sed -n 1p
+            curl --version 2>&1 | sed -n 1p
+            pkg-config --version 2>&1 | sed -n 1p
+          ' || echo "(manylinux_2_28 dnf step unavailable)"
+
+      # Alinux 3 is this project's own runtime base image (blade-ai/Dockerfile),
+      # so it is a first-class compatibility target next to the reporter's host.
+      - name: ALINUX 3 (project base image) - glibc and libstdc++
+        run: |
+          set -uo pipefail
+          docker run --rm -v /tmp/probe.sh:/probe.sh alinux3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3 bash -c '
+            set -uo pipefail
+            sed -n "1,4p" /etc/os-release
+            ldd --version 2>&1 | sed -n 1p
+            command -v objdump >/dev/null 2>&1 || dnf install -y -q binutils >/dev/null 2>&1
+            bash /probe.sh "ALINUX 3" /usr/lib64/libstdc++.so.6 /usr/lib64/libgcc_s.so.1
+            echo "--- python on the base image? ---"
+            python3 -V 2>&1 || echo "(no python3)"
+            ls -l /usr/lib64/libpython3* 2>/dev/null || echo "(no shared libpython)"
+          ' || echo "(alinux3 unavailable - likely registry reachability from the runner)"
+
+      # Upstream of the EulerOS 2.0 host in issue #1349. Strategy A only works
+      # if this distro's own libstdc++ already offers >= GLIBCXX_3.4.21.
+      - name: OPENEULER 22.03 (upstream of the reporters EulerOS 2.0)
+        run: |
+          set -uo pipefail
+          docker run --rm -v /tmp/probe.sh:/probe.sh docker.io/openeuler/openeuler:22.03 bash -c '
+            set -uo pipefail
+            sed -n "1,4p" /etc/os-release
+            ldd --version 2>&1 | sed -n 1p
+            command -v objdump >/dev/null 2>&1 || dnf install -y -q binutils >/dev/null 2>&1
+            bash /probe.sh "OPENEULER 22.03" /usr/lib64/libstdc++.so.6 /usr/lib64/libgcc_s.so.1
+          ' || echo "(openeuler:22.03 unavailable)"
+
       - name: Summary of what each strategy implies
         run: |
           set -euo pipefail
