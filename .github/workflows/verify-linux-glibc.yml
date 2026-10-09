@@ -110,9 +110,16 @@ jobs:
         run: |
           set -euo pipefail
           IMG="$BASE_IMAGE"
+          # Reject anything outside a docker image ref's legal character
+          # set (blocks quotes, $, backticks, semicolons, whitespace).
+          # Deliberately NOT a "must contain a slash" check: official
+          # Docker Hub images such as python:3.11-slim-bullseye carry no
+          # registry/ prefix and a slash test wrongly rejects them.
+          if [ -z "$IMG" ]; then
+            echo "ERROR: BASE_IMAGE is empty" >&2; exit 1
+          fi
           case "$IMG" in
-            */*) : ;;
-            *) echo "ERROR: BASE_IMAGE must look like a docker image ref" >&2; exit 1 ;;
+            *[!a-zA-Z0-9._/:@-]*) echo "ERROR: BASE_IMAGE has illegal characters" >&2; exit 1 ;;
           esac
           echo "=== base image: $IMG ==="
           docker run --rm -v "$PWD/blade-ai:/src" -w /src "$IMG" bash -c '
