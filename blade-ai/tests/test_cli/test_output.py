@@ -2,7 +2,10 @@
 
 import json
 
-from chaos_agent.cli.output import format_output
+import pytest
+
+from chaos_agent.cli import output as output_mod
+from chaos_agent.cli.output import OutputFormat, format_output
 
 
 class TestFormatOutput:
@@ -24,12 +27,19 @@ class TestFormatOutput:
         assert "\n" in result
 
     def test_yaml_format(self):
-        """yaml format should produce valid output (yaml if available, else json)."""
+        """yaml format should produce real YAML, not a JSON fallback."""
         data = {"code": 0, "message": "success"}
         result = format_output(data, "yaml")
-        # Either yaml or json - both should contain the key
-        assert "code" in result
-        assert "success" in result
+        # YAML renders "key: value"; the result is not valid JSON.
+        assert "code: 0" in result
+        assert "message: success" in result
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(result)
+
+    def test_yaml_via_enum_member(self):
+        """Passing the OutputFormat enum member works the same as the string."""
+        data = {"code": 0}
+        assert format_output(data, OutputFormat.YAML) == format_output(data, "yaml")
 
     def test_empty_dict(self):
         result = format_output({}, "json")
@@ -49,3 +59,24 @@ class TestFormatOutput:
         # Default should be json
         parsed = json.loads(result)
         assert parsed == data
+
+    def test_unknown_format_raises(self):
+        """An unrecognized format is rejected instead of silently returning JSON."""
+        with pytest.raises(ValueError, match="Unsupported output format"):
+            format_output({"key": "value"}, "xml")
+
+    def test_yaml_without_pyyaml_raises(self, monkeypatch):
+        """Requesting yaml without PyYAML installed raises a clear error."""
+        monkeypatch.setattr(output_mod, "HAS_YAML", False)
+        with pytest.raises(ValueError, match="PyYAML"):
+            format_output({"key": "value"}, "yaml")
+
+
+class TestOutputFormat:
+    def test_members(self):
+        assert OutputFormat.JSON.value == "json"
+        assert OutputFormat.YAML.value == "yaml"
+
+    def test_str_equality(self):
+        # str subclass: compares equal to its string value
+        assert OutputFormat.JSON == "json"

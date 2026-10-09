@@ -8,13 +8,13 @@ import json
 
 import typer
 
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 from chaos_agent.config.settings import settings
 from chaos_agent.skills.loader import get_skills_dir
 
 
 def list_command(
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.JSON, "--output", "-o", help="Output format: json|yaml"),
 ):
     """List supported fault capabilities (from last sync)."""
     primary = settings.resolved_memory_dir / "skill_capabilities.json"

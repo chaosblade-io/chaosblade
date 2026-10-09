@@ -6,7 +6,7 @@ from typing import Optional
 
 import typer
 
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 from chaos_agent.config.settings import settings
 from chaos_agent.preflight import INJECT_CHECKS, run_command
 
@@ -27,7 +27,7 @@ def inject_command(
     context: Optional[str] = typer.Option(None, "--context", help="Kubeconfig context name"),
     force_override: bool = typer.Option(False, "--force-override", help="Force proceed when confirm_required (P1: same-action overlay)"),
     stream: bool = typer.Option(False, "--stream", help="Stream output in real-time (NL mode only)"),
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.JSON, "--output", "-o", help="Output format: json|yaml"),
 ):
     """Inject a fault into a Kubernetes target.
 

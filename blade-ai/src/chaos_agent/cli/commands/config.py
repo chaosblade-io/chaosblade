@@ -10,7 +10,7 @@ from chaos_agent.cli.config_manager import (
     LOCAL,
     SERVER,
 )
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 
 
 def _mask_value(key: str, value: object) -> object:
@@ -71,7 +71,7 @@ def config_command(
         None,
         help="Extra value (used when key=mode and value=server, this is the server URL)",
     ),
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.JSON, "--output", "-o", help="Output format: json|yaml"),
 ):
     """Manage configuration: view and set all config values.
 
