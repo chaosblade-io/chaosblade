@@ -260,6 +260,61 @@ jobs:
             ls -l /usr/lib64/libpython3.12.so.1.0 2>&1
           ' || echo "(manylinux python probe failed)"
 
+      # DECISIVE for strategy C. The previous probe truncated the dnf listing at
+      # 25 lines, which were entirely consumed by repo-metadata download
+      # progress, so python3.11-devel was never shown. It does exist. Install it
+      # and check the one flag PyInstaller actually requires: Py_ENABLE_SHARED.
+      - name: MANYLINUX_2_28 + dnf python3.11 - does strategy C actually work?
+        run: |
+          set -uo pipefail
+          docker run --rm -v /tmp/probe.sh:/probe.sh quay.io/pypa/manylinux_2_28_x86_64 bash -c '
+            echo "--- the python3.11 packages dnf really offers ---"
+            dnf -q list available "python3.11*" 2>&1 | grep -E "^python3\.11(\.|-libs|-devel|-pip)" | sed -n "1,30p"
+            echo "--- installing python3.11 / -devel / -pip ---"
+            dnf install -y -q python3.11 python3.11-devel python3.11-pip 2>&1 | sed -n "1,20p"
+            echo "install exit: $?"
+            echo "--- resulting libpython files ---"
+            ls -l /usr/lib64/libpython3.11* 2>&1 | sed -n "1,10p"
+            echo "--- PyInstaller-critical sysconfig flags ---"
+            /usr/bin/python3.11 -V 2>&1
+            /usr/bin/python3.11 -c "import sysconfig as s; print(\"Py_ENABLE_SHARED=\", s.get_config_var(\"Py_ENABLE_SHARED\")); print(\"LDLIBRARY=\", s.get_config_var(\"LDLIBRARY\")); print(\"LIBDIR=\", s.get_config_var(\"LIBDIR\"))" 2>&1
+            echo "--- glibc floor this libpython would impose ---"
+            for L in $(ls -1 /usr/lib64/libpython3.11.so* 2>/dev/null); do
+              bash /probe.sh "MANYLINUX_2_28 dnf python3.11 (strategy C floor)" "$L"
+            done
+            echo "--- and the libstdc++ C would ship alongside ---"
+            bash /probe.sh "MANYLINUX_2_28 libstdc++ (strategy C ship-set)" /usr/lib64/libstdc++.so.6
+          ' || echo "(strategy C verification failed)"
+
+      # Gap 3: build-essential did NOT put libgcc_s.so.1 under
+      # /usr/lib/x86_64-linux-gnu, so B1's ship-set is incomplete as measured.
+      # Locate it and measure it; Node links against libgcc_s too.
+      - name: BULLSEYE - where is libgcc_s.so.1 really?
+        run: |
+          set -uo pipefail
+          docker run --rm -v /tmp/probe.sh:/probe.sh python:3.11-slim-bullseye bash -c '
+            set -uo pipefail
+            if grep -q bullseye /etc/os-release; then
+              sed -i "s|deb.debian.org|archive.debian.org|g" /etc/apt/sources.list
+              apt-get -o Acquire::Check-Valid-Until=false update -qq >/dev/null 2>&1
+            else
+              apt-get update -qq >/dev/null 2>&1
+            fi
+            apt-get install -y -qq build-essential binutils >/dev/null 2>&1
+            echo "--- every libgcc_s on the image ---"
+            find / -xdev -name "libgcc_s*" 2>/dev/null | sed -n "1,20p"
+            echo "--- owning packages ---"
+            dpkg -l 2>/dev/null | grep -i libgcc | sed -n "1,10p"
+            echo "--- is /lib a symlink to /usr/lib (usrmerge)? ---"
+            ls -ld /lib /usr/lib 2>&1
+            echo "--- probe each real libgcc_s.so.1 ---"
+            for L in $(find / -xdev -name "libgcc_s.so.1" 2>/dev/null); do
+              bash /probe.sh "BULLSEYE libgcc_s (B1 ship-set)" "$L"
+            done
+            echo "--- what node actually needs at load time ---"
+            echo "(node needs GLIBC_2.28 / GLIBCXX_3.4.21 / CXXABI_1.3.11, measured earlier)"
+          ' || echo "(bullseye libgcc_s probe failed)"
+
       - name: Summary of what each strategy implies
         run: |
           set -euo pipefail
