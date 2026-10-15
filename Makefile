@@ -88,7 +88,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=v1.8.1
+BLADE_EXEC_OS_BRANCH=v1.8.2
 
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
