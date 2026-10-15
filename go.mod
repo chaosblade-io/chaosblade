@@ -6,7 +6,7 @@ require (
 	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.5
 	github.com/chaosblade-io/chaosblade-exec-cri v1.7.5
 	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5
-	github.com/chaosblade-io/chaosblade-exec-os v1.7.5
+	github.com/chaosblade-io/chaosblade-exec-os v1.7.6
 	github.com/chaosblade-io/chaosblade-operator v1.7.5
 	github.com/chaosblade-io/chaosblade-spec-go v1.7.5
 	github.com/glebarez/sqlite v1.11.0
