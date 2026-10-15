@@ -27,8 +27,8 @@ github.com/chaosblade-io/chaosblade-exec-cri v1.8.1 h1:bdUXm/5xnAQ+t7auGMshkwVEE
 github.com/chaosblade-io/chaosblade-exec-cri v1.8.1/go.mod h1:VWTgWI+TPjvyAFmHUcDJeT1TUa3pbnrg6yI1yk2ju3c=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.8.0 h1:vTS78QSqdytCNyTEtckIvRuGtshhpLA6WBU4j7DYEes=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.8.0/go.mod h1:LWi/BtOPLF8NUNULGqqs41DkjyezoQgF1iIoKgnacTU=
-github.com/chaosblade-io/chaosblade-exec-os v1.8.1 h1:L+fdZn0g4HDrZpTqzk9x3LehSeNAtp6Ug2HfDDHuVz8=
-github.com/chaosblade-io/chaosblade-exec-os v1.8.1/go.mod h1:k6QrG3w8mEwvk/6CCGC+K1S+K8u0s1xfHoa/dOGdADo=
+github.com/chaosblade-io/chaosblade-exec-os v1.8.2 h1:De3Es6VQGdezA7thDOsxjpUFLYZI+R4UoMwjIPpmHxc=
+github.com/chaosblade-io/chaosblade-exec-os v1.8.2/go.mod h1:Mur4W6hB7imaEXp7QfMbq9lXPiM2Jhm4G6osrXWSLAw=
 github.com/chaosblade-io/chaosblade-spec-go v1.8.0 h1:UtwBZCXUJMAtqlmUrfTwmzolxfdnY02Itz1o84Ua0b4=
 github.com/chaosblade-io/chaosblade-spec-go v1.8.0/go.mod h1:xxkKn6Ve25MmqX1vWp1/swl4g+o0rJP1Rkp2ph3DzT8=
 github.com/cilium/ebpf v0.17.3 h1:FnP4r16PWYSE4ux6zN+//jMcW4nMVRvuTLVTvCjyyjg=

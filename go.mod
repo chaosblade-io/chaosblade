@@ -20,7 +20,7 @@ require (
 	github.com/chaosblade-io/chaosblade-exec-cloud v1.8.0
 	github.com/chaosblade-io/chaosblade-exec-cri v1.8.1
 	github.com/chaosblade-io/chaosblade-exec-middleware v1.8.0
-	github.com/chaosblade-io/chaosblade-exec-os v1.8.1
+	github.com/chaosblade-io/chaosblade-exec-os v1.8.2
 	github.com/chaosblade-io/chaosblade-spec-go v1.8.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
