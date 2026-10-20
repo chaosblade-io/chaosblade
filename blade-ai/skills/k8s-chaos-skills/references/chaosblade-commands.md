@@ -21,14 +21,14 @@ blade create k8s <scope>-<target> <action> [flags]
 | pod-cpu | `fullload` | CPU 满载 |
 | pod-mem | `load` | 内存占用 |
 | pod-network | `dns`, `drop`, `occupy` | 网络故障 (v1.8.0) |
-| pod-disk | `fill`, `burn` | 磁盘填充 / IO 负载 |
+| pod-disk | `fill`, `burn` | 磁盘填充 / IO 负载 (**无 io_hang**) |
 | pod-process | `kill`, `stop` | 进程操作 |
 | pod-pod | `delete` | Pod 删除 |
 | pod-IO | `delay`, `errno` | 文件系统 IO 故障 |
 | node-cpu | `fullload` | CPU 满载 |
 | node-mem | `load` | 内存占用 |
 | node-network | `drop` | 网络故障 (v1.8.0: `delay`/`loss` → `drop`) |
-| node-disk | `fill`, `burn` | 磁盘填充 / IO 负载 (**无 fullload**) |
+| node-disk | `fill`, `burn` | 磁盘填充 / IO 负载 (**无 fullload**、**无 io_hang**) |
 | node-process | `kill`, `stop` | 进程操作 |
 | container-cpu | `fullload` | CPU 满载 |
 | container-network | `drop` | 网络故障 (v1.8.0: `delay`/`loss` → `drop`) |
@@ -38,6 +38,7 @@ blade create k8s <scope>-<target> <action> [flags]
 > **⚠️ 常见错误警示**：
 > - `node-disk` **没有** `fullload` action！磁盘 IO 负载使用 `burn`，磁盘空间填充使用 `fill`
 > - `pod-disk` 同理，只有 `fill` 和 `burn`，没有 `fullload`
+> - `disk` target **没有** `io_hang` action（burn 是 IO 打满，不是 IO 卡住）。需要「IO 请求不返回」的场景请用 `scripts/inject_io_hang.py`，见用例 `Node_磁盘IO挂起/`
 > - `pod-mem` 的 action 是 `load`，不是 `fullload`
 > - `node-mem` 的 action 是 `load`，不是 `fullload`
 > - 只有 `cpu` target 才有 `fullload` action
@@ -369,6 +370,11 @@ blade create k8s node-disk burn \
 | `--count` | IO 次数 | - |
 
 > **建议**：生产环境务必指定 `--path` 为非根分区目录（如 `/data`），避免影响根分区系统文件。
+
+> **`burn` ≠ IO 挂起**：`burn` 用 `dd` 制造 IO 压力（`%util` 升高，IO 仍在完成）；如果要模拟
+> 「IO 请求迟迟不返回、进程卡在 D 状态」，ChaosBlade 没有对应 action，请改用
+> `scripts/inject_io_hang.py`（fsfreeze / dm-delay 模式），用例见
+> `references/catalogue/Node_磁盘IO挂起/`。
 
 ### 7. 节点进程操作
 
