@@ -50,7 +50,6 @@ func init() {
 	// disable printing of client-go logs
 	klog.InitFlags(nil)
 	flag.Set("v", "0")
-	flag.Parse()
 }
 
 type Executor struct{}

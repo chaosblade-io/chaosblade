@@ -139,10 +139,12 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			// update status
 			model, resp = actionCommand.recordExpModel(cmd.CommandPath(), expModel)
 		}
-		if resp != nil && !resp.Success {
-			return resp
+		if resp != nil {
+			if !resp.Success {
+				return resp
+			}
+			model.Uid = resp.Result.(string)
 		}
-		model.Uid = resp.Result.(string)
 		// is async ?
 		async := expModel.ActionFlags[AsyncFlag] == "true"
 		endpoint := expModel.ActionFlags[EndpointFlag]
