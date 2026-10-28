@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -140,9 +141,22 @@ func (bc *baseCommand) AddCommand(child Command) {
 	childCmd := child.CobraCmd()
 	childCmd.PreRun = func(cmd *cobra.Command, args []string) {
 		util.InitLog(util.Blade)
+		applyLogLevel()
 	}
 	childCmd.SilenceUsage = true
 	childCmd.DisableFlagsInUseLine = true
 	childCmd.SilenceErrors = true
 	bc.CobraCmd().AddCommand(childCmd)
+}
+
+// applyLogLevel honors the --log-level flag. util.InitLog only ever raises the
+// level to debug when --debug is set and never reads util.LogLevel, so the
+// requested level is applied here right after initialization. --debug wins.
+func applyLogLevel() {
+	if util.Debug {
+		return
+	}
+	if level, err := logrus.ParseLevel(util.LogLevel); err == nil {
+		logrus.SetLevel(level)
+	}
 }
