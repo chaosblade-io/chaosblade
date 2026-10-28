@@ -108,11 +108,18 @@ def _launch_default_tui(extra_args: list[str] | None = None) -> None:
     # server instead of ``python -m chaos_agent.server.app ...``.
     if getattr(sys, "frozen", False):
         os.environ["BLADE_AI_SERVER_BIN"] = sys.executable
-        # PyInstaller prepends _internal/ to LD_LIBRARY_PATH with its
-        # old libstdc++ (manylinux2014). Node needs GLIBCXX_3.4.30+
-        # which that old lib doesn't have. Replace LD_LIBRARY_PATH
-        # with vendor/node/lib/ (ships Node's own libstdc++) so Node
-        # loads the right version regardless of what the system has.
+        # Node links the SYSTEM libstdc++ (its official linux tarball ships
+        # no private copy), so on a host whose libstdc++ predates Node the
+        # TUI dies at exec. Point Node at the libstdc++/libgcc_s that the
+        # release workflow copies out of the manylinux_2_28 build container
+        # into vendor/node/lib/. Measured with objdump -T: Node 24.16.0 needs
+        # GLIBCXX_3.4.21 / CXXABI_1.3.11 and that copy offers 3.4.25 /
+        # 1.3.11 — CXXABI has zero headroom, so the build step asserts both
+        # sides rather than trusting this comment.
+        #
+        # Note this REPLACES LD_LIBRARY_PATH wholesale instead of prepending:
+        # PyInstaller puts _internal/ on it, and any stale libstdc++ found
+        # first would win over the one we just vouched for.
         _node_lib = Path(sys._MEIPASS) / "vendor" / "node" / "lib"
         if _node_lib.is_dir():
             os.environ["LD_LIBRARY_PATH"] = str(_node_lib)

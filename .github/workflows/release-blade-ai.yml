@@ -348,35 +348,61 @@ jobs:
           else
             cp "/tmp/${BASENAME}/bin/node" blade-ai/vendor/node/node
             chmod +x blade-ai/vendor/node/node
-            # Bundle libstdc++/libgcc_s that this Node was linked against.
-            # On old-glibc targets (Alinux 3 / RHEL 8) the system libstdc++
-            # lacks GLIBCXX_3.4.30; shipping Node's own copy ensures it works.
-            mkdir -p blade-ai/vendor/node/lib
-            for lib in $(ldd blade-ai/vendor/node/node 2>/dev/null | grep -oP '/\S+lib(stdc\+\+|gcc_s)\S+' || true); do
-              [ -f "$lib" ] && cp -L "$lib" blade-ai/vendor/node/lib/ && echo "Bundled: $lib"
-            done
-            ls -la blade-ai/vendor/node/lib/ 2>/dev/null || true
+            # libstdc++/libgcc_s are deliberately NOT bundled here. This step
+            # runs on the runner host (ubuntu-latest / ubuntu-24.04-arm,
+            # glibc 2.39), so `ldd node` resolved to the RUNNER's libstdc++
+            # and libgcc_s, which need GLIBC_2.38 / GLIBC_2.35. Copying them
+            # raised the whole bundle's floor to 2.38 and made it unloadable
+            # on every host below that (issue #1349).
+            #
+            # The comment that used to sit here justified the copy with "on
+            # old-glibc targets (Alinux 3 / RHEL 8) the system libstdc++
+            # lacks GLIBCXX_3.4.30". Both halves are wrong, measured with
+            # objdump -T: Node 24.16.0 needs only GLIBCXX_3.4.21 /
+            # CXXABI_1.3.11, and the RHEL-8-class libstdc++ it named as
+            # insufficient already offers 3.4.25. It also claimed to ship
+            # "Node's own copy", but Node's official linux tarball links the
+            # SYSTEM libstdc++ — there is no own copy to ship.
+            #
+            # The Linux build step below copies these libs from INSIDE the
+            # build container instead, and asserts they satisfy Node.
           fi
           echo "blade-ai/vendor/node contents:"
           ls -laR blade-ai/vendor/node
           file blade-ai/vendor/node/node* 2>/dev/null || true
 
-      # ── Linux: build inside Debian Bullseye Docker (glibc 2.31 baseline) ─
+      # ── Linux: build inside manylinux_2_28 Docker (glibc 2.28 baseline) ──
       #
-      # manylinux2014 images ship a statically-linked Python (no
-      # libpython3.x.so), which PyInstaller cannot use — it requires a
-      # shared library at bundle time.  Debian Bullseye's python3.11
-      # package includes the shared lib and targets glibc 2.31, which
-      # covers any host with glibc ≥ 2.31 (CentOS 8+, Alma 9+, Ubuntu
-      # 20.04+, Amazon Linux 2023, etc).
-      - name: Build with PyInstaller (Debian Bullseye Docker)
+      # The bundle's glibc floor is the MAX over every ELF inside it, so the
+      # image decides compatibility far more than any code change does.
+      # manylinux_2_28 (AlmaLinux 8, glibc 2.28, maintained through 2029-05)
+      # is the lowest baseline that still receives updates:
+      #   RHEL/CentOS/Alma/Rocky 8 = 2.28   covered
+      #   Debian 11 / Ubuntu 20.04 = 2.31   covered
+      #   EulerOS 2.0 / AlmaLinux 9= 2.34   covered  (issue #1349)
+      #
+      # The note that used to be here ruled out manylinux images because they
+      # "ship a statically-linked Python". That is true only of the
+      # PREINSTALLED /opt/python/cp311-cp311 build (Py_ENABLE_SHARED=0). The
+      # distro package is different: dnf's python3.11-libs provides a shared
+      # /usr/lib64/libpython3.11.so.1.0 with Py_ENABLE_SHARED=1, which is
+      # exactly what PyInstaller requires. Verified end-to-end — bundle floor
+      # GLIBC_2.28, all Rust/C deps resolve to manylinux wheels, and the
+      # frozen binary runs.
+      #
+      # History: a two-line bump of IMG to python:3.11-slim-bookworm (glibc
+      # 2.36) shipped a GLIBC_2.35 baseline for ~15 releases while this
+      # comment block still advertised "Bullseye (glibc 2.31 baseline)", so
+      # the regression was invisible in diff review. The "Assert the Linux
+      # bundle glibc floor" step below exists to make that unrepeatable.
+      - name: Build with PyInstaller (manylinux_2_28 Docker, glibc 2.28)
         if: matrix.use_docker
         shell: bash
         run: |
           set -euo pipefail
           case "${{ matrix.target }}" in
-            linux_amd64)  IMG=python:3.11-slim-bookworm ;;
-            linux_arm64)  IMG=python:3.11-slim-bookworm ;;
+            linux_amd64)  IMG=quay.io/pypa/manylinux_2_28_x86_64 ;;
+            linux_arm64)  IMG=quay.io/pypa/manylinux_2_28_aarch64 ;;
             *) echo "::error::no Docker image for target ${{ matrix.target }}"; exit 1 ;;
           esac
           docker run --rm \
@@ -385,34 +411,169 @@ jobs:
             "$IMG" \
             bash -c '
               set -euo pipefail
-              python --version
 
-              # Verify the shared library is present (PyInstaller
-              # requirement).
-              python -c "import sysconfig; print(sysconfig.get_config_var(\"LDLIBRARY\"))"
+              # Use the DISTRO python3.11, never a bare `python3.11`.
+              # manylinux images place /usr/local/bin/python3.11 -> the
+              # preinstalled /opt/python/cp311-cp311 build AHEAD of /usr/bin
+              # on PATH, and that interpreter has a static libpython
+              # (Py_ENABLE_SHARED=0) which PyInstaller cannot use. There is
+              # also no bare `python` on PATH at all.
+              dnf install -y python3.11 python3.11-devel python3.11-pip binutils
+              PY=/usr/bin/python3.11
+              "$PY" --version
+              "$PY" -c "import sys,sysconfig; v=sysconfig.get_config_var(\"Py_ENABLE_SHARED\"); print(\"Py_ENABLE_SHARED=\",v,\"LDLIBRARY=\",sysconfig.get_config_var(\"LDLIBRARY\"),\"LIBDIR=\",sysconfig.get_config_var(\"LIBDIR\")); sys.exit(0 if v==1 else 1)"
 
-              # Slim image is minimal — install system packages needed
-              # by the Python build chain:
-              #   curl          rustup download (tiktoken / cryptography)
-              #   gcc + make    C extension fallback (grpcio, pyyaml, etc.)
-              #   pkg-config    some C extensions probe for system libs
-              apt-get update -qq && apt-get install -y curl build-essential pkg-config
-
-              # tiktoken may need to build from source on some
-              # platforms — install Rust just in case.
-              if ! command -v cargo >/dev/null 2>&1; then
-                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                  | sh -s -- -y --default-toolchain stable --profile minimal
-                export PATH="$HOME/.cargo/bin:$PATH"
-              fi
-              cargo --version || true
-
+              # Every Rust/C extension in the dependency set (pydantic-core,
+              # watchfiles, uvloop, httptools, tiktoken, cryptography, lxml,
+              # grpcio, rpds-py) resolves to a prebuilt manylinux wheel, so
+              # neither a compiler nor Rust is required. binutils above is
+              # for the ABI assertions, not for building.
+              "$PY" -m venv /tmp/venv
+              . /tmp/venv/bin/activate
               python -m pip install --upgrade pip
               python -m pip install -e ".[dev]"
+
+              # Bundle libstdc++/libgcc_s from THIS container. Note the two
+              # live in the same dir on RHEL-class systems but NOT on Debian
+              # 11 (no usrmerge: libstdc++ in /usr/lib/<triplet>, libgcc_s in
+              # /lib/<triplet>) — enumerate rather than assume one path.
+              mkdir -p vendor/node/lib
+              cp -Lv /usr/lib64/libstdc++.so.6 vendor/node/lib/
+              cp -Lv /usr/lib64/libgcc_s.so.1  vendor/node/lib/
+              ls -la vendor/node/lib/
+
+              # Assert the shipped libstdc++ satisfies the bundled Node.
+              # Both sides are derived from the binaries rather than
+              # hardcoded, so a Node bump fails the build instead of
+              # silently breaking old hosts. manylinux_2_28 offers
+              # GLIBCXX_3.4.25 / CXXABI_1.3.11 while Node 24.16.0 needs
+              # 3.4.21 / 1.3.11 — CXXABI has ZERO headroom, which is exactly
+              # why this cannot be left implicit.
+              # Trailing `|| true` on both: grep exits 1 when a family has no
+              # match, and under `set -o pipefail` that propagates out of the
+              # command substitution into the assignment, so `set -e` would
+              # abort the step with no message at all — making the empty-value
+              # guards below unreachable. Measured, not theorised.
+              abi_offer() { objdump -T "$1" 2>/dev/null | grep -v "\*UND\*" | grep -oE "$2_[0-9]+(\.[0-9]+)*" | sort -uV | tail -1 || true; }
+              abi_need()  { objdump -T "$1" 2>/dev/null | grep "\*UND\*"     | grep -oE "$2_[0-9]+(\.[0-9]+)*" | sort -uV | tail -1 || true; }
+              for fam in GLIBCXX CXXABI; do
+                need=$(abi_need  vendor/node/node "$fam")
+                have=$(abi_offer vendor/node/lib/libstdc++.so.6 "$fam")
+                if [ -z "$need" ]; then echo "ABI ok: $fam — node demands nothing"; continue; fi
+                if [ -z "$have" ] || [ "$(printf "%s\n%s\n" "$need" "$have" | sort -V | tail -1)" != "$have" ]; then
+                  echo "::error::shipped libstdc++ offers ${have:-none} but node needs $need ($fam)"
+                  exit 1
+                fi
+                echo "ABI ok: $fam — node needs $need, shipped libstdc++ offers $have"
+              done
+
               python -m PyInstaller blade-ai.spec --noconfirm
             '
 
-      # ── Native build: linux/amd64 + darwin/{amd64,arm64} ────────────
+      # ── Guard the glibc floor of the Linux bundle ────────────────────
+      #
+      # Whether the bundle loads is decided by the MAX GLIBC_2.x demanded by
+      # any ELF inside it — a property of the build image, not of our source.
+      # Nothing in a normal diff review reveals it, which is how a two-line
+      # IMG bump to bookworm shipped a GLIBC_2.35 floor for ~15 releases and
+      # broke every host below it (issue #1349). This turns the baseline into
+      # an assertion that fails the release instead of the user's machine.
+      #
+      # Files are selected by ELF magic, not by a *.so glob: the glob misses
+      # extension-less binaries (the launcher, vendor/node/node) while
+      # scanning every file would let a text file that merely mentions
+      # "GLIBC_2.3x" inflate the floor.
+      #
+      # grep -ao, not objdump -T: no binutils needed on the runner and it is
+      # architecture-independent. Verified item-for-item equal to
+      # `objdump -T | grep -o 'GLIBC_2\.[0-9]*'` on both x86_64 and aarch64.
+      # Safe because nothing in the bundle DEFINES a GLIBC_2.x version — only
+      # glibc itself does — so every occurrence is a requirement.
+      #
+      # The chaosblade vendor tree is deliberately not a concern here: blade
+      # and chaos_* are built with CGO_ENABLED=0 (Makefile L64) and nsexec
+      # with `gcc -static` (Makefile L329/L332), so all of them are static
+      # and contribute no glibc requirement.
+      - name: Assert the Linux bundle glibc floor
+        if: matrix.use_docker
+        shell: bash
+        env:
+          MAX_GLIBC: '2.28'
+        run: |
+          set -euo pipefail
+          BUNDLE="blade-ai/dist/blade-ai"
+          MAX="$MAX_GLIBC"
+          # Exact two-digit match: a trailing glob (2.[0-9]*) would accept
+          # junk after the digits.
+          case "$MAX" in
+            2.[0-9][0-9]) : ;;
+            *) echo "::error::MAX_GLIBC must look like 2.NN, got '$MAX'"; exit 1 ;;
+          esac
+          test -x "$BUNDLE/blade-ai" || { echo "::error::bundle launcher $BUNDLE/blade-ai is missing"; exit 1; }
+
+          echo "=== libpython shipped in the bundle ==="
+          LIBPY=$(find "$BUNDLE" -name 'libpython*.so*' 2>/dev/null | sed -n 1p)
+          if [ -z "$LIBPY" ]; then
+            # PyInstaller cannot freeze a static libpython, so an absent one
+            # means the build silently used the preinstalled /opt/python
+            # interpreter instead of the distro one.
+            echo "::error::no libpython inside $BUNDLE"
+            exit 1
+          fi
+          ls -la "$LIBPY"
+
+          echo "=== Node runtime shipped in the bundle ==="
+          # main.py replaces LD_LIBRARY_PATH with this dir wholesale, so a
+          # missing libstdc++ here is not a soft degradation.
+          for req in _internal/vendor/node/node \
+                     _internal/vendor/node/lib/libstdc++.so.6 \
+                     _internal/vendor/node/lib/libgcc_s.so.1; do
+            if [ ! -e "$BUNDLE/$req" ]; then
+              echo "::error::$req missing from the bundle — the TUI cannot run"
+              exit 1
+            fi
+          done
+          ls -la "$BUNDLE/_internal/vendor/node/lib/"
+
+          find "$BUNDLE" -type f -print0 \
+            | xargs -0 grep -la $'\x7fELF' 2>/dev/null > /tmp/elfs.txt || true
+          [ -s /tmp/elfs.txt ] || { echo "::error::no ELF files enumerated"; exit 1; }
+          echo "ELF files to scan: $(wc -l < /tmp/elfs.txt)"
+
+          : > /tmp/nodes.txt
+          while IFS= read -r f; do
+            # `|| true` inside the substitution: grep exits 1 for an ELF that
+            # references no versioned glibc symbol, and pipefail would turn
+            # that into a silent abort of the whole step.
+            n=$(grep -ao 'GLIBC_2\.[0-9]*' "$f" 2>/dev/null | sort -uV | tail -1 || true)
+            # if/fi, not `[ -n "$n" ] && echo`: a bare AND-list whose test
+            # fails returns non-zero and set -e aborts the whole step on the
+            # first .so that references no versioned glibc symbol.
+            if [ -n "$n" ]; then echo "$n|$f" >> /tmp/nodes.txt; fi
+          done < /tmp/elfs.txt
+          [ -s /tmp/nodes.txt ] || { echo "::error::no GLIBC symbol versions found"; exit 1; }
+
+          echo "=== top 15 offenders (highest GLIBC first) ==="
+          # sed, not head: head closing the pipe early gives sort a SIGPIPE,
+          # which pipefail turns into exit 141.
+          # -k1,1 -V -r, NOT -k1,1V -r: a key-specific V flag makes sort
+          # ignore the global -r and print ASCENDING, which truncates away
+          # exactly the highest (most interesting) entries.
+          sort -t'|' -k1,1 -V -r /tmp/nodes.txt | sed -n '1,15p'
+
+          HIGH=$(cut -d'|' -f1 /tmp/nodes.txt | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "=== bundle glibc floor: GLIBC_$HIGH (configured limit: GLIBC_$MAX) ==="
+          if [ "$HIGH" != "$MAX" ] && [ "$(printf '%s\n%s\n' "$MAX" "$HIGH" | sort -V | tail -1)" = "$HIGH" ]; then
+            echo "::error::bundle requires GLIBC_$HIGH, above the GLIBC_$MAX limit"
+            exit 1
+          fi
+          echo "PASS: bundle loads on any host with glibc >= $HIGH"
+
+      # ── Native build: darwin/{amd64,arm64} + windows/x64 ────────────
+      #
+      # Linux never reaches these steps — both linux matrix entries set
+      # use_docker: true and are built in manylinux_2_28 above. Every step
+      # from here to "Package archive" is gated on !matrix.use_docker.
       #
       # darwin/amd64 special case: macos-latest is an Apple Silicon
       # (arm64) runner. To produce an x86_64 PyInstaller bundle we
