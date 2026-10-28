@@ -46,11 +46,11 @@
     "ink-spinner": "^5.0.0",
     "marked": "^14.1.4",
     "marked-terminal": "^7.3.0",
-    "react": "^19.2.4"
+    "react": "^19.3.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "@types/react": "^19.2.0",
+    "@types/react": "^19.3.0",
     "ink-testing-library": "^4.0.0",
     "patch-package": "^8.0.1",
     "tsup": "^8.3.5",
