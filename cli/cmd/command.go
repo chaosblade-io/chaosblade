@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -156,7 +157,10 @@ func applyLogLevel() {
 	if util.Debug {
 		return
 	}
-	if level, err := logrus.ParseLevel(util.LogLevel); err == nil {
-		logrus.SetLevel(level)
+	level, err := logrus.ParseLevel(util.LogLevel)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: invalid --log-level %q, falling back to %v\n", util.LogLevel, logrus.GetLevel())
+		return
 	}
+	logrus.SetLevel(level)
 }
