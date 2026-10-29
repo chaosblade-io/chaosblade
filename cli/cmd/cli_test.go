@@ -39,4 +39,14 @@ func TestCli_Run(t *testing.T) {
 	if flag == nil {
 		t.Errorf("unexpected error: %s", "no such shorthand flag -d")
 	}
+
+	flag = cli.rootCmd.Flags().Lookup("log-level")
+	if flag == nil {
+		t.Errorf("unexpected error: %s", "no such flag --log-level")
+	}
+
+	flag = cli.rootCmd.Flags().ShorthandLookup("l")
+	if flag == nil {
+		t.Errorf("unexpected error: %s", "no such shorthand flag -l")
+	}
 }
