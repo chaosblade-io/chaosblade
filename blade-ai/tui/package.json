@@ -41,7 +41,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "cli-spinners": "^2.9.0",
+    "cli-spinners": "^3.4.0",
     "ink": "^7.0.3",
     "ink-spinner": "^5.0.0",
     "marked": "^14.1.4",
