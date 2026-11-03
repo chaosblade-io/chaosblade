@@ -1,5 +1,6 @@
 """Tests for tool output two-stage truncation."""
 
+import json
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
 
@@ -9,6 +10,7 @@ from chaos_agent.memory.tool_compactor import (
     is_ai_message,
     is_tool_message,
     maybe_time_based_microcompact,
+    smart_strip_k8s_json,
     truncate_text,
 )
 
@@ -274,3 +276,60 @@ class TestToolResultCompactorWithTimeMC:
         result = compactor.compact(msgs)
         # Should have processed messages (time cleanup + truncation)
         assert len(result) == len(msgs)
+
+
+# ---------------------------------------------------------------------------
+# smart_strip_k8s_json
+# ---------------------------------------------------------------------------
+
+
+class TestSmartStripK8sJson:
+    """Test that only K8s object lists take the smart-strip path."""
+
+    def test_strips_k8s_pod_list(self):
+        pod = {
+            "kind": "Pod",
+            "metadata": {"name": "web-0", "namespace": "default", "labels": {"a": "b"}},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "web"}]},
+            "status": {"phase": "Running"},
+        }
+        result = smart_strip_k8s_json(json.dumps({"items": [pod]}), 16 * 1024)
+        data = json.loads(result)
+        assert data["truncated"] is True
+        assert data["items"][0]["metadata"] == {"name": "web-0", "namespace": "default"}
+        assert data["items"][0]["spec"] == {"nodeName": "node-1"}
+
+    def test_string_items_not_treated_as_k8s_list(self):
+        payload = json.dumps({"ok": True, "items": ["GET /api/cart", "POST /api/cart"]})
+        assert smart_strip_k8s_json(payload, 1024) is None
+
+    def test_mixed_items_not_treated_as_k8s_list(self):
+        payload = json.dumps({"items": [{"kind": "Pod"}, "GET /api/cart"]})
+        assert smart_strip_k8s_json(payload, 1024) is None
+
+    def test_non_list_items_not_treated_as_k8s_list(self):
+        payload = json.dumps({"items": {"kind": "Pod"}})
+        assert smart_strip_k8s_json(payload, 1024) is None
+
+    def test_non_dict_metadata_kept(self):
+        payload = json.dumps({"metadata": "page-1", "items": [{"kind": "Pod"}]})
+        data = json.loads(smart_strip_k8s_json(payload, 1024))
+        assert data["metadata"] == "page-1"
+
+    def test_compact_old_string_items_falls_back_to_truncation(self):
+        """An aged-out {"items": [<string>, ...]} result is truncated, not stripped."""
+        compactor = ToolResultCompactor()
+
+        names = [f"GET /api/operation/{i}" for i in range(200)]
+        msgs = []
+        for _ in range(4):
+            msg = MagicMock()
+            msg.type = "tool"
+            msg.name = "list_operations"
+            msg.content = json.dumps({"ok": True, "items": names})
+            msgs.append(msg)
+
+        result = compactor.compact(msgs)
+        # The oldest result exceeds OLD_MAX_BYTES and keeps its string items.
+        assert "GET /api/operation/0" in result[0].content
+        assert "{}" not in result[0].content
