@@ -286,7 +286,11 @@ def smart_strip_k8s_json(content: str, max_bytes: int) -> Optional[str]:
         return None
 
     items = data.get("items", [])
-    if not items:
+    if not isinstance(items, list) or not items:
+        return None
+    # A K8s list holds resource objects. Other payloads, such as
+    # {"items": ["GET /api/cart", ...]}, fall back to generic truncation.
+    if not all(isinstance(item, dict) for item in items):
         return None
 
     # Detect kind from first item
@@ -301,7 +305,7 @@ def smart_strip_k8s_json(content: str, max_bytes: int) -> Optional[str]:
     stripped_data["items"] = stripped_items
     stripped_data["truncated"] = True
     # Remove verbose annotations/managedFields from metadata if present
-    if "metadata" in stripped_data:
+    if isinstance(stripped_data.get("metadata"), dict):
         stripped_data["metadata"].pop("annotations", None)
         stripped_data["metadata"].pop("managedFields", None)
 
