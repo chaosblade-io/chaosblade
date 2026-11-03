@@ -50,6 +50,9 @@ type FlagSpec struct {
 }
 
 type ChaosBladeStatus struct {
+	// Recovery contains the immutable plan and observed node recovery results.
+	Recovery *RecoveryStatus `json:"recovery,omitempty"`
+
 	Phase       ClusterPhase       `json:"phase,omitempty"`
 	ExpStatuses []ExperimentStatus `json:"expStatuses"`
 }

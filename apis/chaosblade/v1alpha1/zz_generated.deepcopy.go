@@ -97,6 +97,9 @@ func (in *ChaosBladeSpec) DeepCopy() *ChaosBladeSpec {
 
 func (in *ChaosBladeStatus) DeepCopyInto(out *ChaosBladeStatus) {
 	*out = *in
+	if in.Recovery != nil {
+		out.Recovery = in.Recovery.DeepCopy()
+	}
 	if in.ExpStatuses != nil {
 		in, out := &in.ExpStatuses, &out.ExpStatuses
 		*out = make([]ExperimentStatus, len(*in))

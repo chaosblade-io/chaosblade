@@ -329,13 +329,19 @@ func convertExpModelToChaosBladeObject(uid string, expModel *spec.ExpModel) v1al
 		},
 		Spec: chaosBladeSpec,
 	}
+	if expModel.ActionFlags[RecoveryFlag.Name] == "true" {
+		chaosBlade.Annotations = map[string]string{"chaosblade.io/recovery": "true"}
+	}
 	return chaosBlade
 }
 
 func convertFlagsToResourceFlags(flags map[string]string) []v1alpha1.FlagSpec {
 	flagSpecs := make([]v1alpha1.FlagSpec, 0)
 	for name, values := range flags {
-		if name == KubeConfigFlag.Name || name == WaitingTimeFlag.Name || name == KubectlProxyFlag.Name || name == TokenFlag.Name {
+		if flags[RecoveryFlag.Name] == "true" && (values == "" || name == "log-level" || name == "debug" || name == "uid") {
+			continue
+		}
+		if name == KubeConfigFlag.Name || name == WaitingTimeFlag.Name || name == KubectlProxyFlag.Name || name == TokenFlag.Name || name == RecoveryFlag.Name {
 			continue
 		}
 		valueArr := strings.Split(values, ",")

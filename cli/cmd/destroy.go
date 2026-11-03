@@ -205,6 +205,11 @@ func (dc *DestroyCommand) checkAndForceRemoveForExpRecord(uid string) error {
 }
 
 func (dc *DestroyCommand) destroyExperiment(uid string, executor spec.Executor, expModel *spec.ExpModel) error {
+	unlockRecovery, err := legacyNetworkGuard(expModel)
+	if err != nil {
+		return err
+	}
+	defer unlockRecovery()
 	// set destroy flag
 	ctx := spec.SetDestroyFlag(context.Background(), uid)
 	ctx = context.WithValue(ctx, spec.Uid, uid)
@@ -330,6 +335,11 @@ func (dc *DestroyCommand) actionRunEFunc(target, scope string, _ *actionCommand,
 		if dc.forceRemove {
 			log.Warnf(ctx, "the force-remove flag does not work if the uid does not exist.")
 		}
+		unlockRecovery, guardErr := legacyNetworkGuard(expModel)
+		if guardErr != nil {
+			return guardErr
+		}
+		defer unlockRecovery()
 		executor := actionCommandSpec.Executor()
 		executor.SetChannel(channel.NewLocalChannel())
 		ctx = spec.SetDestroyFlag(ctx, spec.UnknownUid)

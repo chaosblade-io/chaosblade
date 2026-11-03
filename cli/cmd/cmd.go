@@ -55,6 +55,8 @@ func CmdInit() *baseCommand {
 	queryCommand.AddCommand(&QueryJvmCommand{})
 	queryCommand.AddCommand(&QueryK8sCommand{})
 
+	baseCmd.AddCommand(&RecoveryCommand{})
+
 	// UPDATE 2023-12-30 Disable server command mode.
 
 	// add check command

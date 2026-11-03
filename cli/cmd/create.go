@@ -105,6 +105,11 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 	return func(cmd *cobra.Command, args []string) error {
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
 		expModel.ActionProcessHang = actionCommandSpec.ProcessHang()
+		unlockRecovery, guardErr := legacyNetworkGuard(expModel)
+		if guardErr != nil {
+			return guardErr
+		}
+		defer unlockRecovery()
 		// check timeout flag
 		tt := expModel.ActionFlags["timeout"]
 		if tt != "" {
