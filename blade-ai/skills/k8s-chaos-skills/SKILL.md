@@ -3,7 +3,7 @@ name: k8s-chaos-skills
 description: |
   Kubernetes 故障演练与混沌工程专家。当用户需要进行 K8s 故障注入测试、混沌工程演练、系统韧性验证、故障场景模拟时，立即使用此 skill。
 
-  内置多个标准化故障注入用例，覆盖 Pod（Pending、CrashLoopBackOff、OOM、CPU 满载、内存接近 Limit、磁盘满、Terminating 卡住、镜像拉取失败等）、Workload（副本不一致、HPA 副本达到上限、DaemonSet 未完全调度）、Service（状态异常、负载均衡异常）、Node（宕机、磁盘使用率过高、磁盘 IO 过高、CPU 使用率过高、内存使用率过高）、存储（PVC 挂载 Pending）五个层级。
+  内置多个标准化故障注入用例，覆盖 Pod（Pending、CrashLoopBackOff、OOM、CPU 满载、内存接近 Limit、磁盘满、Terminating 卡住、镜像拉取失败等）、Workload（副本不一致、HPA 副本达到上限、DaemonSet 未完全调度）、Service（状态异常、负载均衡异常）、Node（宕机、磁盘使用率过高、磁盘 IO 过高、磁盘 IO 挂起、CPU 使用率过高、内存使用率过高）、存储（PVC 挂载 Pending）五个层级。
 
   通过「意图识别 → 用例选择 → 用例执行」的决策树流程，精确匹配用户需求并执行对应演练方案。即使用户只是笼统地说「帮我做个故障演练」或「测试下应用的容错能力」，也应该触发此 skill 引导用户完成完整流程。
 
@@ -12,6 +12,8 @@ scripts:
     description: "列出当前支持的所有故障演练场景（JSON 结构化输出）"
   - name: inject_cni_exhaust.py
     description: "CNI IP 耗尽注入 — 自动计算副本数，精确耗尽目标节点 IP 而不触发 OutOfpods。参数: --namespace <ns> --node <node> --kubeconfig <path>"
+  - name: inject_io_hang.py
+    description: "磁盘 IO 挂起（io_hang）注入/恢复/状态查询 — ChaosBlade disk 只有 burn/fill，本脚本用 fsfreeze 或 dm-delay 补齐 IO 请求不返回的场景，注入时自带超时自动恢复看门狗。参数: --node <node> --path <path> --kubeconfig <path> [--action inject|recover|status] [--mode fsfreeze|dm-delay] [--timeout 300]"
 ---
 
 # K8s 故障演练
@@ -54,6 +56,7 @@ scripts:
 | 副本、deployment、扩容、缩容 | Workload |
 | service、服务发现、负载均衡、端口、endpoints | Service |
 | 节点、node、磁盘、宿主机 | Node |
+| IO挂起、IO hang、io_hang、写入卡住、fsync 不返回、D 状态、存储无响应 | Node |
 
 **信息不全时的处理：**
 - 用户明确说出故障现象 → 直接进入第二步
@@ -118,6 +121,10 @@ ls references/catalogue/<匹配的目录>/
 
 - `scripts/list_scenarios.py`：一键列出所有已支持的演练场景（JSON 结构化输出），用于快速总览或对接外部系统
   用法：`execute_skill_script(skill_name="k8s-chaos-skills", script_name="list_scenarios.py")`
+- `scripts/inject_io_hang.py`：磁盘 IO 挂起（io_hang）注入 / 恢复 / 状态查询。ChaosBlade 的 disk 实验没有
+  io_hang action，涉及「IO 卡住、写入不返回」的用例必须走这个脚本而不是 `blade create`。
+  由于不经过 blade，**没有 blade_uid**，恢复只能用 `--action recover`（脚本注入时还会挂一个 `--timeout` 看门狗自动兜底）。
+  用法：`execute_skill_script(skill_name="k8s-chaos-skills", script_name="inject_io_hang.py", params="--node <node> --path <path> --timeout 300 --kubeconfig <path>", timeout=300)`
 
 ---
 
