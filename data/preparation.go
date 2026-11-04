@@ -359,14 +359,6 @@ func (s *Source) QueryPreparationRecords(target, status, action, flag, limit str
 		sql = fmt.Sprintf(`%s and status = ?`, sql)
 		parameters = append(parameters, UpperFirst(status))
 	}
-	if action != "" {
-		sql = fmt.Sprintf(`%s and sub_command = ?`, sql)
-		parameters = append(parameters, action)
-	}
-	if flag != "" {
-		sql = fmt.Sprintf(`%s and flag like ?`, sql)
-		parameters = append(parameters, "%"+flag+"%")
-	}
 	if asc {
 		sql = fmt.Sprintf(`%s order by id asc`, sql)
 	} else {
