@@ -50,7 +50,11 @@ func init() {
 	// disable printing of client-go logs
 	klog.InitFlags(nil)
 	flag.Set("v", "0")
-	flag.Parse()
+	// NOTE: do not call flag.Parse() here. It parses the raw argv against the
+	// standard flag.CommandLine (which only holds klog flags), so blade's own
+	// cobra/pflag global flags (--debug, --log-level, ...) were rejected with
+	// "flag provided but not defined" before cobra ever ran. klog is fully
+	// configured by InitFlags + Set above; parsing is cobra's job.
 }
 
 type Executor struct{}

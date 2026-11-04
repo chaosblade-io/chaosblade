@@ -44,7 +44,7 @@ jobs:
       version: ${{ steps.derive.outputs.version }}
       tag: ${{ steps.derive.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.ref }}
       - name: Derive tag/version from inputs or ref
@@ -98,10 +98,10 @@ jobs:
     needs: verify-versions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.ref }}
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: '22'
           cache: 'npm'
@@ -151,7 +151,7 @@ jobs:
       #   run: |
       #     node scripts/smoke-i18n.mjs
       #     node scripts/smoke-slash.mjs
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: tui-bundle
           # Both cli.js (the bundle) and package.json (the {"type":"module"}
@@ -194,13 +194,13 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.ref }}
 
       # Pull the TS bundle into ``blade-ai/tui/dist/cli.js`` BEFORE
       # pyinstaller runs.
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: tui-bundle
           path: blade-ai/tui/dist
@@ -317,7 +317,7 @@ jobs:
         # universal2 Python above). Single-line if expression keeps
         # the YAML readable; equivalent to the long disjunction.
         if: ${{ !matrix.use_docker && !(matrix.os == 'darwin' && matrix.arch == 'amd64') }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -374,7 +374,7 @@ jobs:
           PLATFORM="${{ matrix.os }}-${{ matrix.arch }}"
           tar -czf "blade-ai-${PLATFORM}.tar.gz" -C blade-ai/dist blade-ai
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: blade-ai-${{ matrix.os }}-${{ matrix.arch }}
           path: blade-ai-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
@@ -389,7 +389,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: artifacts
 
@@ -402,7 +402,7 @@ jobs:
           cat checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ needs.verify-versions.outputs.tag }}
           generate_release_notes: true

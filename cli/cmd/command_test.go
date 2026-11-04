@@ -20,10 +20,65 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 
 	"github.com/chaosblade-io/chaosblade/data"
 )
+
+func Test_applyLogLevel(t *testing.T) {
+	// applyLogLevel mutates process-global state (util.Debug, util.LogLevel and
+	// the logrus root level); save and restore it so the test is hermetic.
+	origDebug := util.Debug
+	origLogLevel := util.LogLevel
+	origLevel := logrus.GetLevel()
+	defer func() {
+		util.Debug = origDebug
+		util.LogLevel = origLogLevel
+		logrus.SetLevel(origLevel)
+	}()
+
+	tests := []struct {
+		name     string
+		debug    bool
+		logLevel string
+		want     logrus.Level
+	}{
+		{"default stays info", false, "info", logrus.InfoLevel},
+		{"warn lowers to warn", false, "warn", logrus.WarnLevel},
+		{"error lowers to error", false, "error", logrus.ErrorLevel},
+		{"debug value raises to debug", false, "debug", logrus.DebugLevel},
+		{"--debug wins over --log-level", true, "error", logrus.DebugLevel},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			util.Debug = tt.debug
+			util.LogLevel = tt.logLevel
+			// Reproduce the state util.InitLog leaves behind: info by default,
+			// debug when --debug is set.
+			if tt.debug {
+				logrus.SetLevel(logrus.DebugLevel)
+			} else {
+				logrus.SetLevel(logrus.InfoLevel)
+			}
+			applyLogLevel()
+			if got := logrus.GetLevel(); got != tt.want {
+				t.Errorf("applyLogLevel() level = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// An unparsable value must not panic and must fall back to the baseline.
+	util.Debug = false
+	util.LogLevel = "not-a-level"
+	logrus.SetLevel(logrus.InfoLevel)
+	applyLogLevel()
+	if got := logrus.GetLevel(); got != logrus.InfoLevel {
+		t.Errorf("applyLogLevel() with invalid value level = %v, want info", got)
+	}
+}
 
 func Test_baseCommand_recordExpModel(t *testing.T) {
 	source := &MockSource{}
