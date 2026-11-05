@@ -12,10 +12,16 @@ library is authoritative, no live probing of the blade binary is performed:
   which one the operator fills) and an executability flag
 
 The output is a v2 JSON registry written to
-``~/.blade-ai/memory/skill_capabilities.json``. Package maintainers commit the
-same artifact (per language) into ``chaos_agent/_capabilities/`` so installing
-the package ships its capabilities; ``chaos_agent.skills.capabilities`` is the
-runtime reader and the single consumption entry point.
+``~/.blade-ai/memory/skill_capabilities_{locale}.json`` — one file per
+language, so an ``--lang en`` run cannot evict the zh override. Package
+maintainers commit the same artifact (per language) into
+``chaos_agent/_capabilities/`` so installing the package ships its
+capabilities; ``chaos_agent.skills.capabilities`` is the runtime reader and the
+single consumption entry point.
+
+Re-running over an unchanged case library is cheap: ``cache_path`` keeps each
+case's raw distillation result and reuses it when neither the prompt, the model
+nor that case's markdown changed.
 """
 
 from __future__ import annotations
@@ -44,6 +50,10 @@ _STRUCTURAL_FIELDS = (
     "inject_kind", "scope", "target", "action", "params", "structured_cmd",
 )
 _PROSE_FIELDS = ("title", "fault_symptom", "nl_cmd")
+# build_registry (:854) renames fault_symptom → symptom when writing the file.
+# _align_with_reference runs BEFORE build_registry, so ref_case (loaded from a
+# previously written file) uses the registry key. Map LLM-side → file-side.
+_PROSE_REF_KEY_MAP: dict[str, str] = {"fault_symptom": "symptom"}
 
 # Authoritative case name lives in the md content (``**用例名称** ...``),
 # same line extract_planning_metadata consumes. Filename conventions are only
@@ -126,8 +136,29 @@ Output JSON only, no other content.""",
 Output JSON only, no other content.""",
 }
 
-# CLI lang value → registry `lang` tag / bundled artifact name.
-_LANG_TAG = {"en": "en", "cn": "zh"}
+# CLI lang value → registry `lang` tag / bundled artifact name. Public: the
+# CLI needs it to pick the per-language output filename, and that filename is
+# what ``capabilities.load_capabilities`` matches the tag against.
+LANG_TAG_BY_RUN = {"en": "en", "cn": "zh"}
+
+# Every key the JSON schema in _SYSTEM_PROMPT asks for. Presence — not
+# non-emptiness — is the completeness test: the prompt deliberately allows an
+# empty scope/target/action (a case the model could not reduce to a triple is
+# reported as non-executable rather than invented), so demanding values would
+# reject legitimate answers. What this catches is a truncated or partially
+# formed response, which is a different thing: the model answered, but not to
+# the schema, and shaping it anyway would silently degrade the case (missing
+# keys become "unknown"/""/[]) and then freeze that degradation in the cache.
+_REQUIRED_RESULT_KEYS = frozenset({
+    "inject_kind", "title", "fault_symptom", "scope", "target", "action",
+    "params", "nl_cmd", "structured_cmd",
+})
+
+
+def _missing_result_keys(result: dict) -> list[str]:
+    """Schema keys absent from a parsed LLM answer (sorted, for a stable message)."""
+    return sorted(_REQUIRED_RESULT_KEYS - set(result))
+
 
 # Skill name → capability family. Unknown skills fall back to a scope-based
 # derivation from fault_registry (python_* → python, host_* → host, else k8s).
@@ -219,8 +250,162 @@ async def _llm_invoke(llm, messages: list) -> tuple[dict, str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-case distillation cache
+# ---------------------------------------------------------------------------
+#
+# A sync run is one LLM call per catalogue case (~115 today), but a typical
+# edit touches one or two cases. Without a cache every run re-distilled all of
+# them — minutes of latency and tokens to produce a byte-identical artifact for
+# the untouched 113. The cache stores the RAW per-case LLM result (not the
+# assembled registry case), so reference alignment, family/profile derivation
+# and id assignment all stay live and keep applying to cached entries too.
+#
+# Entries are guarded by two hashes: the generation fingerprint (whole-table —
+# prompt + model) and the case's own content hash (per-entry). Failures and
+# schema-incomplete answers are never cached — a transient LLM outage must not
+# be frozen into the artifact.
+
+# 2: the identity gained a model dimension. Bumping this drops any v1 cache
+# rather than mis-reading it, which is free here — v1 caches are per-user
+# speed artifacts under ~/.blade-ai/memory, never committed.
+_CACHE_VERSION = 2
+
+
+def _generation_fingerprint(system_prompt: str, model_tag: str) -> str:
+    """Identity of everything shared by every case in one generation run.
+
+    The LLM's answer for a case is a function of (prompt, case body, the model
+    that answers). The case body is hashed per entry; this fingerprint covers
+    the other two, so a prompt change OR a model change invalidates every entry.
+    Leaving the model out would let a switch to a stronger model silently reuse
+    the weaker model's answers, with nothing on disk recording which model
+    produced them.
+
+    ``model_tag`` is the caller's label for the generator behind ``llm``,
+    declared explicitly rather than reflected off the client object (whose
+    attribute layout is nobody's contract). Sampling knobs such as temperature
+    are deliberately NOT part of it: reusing an answer already accepts
+    run-to-run sampling variance, so hashing the knob would only invalidate
+    without buying correctness. An empty tag means "the caller did not say" —
+    still a stable identity, but blind to model changes.
+    """
+    return hashlib.md5(
+        f"{_CACHE_VERSION}\0{model_tag}\0{system_prompt}".encode("utf-8")
+    ).hexdigest()
+
+
+def _case_src_hash(md_content: str) -> str:
+    return hashlib.md5(md_content.encode("utf-8")).hexdigest()
+
+
+def _cache_key(task_info: dict) -> str:
+    return f"{task_info['skill']}|{task_info['resource_path']}"
+
+
+def _load_distill_cache(path: Path | None, generation_fp: str) -> dict:
+    """Read the distillation cache for ``generation_fp``; ``{}`` when unusable.
+
+    Every mismatch (no file, other prompt/model, corrupt JSON, foreign shape)
+    yields an empty cache instead of an error: the cache is an optimization, and
+    refusing to sync because of it would be strictly worse than re-distilling.
+    """
+    if path is None:
+        return {}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.debug("No usable distillation cache at %s", path)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("cache_version") != _CACHE_VERSION:
+        logger.info("Distillation cache %s dropped: cache_version changed", path)
+        return {}
+    if data.get("generation_fingerprint") != generation_fp:
+        logger.info(
+            "Distillation cache %s dropped: distillation prompt or model changed", path
+        )
+        return {}
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    return {k: v for k, v in entries.items() if isinstance(v, dict)}
+
+
+def _save_distill_cache(path: Path | None, generation_fp: str, entries: dict) -> None:
+    """Atomically persist the cache; failure only costs the next run's speed."""
+    if path is None:
+        return
+    path = Path(path)
+    payload = {
+        "cache_version": _CACHE_VERSION,
+        "generation_fingerprint": generation_fp,
+        "entries": entries,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".json.tmp")
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, str(path))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        logger.warning("Cannot write distillation cache %s: %s", path, e)
+
+
+def _cache_lookup(entries: dict, task_info: dict) -> dict | None:
+    """Cached LLM result for this case, or None when absent/out of date."""
+    hit = entries.get(_cache_key(task_info))
+    if not isinstance(hit, dict):
+        return None
+    if hit.get("src_hash") != task_info["src_hash"]:
+        return None  # case body edited since it was distilled
+    result = hit.get("result")
+    return result if isinstance(result, dict) and result else None
+
+
+def _case_from_llm_result(task_info: dict, result: dict) -> dict:
+    """One sync output row, shaped from its raw LLM result.
+
+    Shared by the fresh-call and cache-hit paths so a reused answer goes
+    through exactly the same shaping as a newly generated one.
+    """
+    return {
+        "skill": task_info["skill"],
+        "category": task_info["category"],
+        "use_case_name": task_info["use_case_name"],
+        "resource_path": task_info["resource_path"],
+        "stem": task_info["stem"],
+        "fault_symptom": result.get("fault_symptom", ""),
+        "inject_kind": result.get("inject_kind", "unknown"),
+        "title": str(result.get("title", "") or "").strip(),
+        "scope": str(result.get("scope", "") or "").strip(),
+        "target": str(result.get("target", "") or "").strip(),
+        "action": str(result.get("action", "") or "").strip(),
+        "params": result.get("params", []) if isinstance(result.get("params"), list) else [],
+        "nl_cmd": result.get("nl_cmd", ""),
+        "structured_cmd": result.get("structured_cmd", ""),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
+
+def _safe_skills_fingerprint() -> str:
+    """Best-effort skills fingerprint; a failure must not abort a sync run."""
+    try:
+        return _compute_sync_fingerprint()
+    except Exception:  # noqa: BLE001 — fingerprint is metadata, not the product
+        logger.warning("Failed to compute skills fingerprint", exc_info=True)
+        return ""
+
 
 async def sync_capabilities(
     catalogue_roots: dict[str, Path],
@@ -228,6 +413,10 @@ async def sync_capabilities(
     output_path: Path,
     lang: str = "en",
     reference_registry: Path | None = None,
+    *,
+    cache_path: Path | None = None,
+    use_cache: bool = True,
+    model_tag: str = "",
 ) -> dict:
     """Sync: LLM derives commands from each case's markdown → write JSON.
 
@@ -243,6 +432,27 @@ async def sync_capabilities(
             structural fields (triple/params/commands) are anchored to the
             matching case_path entry so both languages stay id-isomorphic;
             only prose fields are re-generated in this run's language.
+        cache_path: Optional per-case distillation cache. ``None`` (default)
+            disables it entirely — nothing is read and nothing is written — so
+            callers that pass no path can never touch a real user cache.
+            Unchanged cases are reused without an LLM call; the cache is
+            invalidated wholesale when the distillation prompt or the model
+            changes and per-entry when a case's markdown changes.
+        use_cache: When False, ignore whatever ``cache_path`` holds and
+            re-distill every case — but still WRITE the file, rebuilding it
+            from this run's results. Reading and writing are separate switches
+            on purpose: a forced re-distillation produces the freshest answers
+            there are, so discarding them and leaving the previous generation
+            in place would make the next ordinary run reuse exactly the stale
+            entries the caller just paid to replace.
+        model_tag: Caller's label for the generator behind ``llm`` — the model
+            name plus anything else the caller treats as identity-bearing (the
+            CLI passes ``model_name`` and ``api_base_url``, since the same model
+            name served by a different endpoint is a different generator). Part
+            of the cache identity: answers are a function of what produced them,
+            so reusing a cache written under another generator would freeze that
+            generator's quality into the artifact. Empty means the cache cannot
+            tell two generators apart.
 
     Returns:
         The full catalog dict (also written to output_path)
@@ -251,6 +461,20 @@ async def sync_capabilities(
     if lang_key not in _LANGUAGE_SECTIONS:
         raise ValueError(f"Unsupported lang {lang!r}; expected one of {sorted(_LANGUAGE_SECTIONS)}")
     system_prompt = _SYSTEM_PROMPT + _LANGUAGE_SECTIONS[lang_key]
+
+    # Stamped BEFORE a single case body is read. Distilling ~115 cases takes
+    # minutes; a fingerprint taken afterwards would describe files the
+    # artifact was not built from, and every later staleness check would
+    # compare against the wrong baseline — silently passing a registry whose
+    # content predates the edit that happened mid-run.
+    skills_fingerprint = _safe_skills_fingerprint()
+
+    generation_fp = _generation_fingerprint(system_prompt, model_tag)
+    stale_cache = _load_distill_cache(cache_path, generation_fp) if use_cache else {}
+    if cache_path is not None and not use_cache:
+        logger.info("Ignoring the distillation cache at %s (--no-cache); it will be rebuilt", cache_path)
+    fresh_cache: dict[str, dict] = {}
+    cache_hits = 0
 
     # Collect all tasks (metadata + md content) across every skill catalogue
     tasks: list[dict] = []
@@ -277,6 +501,7 @@ async def sync_capabilities(
                     "resource_path": str(md_file.relative_to(catalogue_root.parent.parent)),
                     "stem": md_file.stem,
                     "md_content": md_content,
+                    "src_hash": _case_src_hash(md_content),
                 })
 
     CONCURRENCY = 10
@@ -291,18 +516,64 @@ async def sync_capabilities(
         filled = int(bar_width * done / total) if total else bar_width
         bar = "#" * filled + "-" * (bar_width - filled)
         icon = _KIND_ICON.get(kind, "?")
-        mark = f"[{icon}]" if status == "ok" else "[X]"
+        # "=" marks a case reused from the distillation cache (no LLM call),
+        # so a fast run is visibly a cache hit rather than a silent skip.
+        mark = f"[{icon}]" if status == "ok" else (f"[{icon}=]" if status == "cached" else "[X]")
         pct = int(100 * done / total) if total else 100
         sys.stderr.write(f"\r  [{bar}] {pct:3d}% ({done}/{total}) {mark} {name[:45]}\033[K\n")
         sys.stderr.flush()
 
     MAX_RETRIES = 3
 
+    def _remember(task_info: dict, result: dict) -> None:
+        """Carry this case's distillation into the new cache generation.
+
+        Only complete, successful results are stored. Two things must not be
+        frozen here: an empty result (a transient LLM outage) and a
+        schema-incomplete one (the model answered off-schema and the retries
+        ran out). Both would otherwise be replayed by every later run — the
+        case keeps its degraded shape until someone edits its markdown, while a
+        run without the cache would simply have re-asked and probably healed.
+        The row is still emitted from whatever the model gave us, so this costs
+        one re-distillation next run, not a lost case.
+
+        ``fresh_cache`` is built from scratch each run, so cases deleted from
+        the catalogue drop out of the cache on their own. This is also the only
+        admission gate: the cache version bump discarded every pre-completeness
+        entry, so nothing incomplete can arrive via a cache hit either.
+        """
+        if cache_path is None or not result:
+            return
+        missing = _missing_result_keys(result)
+        if missing:
+            logger.info(
+                "Not caching %s: answer is missing %s; it will be re-distilled next run",
+                task_info["resource_path"], ", ".join(missing),
+            )
+            return
+        fresh_cache[_cache_key(task_info)] = {
+            "src_hash": task_info["src_hash"],
+            "result": result,
+        }
+
     async def _process_one(task_info: dict) -> dict:
-        nonlocal completed_count
+        nonlocal completed_count, cache_hits
         from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
         stem = task_info["stem"]
+
+        cached = _cache_lookup(stale_cache, task_info)
+        if cached is not None:
+            # Same case body under the same prompt: the previous distillation
+            # is still the answer, so skip the LLM entirely.
+            cache_hits += 1
+            _remember(task_info, cached)
+            completed_count += 1
+            _print_progress(completed_count, total_count, task_info["use_case_name"],
+                            cached.get("inject_kind", "unknown"), "cached")
+            logger.debug("  Cache hit: %s", task_info["use_case_name"])
+            return _case_from_llm_result(task_info, cached)
+
         logger.info("  Processing: %s", task_info["use_case_name"])
 
         messages = [
@@ -336,6 +607,28 @@ async def sync_capabilities(
                         "described in the system prompt — no markdown fences, no commentary."
                     )))
                     continue
+                break
+
+            missing = _missing_result_keys(result)
+            if missing:
+                # Valid JSON, but not the asked-for object — a truncated or
+                # partly formed answer. Equally fixable by the model, so it
+                # gets the same feedback-and-retry treatment rather than being
+                # shaped into a silently degraded case. When the budget runs
+                # out we keep the partial answer: a row with some real fields
+                # still beats the all-empty placeholder below.
+                if attempt < MAX_RETRIES:
+                    logger.info(
+                        "    Retry %d/%d for %s: response was missing %s",
+                        attempt, MAX_RETRIES, stem, ", ".join(missing),
+                    )
+                    messages.append(AIMessage(content=raw))
+                    messages.append(HumanMessage(content=(
+                        f"Your JSON was missing these required keys: {', '.join(missing)}. "
+                        "Output the COMPLETE JSON object described in the system prompt, with "
+                        "every key present — no markdown fences, no commentary."
+                    )))
+                    continue
 
             break
 
@@ -353,27 +646,14 @@ async def sync_capabilities(
                 "structured_cmd": "",
             }
 
+        _remember(task_info, result)
+
         inject_kind = result.get("inject_kind", "unknown")
 
         completed_count += 1
         _print_progress(completed_count, total_count, task_info["use_case_name"], inject_kind, "ok")
 
-        return {
-            "skill": task_info["skill"],
-            "category": task_info["category"],
-            "use_case_name": task_info["use_case_name"],
-            "resource_path": task_info["resource_path"],
-            "stem": stem,
-            "fault_symptom": result.get("fault_symptom", ""),
-            "inject_kind": inject_kind,
-            "title": str(result.get("title", "") or "").strip(),
-            "scope": str(result.get("scope", "") or "").strip(),
-            "target": str(result.get("target", "") or "").strip(),
-            "action": str(result.get("action", "") or "").strip(),
-            "params": result.get("params", []) if isinstance(result.get("params"), list) else [],
-            "nl_cmd": result.get("nl_cmd", ""),
-            "structured_cmd": result.get("structured_cmd", ""),
-        }
+        return _case_from_llm_result(task_info, result)
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
@@ -383,6 +663,15 @@ async def sync_capabilities(
 
     raw_results = await asyncio.gather(*[_bounded(t) for t in tasks], return_exceptions=True)
     cases = [r for r in raw_results if isinstance(r, dict)]
+    # _process_one turns LLM failures into a placeholder row, so anything
+    # arriving here as an exception is an unexpected internal error. Dropping
+    # it silently would shrink the registry and make the case look nonexistent.
+    for task_info, r in zip(tasks, raw_results):
+        if isinstance(r, BaseException):
+            logger.error(
+                "Case %s dropped from the registry: %s",
+                task_info["resource_path"], r, exc_info=r,
+            )
 
     if reference_registry is not None:
         cases = _align_with_reference(cases, reference_registry)
@@ -393,7 +682,14 @@ async def sync_capabilities(
         kind = c.get("inject_kind", "unknown")
         stats[kind] = stats.get(kind, 0) + 1
 
-    catalog = build_registry(cases, lang=lang)
+    _save_distill_cache(cache_path, generation_fp, fresh_cache)
+    if cache_path is not None:
+        logger.info(
+            "Distillation cache %s: %d/%d case(s) reused, %d distilled",
+            cache_path, cache_hits, len(tasks), len(tasks) - cache_hits,
+        )
+
+    catalog = build_registry(cases, lang=lang, skills_fingerprint=skills_fingerprint)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(output_path.parent), suffix=".json.tmp")
@@ -469,8 +765,10 @@ def _align_with_reference(cases: list[dict], reference_registry: Path) -> list[d
         # Prose fields stay as freshly generated; fall back to the reference
         # text when this run's LLM failed, so the case is never empty.
         for field in _PROSE_FIELDS:
-            if not c.get(field) and ref_case.get(field):
-                c[field] = ref_case[field]
+            if not c.get(field):
+                ref_key = _PROSE_REF_KEY_MAP.get(field, field)
+                if ref_case.get(ref_key):
+                    c[field] = ref_case[ref_key]
         aligned += 1
     if aligned:
         logger.info("Anchored %d/%d cases to reference registry %s", aligned, len(cases), reference_registry)
@@ -501,12 +799,23 @@ def _normalize_param(raw: dict) -> dict | None:
     }
 
 
-def build_registry(cases: list[dict], lang: str = "en") -> dict:
+def build_registry(
+    cases: list[dict],
+    lang: str = "en",
+    *,
+    skills_fingerprint: str | None = None,
+) -> dict:
     """Assemble the v2 registry envelope: derive family/profile/cluster_scoped/
     executable, assign deterministic ids and stamp the skills fingerprint.
 
     ``cases`` items carry the sync output fields (skill/category/use_case_name/
     resource_path/stem/scope/target/action/params/commands...).
+
+    ``skills_fingerprint`` lets the caller pass a fingerprint captured BEFORE
+    the case markdown was read (which is what ``sync_capabilities`` does — the
+    value must describe the inputs the artifact was actually built from).
+    ``None`` keeps the historical late computation for callers that assemble a
+    registry from data they already hold, such as ``convert_v1_to_v2``.
     """
     cluster_scoped = _cluster_scoped_set()
     id_counts: dict[str, int] = {}
@@ -559,15 +868,11 @@ def build_registry(cases: list[dict], lang: str = "en") -> dict:
             "structured_cmd": c.get("structured_cmd", ""),
         })
 
-    try:
-        fingerprint = _compute_sync_fingerprint()
-    except Exception:  # noqa: BLE001 — fingerprint is best-effort metadata
-        logger.warning("Failed to compute skills fingerprint", exc_info=True)
-        fingerprint = ""
+    fingerprint = skills_fingerprint if skills_fingerprint is not None else _safe_skills_fingerprint()
 
     return {
         "schema_version": SCHEMA_VERSION,
-        "lang": _LANG_TAG.get((lang or "en").strip().lower(), "en"),
+        "lang": LANG_TAG_BY_RUN.get((lang or "en").strip().lower(), "en"),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "skills_fingerprint": fingerprint,
         "total": len(out_cases),

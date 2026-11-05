@@ -93,16 +93,47 @@ async def _git_clone(url: str, dest: Path) -> None:
     try:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
     except asyncio.TimeoutError as exc:
-        proc.kill()
+        # Reap the killed child deterministically (kill + await wait), matching
+        # the other asyncio spawn sites (shell / env_info / preflight /
+        # wizard_validators). Not payload-bearing under ThreadedChildWatcher —
+        # the watcher thread reaps the zombie and the loop closes the pipes on
+        # child-exit EOF regardless of this await — but it makes fd release
+        # synchronous instead of deferred to the next loop pass, and removes
+        # the lone asymmetry (probe: .b4tmp/_gitclone_reap_probe.py).
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
         raise SkillInstallError(f"git clone timed out after 120s: {url}") from exc
     if proc.returncode != 0:
         msg = stderr.decode(errors="replace").strip()[:400]
         raise SkillInstallError(f"git clone failed ({proc.returncode}): {msg}")
 
 
-def _copy_skill(src_dir: Path, target_root: Path, *, overwrite: bool) -> Path:
-    """Copy *src_dir* under *target_root*; return the new directory."""
-    target_dir = target_root / src_dir.name
+def _copy_skill(
+    src_dir: Path, target_root: Path, *, dest_name: str, overwrite: bool,
+) -> Path:
+    """Copy *src_dir* under *target_root* as *dest_name*; return the new dir.
+
+    The destination directory is named after the skill's canonical
+    frontmatter ``name`` (``dest_name``), NOT the source directory's
+    basename. This upholds the system-wide invariant ``dirname ==
+    frontmatter name`` at the write side, so the on-disk layout always
+    matches the registry key and ``resolve_skill_dir`` (which resolves by
+    frontmatter name). It also stops two differently-named source dirs that
+    declare the SAME skill name from aliasing to different installed dirs.
+    ``dest_name`` is already validated by ``SkillValidator.NAME_PATTERN``
+    (``^[a-z0-9][a-z0-9-]*$``) before install reaches here, so it is
+    filesystem-safe; the separator/``..`` guard is defence-in-depth on an
+    install path.
+    """
+    safe = (dest_name or "").strip()
+    if not safe or safe in (".", "..") or "/" in safe or "\\" in safe:
+        raise SkillInstallError(
+            f"Refusing to install skill under an unsafe directory name: {dest_name!r}"
+        )
+    target_dir = target_root / safe
     if target_dir.exists():
         if not overwrite:
             raise SkillInstallError(
@@ -173,15 +204,19 @@ async def install_skill(
                     "Skipping invalid skill at %s: %s", src_dir, errors
                 )
                 continue
-            target_dir = _copy_skill(src_dir, target_root, overwrite=overwrite)
+            # Read metadata from the SOURCE before copying, so the installed
+            # directory can be named after the canonical frontmatter name
+            # (see _copy_skill) rather than the source dir's basename.
             try:
-                meta = load_skill_metadata(target_dir)
+                meta = load_skill_metadata(src_dir)
             except Exception as exc:
-                # Roll back the partial copy so the registry doesn't see junk.
-                shutil.rmtree(target_dir, ignore_errors=True)
-                raise SkillInstallError(
-                    f"Failed to read metadata after copy ({target_dir}): {exc}"
-                ) from exc
+                logger.warning(
+                    "Skipping skill at %s: unreadable metadata (%s)", src_dir, exc
+                )
+                continue
+            target_dir = _copy_skill(
+                src_dir, target_root, dest_name=meta.name, overwrite=overwrite,
+            )
             installed.append(
                 InstalledSkill(
                     name=meta.name,

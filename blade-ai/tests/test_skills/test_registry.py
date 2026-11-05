@@ -515,3 +515,78 @@ class TestRegistryMatchUseCaseHost:
         """The 系统调用 keyword must not spill into the k8s Service_调用失败 dir
         (which is why the map uses "系统调用", not bare "调用")."""
         assert registry.match_use_cases("service", "syscall", "delay") == []
+
+
+def _mk_root_skill(parent: Path, dir_name: str, fm_name: str, desc: str) -> Path:
+    """Create ``<parent>/<dir_name>/SKILL.md`` declaring frontmatter ``name=fm_name``."""
+    d = parent / dir_name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        "---\n"
+        f"name: {fm_name}\n"
+        f"description: {desc}\n"
+        "version: '1.0'\n"
+        "category: test\n"
+        "---\n\nbody\n",
+        encoding="utf-8",
+    )
+    return d
+
+
+class TestLoadFromRoots:
+    """Dual-root merge: user root shadows built-in by name; built-in fills gaps."""
+
+    def test_user_root_shadows_builtin_same_name(self, tmp_path):
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        _mk_root_skill(user, "shared", "shared", "user version")
+        _mk_root_skill(builtin, "shared", "shared", "builtin version")
+
+        reg = SkillRegistry()
+        reg.load_from_roots([user, builtin])
+
+        assert len(reg) == 1
+        assert reg.get_metadata("shared").description == "user version"
+        # The winning dir is the user-root copy.
+        assert reg.get_skill_dir("shared") == user / "shared"
+
+    def test_builtin_fills_gaps(self, tmp_path):
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        _mk_root_skill(user, "user-only", "user-only", "u")
+        _mk_root_skill(builtin, "builtin-only", "builtin-only", "b")
+
+        reg = SkillRegistry()
+        reg.load_from_roots([user, builtin])
+
+        assert set(reg.list_skills()) == {"user-only", "builtin-only"}
+
+    def test_reload_preserves_merged_precedence(self, tmp_path):
+        """No-arg reload re-scans BOTH remembered roots, keeping user-wins."""
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        _mk_root_skill(user, "shared", "shared", "user version")
+        _mk_root_skill(builtin, "shared", "shared", "builtin version")
+        _mk_root_skill(builtin, "builtin-only", "builtin-only", "b")
+
+        reg = SkillRegistry()
+        reg.load_from_roots([user, builtin])
+        reg.reload()  # no arg — must not collapse to a single root
+
+        assert set(reg.list_skills()) == {"shared", "builtin-only"}
+        assert reg.get_metadata("shared").description == "user version"
+
+    def test_reload_picks_up_new_builtin_skill(self, tmp_path):
+        """A skill added to the built-in root after load appears on reload."""
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        user.mkdir()
+        _mk_root_skill(builtin, "builtin-only", "builtin-only", "b")
+
+        reg = SkillRegistry()
+        reg.load_from_roots([user, builtin])
+        assert set(reg.list_skills()) == {"builtin-only"}
+
+        _mk_root_skill(builtin, "late-added", "late-added", "new")
+        reg.reload()
+        assert set(reg.list_skills()) == {"builtin-only", "late-added"}

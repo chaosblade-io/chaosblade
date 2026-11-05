@@ -4,8 +4,10 @@ Pinned behaviors:
 1. sync_capabilities derives commands from every fault-injection skill's
    catalogue (data-driven multi-skill; caller passes catalogue_roots).
 2. Each case carries a ``skill`` field naming its source skill.
-3. Parse failure → feedback retry (model's own answer is appended and it is
-   asked to output JSON only; converges within the attempt budget).
+3. Parse failure OR a schema-incomplete answer → feedback retry (the model's
+   own answer is appended and it is told what to fix; converges within the
+   attempt budget, and an exhausted budget keeps the partial answer rather than
+   dropping the case).
 4. Transport failure (LLM invoke raises) → terminal FAILED for that case,
    no case-layer retry (the LLM client owns the transport retry budget).
 5. kubectl cases: the kubectl-native triple / structured_cmd are kept —
@@ -21,6 +23,16 @@ Pinned behaviors:
    structural fields (triple/params) to the first-language artifact, so both
    languages stay id-isomorphic despite LLM derivation jitter; prose fields
    stay localized.
+10. The skills fingerprint is stamped BEFORE the case bodies are read, so it
+    always describes the inputs the artifact was actually built from.
+11. ``cache_path`` reuses an unchanged case's distillation without an LLM call;
+    a prompt change, a ``model_tag`` change or a case edit forces
+    re-distillation, failures and schema-incomplete answers are never cached,
+    ``cache_path=None`` (the default) touches no cache at all, and
+    ``use_cache=False`` skips reading while still rebuilding the file.
+12. Cache completeness is key presence, not non-empty values: an answer with an
+    empty scope/target/action triple is a legitimate non-executable case and is
+    cached like any other.
 """
 
 from __future__ import annotations
@@ -115,9 +127,34 @@ def _blade_json(**overrides) -> str:
     return json.dumps(payload)
 
 
-def _run_sync(tmp_path: Path, llm, roots: dict[str, Path]) -> dict:
+def _run_sync(tmp_path: Path, llm, roots: dict[str, Path], cache_path: Path | None = None) -> dict:
     out = tmp_path / "out.json"
-    return asyncio.run(case_sync.sync_capabilities(roots, llm, out))
+    return asyncio.run(case_sync.sync_capabilities(roots, llm, out, cache_path=cache_path))
+
+
+def _truncated_json(*drop: str) -> str:
+    """A parseable answer that omits ``drop`` — what a truncated or partly
+    formed model response looks like once the JSON is extracted."""
+    payload = json.loads(_blade_json())
+    for key in drop:
+        payload.pop(key)
+    return json.dumps(payload)
+
+
+class _MidRunEditor(FakeLLM):
+    """Edits the catalogue on its first call — what a maintainer saving a case
+    doc during a minutes-long run looks like from the sync's point of view."""
+
+    def __init__(self, responses: list, on_first_call):
+        super().__init__(responses)
+        self._on_first_call = on_first_call
+        self._fired = False
+
+    async def ainvoke(self, messages):
+        if not self._fired:
+            self._fired = True
+            self._on_first_call()
+        return await super().ainvoke(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +178,50 @@ class TestSyncRetryLoop:
         second = llm.calls[1]
         assert second[-2].content.startswith("Here is some prose")
         assert "could not be parsed as JSON" in second[-1].content
+
+    def test_schema_incomplete_answer_feeds_back_and_retries(self, tmp_path):
+        """Parseable but off-schema → same feedback-and-retry treatment, with
+        the missing key names in the nudge.
+
+        Regression: the loop only asked "did it parse?". A truncated answer
+        like ``{"inject_kind": "blade"}`` parsed fine, so it was shaped into a
+        silently degraded case — inject_kind kept, everything else defaulted to
+        ""/[]/unknown — with no retry and no signal in the output.
+        """
+        partial = _truncated_json("structured_cmd", "params")
+        llm = FakeLLM([partial, _blade_json()])
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+
+        catalog = _run_sync(tmp_path, llm, roots)
+
+        assert len(llm.calls) == 2
+        second = llm.calls[1]
+        assert second[-2].content == partial
+        nudge = second[-1].content
+        assert "missing these required keys" in nudge
+        assert "structured_cmd" in nudge and "params" in nudge
+        # The repaired answer is what lands in the registry.
+        assert catalog["cases"][0]["executable"] is True
+        assert catalog["cases"][0]["structured_cmd"]
+
+    def test_schema_incomplete_answer_still_yields_a_row_when_retries_run_out(
+            self, tmp_path):
+        """Budget exhausted → keep the partial answer. A row carrying some real
+        fields beats the all-empty FAILED placeholder, and the case must not
+        vanish from the registry."""
+        partial = _truncated_json("structured_cmd")
+        llm = FakeLLM([partial, partial, partial])
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+
+        catalog = _run_sync(tmp_path, llm, roots)
+
+        assert len(llm.calls) == 3
+        assert catalog["total"] == 1
+        case = catalog["cases"][0]
+        assert case["inject_kind"] == "blade"          # real fields survived
+        assert case["nl_cmd"] == json.loads(partial)["nl_cmd"]
+        assert case["structured_cmd"] == ""            # the missing one is empty
+        assert case["executable"] is True              # triple was present
 
     def test_transport_failure_is_terminal(self, tmp_path):
         """ConnectionResetError surfaces after the client's own retry budget —
@@ -348,3 +429,432 @@ class TestCrossLanguageAlignment:
         ))
         assert catalog["total"] == 1
         assert catalog["cases"][0]["target"] == "cpu"
+
+    def test_prose_fallback_uses_registry_key_for_symptom(self, tmp_path):
+        """LLM 失败时 fault_symptom 从 reference 的 symptom 键回落。
+
+        回归：build_registry 把 fault_symptom 重命名为 symptom 写入文件，
+        但 _align_with_reference 在 build_registry 之前跑，ref_case 来自
+        文件（键是 symptom），_PROSE_FIELDS 用 fault_symptom 查 → 恒 None
+        → 回落永不触发。修复：_PROSE_REF_KEY_MAP 做键名映射。
+        """
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        # zh 正常生成 → 文件里 symptom 有值
+        asyncio.run(case_sync.sync_capabilities(
+            roots, FakeLLM([_blade_json(fault_symptom="CPU 飙高到 95%")]),
+            tmp_path / "zh.json", lang="cn",
+        ))
+        # en LLM 失败 → 兜底 dict 的 fault_symptom 是空串
+        en_catalog = asyncio.run(case_sync.sync_capabilities(
+            roots, FakeLLM([RuntimeError("network timeout")]),
+            tmp_path / "en.json", lang="en",
+            reference_registry=tmp_path / "zh.json",
+        ))
+        en_case = en_catalog["cases"][0]
+        # 修复前：symptom 是空串（回落查 fault_symptom 键，文件里叫 symptom，恒 None）
+        # 修复后：从 reference 的 symptom 键回落成功
+        assert en_case["symptom"] == "CPU 飙高到 95%", (
+            f"fault_symptom 回落失败，symptom={en_case['symptom']!r}"
+        )
+        # title/nl_cmd 同样回落（两侧键名一致，原本就正常）
+        assert en_case["title"] == "CPU fullload"
+        assert "blade-ai inject" in en_case["nl_cmd"]
+
+
+# ---------------------------------------------------------------------------
+# Fingerprint timing
+# ---------------------------------------------------------------------------
+
+class TestFingerprintTiming:
+    def test_fingerprint_describes_the_inputs_the_artifact_was_built_from(self, tmp_path, monkeypatch):
+        """The stamp is taken BEFORE any case body is read.
+
+        Regression: it used to be computed at the very end of the run, so an
+        edit landing inside the (minutes-long) distillation window produced an
+        artifact holding the OLD content stamped with the NEW fingerprint —
+        every later staleness check then passed while the registry was wrong,
+        which is worse than failing: the drift is invisible.
+        """
+        cat = _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# original"})
+        roots = {"s1": cat}
+        state = {"fp": "fp-before"}
+        monkeypatch.setattr(case_sync, "_compute_sync_fingerprint", lambda: state["fp"])
+
+        def _edit_midway():
+            (cat / "CPU" / "CPU_caseA.md").write_text("# edited mid-run", encoding="utf-8")
+            state["fp"] = "fp-after"
+
+        llm = _MidRunEditor([_blade_json()], _edit_midway)
+        catalog = _run_sync(tmp_path, llm, roots)
+
+        # Both sides of the artifact agree on the pre-edit input.
+        assert catalog["skills_fingerprint"] == "fp-before"
+        assert llm.calls[0][1].content == "# original"
+
+    def test_build_registry_computes_late_when_not_given(self, monkeypatch):
+        """``convert_v1_to_v2`` assembles from data it already holds, so the
+        historical late computation stays for that caller."""
+        monkeypatch.setattr(case_sync, "_compute_sync_fingerprint", lambda: "fp-late")
+        assert case_sync.build_registry([])["skills_fingerprint"] == "fp-late"
+
+    def test_build_registry_honours_an_explicit_fingerprint(self, monkeypatch):
+        monkeypatch.setattr(case_sync, "_compute_sync_fingerprint", lambda: "fp-late")
+        registry = case_sync.build_registry([], skills_fingerprint="fp-early")
+        assert registry["skills_fingerprint"] == "fp-early"
+
+    def test_fingerprint_failure_does_not_abort_the_sync(self, tmp_path, monkeypatch):
+        """The fingerprint is metadata about the product, not the product."""
+        def _boom():
+            raise RuntimeError("skills dir unreadable")
+
+        monkeypatch.setattr(case_sync, "_compute_sync_fingerprint", _boom)
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+
+        catalog = _run_sync(tmp_path, FakeLLM([_blade_json()]), roots)
+
+        assert catalog["total"] == 1
+        assert catalog["skills_fingerprint"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Per-case distillation cache
+# ---------------------------------------------------------------------------
+
+class TestDistillationCache:
+    """A sync run is one LLM call per case (~115 today) while a typical edit
+    touches one case. Re-distilling the rest to produce a byte-identical
+    artifact is pure cost — but a reuse that survives a prompt change or a case
+    edit would be a silent correctness bug, so both are pinned here."""
+
+    def test_second_run_reuses_unchanged_case_without_llm(self, tmp_path):
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        first = _run_sync(tmp_path, FakeLLM([_blade_json()]), roots, cache_path=cache)
+        assert cache.exists()
+
+        # An exhausted FakeLLM pops from an empty list, so any call would raise
+        # IndexError — the empty response list IS the assertion.
+        replay = FakeLLM([])
+        second = _run_sync(tmp_path, replay, roots, cache_path=cache)
+
+        assert replay.calls == []
+        assert second["cases"] == first["cases"]
+
+    def test_edited_case_goes_back_to_the_model(self, tmp_path):
+        cat = _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})
+        roots = {"s1": cat}
+        cache = tmp_path / "cache.json"
+        _run_sync(tmp_path, FakeLLM([_blade_json()]), roots, cache_path=cache)
+
+        (cat / "CPU" / "CPU_caseA.md").write_text("# a, edited", encoding="utf-8")
+        llm = FakeLLM([_blade_json(title="edited title")])
+        catalog = _run_sync(tmp_path, llm, roots, cache_path=cache)
+
+        assert len(llm.calls) == 1
+        assert catalog["cases"][0]["title"] == "edited title"
+
+    def test_only_the_new_case_is_distilled(self, tmp_path):
+        cat = _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})
+        roots = {"s1": cat}
+        cache = tmp_path / "cache.json"
+        _run_sync(tmp_path, FakeLLM([_blade_json()]), roots, cache_path=cache)
+
+        (cat / "CPU" / "CPU_caseB.md").write_text("# b", encoding="utf-8")
+        llm = FakeLLM([_blade_json(scope="node", target="schedule", action="drain")])
+        catalog = _run_sync(tmp_path, llm, roots, cache_path=cache)
+
+        assert len(llm.calls) == 1                       # caseA reused, caseB distilled
+        assert catalog["total"] == 2
+        triples = {(c["scope"], c["target"], c["action"]) for c in catalog["cases"]}
+        assert triples == {("pod", "cpu", "fullload"), ("node", "schedule", "drain")}
+
+    def test_prompt_change_invalidates_the_whole_cache(self, tmp_path):
+        """The language section is part of the prompt, and the prompt is part of
+        the cache identity — so sharing ONE cache file across languages is safe
+        but useless: every switch drops the other language's entries.
+        Correctness backstop; the cost half is fixed by giving each language its
+        own file (see ``test_per_language_caches_do_not_evict`` and
+        ``capabilities.distill_cache_path``)."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        asyncio.run(case_sync.sync_capabilities(
+            roots, FakeLLM([_blade_json()]), tmp_path / "en.json", lang="en", cache_path=cache))
+
+        cn = FakeLLM([_blade_json(title="CPU满载")])
+        catalog = asyncio.run(case_sync.sync_capabilities(
+            roots, cn, tmp_path / "zh.json", lang="cn", cache_path=cache))
+
+        assert len(cn.calls) == 1
+        assert catalog["lang"] == "zh"
+        assert catalog["cases"][0]["title"] == "CPU满载"
+
+    def test_failures_are_not_cached(self, tmp_path):
+        """A transient outage must not be frozen into every later run."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        failed = _run_sync(tmp_path, FakeLLM([ConnectionResetError("boom")]), roots, cache_path=cache)
+        assert failed["cases"][0]["inject_kind"] == "unknown"
+
+        retried = FakeLLM([_blade_json()])
+        ok = _run_sync(tmp_path, retried, roots, cache_path=cache)
+
+        assert len(retried.calls) == 1
+        assert ok["cases"][0]["inject_kind"] == "blade"
+
+    def test_deleted_case_drops_out_of_the_cache(self, tmp_path):
+        cat = _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a", "caseB": "# b"})
+        roots = {"s1": cat}
+        cache = tmp_path / "cache.json"
+        _run_sync(tmp_path, FakeLLM([_blade_json(), _blade_json()]), roots, cache_path=cache)
+        assert len(json.loads(cache.read_text(encoding="utf-8"))["entries"]) == 2
+
+        (cat / "CPU" / "CPU_caseB.md").unlink()
+        llm = FakeLLM([])                                  # caseA reused; nothing else may run
+        catalog = _run_sync(tmp_path, llm, roots, cache_path=cache)
+
+        assert catalog["total"] == 1
+        assert llm.calls == []
+        assert len(json.loads(cache.read_text(encoding="utf-8"))["entries"]) == 1
+
+    def test_corrupt_cache_falls_back_to_a_full_run(self, tmp_path):
+        """The cache is an optimization: it may never be the reason a sync
+        refuses to run."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        cache.write_text("{not json", encoding="utf-8")
+
+        llm = FakeLLM([_blade_json()])
+        catalog = _run_sync(tmp_path, llm, roots, cache_path=cache)
+
+        assert len(llm.calls) == 1
+        assert catalog["total"] == 1
+
+    def test_cache_path_none_leaves_no_cache_behind(self, tmp_path):
+        """Default is OFF: a caller that passes no cache_path must not read or
+        write one, or every test run would scribble on the real
+        ``~/.blade-ai/memory``."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+
+        catalog = _run_sync(tmp_path, FakeLLM([_blade_json()]), roots)
+
+        assert catalog["total"] == 1
+        assert sorted(p.name for p in tmp_path.glob("*.json")) == ["out.json"]
+
+    def test_cache_survives_reference_alignment(self, tmp_path):
+        """The cache stores the RAW model answer, not the assembled registry
+        case — so anchoring to a reference registry still applies on a fully
+        cached run. Caching the post-processed case instead would silently
+        drop the id-isomorphism guarantee whenever the cache hit."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        zh = asyncio.run(case_sync.sync_capabilities(
+            roots, FakeLLM([_blade_json(title="CPU满载")]), tmp_path / "zh.json", lang="cn",
+        ))
+
+        # Warm the cache with a DRIFTED answer (same language, so the prompt —
+        # and therefore the cache — matches the run below).
+        cache = tmp_path / "cache.json"
+        drifted = _blade_json(title="CPU Fullload", target="process", action="kill")
+        asyncio.run(case_sync.sync_capabilities(
+            roots, FakeLLM([drifted]), tmp_path / "warm.json", lang="en", cache_path=cache,
+        ))
+
+        replay = FakeLLM([])  # exhausted: any LLM call raises IndexError
+        en = asyncio.run(case_sync.sync_capabilities(
+            roots, replay, tmp_path / "en.json", lang="en",
+            reference_registry=tmp_path / "zh.json", cache_path=cache,
+        ))
+
+        assert replay.calls == []
+        # Structure anchored to the reference despite coming from the cache.
+        assert en["cases"][0]["id"] == zh["cases"][0]["id"]
+        assert (en["cases"][0]["scope"], en["cases"][0]["target"], en["cases"][0]["action"]) \
+            == ("pod", "cpu", "fullload")
+        # Prose stays this run's own generation.
+        assert en["cases"][0]["title"] == "CPU Fullload"
+
+    def test_per_language_caches_do_not_evict_each_other(self, tmp_path):
+        """cn → en → cn: the third run must be free.
+
+        Regression: one shared cache file plus a language-dependent prompt
+        fingerprint meant every language switch wiped the whole file, so the
+        bilingual refresh the platform needs (``catalog.py`` loads zh AND en)
+        re-distilled all ~115 cases on every alternating run, forever.
+        """
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        zh_cache, en_cache = tmp_path / "cache_zh.json", tmp_path / "cache_en.json"
+
+        def _run(lang: str, cache: Path, llm) -> dict:
+            return asyncio.run(case_sync.sync_capabilities(
+                roots, llm, tmp_path / f"{lang}.json", lang=lang, cache_path=cache))
+
+        cn1 = FakeLLM([_blade_json(title="CPU满载")])
+        _run("cn", zh_cache, cn1)
+        en1 = FakeLLM([_blade_json(title="CPU fullload")])
+        _run("en", en_cache, en1)
+        assert len(cn1.calls) == len(en1.calls) == 1      # both cold
+
+        cn2 = FakeLLM([])                                  # exhausted: any call raises
+        again = _run("cn", zh_cache, cn2)
+
+        assert cn2.calls == []
+        assert again["cases"][0]["title"] == "CPU满载"
+        # The en cache is intact too — writing zh never touched it.
+        en2 = FakeLLM([])
+        assert _run("en", en_cache, en2)["cases"][0]["title"] == "CPU fullload"
+        assert en2.calls == []
+
+    def test_no_cache_reruns_every_case_but_rewrites_the_cache(self, tmp_path):
+        """``use_cache=False`` disables READING, not writing.
+
+        Regression: the flag used to pass ``cache_path=None``, which disabled
+        both. The forced run's fresh answers were then thrown away while the
+        previous generation stayed on disk, so the next ordinary run reused
+        exactly the entries the caller had just paid to replace — and left a
+        fresh registry beside a stale cache.
+        """
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        asyncio.run(case_sync.sync_capabilities(
+            roots, FakeLLM([_blade_json(title="stale title")]), tmp_path / "a.json",
+            cache_path=cache))
+
+        forced = FakeLLM([_blade_json(title="fresh title")])
+        catalog = asyncio.run(case_sync.sync_capabilities(
+            roots, forced, tmp_path / "b.json", cache_path=cache, use_cache=False))
+
+        assert len(forced.calls) == 1                      # the warm entry was ignored
+        assert catalog["cases"][0]["title"] == "fresh title"
+
+        # …and the cache now holds THIS run's answer, not the one it replaced.
+        replay = FakeLLM([])
+        after = asyncio.run(case_sync.sync_capabilities(
+            roots, replay, tmp_path / "c.json", cache_path=cache))
+        assert replay.calls == []
+        assert after["cases"][0]["title"] == "fresh title"
+
+    def test_no_cache_without_a_path_still_writes_nothing(self, tmp_path):
+        """``cache_path=None`` stays a hard OFF in both directions, so a caller
+        that never opted in cannot scribble on ``~/.blade-ai/memory``."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+
+        asyncio.run(case_sync.sync_capabilities(
+            roots, FakeLLM([_blade_json()]), tmp_path / "out.json",
+            cache_path=None, use_cache=False))
+
+        assert sorted(p.name for p in tmp_path.glob("*.json")) == ["out.json"]
+
+    def test_model_change_invalidates_the_whole_cache(self, tmp_path):
+        """The answer is a function of (prompt, case body, model); the cache
+        identity used to cover only the first two.
+
+        Regression: switching models left every entry in place, so the
+        "refresh" re-emitted the old model's answers with zero LLM calls, and
+        nothing on disk recorded which model had produced them.
+        """
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+
+        def _run(llm, model_tag: str) -> dict:
+            return asyncio.run(case_sync.sync_capabilities(
+                roots, llm, tmp_path / "out.json", cache_path=cache, model_tag=model_tag))
+
+        weak = FakeLLM([_blade_json(title="weak-model answer")])
+        _run(weak, "qwen-weak@https://api.example/v1")
+        assert len(weak.calls) == 1
+
+        strong = FakeLLM([_blade_json(title="strong-model answer")])
+        catalog = _run(strong, "qwen-strong@https://api.example/v1")
+
+        assert len(strong.calls) == 1                       # nothing was reused
+        assert catalog["cases"][0]["title"] == "strong-model answer"
+
+    def test_endpoint_change_alone_invalidates_the_cache(self, tmp_path):
+        """Same model NAME served by a different endpoint is a different
+        generator — a self-hosted ``qwen-max`` and the vendor's are not
+        interchangeable, and the tag the CLI composes must say so."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+
+        def _run(llm, model_tag: str) -> dict:
+            return asyncio.run(case_sync.sync_capabilities(
+                roots, llm, tmp_path / "out.json", cache_path=cache, model_tag=model_tag))
+
+        vendor = FakeLLM([_blade_json(title="vendor answer")])
+        _run(vendor, "qwen-max@https://dashscope.example/v1")
+
+        local = FakeLLM([_blade_json(title="self-hosted answer")])
+        catalog = _run(local, "qwen-max@http://127.0.0.1:8000/v1")
+
+        assert len(local.calls) == 1
+        assert catalog["cases"][0]["title"] == "self-hosted answer"
+
+    def test_same_generator_keeps_the_cache(self, tmp_path):
+        """The other half: the tag is an identity, not a nonce. A run under the
+        same generator must still be free, or the fix would just turn the cache
+        off."""
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        tag = "qwen-max@https://api.example/v1"
+
+        def _run(llm) -> dict:
+            return asyncio.run(case_sync.sync_capabilities(
+                roots, llm, tmp_path / "out.json", cache_path=cache, model_tag=tag))
+
+        cold = FakeLLM([_blade_json(title="cached answer")])
+        _run(cold)
+        assert len(cold.calls) == 1
+
+        replay = FakeLLM([])                                  # exhausted: any call raises
+        warm = _run(replay)
+
+        assert replay.calls == []
+        assert warm["cases"][0]["title"] == "cached answer"
+
+    def test_incomplete_answer_is_not_cached(self, tmp_path):
+        """A degraded answer must stay a one-run accident, not a permanent
+        artifact.
+
+        Regression: ``_remember`` only refused EMPTY results, so a parseable
+        but off-schema answer was frozen — every later run replayed it with
+        zero LLM calls until someone edited that case's markdown, whereas a
+        run without the cache would have re-asked and probably healed.
+        """
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        partial = _truncated_json("structured_cmd")
+        degraded = _run_sync(
+            tmp_path, FakeLLM([partial, partial, partial]), roots, cache_path=cache)
+
+        assert degraded["cases"][0]["structured_cmd"] == ""     # this run did degrade
+        assert json.loads(cache.read_text(encoding="utf-8"))["entries"] == {}
+
+        # …so the next run asks again and gets a real answer.
+        healed = FakeLLM([_blade_json()])
+        ok = _run_sync(tmp_path, healed, roots, cache_path=cache)
+
+        assert len(healed.calls) == 1
+        assert ok["cases"][0]["structured_cmd"]
+        assert len(json.loads(cache.read_text(encoding="utf-8"))["entries"]) == 1
+
+    def test_complete_answer_with_an_empty_triple_is_still_cached(self, tmp_path):
+        """Completeness is KEY PRESENCE, not non-empty values.
+
+        The prompt allows a case the model could not reduce to a
+        scope/target/action triple — it is reported as non-executable rather
+        than invented (pinned by ``test_kubectl_case_without_triple_not_
+        executable``). Demanding values here would reject that legitimate
+        answer and re-distill it on every run forever.
+        """
+        roots = {"s1": _make_catalogue(tmp_path / "s1", "CPU", {"caseA": "# a"})}
+        cache = tmp_path / "cache.json"
+        no_triple = _blade_json(inject_kind="kubectl", scope="", target="", action="")
+        first = _run_sync(tmp_path, FakeLLM([no_triple]), roots, cache_path=cache)
+
+        assert first["cases"][0]["executable"] is False
+        assert len(json.loads(cache.read_text(encoding="utf-8"))["entries"]) == 1
+
+        replay = FakeLLM([])
+        again = _run_sync(tmp_path, replay, roots, cache_path=cache)
+
+        assert replay.calls == []                             # reused, not re-asked
+        assert again["cases"][0]["executable"] is False

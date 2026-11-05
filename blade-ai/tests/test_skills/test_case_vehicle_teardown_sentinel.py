@@ -28,12 +28,19 @@ The sentinel converts silent drift into loud drift:
   case unexecutable). Two-step form measured 200 on the same stack/probe;
   the merged flag string has no legitimate appearance in a case.
 
-Exemptions (``_VEHICLE_TEARDOWN_EXEMPT``) are for cases with a legitimate
-reason to carry the carrier signature WITHOUT needing the tail step (e.g. a
-future case whose timer host is an existing pod borrowing existing
-credentials). Admission bar: an exemption must name its reason here, and
-the named file must actually still carry the signature — a stale exemption
-is itself a failure (no silent rot).
+Disposition is declared per case in its OWN frontmatter (``carrier_teardown:``),
+replacing the old test-side ``_VEHICLE_TEARDOWN_EXEMPT`` whitelist. A case that
+carries the carrier signature WITHOUT needing the tail step — the assembler
+(``faultdrill_assemble_carrier``) builds the stack programmatically and tears it
+down structurally, so the degraded path builds no self-revoking RBAC — declares
+``carrier_teardown: assembler-managed``; a case that builds a self-revoking
+stack declares ``self-built-stack`` (or simply carries the ``自断授权尾步``
+marker). Because the disposition travels WITH the case (atomic in git), a NEW
+assembler case is exempt the moment it declares itself — no lagging registration
+step, hence no recurring silent red. Admission bar: the sentinel CROSS-CHECKS
+each declaration against the case's structure — an ``assembler-managed`` claim
+on a case that teaches a manual stack build is a lying declaration (failure),
+and a declaration whose assembler basis was removed is stale (failure).
 
 Legislation checklist (added after K1/K2/K7 — the third consecutive round
 of cascade findings; F-G missed stack shapes, J1 missed the byte budget,
@@ -56,6 +63,8 @@ writing a NEW rule into the carrier standard, pass four questions:
 import pathlib
 import re
 
+from chaos_agent.skills.loader import parse_frontmatter
+
 _SKILLS_DIR = pathlib.Path(__file__).resolve().parents[2] / "skills"
 _CATALOGUE_DIR = _SKILLS_DIR / "k8s-chaos-skills" / "references" / "catalogue"
 _CARRIER_STANDARD = (
@@ -69,43 +78,99 @@ _TEARDOWN_MARKER = "自断授权尾步"
 # The case that legislated the tail step (#36 inject-dfee9d3d) — full form.
 _EXEMPLAR_CASE = "Pod_ContainerCreating_无效挂载选项注入.md"
 
-# Legitimate exemptions: basename -> reason. Empty today — the socat-timer
-# case (Node_网络故障_节点端口占用) carries no carrier signature and is
-# naturally out of scope. Add ONLY with a written reason.
-_VEHICLE_TEARDOWN_EXEMPT: dict[str, str] = {
-    # M2 (openspec faultdrill-cluster-native-recovery, task 2.5): these
-    # cases carry the ``drill-rc-`` signature ONLY via the assembler
-    # carrier-stack note (frontmatter legislation header + recipe title —
-    # "SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash> 四件套"). That
-    # stack is built programmatically INSIDE the faultdrill_assemble_carrier
-    # tool (design ND3: it never rides the LLM write face) and its teardown
-    # is structural — the tool's fail-closed path and the recovery handle's
-    # cleanup chain both execute it, so there is no tail-step knowledge a
-    # case body needs to transmit. Their degraded-path timer host is an
-    # EXISTING tool Pod (armed via kubectl exec), not a self-built RBAC
-    # stack — nothing self-revoking to teach. Signature without a stack to
-    # tear down; the exemption names that shape.
-    "Pod_CPU_Throttling_limits.cpu过低.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Pod_CrashLoopBackOff_LivenessProbe配置不合理.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Pod_CrashLoopBackOff_StartupProbe配置不足.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Pod_OOM内存异常_limit单位写错.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Pod_Terminating_Finalizers未清理.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Pod_镜像拉取失败_凭证缺失或过期.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    # Added 2026-09-22 (#62 live-test prep): same per-case assembler migration
-    # shape as the M2 batch above (M4-style) — same exemption reason.
-    "Pod_镜像拉取失败_容器镜像被篡改.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Pod_镜像拉取失败_镜像不存在或标签错误.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Service_调用失败_ReadinessProbe配置不一致.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "Service_调用失败_selector不匹配.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    "workload_副本被缩容_人为误操作.md": "assembler-note-only signature; degraded host is an existing tool Pod",
-    # Added 2026-09-23 (expand-k8s-case-coverage batch A): assembler-main-path
-    # cases — the drill-rc- signature appears ONLY in the assembler carrier-stack
-    # note; the degraded path delegates to the recovery-carrier SOP by reference
-    # ("武装命令形态参照 ConfigMap 篡改 case"), which itself carries the full
-    # tail-step knowledge — same exemption shape as the M2/M4 batches.
-    "Ingress_入口异常_后端服务不存在.md": "assembler-note-only signature; degraded path delegates to the ConfigMap SOP by reference",
-    "Ingress_入口异常_TLS证书过期.md": "assembler-note-only signature; degraded path delegates to the ConfigMap SOP by reference",
-}
+# Carrier teardown disposition — declared per case in its OWN frontmatter
+# (``carrier_teardown:``), NOT in a test-side whitelist. The disposition is a
+# structural property of the case (does the assembler build + tear down the
+# carrier, or does the case body build a self-revoking RBAC stack?), so it
+# travels WITH the case and is atomic in git. The sentinel READS it and
+# CROSS-CHECKS it against the case's structure — strictly stronger than the old
+# ``_VEHICLE_TEARDOWN_EXEMPT`` snapshot whitelist: a new assembler case is exempt
+# the moment it declares itself (no lagging registration → no recurring silent
+# red), and a case declaring ``assembler-managed`` while teaching a manual stack
+# build is caught as a lying declaration.
+_TEARDOWN_ASSEMBLER_MANAGED = "assembler-managed"
+_TEARDOWN_SELF_BUILT_STACK = "self-built-stack"
+_KNOWN_CARRIER_TEARDOWN = frozenset(
+    {_TEARDOWN_ASSEMBLER_MANAGED, _TEARDOWN_SELF_BUILT_STACK}
+)
+
+# Positive structural basis for an ``assembler-managed`` declaration: the case
+# must delegate carrier construction to the assembler tool (design ND3: the
+# stack never rides the LLM write face).
+_ASSEMBLER_REF = "faultdrill_assemble_carrier"
+
+# Manual-stack teaching signals. A case carrying ANY of these builds a
+# self-revoking RBAC stack in its (degraded) path and therefore MUST transmit
+# the tail-step marker — it may NOT claim ``assembler-managed``. Kept in sync
+# with the two-step-stack / six-object / byte-budget teeth below. ``secret`` is
+# deliberately absent: an assembler-managed case may still ``kubectl create`` a
+# prop Secret (image-pull cases) without building any self-revoking RBAC.
+_MANUAL_STACK_TEACHING = re.compile(
+    r"两步建栈法|六对象栈|五件套变体|超 1024B 硬上限"
+    r"|kubectl (?:create|patch) "
+    r"(?:sa|serviceaccount|role|rolebinding|clusterrole|clusterrolebinding)"
+)
+
+
+def _carrier_teardown_decl(text: str) -> str | None:
+    """Read a case's ``carrier_teardown`` frontmatter declaration (None if absent)."""
+    frontmatter = parse_frontmatter(text)
+    if not isinstance(frontmatter, dict):
+        return None
+    value = frontmatter.get("carrier_teardown")
+    return str(value).strip() if value is not None else None
+
+
+def _teardown_problems(rel: str, text: str) -> list[str]:
+    """Per-case teardown-disposition verdict (pure; unit-tested below).
+
+    Returns the consistency problems for ONE carrier-signature case — empty
+    when compliant. Rules:
+
+    * no ``carrier_teardown`` declaration → the case must transmit the tail-step
+      marker itself (legacy self-built-stack path);
+    * ``assembler-managed`` → must reference the assembler AND must NOT teach a
+      manual RBAC stack build (else it is a lying declaration);
+    * ``self-built-stack`` → must carry the tail-step marker;
+    * any other value → illegal.
+    """
+    decl = _carrier_teardown_decl(text)
+    has_marker = _TEARDOWN_MARKER in text
+    teaches_stack = bool(_MANUAL_STACK_TEACHING.search(text))
+    problems: list[str] = []
+
+    if decl is None:
+        if not has_marker:
+            problems.append(
+                f"{rel}: carries the drill-rc- signature but neither "
+                "declares `carrier_teardown:` nor transmits the "
+                "tail-step marker (自断授权尾步)"
+            )
+        return problems
+
+    if decl not in _KNOWN_CARRIER_TEARDOWN:
+        problems.append(f"{rel}: illegal carrier_teardown={decl!r}")
+        return problems
+
+    if decl == _TEARDOWN_ASSEMBLER_MANAGED:
+        if _ASSEMBLER_REF not in text:
+            problems.append(
+                f"{rel}: declares assembler-managed but never references "
+                f"{_ASSEMBLER_REF} — the declaration has no structural basis"
+            )
+        if has_marker or teaches_stack:
+            problems.append(
+                f"{rel}: declares assembler-managed yet teaches a manual "
+                "RBAC stack build (自断授权尾步 / 两步建栈法 / kubectl "
+                "create role...) — lying declaration"
+            )
+    elif not has_marker:  # self-built-stack
+        problems.append(
+            f"{rel}: declares self-built-stack but carries no tail-step "
+            "marker (自断授权尾步)"
+        )
+    return problems
+
 
 # The merged self-revoke flag strings (F-A propagation vector): a case
 # teaching the model to fold these into ``kubectl create role/clusterrole``
@@ -145,37 +210,63 @@ _DUAL_BINDING_GUIDANCE = "两个 Binding 都删"
 
 
 def test_vehicle_cases_carry_teardown_knowledge() -> None:
-    """Every carrier-signature case must transmit the tail-step knowledge."""
-    missing: list[str] = []
+    """Every carrier-signature case must either transmit the tail-step
+    knowledge (self-built stack) or carry a structurally-consistent
+    ``carrier_teardown: assembler-managed`` frontmatter declaration.
+
+    The disposition now travels WITH the case (frontmatter), not in a lagging
+    test-side whitelist — so a new assembler case is exempt the moment it
+    declares itself, and a case that declares ``assembler-managed`` while
+    teaching a manual RBAC stack build is caught as a lying declaration.
+    """
+    problems: list[str] = []
     for path, text in _vehicle_cases():
-        if path.name in _VEHICLE_TEARDOWN_EXEMPT:
-            continue
-        if _TEARDOWN_MARKER not in text:
-            missing.append(str(path.relative_to(_SKILLS_DIR)))
-    assert not missing, (
-        "Cases build a self-recovery carrier but never mention the "
-        "self-revoking teardown tail step — the carrier RBAC will outlive "
-        "the drill (inject-dfee9d3d). Add the carrier-standard §4 pointer "
-        f"next to the armed template, or file an exemption with a reason: {missing}"
+        problems.extend(
+            _teardown_problems(str(path.relative_to(_SKILLS_DIR)), text)
+        )
+
+    assert not problems, (
+        "Carrier teardown disposition is inconsistent — the carrier RBAC would "
+        "outlive the drill (inject-dfee9d3d). Declare `carrier_teardown: "
+        "assembler-managed` (assembler builds + structurally tears down the "
+        "stack, no tail step to transmit) or `self-built-stack` (the case body "
+        "must carry the 自断授权尾步 tail-step knowledge) in the case "
+        f"frontmatter: {problems}"
     )
 
 
-def test_exemptions_are_not_stale() -> None:
-    """An exemption entry must still point at a signature-carrying case."""
-    signature_names = {path.name for path, _ in _vehicle_cases()}
-    for name in _VEHICLE_TEARDOWN_EXEMPT:
-        assert name in signature_names, (
-            f"exemption '{name}' no longer carries the carrier signature — "
-            "remove the stale entry"
+def test_declarations_are_consistent() -> None:
+    """Every ``assembler-managed`` declaration must keep its structural basis.
+
+    Replaces ``test_exemptions_are_not_stale`` (which policed the deleted
+    test-side whitelist). A declaration whose assembler basis was removed — the
+    ``faultdrill_assemble_carrier`` reference deleted but the exemption kept —
+    is itself a failure (no silent rot). Also pins the declaration count so a
+    mass removal cannot slip through unnoticed.
+    """
+    declared = 0
+    for path, text in _vehicle_cases():
+        if _carrier_teardown_decl(text) != _TEARDOWN_ASSEMBLER_MANAGED:
+            continue
+        declared += 1
+        assert _ASSEMBLER_REF in text, (
+            f"{path.name}: the assembler-managed declaration lost its "
+            f"{_ASSEMBLER_REF} structural basis — remove the stale declaration "
+            "or restore the assembler reference"
         )
+    assert declared >= 22, (
+        f"assembler-managed declarations dropped to {declared} (baseline 22) — "
+        "the disposition convention changed or declarations were silently "
+        "removed; re-baseline deliberately, not silently"
+    )
 
 
 def test_vehicle_scan_is_not_vacuous() -> None:
     """The sentinel must keep scanning a non-trivial corpus."""
     cases = _vehicle_cases()
     assert cases, "no carrier-signature cases found — signature moved?"
-    assert len(cases) >= 8, (
-        "carrier-signature cases dropped below the known baseline (8) — "
+    assert len(cases) >= 36, (
+        "carrier-signature cases dropped below the known baseline (36) — "
         "either the signature convention changed or the catalogue shrank; "
         "re-baseline deliberately, not silently"
     )
@@ -475,3 +566,86 @@ def test_case_pointer_discipline_count_matches_standard() -> None:
         "cascade update (three consecutive rounds missed a consumer "
         f"surface; legislation checklist Q2): {stale}"
     )
+
+
+# ---------------------------------------------------------------------------
+# B4: unit tests for the pure per-case disposition verdict. These synthesize
+# minimal carrier-signature case docs (frontmatter + body) so the classification
+# rules stay pinned independent of the live corpus — a lying declaration or a
+# missing disposition must be caught loudly, and the two legitimate shapes
+# (marker-only self-built / assembler-managed) must pass.
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_case(*, decl: "str | None", body: str) -> str:
+    """Build a minimal catalogue case doc with the given frontmatter decl."""
+    frontmatter = [
+        "---",
+        "fault_scope: deployment",
+        "recovery_channel: apiserver-write",
+    ]
+    if decl is not None:
+        frontmatter.append(f"carrier_teardown: {decl}")
+    frontmatter.append("---")
+    return "\n".join([*frontmatter, body])
+
+
+_ASM_BODY = "载体栈由 faultdrill_assemble_carrier 建，drill-rc-<hash> 四件套。"
+
+
+def test_disposition_marker_only_passes() -> None:
+    """① self-built stack carrying the tail-step marker, no declaration → PASS."""
+    text = _synthetic_case(
+        decl=None, body="自建栈 drill-rc-x；主恢复见标准件，自断授权尾步 指向 §4。"
+    )
+    assert _teardown_problems("case.md", text) == []
+
+
+def test_disposition_assembler_managed_passes() -> None:
+    """② assembler-managed + assembler ref + no manual teaching → PASS."""
+    text = _synthetic_case(decl="assembler-managed", body=_ASM_BODY)
+    assert _teardown_problems("case.md", text) == []
+
+
+def test_disposition_missing_declaration_and_marker_fails() -> None:
+    """③ carrier signature, no declaration, no marker → FAIL (loud)."""
+    text = _synthetic_case(
+        decl=None, body="装配器建栈 drill-rc-x，但既未声明处置也无尾步 marker。"
+    )
+    problems = _teardown_problems("case.md", text)
+    assert problems and "neither" in problems[0]
+
+
+def test_disposition_lying_assembler_managed_fails() -> None:
+    """④ assembler-managed yet teaches a manual stack build → FAIL (lying)."""
+    text = _synthetic_case(
+        decl="assembler-managed",
+        body=f"{_ASM_BODY}\n\n降级路径按 两步建栈法 自建 drill-rc- 栈。",
+    )
+    problems = _teardown_problems("case.md", text)
+    assert problems and "lying declaration" in problems[0]
+
+
+def test_disposition_assembler_managed_without_basis_fails() -> None:
+    """assembler-managed with no faultdrill_assemble_carrier reference → FAIL."""
+    text = _synthetic_case(
+        decl="assembler-managed", body="drill-rc-x 载体，正文未提装配器工具。"
+    )
+    problems = _teardown_problems("case.md", text)
+    assert problems and "no structural basis" in problems[0]
+
+
+def test_disposition_self_built_without_marker_fails() -> None:
+    """⑤ self-built-stack declaration but no tail-step marker → FAIL."""
+    text = _synthetic_case(
+        decl="self-built-stack", body="自建 drill-rc-x 栈，漏写尾步知识。"
+    )
+    problems = _teardown_problems("case.md", text)
+    assert problems and "self-built-stack but carries no tail-step" in problems[0]
+
+
+def test_disposition_illegal_value_fails() -> None:
+    """An unknown carrier_teardown value → FAIL."""
+    text = _synthetic_case(decl="auto-magic", body=_ASM_BODY)
+    problems = _teardown_problems("case.md", text)
+    assert problems and "illegal carrier_teardown" in problems[0]

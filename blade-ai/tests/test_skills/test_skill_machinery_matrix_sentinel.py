@@ -15,9 +15,11 @@ The sentinel converts that silent drift into loud drift, face by face:
 - HOST face: every ``systemd-run`` command line in the host catalogue
   (comment forms unwrapped, backslash continuations joined) is judged by
   the matrix entry point. A command whose text carries the timer
-  semantics (``--on-active``) must be exempted; one without it (the
-  killloop fault-carrier form) must stay attributed — both directions
-  pinned, both live in the corpus today.
+  semantics (``--on-active``) must be exempted; one without it must stay
+  attributed — both directions pinned by the reconciliation tooth. As of
+  the Case #12 root-fix every host ``systemd-run`` in the corpus is a
+  timer form (the synchronous killloop fault-carrier was adjudicated
+  away), and a dedicated tooth asserts none reappears.
 - CHANNEL face: every ``kubectl exec drill-rc-…`` command (fenced-block
   line starts AND inline backtick spans, continuations joined) is
   materialized (placeholders → a registered carrier) and judged:
@@ -49,10 +51,16 @@ excluded):
   delete/exec domain. A post-issue patch of a registered carrier would
   stay attributed (the conservative direction); re-examine if a case
   ever teaches that sequence.
-- the killloop non-timer form (Host_进程异常_进程被杀死.md 形态A) is
-  the corpus's one attributed systemd-run — pinned below AND colliding
-  with ToolGuard's admission law (``systemd-run`` admitted ONLY as a
-  timer): a live skill↔guard drift, kept loud until adjudicated.
+- the killloop non-timer form (Host_进程异常_进程被杀死.md 旧形态A) was
+  the corpus's one attributed systemd-run AND collided with ToolGuard's
+  admission law (``systemd-run`` admitted ONLY as a timer) — a live
+  skill↔guard drift kept loud until adjudicated. **Adjudicated by the
+  Case #12 root-fix**: the synchronous killloop was removed and form A
+  re-expressed as a timer-armed static-death form (``--on-active``
+  carrier + ``systemctl mask`` + ``kill -9 <MainPID>``), so it is no
+  longer a boundary. ``test_host_systemd_run_fault_carrier_form_is_adjudicated_away``
+  now guards the resolved direction (no synchronous fault carrier may
+  reappear).
 """
 
 import pathlib
@@ -70,14 +78,17 @@ _CARRIER = "drill-rc-x"
 _NS = "ns"
 
 #: The carriers a 自恢复 claim may name — the HOST face's legislated
-#: domain, two families (baseline re-measured R23: the stress-ng case
-#: taught the second one): ``systemd-run`` transient timers (the armed
-#: form, matrix-legislated) and the fault binary's OWN ``timeout``
-#: (self-expiring faults — stress-ng ``--timeout`` exits on its own, fd
-#: released, nothing to arm). A FUTURE carrier family (--on-calendar,
-#: at, nohup …) must fail the claim tooth FIRST, then either extend
-#: ``is_systemd_run_timer``'s domain or reshape the case.
-_HOST_CARRIER_CLAIMS = ("systemd-run", "timeout")
+#: domain, three families: ``systemd-run`` transient timers (the Tier-1
+#: armed form, matrix-legislated), ``setsid`` detached-timers (the Tier-2
+#: no-systemd armed form — host-native-recovery-carrier legislation: the
+#: guard admits ``setsid`` ONLY as ``setsid --fork sh -c '<script>'`` and
+#: the HOST attribution face exempts it on the SAME single-source
+#: primitive ``is_setsid_detached_timer``), and the fault binary's OWN
+#: ``timeout`` (self-expiring faults — stress-ng ``--timeout`` exits on
+#: its own, fd released, nothing to arm). A FUTURE carrier family
+#: (--on-calendar, at, nohup …) must fail the claim tooth FIRST, then
+#: either extend the form primitives' domain or reshape the case.
+_HOST_CARRIER_CLAIMS = ("systemd-run", "setsid", "timeout")
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +116,35 @@ def _host_systemd_run_commands() -> list[tuple[str, str]]:
             # starting with the binary ("systemd-run transient service
             # 承载…") carries a flag-less tail and is not a command.
             if not body.startswith("systemd-run -"):
+                i += 1
+                continue
+            parts = [body]
+            while parts[-1].endswith("\\") and i + 1 < len(lines):
+                parts[-1] = parts[-1].rstrip("\\").rstrip()
+                i += 1
+                parts.append(lines[i].strip())
+            out.append((str(path.relative_to(_SKILLS_DIR)), " ".join(parts)))
+            i += 1
+    return out
+
+
+def _host_setsid_commands() -> list[tuple[str, str]]:
+    """(relpath, command) — every setsid command line in the host catalogue.
+
+    The Tier-2 (no-systemd) twin of :func:`_host_systemd_run_commands`:
+    comment forms unwrapped (``# setsid …`` teaches the same form),
+    backslash continuations joined, line-start anchor discriminates the
+    command/fence from prose. Judged by the SAME matrix entry point so the
+    corpus and the HOST attribution face stay in lockstep for both carriers.
+    """
+    out: list[tuple[str, str]] = []
+    for path in sorted(_HOST_CATALOGUE.rglob("*.md")):
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].lstrip()
+            body = stripped[1:].lstrip() if stripped.startswith("#") else stripped
+            if not body.startswith("setsid "):
                 i += 1
                 continue
             parts = [body]
@@ -289,9 +329,11 @@ def _materialize_destroy(cmd: str) -> str:
 def test_host_systemd_run_forms_match_the_single_source() -> None:
     """HOST 面对账主牙：语料中每条 systemd-run 命令的 timer 语义特征
     （--on-active 在场）必须与矩阵豁免判定一致——双向。timer 形态
-    （machinery）必须豁免；killloop 形态（fault carrier）必须保持
+    （machinery）必须豁免；非 timer 形态（无 --on-active）必须保持
     归因。文本特征与判定分叉 = 新形态漂移（payload-carried flag、
-    未立法的新 timer 变体都会在这里先红）。"""
+    未立法的新 timer 变体都会在这里先红）。Case #12 root-fix 后语料
+    中每条 host systemd-run 都是 timer 形态，本牙覆盖 timer=True 侧；
+    非 timer 故障载体不得复现由 ``..._is_adjudicated_away`` 守护。"""
     from chaos_agent.agent.execution_artifacts import (
         issue_call_is_registered_teardown,
     )
@@ -315,32 +357,96 @@ def test_host_systemd_run_forms_match_the_single_source() -> None:
     )
 
 
-def test_host_fault_carrier_systemd_run_form_is_pinned() -> None:
-    """钉住牙：语料中非 timer 的 systemd-run（killloop 故障载体，形态A）
-    必须保持归因（谓词 False）——它实例化 HOST 面的钉住方向（豁免由
-    timer 形态挣得，不由二进制名挣得）。它同时与 ToolGuard 准入立法
-    冲突（systemd-run 只放行 timer 形态——形态A 命令过不了 guard）：
-    一处活着的 skill↔guard 执行面漂移，本牙让它保持响亮直到裁决。"""
-    from chaos_agent.agent.execution_artifacts import (
-        issue_call_is_registered_teardown,
-    )
+def test_host_systemd_run_fault_carrier_form_is_adjudicated_away() -> None:
+    """钉住牙（已裁决方向）：语料中**不得再有**非 timer 的同步 systemd-run
+    故障载体。
 
+    历史：Case #12（Host_进程异常_进程被杀死）旧形态A 曾用同步
+    ``systemd-run --unit=blade-killloop-<service> sh -c 'while … systemctl
+    kill …'`` 承载"拉起-杀死风暴"。该形态与 ToolGuard 准入立法**双重冲突**
+    （① 无 ``--on-active`` 的同步 systemd-run = 任意代码执行绕过，被
+    ``_check_systemd_run`` 拒；② 载荷内 ``systemctl kill`` 不在
+    ``SYSTEMCTL_ALLOWED_SUBCOMMANDS``），是一处活着的 skill↔guard 执行面漂移，
+    旧牙（``..._is_pinned``）让它保持响亮直到裁决。
+
+    裁决（Case #12 root-fix）：风暴在 Agent 执行模型下结构性不可达（逐轮工具
+    调用间隔 >> ``StartLimitIntervalSec``、systemd 合并同 unit 并发 job），且
+    守卫准入面无法表达有界 kill 循环——故形态A 重写为**静态持续死亡**：
+    ``systemd-run --on-active`` 定时恢复载体 + ``systemctl mask`` 破守护重启 +
+    ``kill -9 <MainPID>`` abrupt 强杀。killloop 同步载体已从语料根除。
+
+    本牙守住裁决方向：任何重新引入同步 systemd-run 故障载体（无 ``--on-active``）
+    的语料漂移都会在这里红。timer 形态与二进制名豁免的方向对账由主牙
+    ``test_host_systemd_run_forms_match_the_single_source`` 双向守护。"""
     faults = [
         (rel, cmd) for rel, cmd in _host_systemd_run_commands()
         if "--on-active" not in cmd
     ]
-    assert faults, (
-        "the killloop fault-carrier form vanished from the corpus — "
-        "re-baseline deliberately, not silently"
+    assert not faults, (
+        "a synchronous (non-timer) systemd-run fault carrier reappeared in "
+        "the host corpus — this form is guard-unreachable (a synchronous "
+        "systemd-run is an arbitrary-execution bypass; only the "
+        "`--on-active` timer form is admitted). Case #12 adjudicated the "
+        "killloop carrier away (timer + mask + `kill -9`); re-express the "
+        "fault as a timer-armed static-death form, not a synchronous "
+        f"carrier: {faults}"
     )
-    for rel, cmd in faults:
-        assert "--unit=blade-killloop-" in cmd, (
-            f"a NEW non-timer systemd-run shape appeared ({rel}): "
-            f"{cmd[:90]} — the HOST face's pinned direction needs a "
-            "deliberate ruling, not a silent corpus drift"
-        )
-        assert not issue_call_is_registered_teardown(
+
+
+def test_host_setsid_forms_match_the_single_source() -> None:
+    """HOST 面 Tier-2 对账主牙（host-native-recovery-carrier）：语料中每条
+    setsid 命令的 detached-timer 语义特征（``--fork``/``-f`` 在场且无
+    ``--wait``）必须与矩阵 HOST 面豁免判定一致——双向。timer 形态
+    （machinery）必须豁免；非 timer 形态（裸 setsid / 缺 --fork）必须保持
+    归因。文本特征与判定分叉 = 新形态漂移，先红这里。"""
+    from chaos_agent.agent.execution_artifacts import (
+        issue_call_is_registered_teardown,
+    )
+
+    drift: list[str] = []
+    for rel, cmd in _host_setsid_commands():
+        verdict = issue_call_is_registered_teardown(
             "host_inject", {"command": cmd}, [],
+        )
+        timer_text = ("--fork" in cmd or " -f " in cmd) and "--wait" not in cmd
+        if verdict != timer_text:
+            drift.append(
+                f"{rel}: timer-text={timer_text} verdict={verdict}: {cmd[:90]}"
+            )
+    assert not drift, (
+        "A host setsid command's detached-timer semantics and the matrix's "
+        "HOST-face verdict disagree — the corpus taught a Tier-2 form the "
+        "attribution matrix has not legislated (or a machinery form that no "
+        "longer exempts). Legislate the face (is_setsid_detached_timer) or "
+        f"reshape the case BEFORE the next round finds it in production: {drift}"
+    )
+
+
+def test_host_setsid_detached_timer_form_is_pinned() -> None:
+    """钉住牙（Tier-2）：语料中 setsid detached-timer 武装形态必须真的
+    被 HOST 面豁免（谓词 True）——它实例化 Tier-2 的钉住方向（豁免由
+    detached-timer 形态挣得，与 Tier-1 systemd-run 同源同面）。活性牙：
+    试点 case 落地后语料必须至少含一条 setsid 武装命令，否则本牙空转。"""
+    from chaos_agent.agent.execution_artifacts import (
+        issue_call_is_registered_teardown,
+    )
+
+    timers = [
+        (rel, cmd) for rel, cmd in _host_setsid_commands()
+        if ("--fork" in cmd or " -f " in cmd) and "--wait" not in cmd
+    ]
+    assert timers, (
+        "the setsid detached-timer arm form vanished from the host corpus — "
+        "the Tier-2 pilot case (Host_磁盘空间不足_磁盘被填满.md 手段2) lost "
+        "its arm command; re-baseline deliberately, not silently"
+    )
+    for rel, cmd in timers:
+        assert issue_call_is_registered_teardown(
+            "host_inject", {"command": cmd}, [],
+        ), (
+            f"{rel}: a setsid detached-timer arm is NOT exempt by the HOST "
+            f"face — the no-systemd arm-first order would be mis-attributed "
+            f"as host_native injection: {cmd[:90]}"
         )
 
 

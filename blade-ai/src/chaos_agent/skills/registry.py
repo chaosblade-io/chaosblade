@@ -39,6 +39,12 @@ class SkillRegistry:
         self._metadata: dict[str, SkillMetadata] = {}  # Tier 1: always in memory
         self._instructions_cache: dict[str, str] = {}  # Tier 2: loaded on demand
         self._skill_dirs: dict[str, Path] = {}
+        # Ordered, de-duplicated roots this registry was loaded from
+        # (user root first, built-in root second). ``reload()`` re-scans
+        # exactly these so a hot-reload reproduces the same merged view —
+        # including the user-shadows-built-in precedence — instead of
+        # silently collapsing back to a single directory.
+        self._roots: list[Path] = []
         self._validator = validator or SkillValidator()
 
     @property
@@ -46,7 +52,7 @@ class SkillRegistry:
         return self._metadata
 
     def _scan_directory(
-        self, skills_dir: Path,
+        self, skills_dir: Path, *, quiet: bool = False,
     ) -> tuple[dict[str, SkillMetadata], dict[str, Path]]:
         """Scan ``skills_dir`` and return ``(metadata, skill_dirs)`` dicts.
 
@@ -54,15 +60,23 @@ class SkillRegistry:
         detection within this scan, and ``disabled_skills`` filtering all
         happen inline. Returns empty dicts when the directory is missing.
 
-        Shared by ``load_from_directory`` (additive init path) and
-        ``reload`` (atomic swap path) — keeping the scan logic in one place
-        means both paths apply identical validation/filtering rules.
+        This is the SINGLE AUTHORITY for the "which directory does a skill
+        name load from" contract. It is shared by ``load_from_directory``
+        (additive init path), ``reload`` (atomic swap path), and
+        ``resolve_dir`` (cache-free single-name lookup) — keeping the scan
+        logic in ONE place means every path applies identical
+        validation/filtering rules, so a name always resolves to the same
+        directory no matter which path asks. ``quiet`` suppresses the
+        per-skill load/skip logging for callers (like ``resolve_dir``) that
+        run this off the load path and would otherwise emit misleading
+        "Loaded skill" noise on every invocation.
         """
         new_metadata: dict[str, SkillMetadata] = {}
         new_skill_dirs: dict[str, Path] = {}
 
         if not skills_dir.exists():
-            logger.warning(f"Skills directory not found: {skills_dir}")
+            if not quiet:
+                logger.warning(f"Skills directory not found: {skills_dir}")
             return new_metadata, new_skill_dirs
 
         disabled = set(settings.disabled_skills or [])
@@ -75,41 +89,97 @@ class SkillRegistry:
 
             is_valid, errors = self._validator.validate(skill_dir)
             if not is_valid:
-                logger.warning(
-                    f"Skill validation failed for {skill_dir.name}: {errors}"
-                )
+                if not quiet:
+                    logger.warning(
+                        f"Skill validation failed for {skill_dir.name}: {errors}"
+                    )
                 continue
 
             try:
                 meta = load_skill_metadata(skill_dir)
                 if not meta.name:
-                    logger.warning(f"Skill in {skill_dir} has empty name, skipping")
+                    if not quiet:
+                        logger.warning(f"Skill in {skill_dir} has empty name, skipping")
                     continue
 
                 if meta.name in disabled:
-                    logger.info(
-                        f"Skill '{meta.name}' is disabled in config; skipping load"
-                    )
+                    if not quiet:
+                        logger.info(
+                            f"Skill '{meta.name}' is disabled in config; skipping load"
+                        )
                     continue
 
                 # Intra-scan duplicate (two skill dirs in same scan declare
                 # the same name) — keep the first, warn about the rest.
                 if meta.name in new_metadata:
                     existing_dir = new_skill_dirs[meta.name]
-                    logger.warning(
-                        f"Duplicate skill name '{meta.name}': "
-                        f"'{skill_dir}' conflicts with already-loaded '{existing_dir}', "
-                        f"skipping"
-                    )
+                    if not quiet:
+                        logger.warning(
+                            f"Duplicate skill name '{meta.name}': "
+                            f"'{skill_dir}' conflicts with already-loaded '{existing_dir}', "
+                            f"skipping"
+                        )
                     continue
 
                 new_metadata[meta.name] = meta
                 new_skill_dirs[meta.name] = skill_dir
-                logger.info(f"Loaded skill: {meta.name} ({meta.category})")
+                if not quiet:
+                    logger.info(f"Loaded skill: {meta.name} ({meta.category})")
             except Exception as e:
-                logger.warning(f"Failed to load skill from {skill_dir}: {e}")
+                if not quiet:
+                    logger.warning(f"Failed to load skill from {skill_dir}: {e}")
 
         return new_metadata, new_skill_dirs
+
+    def resolve_dir(self, skill_name: str, roots: list[Path]) -> Optional[Path]:
+        """Cache-free, log-quiet ``skill_name`` → directory resolution.
+
+        THE single authority for "which directory does ``skill_name`` load
+        from". It runs the SAME :meth:`_scan_directory` contract —
+        validation, ``disabled_skills``, empty-name skip, frontmatter-name
+        key, first-wins — that :meth:`load_from_roots` uses, over ``roots``
+        in precedence order (first root that loads the name wins, mirroring
+        the additive first-wins merge). It scans into throwaway dicts and
+        never touches ``self``'s cached maps, so safety-critical callers can
+        re-read the resolved directory's files fresh from disk while still
+        getting exactly the directory the registry would activate.
+
+        ``loader.resolve_skill_dir`` delegates here so there is precisely
+        ONE name→dir implementation in the codebase. A second copy would
+        drift on whatever filters it omits — an earlier ``resolve_skill_dir``
+        matched only the frontmatter name and skipped validation + disabled,
+        so an invalid or disabled dir sharing a name resolved differently
+        from the registry (the guard then read a different case dir than the
+        model ran). Delegation makes that divergence structurally impossible.
+        """
+        for root in roots:
+            if not root.is_dir():
+                continue
+            _metadata, skill_dirs = self._scan_directory(root, quiet=True)
+            hit = skill_dirs.get(skill_name)
+            if hit is not None:
+                return hit
+        return None
+
+    def _remember_root(self, skills_dir: Path) -> None:
+        """Record ``skills_dir`` as a load root (order-preserving, de-duped).
+
+        De-dupes on the resolved path so a root loaded twice (or a user
+        root that coincides with the built-in root) is scanned once on the
+        next ``reload()``.
+        """
+        try:
+            resolved = skills_dir.resolve()
+        except OSError:
+            resolved = skills_dir
+        for existing in self._roots:
+            try:
+                if existing.resolve() == resolved:
+                    return
+            except OSError:
+                if existing == resolved:
+                    return
+        self._roots.append(skills_dir)
 
     def load_from_directory(self, skills_dir: Path) -> None:
         """Scan ``skills_dir`` and ADD newly-discovered skills to the registry.
@@ -122,20 +192,39 @@ class SkillRegistry:
         appears in ``settings.disabled_skills`` are skipped silently with
         an INFO log so the user can re-enable them later.
         """
+        self._remember_root(skills_dir)
         scanned_meta, scanned_dirs = self._scan_directory(skills_dir)
         # Additive merge — preserve already-loaded entries, add the rest.
         for name, meta in scanned_meta.items():
             if name in self._metadata:
-                # Cross-scan duplicate (caller is loading from a second dir
-                # that overlaps with what's already loaded).
+                # Cross-root duplicate: an earlier root already provided this
+                # name, so it wins. This is the EXPECTED outcome of the
+                # dual-root merge — a user skill in the writable root shadows
+                # the built-in one of the same name — logged at INFO, not
+                # WARNING, so it isn't mistaken for a misconfiguration on
+                # every start.
                 existing_dir = self._skill_dirs.get(name)
-                logger.warning(
-                    f"Duplicate skill name '{name}': '{scanned_dirs[name]}' "
-                    f"conflicts with already-loaded '{existing_dir}', skipping"
+                logger.info(
+                    f"Skill '{name}' already loaded from '{existing_dir}'; "
+                    f"skipping '{scanned_dirs[name]}' (earlier root wins)"
                 )
                 continue
             self._metadata[name] = meta
             self._skill_dirs[name] = scanned_dirs[name]
+
+    def load_from_roots(self, roots: list[Path]) -> None:
+        """Merge-load skills from multiple roots, in precedence order.
+
+        Loads each root via :meth:`load_from_directory` in the given order.
+        Because that merge is additive and first-seen-wins, an EARLIER root
+        takes precedence: a skill name present in ``roots[0]`` shadows the
+        same name in ``roots[1]``. Callers pass ``get_skill_roots()`` —
+        user root first, built-in root second — so user skills win and
+        built-in skills fill the gaps (the built-in pack is always loaded
+        unless the user shadows it by name).
+        """
+        for root in roots:
+            self.load_from_directory(root)
 
     def reload(self, skills_dir: Optional[Path] = None) -> None:
         """Hot-reload via copy-and-swap atomic replacement.
@@ -151,31 +240,42 @@ class SkillRegistry:
         may reference now-stale content; the next ``activate()`` call
         repopulates from disk.
 
-        If ``skills_dir`` is not provided, falls back to the parent of
-        any currently-loaded skill (preserves prior reload signature).
+        If ``skills_dir`` is not provided, re-scans the roots this registry
+        was originally loaded from (``self._roots`` — user root first, then
+        the built-in root), so a hot-reload reproduces the same merged view
+        and precedence instead of collapsing to a single directory. Falls
+        back to the parent of any currently-loaded skill when no roots were
+        recorded (preserves the prior single-dir reload signature for
+        direct ``load_from_directory`` callers).
         """
-        # Resolve which parent directory to scan.
-        dir_to_scan = skills_dir or next(iter(self._skill_dirs.values()), None)
-        if dir_to_scan is None or not dir_to_scan.exists():
-            return
+        # Resolve which roots to scan, in precedence order.
+        if skills_dir is not None:
+            roots: list[Path] = [Path(skills_dir)]
+        elif self._roots:
+            roots = list(self._roots)
+        else:
+            legacy = next(iter(self._skill_dirs.values()), None)
+            roots = [legacy] if legacy is not None else []
 
-        # Normalise: ``skill_dirs`` values point at individual skill dirs;
-        # we need to scan their parent (the directory CONTAINING skill
-        # subdirs). When ``dir_to_scan`` is already such a parent, its
-        # immediate children include at least one ``SKILL.md``-bearing dir.
-        has_skill_subdirs = any(
-            d.is_dir() and (d / "SKILL.md").exists()
-            for d in dir_to_scan.iterdir()
-        )
-        if not has_skill_subdirs:
-            dir_to_scan = dir_to_scan.parent
-            if not any(
-                d.is_dir() and (d / "SKILL.md").exists()
-                for d in dir_to_scan.iterdir()
-            ):
-                return  # nothing to scan anywhere
+        new_metadata: dict[str, SkillMetadata] = {}
+        new_skill_dirs: dict[str, Path] = {}
+        scanned_any = False
+        for root in roots:
+            dir_to_scan = self._normalise_reload_root(root)
+            if dir_to_scan is None:
+                continue
+            scanned_any = True
+            meta, dirs = self._scan_directory(dir_to_scan)
+            for name, m in meta.items():
+                if name in new_metadata:
+                    # Earlier root wins — a user skill shadows the built-in
+                    # one of the same name across the merged roots.
+                    continue
+                new_metadata[name] = m
+                new_skill_dirs[name] = dirs[name]
 
-        new_metadata, new_skill_dirs = self._scan_directory(dir_to_scan)
+        if not scanned_any:
+            return  # nothing to scan anywhere
 
         # Atomic swap. Reader-visible state moves from old-snapshot to
         # new-snapshot in two single-bytecode reference assignments. A
@@ -185,6 +285,25 @@ class SkillRegistry:
         self._skill_dirs = new_skill_dirs
         self._metadata = new_metadata
         self._instructions_cache = {}
+
+    @staticmethod
+    def _normalise_reload_root(root: Optional[Path]) -> Optional[Path]:
+        """Return the directory to scan for ``root``, or None if empty.
+
+        ``root`` is normally a skills PARENT dir (its immediate children
+        include at least one ``SKILL.md``-bearing dir). The legacy no-arg
+        fallback may hand in an individual skill dir instead; normalise
+        that to its parent so the scan still finds sibling skills. Returns
+        None when neither the root nor its parent contains any skill.
+        """
+        if root is None or not root.exists():
+            return None
+        if any(d.is_dir() and (d / "SKILL.md").exists() for d in root.iterdir()):
+            return root
+        parent = root.parent
+        if any(d.is_dir() and (d / "SKILL.md").exists() for d in parent.iterdir()):
+            return parent
+        return None
 
     def build_catalog_prompt(self) -> str:
         """Generate skill catalog text for system prompt / activate_skill tool description."""

@@ -4,14 +4,17 @@ from pathlib import Path
 
 import pytest
 
+from chaos_agent.skills import loader
 from chaos_agent.skills.loader import (
     _parse_parameters,
+    get_skill_roots,
     get_skills_dir,
     list_skill_resources,
     load_skill_instructions,
     load_skill_metadata,
     load_skill_resource,
     parse_frontmatter,
+    resolve_skill_dir,
 )
 
 
@@ -257,3 +260,271 @@ class TestParseParameters:
         assert len(params) == 1
         assert params[0].name == "x"
         assert params[0].type == "string"
+
+
+def _mk_skill(parent: Path, dir_name: str, fm_name: str | None = None) -> Path:
+    """Create ``<parent>/<dir_name>/SKILL.md`` (frontmatter name = fm_name or dir_name)."""
+    d = parent / dir_name
+    d.mkdir(parents=True, exist_ok=True)
+    name = fm_name or dir_name
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test {name}\ncategory: test\n---\nbody",
+        encoding="utf-8",
+    )
+    return d
+
+
+class TestGetSkillRoots:
+    """Merged-root resolution: user root first, built-in second, de-duped."""
+
+    def test_user_root_first_then_builtin(self, monkeypatch, tmp_path):
+        user = tmp_path / "user"
+        user.mkdir()
+        builtin = tmp_path / "builtin"
+        builtin.mkdir()
+        monkeypatch.setattr(loader, "get_skills_dir", lambda: user)
+        monkeypatch.setattr(loader, "get_builtin_skills_dir", lambda: builtin)
+        assert get_skill_roots() == [user, builtin]
+
+    def test_dedup_when_both_same_dir(self, monkeypatch, tmp_path):
+        """Dev/frozen case: user root == built-in root → returned once."""
+        same = tmp_path / "skills"
+        same.mkdir()
+        monkeypatch.setattr(loader, "get_skills_dir", lambda: same)
+        monkeypatch.setattr(loader, "get_builtin_skills_dir", lambda: same)
+        assert get_skill_roots() == [same]
+
+    def test_builtin_none_yields_user_only(self, monkeypatch, tmp_path):
+        user = tmp_path / "user"
+        user.mkdir()
+        monkeypatch.setattr(loader, "get_skills_dir", lambda: user)
+        monkeypatch.setattr(loader, "get_builtin_skills_dir", lambda: None)
+        assert get_skill_roots() == [user]
+
+
+class TestResolveSkillDir:
+    """Cross-root skill-dir resolution used by safety-critical readers."""
+
+    def test_finds_in_user_root(self, monkeypatch, tmp_path):
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        builtin.mkdir()
+        _mk_skill(user, "my-skill")
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [user, builtin])
+        assert resolve_skill_dir("my-skill") == user / "my-skill"
+
+    def test_user_root_wins_on_name_clash(self, monkeypatch, tmp_path):
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        _mk_skill(user, "k8s-chaos-skills")
+        _mk_skill(builtin, "k8s-chaos-skills")
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [user, builtin])
+        assert resolve_skill_dir("k8s-chaos-skills") == user / "k8s-chaos-skills"
+
+    def test_falls_back_to_builtin(self, monkeypatch, tmp_path):
+        user = tmp_path / "user"
+        user.mkdir()
+        builtin = tmp_path / "builtin"
+        _mk_skill(builtin, "only-builtin")
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [user, builtin])
+        assert resolve_skill_dir("only-builtin") == builtin / "only-builtin"
+
+    def test_missing_returns_none(self, monkeypatch, tmp_path):
+        user = tmp_path / "user"
+        user.mkdir()
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [user])
+        assert resolve_skill_dir("nope") is None
+
+    def test_traversal_and_empty_rejected(self, monkeypatch, tmp_path):
+        """Authorization path: skill_name may be LLM-influenced — reject escapes."""
+        user = tmp_path / "user"
+        user.mkdir()
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [user])
+        assert resolve_skill_dir("../etc") is None
+        assert resolve_skill_dir("a/b") is None
+        assert resolve_skill_dir("") is None
+        assert resolve_skill_dir(".") is None
+
+
+class TestResolveSkillDirKeysOnFrontmatterName:
+    """``resolve_skill_dir`` keys on frontmatter ``name`` — the SAME authority
+    the registry uses — NOT on the directory basename.
+
+    Before the fix these were two independent name→dir authorities that only
+    agreed under the unenforced invariant ``dirname == frontmatter name``.
+    The measured divergence: an override dir ``my-override`` declaring
+    ``name: k8s-chaos-skills`` shadowed the built-in in the registry (which
+    keys by frontmatter name), yet basename matching fell through to the
+    BUILT-IN ``k8s-chaos-skills`` dir — so the guard read the built-in case
+    while the model ran the override. Identity is now guaranteed by
+    DELEGATION (``resolve_skill_dir`` calls ``SkillRegistry.resolve_dir``,
+    which runs the registry's own ``_scan_directory``), so the two cannot
+    drift on basename OR on any load filter (see the matrix class below).
+    """
+
+    def test_agrees_with_registry_when_dir_name_differs_from_frontmatter_name(
+        self, monkeypatch, tmp_path
+    ):
+        """The exact divergence scenario: user override dir basename != name."""
+        from chaos_agent.skills.registry import SkillRegistry
+
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        # User override lives in a dir whose basename ("my-override") differs
+        # from the frontmatter name it declares ("k8s-chaos-skills").
+        _mk_skill(user, "my-override", fm_name="k8s-chaos-skills")
+        _mk_skill(builtin, "k8s-chaos-skills")
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [user, builtin])
+
+        registry = SkillRegistry()
+        registry.load_from_roots([user, builtin])
+        loaded = registry.get_skill_dir("k8s-chaos-skills")
+
+        # Registry loads the user override (first-wins by frontmatter name).
+        assert loaded == user / "my-override"
+        # THE invariant: resolve_skill_dir returns the SAME dir the registry
+        # loaded — no second, disagreeing authority. Before A′ this returned
+        # builtin/"k8s-chaos-skills" (basename match) and the assert failed.
+        assert resolve_skill_dir("k8s-chaos-skills") == loaded
+
+    def test_resolves_by_frontmatter_name_not_basename(self, monkeypatch, tmp_path):
+        """A dir is found by its declared name; its basename is NOT a key."""
+        user = tmp_path / "user"
+        _mk_skill(user, "weird-dirname", fm_name="real-name")
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [user])
+
+        assert resolve_skill_dir("real-name") == user / "weird-dirname"
+        # The directory's basename is no longer an alias for the skill.
+        assert resolve_skill_dir("weird-dirname") is None
+
+
+class TestGetSkillsDirDoesNotMaterialize:
+    """Root-fix: ``get_skills_dir()`` must NOT copy the built-in pack into the
+    writable user root. Materialization was removed — a fresh install's user
+    root stays EMPTY and the built-in pack is merge-loaded read-only via
+    ``get_builtin_skills_dir()``. The old copy never refreshed and, being
+    same-named, shadowed the fresh built-in pack in the merge (the
+    stale-shadow bug this removal fixes)."""
+
+    def test_empty_user_root_created_but_not_populated(self, monkeypatch, tmp_path):
+        """An absent/empty config dir is created and returned, but NOT filled
+        with a copy of the built-in pack — even when a built-in pack exists."""
+        config_dir = tmp_path / "user_root"  # does not exist yet
+        builtin = tmp_path / "builtin"
+        _mk_skill(builtin, "k8s-chaos-skills")
+        monkeypatch.setattr(
+            "chaos_agent.config.settings.settings.skills_dir", config_dir
+        )
+        monkeypatch.delenv("BLADE_AI_SKILLS_DIR", raising=False)
+        # Only the built-in dir "has skills"; the config dir and the dev repo
+        # path report False, forcing fall-through to the create-empty branch
+        # (priority 5) instead of the dev path (priority 4).
+        monkeypatch.setattr(loader, "_has_skills", lambda p: p == builtin)
+
+        result = get_skills_dir()
+
+        assert result == config_dir
+        assert config_dir.is_dir()               # created
+        assert list(config_dir.iterdir()) == []  # but EMPTY — nothing copied out
+
+    def test_builtin_still_loads_via_merge_when_user_root_empty(self, tmp_path):
+        """The built-in pack is reachable through the merge even though the
+        user root is empty — proving materialization was never load-bearing."""
+        from chaos_agent.skills.registry import SkillRegistry
+
+        user = tmp_path / "user"
+        user.mkdir()  # empty user root
+        builtin = tmp_path / "builtin"
+        _mk_skill(builtin, "k8s-chaos-skills")
+
+        registry = SkillRegistry()
+        registry.load_from_roots([user, builtin])
+
+        assert (
+            registry.get_skill_dir("k8s-chaos-skills")
+            == builtin / "k8s-chaos-skills"
+        )
+
+
+class TestResolveSkillDirDelegatesToRegistryAuthority:
+    """Root-fix invariant: ``resolve_skill_dir`` and the registry are ONE
+    authority (delegation via ``SkillRegistry.resolve_dir`` → the registry's
+    own ``_scan_directory``), so they agree under EVERY load filter — not just
+    frontmatter-name keying.
+
+    Each scenario below is a case a hand-rolled copy of the scan (matching the
+    name but omitting validation / disabled / dup handling) resolves
+    DIFFERENTLY from the registry. The equality assertion is the anti-drift
+    net: it reddens if ``resolve_skill_dir`` ever stops delegating and grows a
+    second, diverging implementation again.
+    """
+
+    def _invalid_skill(self, parent: Path, dir_name: str, fm_name: str) -> Path:
+        """A dir declaring ``fm_name`` but MISSING required ``description`` —
+        the validator rejects it, so the registry never loads it."""
+        d = parent / dir_name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {fm_name}\ncategory: test\n---\nbody", encoding="utf-8"
+        )
+        return d
+
+    def _assert_agrees(self, monkeypatch, roots, name):
+        from chaos_agent.skills.registry import SkillRegistry
+
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: list(roots))
+        registry = SkillRegistry()
+        registry.load_from_roots(list(roots))
+        expected = registry.get_skill_dir(name)
+        assert resolve_skill_dir(name) == expected
+        return expected
+
+    def test_invalid_user_shadow_falls_through_to_valid_builtin(
+        self, monkeypatch, tmp_path
+    ):
+        """The proven divergence: an INVALID user-root dir sharing the name
+        must NOT win — the registry skips it and loads the valid built-in, and
+        resolve_skill_dir must land on the SAME valid built-in. A name-only
+        copy returned the invalid user dir (guard read the wrong case)."""
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        self._invalid_skill(user, "foo", "foo")  # missing description -> invalid
+        _mk_skill(builtin, "foo")  # valid
+        assert self._assert_agrees(monkeypatch, [user, builtin], "foo") == builtin / "foo"
+
+    def test_disabled_skill_resolves_to_none_like_registry(self, monkeypatch, tmp_path):
+        """A disabled skill is loaded by NO authority: the registry returns
+        None and resolve_skill_dir must too (a name-only copy returned the
+        dir, contradicting its 'the dir load_from_roots loaded' contract)."""
+        from chaos_agent.config.settings import settings
+        from chaos_agent.skills.registry import SkillRegistry
+
+        root = tmp_path / "root"
+        _mk_skill(root, "bar")
+        monkeypatch.setattr(loader, "get_skill_roots", lambda: [root])
+        old = settings.disabled_skills
+        try:
+            settings.disabled_skills = ["bar"]
+            registry = SkillRegistry()
+            registry.load_from_roots([root])
+            assert registry.get_skill_dir("bar") is None
+            assert resolve_skill_dir("bar") is None
+        finally:
+            settings.disabled_skills = old
+
+    def test_duplicate_name_same_root_first_sorted_wins(self, monkeypatch, tmp_path):
+        """Two valid dirs in ONE root declaring the same name: the registry
+        keeps the first in ``sorted()`` order; resolve_skill_dir must match."""
+        root = tmp_path / "root"
+        _mk_skill(root, "zzz-dup", fm_name="dup")
+        first = _mk_skill(root, "aaa-dup", fm_name="dup")  # sorts first -> wins
+        assert self._assert_agrees(monkeypatch, [root], "dup") == first
+
+    def test_valid_cross_root_user_wins(self, monkeypatch, tmp_path):
+        """Baseline: a valid user override shadows a valid built-in
+        (first-root wins) and both authorities agree on the user dir."""
+        user = tmp_path / "user"
+        builtin = tmp_path / "builtin"
+        u = _mk_skill(user, "k8s", fm_name="k8s-chaos-skills")
+        _mk_skill(builtin, "k8s-chaos-skills")
+        assert self._assert_agrees(monkeypatch, [user, builtin], "k8s-chaos-skills") == u
