@@ -359,3 +359,120 @@ class TestResumeStreamCleanupContract:
         # The queue subscribed by resume_stream was removed from the
         # tracker (unsubscribe received the queue, not just the task id).
         assert tracker._subscribers == []
+
+
+class TestInjectStreamCrashOwedTeardown:
+    """W-78R-1: a mid-run uncaught exception must still surface the owed
+    vehicle teardown on the crash envelope + render the CLI recover hint.
+
+    The crash arm used to build the terminal envelope off ``initial_state``
+    — the pre-run projection, which by definition carries no carrier armed
+    DURING the run. So an elevated-RBAC recovery vehicle orphaned by an
+    httpx.ReadError-class crash was recorded in the audit row but never
+    surfaced to the operator, who was never told to run ``blade-ai recover``.
+
+    These tests drive the REAL ``inject_stream`` end to end; the only seam is
+    the fake pipeline graph the whole suite injects via ``runner._agents``
+    (r47: prove the mechanism actually fires, don't mock the integration
+    boundary it lives on).
+    """
+
+    @staticmethod
+    def _crash_graph(final_values):
+        class _Snap:
+            values = final_values
+            next = ()
+            tasks = []
+
+        class _Graph:
+            async def aget_state(self, config):
+                return _Snap()
+
+            async def astream_events(self, *args, **kwargs):
+                # Simulate the uncaught transport exception that terminates
+                # the run mid-superstep (the ReadError this gap shipped as).
+                raise RuntimeError("ReadError: connection reset by peer")
+                if False:  # pragma: no cover - makes this an async generator
+                    yield
+
+        return _Graph()
+
+    @staticmethod
+    async def _drive(runner):
+        events = []
+        async for evt in runner.inject_stream(
+            scope="node",
+            target="disk",
+            action="fill",
+            target_name="node-1",
+            namespace="cms-demo",
+        ):
+            events.append(evt)
+        return events
+
+    @pytest.mark.asyncio
+    async def test_crash_arm_surfaces_owed_teardown_and_hint(self):
+        import json
+
+        carrier_values = {
+            "operation": "inject",
+            "execution_artifacts": [
+                {
+                    "type": "recovery_carrier",
+                    "name": "carrier-abc",
+                    "namespace": "cms-demo",
+                    "status": "recovery_armed",
+                },
+            ],
+        }
+        runner = AgentRunner()
+        runner._initialized = True
+        runner._session_store = None  # set by _ensure_initialized, bypassed here
+        runner._agents = {"pipeline": self._crash_graph(carrier_values)}
+
+        events = await self._drive(runner)
+
+        # The crash result envelope carries the owed vehicle — read off the
+        # FINAL checkpoint, NOT initial_state (which has no carrier). This is
+        # the assertion with teeth: revert the arm to initial_state and the
+        # ledger reads empty here.
+        result_evts = [e for e in events if e.type == "result"]
+        assert result_evts, "crash arm must yield a terminal result event"
+        data = json.loads(result_evts[-1].content)["data"]
+        assert data["vehicle_teardown_pending"] == [
+            "recovery_carrier:cms-demo/carrier-abc"
+        ]
+
+        # And the CLI hint is rendered, symmetric with the success path
+        # (_build_inject_result_events) — the operator watching a crashed
+        # inject is told to collect the carrier stack.
+        assert [
+            e
+            for e in events
+            if e.type == "token" and "blade-ai recover" in (e.content or "")
+        ], "crash arm must render the vehicle-teardown hint"
+
+    @pytest.mark.asyncio
+    async def test_crash_arm_no_hint_when_no_carrier_owed(self):
+        import json
+
+        # Reverse proposition: a crash with NO carrier in the final state
+        # rides an empty ledger and renders NO hint. The fix surfaces owed
+        # teardown; it does not invent it (no false `blade-ai recover` cry on
+        # a task that built no vehicle).
+        runner = AgentRunner()
+        runner._initialized = True
+        runner._session_store = None  # set by _ensure_initialized, bypassed here
+        runner._agents = {"pipeline": self._crash_graph({"operation": "inject"})}
+
+        events = await self._drive(runner)
+
+        result_evts = [e for e in events if e.type == "result"]
+        assert result_evts
+        data = json.loads(result_evts[-1].content)["data"]
+        assert data["vehicle_teardown_pending"] == []
+        assert not [
+            e
+            for e in events
+            if e.type == "token" and "blade-ai recover" in (e.content or "")
+        ]

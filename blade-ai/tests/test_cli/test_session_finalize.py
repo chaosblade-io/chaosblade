@@ -57,7 +57,7 @@ async def test_blade_handle_dispatches_destroy(monkeypatch):
             return "destroyed"
 
     monkeypatch.setattr(blade_tools_mod, "blade_destroy", _FakeDestroy())
-    graph = _FakeGraph({
+    values = {
         "experiment_uid": uid,
         "kubeconfig": "/tmp/kc",
         "messages": [
@@ -76,10 +76,15 @@ async def test_blade_handle_dispatches_destroy(monkeypatch):
                 tool_call_id="tc-r30-rb",
             ),
         ],
-    })
+    }
+    graph = _FakeGraph(values)
     suffix = await auto_rollback(graph, CONFIG)
     assert suffix == f" (auto-rolled back experiment_uids={uid})"
-    assert calls == [{"uid": uid, "kubeconfig": "/tmp/kc"}]
+    # The sweep threads its liability ``values`` snapshot through to the
+    # destroy dispatch as ``state`` (single-authority transport target source);
+    # a birth-receipt-only history leaves ``values`` unmutated (no proven
+    # destroy → no ``retired_experiment_uids`` absorption).
+    assert calls == [{"uid": uid, "kubeconfig": "/tmp/kc", "state": values}]
 
 
 @pytest.mark.asyncio
@@ -155,7 +160,7 @@ class TestRollbackDomainAlignment:
         provider = FaultProviderRegistry.resolve_by_method(method)
         calls: list = []
 
-        async def _fake_destroy(uid, kubeconfig=""):
+        async def _fake_destroy(uid, kubeconfig="", state=None):
             calls.append(uid)
             return _json.dumps({"code": 200, "success": True, "result": uid})
 

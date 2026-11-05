@@ -1,7 +1,9 @@
 """CLI command: blade-ai list
 
-Reads the pre-generated skill_capabilities.json (from `capabilities-sync`)
-and outputs it. Fast (reads one JSON file), no blade/LLM/agent calls.
+Reads a registry produced by `capabilities-sync` and outputs it. Registries are
+per language, so this language-agnostic view takes zh first when both exist and
+reports the chosen language and file in its payload.
+Fast (reads one JSON file), no blade/LLM/agent calls.
 """
 
 import json
@@ -9,20 +11,27 @@ import json
 import typer
 
 from chaos_agent.cli.output import OutputFormat, format_output
-from chaos_agent.config.settings import settings
-from chaos_agent.skills.loader import get_skills_dir
+from chaos_agent.skills.capabilities import existing_local_registries
+from chaos_agent.skills.loader import resolve_skill_dir
 
 
 def list_command(
     output: OutputFormat = typer.Option(OutputFormat.json, "--output", "-o", help="Output format: json|yaml"),
 ):
     """List supported fault capabilities (from last sync)."""
-    primary = settings.resolved_memory_dir / "skill_capabilities.json"
-    default = get_skills_dir() / "k8s-chaos-skills" / "references" / "skill_capabilities.default.json"
+    # Language-agnostic display command: take whichever local registry exists
+    # (zh first) instead of picking a locale, and fall back to the checked-in
+    # default so the command still works before any sync has run.
+    local_files = existing_local_registries()
+    k8s_dir = resolve_skill_dir("k8s-chaos-skills")
+    default = (
+        k8s_dir / "references" / "skill_capabilities.default.json"
+        if k8s_dir else None
+    )
 
-    src = primary if primary.exists() else default
+    src = local_files[0] if local_files else default
 
-    if not src.exists():
+    if src is None or not src.exists():
         result = {
             "status": "success",
             "code": 0,
@@ -58,6 +67,12 @@ def list_command(
         "data": {
             "total": len(cases),
             "blade_version": catalog.get("blade_version", ""),
+            # Registries are per language now, so "the last sync" is ambiguous
+            # the moment two files exist: this command takes zh first and would
+            # otherwise report an en-only sync's shape in zh, or vice versa,
+            # with no way for the caller to tell. Name what was actually read.
+            "lang": catalog.get("lang", ""),
+            "source": str(src),
             "categories": list(cats.values()),
         },
     }

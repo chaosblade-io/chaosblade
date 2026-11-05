@@ -776,3 +776,60 @@ class TestScopeRegistry:
             assert pf.checks_for("metric") == [fake_metric_check]
         finally:
             pf._CHECK_SCOPES["metric"].remove(fake_metric_check)
+
+
+class TestCheckSkillsDedup:
+    """``check_skills`` counts across the merged roots de-duplicated by the
+    skill's frontmatter ``name`` — the SAME key ``SkillRegistry._scan_directory``
+    uses — not by directory basename. Under ``dirname != frontmatter name``
+    (e.g. a user override installed under a different dir name) basename
+    de-dup would over-count vs what the registry actually loads, contradicting
+    the docstring's shadowing claim. The count is internal (only its
+    zero/non-zero branch is surfaced), so these tests lock the observable
+    contract: the frontmatter-reading path doesn't crash and reports
+    ``passed=True`` for a valid dir!=name shadowing pair, and tolerates a
+    malformed SKILL.md via the lenient basename fallback.
+    """
+
+    @staticmethod
+    def _mk(parent, dir_name, fm_name=None):
+        d = parent / dir_name
+        d.mkdir(parents=True, exist_ok=True)
+        name = fm_name or dir_name
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test {name}\ncategory: test\n---\nbody",
+            encoding="utf-8",
+        )
+        return d
+
+    def test_dir_ne_name_shadowing_pair_passes(self, monkeypatch, tmp_path):
+        from chaos_agent.preflight import check_skills
+
+        user = tmp_path / "user"
+        user.mkdir()
+        builtin = tmp_path / "builtin"
+        builtin.mkdir()
+        # User override: dir basename ("my-override") != frontmatter name it
+        # declares ("k8s-chaos-skills"); shadows the built-in of that name.
+        self._mk(user, "my-override", "k8s-chaos-skills")
+        self._mk(builtin, "k8s-chaos-skills", "k8s-chaos-skills")
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skill_roots", lambda: [user, builtin]
+        )
+        assert check_skills().passed is True
+
+    def test_malformed_frontmatter_does_not_crash(self, monkeypatch, tmp_path):
+        from chaos_agent.preflight import check_skills
+
+        user = tmp_path / "user"
+        user.mkdir()
+        bad = user / "broken"
+        bad.mkdir()
+        (bad / "SKILL.md").write_text("no frontmatter here", encoding="utf-8")
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skill_roots", lambda: [user]
+        )
+        # Lenient fallback: parse_frontmatter returns None → key falls back to
+        # the basename, dir counted once, no AttributeError on ``None.get``.
+        assert check_skills().passed is True
+

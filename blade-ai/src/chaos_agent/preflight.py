@@ -45,6 +45,7 @@ from chaos_agent.transports import (
     is_host_scope_channel,
     is_kubewiz_channel,
     resolve_channel_name,
+    resolve_transport_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -228,7 +229,13 @@ def check_transport_config() -> CheckResult:
     ssh/kubewiz_host but forgets a required field is told at boot time,
     not deep inside execution.
     """
-    target = TransportTarget.from_state({})
+    # settings-only by design: preflight runs at BOOT time, before any
+    # per-session graph state exists, so the persisted settings are the only
+    # authority to read. This is the sanctioned exception to the seam
+    # threading (ground-truth-single-authority task 3.4) — ``resolve_transport_
+    # target(None)`` is the "no state → settings" primitive; do NOT thread a
+    # TransportTarget param through preflight.
+    target = resolve_transport_target(None)
     try:
         channel = TransportRegistry.resolve(target)
     except ValueError as exc:
@@ -874,33 +881,61 @@ async def check_blade_version() -> CheckResult:
 def check_skills() -> CheckResult:
     """Check that skill files exist where the loader will look for them.
 
-    Resolves the directory via skills.loader.get_skills_dir() so the result
-    matches SkillRegistry.load_from_directory() — same path priority,
-    same one-level iteration, no recursive os.walk.
+    Counts across the merged roots via skills.loader.get_skill_roots()
+    (user root first, then the read-only built-in pack) so the result
+    matches what SkillRegistry.load_from_roots() actually loads — same
+    path priority, same one-level iteration, de-duplicated by the skill's
+    frontmatter ``name`` (the SAME key the registry uses in
+    ``_scan_directory``) so a user skill shadowing a built-in one of the
+    same name isn't double-counted. Keying on the directory basename
+    instead would over-count whenever ``dirname != frontmatter name``
+    (e.g. an override installed under a different dir name), diverging
+    from the registry's real load count. Dirs whose frontmatter name is
+    unreadable fall back to the basename so a present-but-malformed skill
+    is still counted once (lenient, matches the pre-fix behaviour).
     """
-    actual_dir = get_skills_dir()
+    from chaos_agent.skills.loader import get_skill_roots, parse_frontmatter
 
-    if not actual_dir.is_dir():
-        return CheckResult(
-            name="skills",
-            severity="warning",
-            passed=False,
-            message=f"Skills directory not found: {actual_dir}",
-            fix="Skills will be loaded from package defaults",
-        )
+    roots = get_skill_roots()
+    primary = roots[0] if roots else get_skills_dir()
 
-    count = sum(
-        1 for d in actual_dir.iterdir()
-        if d.is_dir() and (d / "SKILL.md").is_file()
-    )
-    disabled_count = len(settings.disabled_skills or [])
+    seen: set[str] = set()
+    count = 0
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for d in sorted(root.iterdir()):
+            if not (d.is_dir() and (d / "SKILL.md").is_file()):
+                continue
+            key = d.name
+            try:
+                frontmatter = parse_frontmatter(
+                    (d / "SKILL.md").read_text(encoding="utf-8")
+                )
+                fm_name = str((frontmatter or {}).get("name", "")).strip()
+                if fm_name:
+                    key = fm_name
+            except OSError:
+                pass
+            if key in seen:
+                continue
+            seen.add(key)
+            count += 1
 
     if count == 0:
+        if not primary.is_dir():
+            return CheckResult(
+                name="skills",
+                severity="warning",
+                passed=False,
+                message=f"Skills directory not found: {primary}",
+                fix="Skills will be loaded from package defaults",
+            )
         return CheckResult(
             name="skills",
             severity="warning",
             passed=False,
-            message=f"No skill files found in {actual_dir}",
+            message=f"No skill files found in {primary}",
             fix="Place SKILL.md folders under the skills directory, or run:\n"
                 "  blade-ai skills install",
         )
@@ -909,7 +944,8 @@ def check_skills() -> CheckResult:
     # is information the user can compute themselves once they know
     # where to look. Disabled count is appended only when non-zero so
     # the common case stays uncluttered.
-    pretty = _pretty_path(actual_dir)
+    disabled_count = len(settings.disabled_skills or [])
+    pretty = _pretty_path(primary)
     if disabled_count > 0:
         message = f"{pretty} ({disabled_count} disabled)"
     else:
@@ -931,7 +967,9 @@ async def _check_host_connectivity() -> CheckResult:
     channel preflight failure inside ``execute_via_transport`` — exit code
     ``-1`` with the error in stderr — which we render as "not reachable".
     """
-    target = TransportTarget.from_state({})
+    # settings-only by design (see check_transport_config): a boot-time host
+    # reachability probe with no per-session state to read.
+    target = resolve_transport_target(None)
     chan = resolve_channel_name()
     timeout = _self_check_timeout()
     try:
@@ -1134,7 +1172,9 @@ def _extract_operator_image_version(images: list[str]) -> str:
     return m.group(1) if m else ""
 
 
-async def check_chaosblade_operator() -> CheckResult:
+async def check_chaosblade_operator(
+    *, target: TransportTarget | None = None,
+) -> CheckResult:
     """Check if ChaosBlade Operator is deployed and capture its image tag."""
     if _is_host_scope_channel():
         # host-scope drill: the ChaosBlade Operator is a K8s component and
@@ -1154,7 +1194,7 @@ async def check_chaosblade_operator() -> CheckResult:
     timeout = _self_check_timeout()
 
     try:
-        result = await exec_kubectl_raw("get", v_args, timeout=timeout)
+        result = await exec_kubectl_raw("get", v_args, timeout=timeout, target=target)
     except Exception as e:
         return CheckResult(
             name="chaosblade_operator", severity="warning", passed=False,

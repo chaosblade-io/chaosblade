@@ -39,7 +39,14 @@ def _patch_streaming_common(resolution, recover_data):
         ),
         patch(
             "chaos_agent.persistence.task_store.get_task_store",
-            new=AsyncMock(return_value=MagicMock(update_task_state=AsyncMock())),
+            new=AsyncMock(return_value=MagicMock(
+                update_task_state=AsyncMock(),
+                # recover_stream() expands a short task-id prefix through
+                # resolve_full_task_id first; these keep the store on the
+                # not_found path so inject_task_id passes through unchanged.
+                get=AsyncMock(return_value=None),
+                find_ids_by_prefix=AsyncMock(return_value=[]),
+            )),
         ),
         patch("chaos_agent.tools.wait.reset_wait_state"),
         patch("chaos_agent.cli.runner.subscribe", return_value=MagicMock()),

@@ -11,16 +11,31 @@ from chaos_agent.memory.session_finalizer import (
 logger = logging.getLogger(__name__)
 
 
-def _format_error(e: Exception) -> tuple[int, str]:
+def _format_error(e: Exception, domain: str = "") -> tuple[int, str]:
     """Format an exception into (error_code, message) with type info.
 
     - ChaosAgentError subclasses: use their built-in error_code
-    - Other exceptions: code 4001 with type name prefix for debuggability
+    - Other exceptions: a domain-appropriate catch-all code with type name
+      prefix for debuggability.
+
+    The default catch-all is 4001 (RECOVERY_FAILED) — correct for the recover
+    and confirm arms, whose unclassified errors really are recovery-side. The
+    ``inject`` domain uses INTERNAL_ERROR (5099) instead: an inject-period
+    interruption (e.g. an LLM ``httpx.ReadTimeout`` in the verifier loop) never
+    entered recovery, so wearing RECOVERY_FAILED is a semantic collision that
+    reads as "recovery failed" for a run with no recovery phase. 5099 is
+    domain-neutral, and unlike INJECTION_FAILED (4002) it does NOT overclaim
+    that the injection itself failed — whether the fault landed is reported
+    separately by the durable Layer-1 floor (``terminal_task_state`` /
+    ``data["result"]``), so the code axis stays honest about "the run was
+    interrupted" without contradicting the outcome axis.
     """
     from chaos_agent.errors import ChaosAgentError
 
     if isinstance(e, ChaosAgentError):
         return e.error_code, f"{type(e).__name__}: {e}"
+    if domain == "inject":
+        return 5099, f"{type(e).__name__}: {e}"  # ResponseCode.INTERNAL_ERROR
     return 4001, f"{type(e).__name__}: {e}"
 
 

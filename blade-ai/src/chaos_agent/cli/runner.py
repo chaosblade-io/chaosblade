@@ -33,7 +33,7 @@ from chaos_agent.skills.catalog_generator import (
     generate_skill_catalog,
     infer_scope,
 )
-from chaos_agent.skills.loader import get_skills_dir
+from chaos_agent.skills.loader import get_skill_roots, get_skills_dir
 from chaos_agent.skills.models import SKILL_TYPE_FAULT_INJECTION
 from chaos_agent.skills.prerequisites import PrerequisitesChecker
 from chaos_agent.skills.registry import SkillRegistry
@@ -41,6 +41,7 @@ from chaos_agent.utils.fault_type import extract_fault_type
 from chaos_agent.utils.time import now_iso
 from chaos_agent.cli.result_builder import (
     _build_inject_result_events,
+    _vehicle_teardown_hint,
 )
 from chaos_agent.cli.session_finalize import (
     _finalize_inject_session,
@@ -164,9 +165,11 @@ class AgentRunner:
         if self._initialized:
             return
 
-        # Initialize skill registry
+        # Initialize skill registry — merge-load the user root first, then
+        # the read-only built-in pack, so the built-in cases are always
+        # available and a user skill of the same name shadows them.
         self._registry = SkillRegistry()
-        self._registry.load_from_directory(get_skills_dir())
+        self._registry.load_from_roots(get_skill_roots())
 
         # Check skills loaded
         self._check_skills_loaded(self._registry)
@@ -205,11 +208,11 @@ class AgentRunner:
         Warns if no skills found, as the agent cannot perform fault injection without skills.
         """
         if len(registry) == 0:
-            skills_dir = get_skills_dir()
+            roots = get_skill_roots()
             logger.warning(
-                f"No skills loaded from {skills_dir}. "
+                f"No skills loaded from {', '.join(str(r) for r in roots)}. "
                 f"The agent will not be able to perform fault injection. "
-                f"Please copy skill directories (each containing SKILL.md) to {skills_dir}/"
+                f"Please copy skill directories (each containing SKILL.md) to {roots[0] if roots else get_skills_dir()}/"
             )
 
     # ---- inject_stream ----
@@ -287,7 +290,8 @@ class AgentRunner:
             # Transport/channel fields are config-driven for the CLI surface
             # (AGENTS.md CLI syntax exposes no --ssh-host/--kube-connection-mode
             # flags), so these kwargs are normally absent and fall back to
-            # settings via TransportTarget.from_state. They are read here only to
+            # settings via the transport seam (resolve_transport_target). They
+            # are read here only to
             # honor a programmatic caller that does supply them.
             kubewiz_cluster_uuid=kwargs.get("cluster_uuid", ""),
             kubewiz_profile=kwargs.get("profile", ""),
@@ -350,6 +354,13 @@ class AgentRunner:
         # (one event, two words, two user-visible surfaces: the r55 F2
         # split, still open on the inject-CLI side).
         abort_word = ""
+        # Reason channel (error_override): the generic except arm below
+        # stashes the cause it builds for the user so the finally's session
+        # finalize can deposit it into a reason-less projection — an uncaught
+        # exception kills the node before it writes failure_reason to the
+        # graph state, and the durable record must not lose the cause the
+        # orchestrator witnessed. Empty on every non-crash path.
+        _terminal_reason = ""
 
         # Orphan-row guard: SIGTERM's default kill disposition leaves the
         # row at its last mid-graph upsert (see _install_sigterm_cancel_guard).
@@ -532,10 +543,30 @@ class AgentRunner:
             raise
 
         except Exception as e:
-            code, msg = _format_error(e)
+            code, msg = _format_error(e, domain="inject")
             logger.exception(f"Stream inject failed for task {task_id}")
 
             rollback_info = await auto_rollback(graph, config)
+            # Reason channel: the same cause string the user-facing result
+            # carries, stashed for the finally's finalize to deposit into a
+            # reason-less projection (graph state wins when it has one).
+            _terminal_reason = f"internal_error: Inject failed: {msg}{rollback_info}"
+
+            # Owed-teardown symmetry (W-78R-1): read the FINAL checkpoint
+            # state, not initial_state — a carrier armed mid-run lives only in
+            # the checkpoint, so building the crash envelope off initial_state
+            # reports an empty vehicle_teardown_pending and never surfaces the
+            # `blade-ai recover` handoff. Fail-soft to initial_state: a
+            # state-read error must never mask the original crash.
+            try:
+                _crash_snap = await graph.aget_state(config)
+                _crash_values = (
+                    _crash_snap.values
+                    if _crash_snap and _crash_snap.values
+                    else initial_state
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never mask crash
+                _crash_values = initial_state
 
             yield StreamEvent(
                 type="error",
@@ -543,21 +574,44 @@ class AgentRunner:
                 task_id=task_id,
             )
             from chaos_agent.agent.result.operation_result import build_inject_status_data_from_state
+            from chaos_agent.agent.state import terminal_task_state
 
+            # Honest terminal label (a82984a3 root cure): the envelope stays a
+            # ``fail`` (the CLI run WAS interrupted — an exception bubbled) but
+            # ``data["result"]`` is derived from the durable checkpoint via the
+            # SAME single source the audit row uses (``terminal_task_state`` →
+            # the Layer-1 floor). So a ReadTimeout that killed the verifier
+            # AFTER injection landed reads "injected"/"unverified" here, not a
+            # hardcoded "failed" that mislabels a successful injection as a
+            # failed one. No durable evidence ⇒ the floor is None ⇒ "failed"
+            # stands. Envelope axis (operation interrupted) and data axis
+            # (injection outcome) are deliberately separate.
+            _crash_data = build_inject_status_data_from_state(
+                _crash_values,
+                task_id,
+                result=terminal_task_state(_crash_values),
+                error=_terminal_reason,
+            )
             yield StreamEvent(
                 type="result",
                 content=json.dumps(JSONEnvelope.fail(
                     code=code,
                     message=f"Inject failed: {msg}{rollback_info}",
-                    data=build_inject_status_data_from_state(
-                        initial_state,
-                        task_id,
-                        result="failed",
-                        error=f"internal_error: Inject failed: {msg}{rollback_info}",
-                    ),
+                    data=_crash_data,
                 ), ensure_ascii=False),
                 task_id=task_id,
             )
+            # CLI hint symmetry: render the owed-teardown guidance exactly as
+            # the success path (_build_inject_result_events) does, so an
+            # operator watching a crashed inject is told to collect the
+            # carrier stack instead of discovering it hours later.
+            _pending_vehicles = _crash_data.get("vehicle_teardown_pending") or []
+            if _pending_vehicles:
+                yield StreamEvent(
+                    type="token",
+                    content=_vehicle_teardown_hint(_pending_vehicles, task_id),
+                    task_id=task_id,
+                )
         finally:
             if _sigterm_cleanup is not None:
                 _sigterm_cleanup()
@@ -576,6 +630,9 @@ class AgentRunner:
                 # inferred "failed" (the finalizer's own verdict gate
                 # still yields to a reached verdict).
                 status_override=abort_word or None,
+                # Reason channel: fill a reason-less projection with the
+                # cause the crash arm witnessed (graph state wins).
+                error_override=_terminal_reason or None,
             )
             done_event.set()
             await printer_task
@@ -634,7 +691,8 @@ class AgentRunner:
             # Transport/channel fields are config-driven for the CLI surface
             # (AGENTS.md CLI syntax exposes no --ssh-host/--kube-connection-mode
             # flags), so these kwargs are normally absent and fall back to
-            # settings via TransportTarget.from_state. They are read here only to
+            # settings via the transport seam (resolve_transport_target). They
+            # are read here only to
             # honor a programmatic caller that does supply them.
             kubewiz_cluster_uuid=kwargs.get("cluster_uuid", ""),
             kubewiz_profile=kwargs.get("profile", ""),
@@ -688,6 +746,10 @@ class AgentRunner:
         # signal arm below and rides into the session finalize as its
         # override (see inject_stream for the split it closes).
         abort_word = ""
+        # Reason channel (error_override): see the streaming twin — the
+        # generic except arm stashes the crash cause for the finally's
+        # finalize to deposit into a reason-less projection.
+        _terminal_reason = ""
 
         # Orphan-row guard (see _install_sigterm_cancel_guard).
         _sigterm_cleanup = _install_sigterm_cancel_guard()
@@ -782,21 +844,47 @@ class AgentRunner:
             raise
 
         except Exception as e:
-            code, msg = _format_error(e)
+            code, msg = _format_error(e, domain="inject")
             logger.exception(f"Local inject failed for task {task_id}")
 
             rollback_status = await auto_rollback(self._agents["pipeline"], config)
+            # Reason channel: the same cause string the user-facing envelope
+            # carries, stashed for the finally's finalize to deposit into a
+            # reason-less projection (graph state wins when it has one).
+            _terminal_reason = f"internal_error: Inject failed: {msg}{rollback_status}"
 
             from chaos_agent.agent.result.operation_result import build_inject_status_data_from_state
+            from chaos_agent.agent.state import terminal_task_state
 
+            # Owed-teardown symmetry (W-78R-1): see the inject_stream crash
+            # arm — read the FINAL checkpoint state so a mid-run carrier is
+            # surfaced in the returned data dict (the non-stream contract
+            # carries the field in-band; carrier-doc guidance covers the
+            # non-interactive follow-up, per result_builder). Fail-soft to
+            # initial_state: a state-read error must never mask the crash.
+            try:
+                _crash_snap = await self._agents["pipeline"].aget_state(config)
+                _crash_values = (
+                    _crash_snap.values
+                    if _crash_snap and _crash_snap.values
+                    else initial_state
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never mask crash
+                _crash_values = initial_state
+
+            # Honest terminal label (a82984a3 root cure): see the inject_stream
+            # crash arm — ``data["result"]`` derives from the durable checkpoint
+            # via the single-source ``terminal_task_state`` (Layer-1 floor), not
+            # a hardcoded "failed". The envelope stays ``fail`` (the run was
+            # interrupted); the data axis carries the injection outcome.
             return JSONEnvelope.fail(
                 code=code,
                 message=f"Inject failed: {msg}{rollback_status}",
                 data=build_inject_status_data_from_state(
-                    initial_state,
+                    _crash_values,
                     task_id,
-                    result="failed",
-                    error=f"internal_error: Inject failed: {msg}{rollback_status}",
+                    result=terminal_task_state(_crash_values),
+                    error=_terminal_reason,
                 ),
             )
         finally:
@@ -811,6 +899,9 @@ class AgentRunner:
                 # inject_stream) — the finalizer's own verdict gate still
                 # yields to a verdict the graph already reached.
                 status_override=abort_word or None,
+                # Reason channel: fill a reason-less projection with the
+                # cause the crash arm witnessed (graph state wins).
+                error_override=_terminal_reason or None,
             )
             done_event.set()
             await printer_task
@@ -1253,11 +1344,52 @@ class AgentRunner:
         reset_wait_state()
 
         inject_task_id = task_id
+        # Expand a human-supplied short prefix (``inject-c28f25f5``) to the full
+        # task id BEFORE the thread_id / config / aget_state / store / session
+        # writes below key on it — every one of those needs the exact UUID, so a
+        # short id must be resolved at the very top, not deeper in the lookup.
+        from chaos_agent.agent.result.task_snapshot import resolve_full_task_id
+
+        _id_res = await resolve_full_task_id(inject_task_id)
+        if _id_res.status == "ambiguous":
+            return JSONEnvelope.fail(
+                code=ResponseCode.AMBIGUOUS_TASK_ID,
+                message=(
+                    f"Task id prefix '{inject_task_id}' matches "
+                    f"{len(_id_res.candidates)} tasks — pass the full id. "
+                    f"Candidates: {', '.join(_id_res.candidates)}"
+                ),
+            )
+        if _id_res.status == "resolved" and _id_res.task_id != inject_task_id:
+            logger.info(
+                "recover: expanded task-id prefix %r → %s",
+                inject_task_id, _id_res.task_id,
+            )
+            inject_task_id = _id_res.task_id
+        # not_found → leave inject_task_id unchanged; resolve_recover_initial_state
+        # below still tries the checkpoint/session fallback and emits the 2001.
+
         # Recover gets its own task record file, cross-referenced back to inject
-        # via parent_task_id. The langgraph thread_id stays = inject_task_id so
-        # the recover graph can read inject's checkpoint.
+        # via parent_task_id.
         record_task_id = new_recover_task_id()
-        config = {"configurable": {"thread_id": inject_task_id}, "recursion_limit": settings.recursion_limit}
+        # Two threads, two jobs — mirrors the L4 (l4/recovery.py) and HTTP
+        # (server/routes/recover_stream.py) recover paths, which already split
+        # inject_config / recover_config this way:
+        #   inject_config  → READ-ONLY inheritance of inject's checkpoint facts
+        #                    (pipeline.aget_state below).
+        #   recover_config → the recover graph RUNS on its own thread keyed by
+        #                    record_task_id. It must NOT share inject's thread:
+        #                    that thread's ``messages`` channel is an append-only
+        #                    add_messages ledger, so running recover on it makes
+        #                    every attempt inherit the previous attempt's stale
+        #                    messages (capability violations, "profile
+        #                    unsupported" system notes) — a failed recover would
+        #                    poison the next. Inject facts still reach the recover
+        #                    graph through the explicit ``inject_context`` digest
+        #                    in initial_state (thread-independent), exactly as the
+        #                    fresh-thread L4/HTTP paths already do.
+        inject_config = {"configurable": {"thread_id": inject_task_id}, "recursion_limit": settings.recursion_limit}
+        recover_config = {"configurable": {"thread_id": record_task_id}, "recursion_limit": settings.recursion_limit}
 
         # Subscribe to status events emitted by recover nodes (keyed by state.task_id)
         status_queue = subscribe(record_task_id)
@@ -1278,6 +1410,10 @@ class AgentRunner:
         # abort event shipped "cancelled" to the row and the optimistic
         # "completed" to the session record.
         abort_word = ""
+        # Reason channel (error_override): the generic except arm below
+        # stashes the crash cause so the finally's finalize can deposit it
+        # into a reason-less projection (graph state wins when it has one).
+        _terminal_reason = ""
 
         # Orphan-row guard: SIGTERM's default kill disposition leaves the
         # inject row AND this run's recover session at their last mid-run
@@ -1286,7 +1422,7 @@ class AgentRunner:
 
         try:
             # Try to fetch LangGraph checkpoint as supplemental live context.
-            current_state = await self._agents["pipeline"].aget_state(config)
+            current_state = await self._agents["pipeline"].aget_state(inject_config)
             checkpoint_values = current_state.values if current_state and current_state.values else {}
 
             from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
@@ -1301,7 +1437,10 @@ class AgentRunner:
             if resolution is None:
                 return JSONEnvelope.fail(
                     code=ResponseCode.TASK_NOT_FOUND,
-                    message=f"Task not recoverable: {inject_task_id}",
+                    message=(
+                        f"Task not recoverable: {inject_task_id} "
+                        f"(no task matches this id or prefix — pass the full task UUID)"
+                    ),
                 )
 
             initial_state = resolution.initial_state
@@ -1338,7 +1477,7 @@ class AgentRunner:
             if not settings.is_debug:
                 sys.stderr.write("  ⏳ Fault recovery in progress — the AI is recovering and verifying, please wait...\n")
                 sys.stderr.flush()
-            result = await self._agents["recover"].ainvoke(initial_state, config)
+            result = await self._agents["recover"].ainvoke(initial_state, recover_config)
 
             from chaos_agent.agent.result.operation_result import (
                 build_recover_cli_data_from_state,
@@ -1383,9 +1522,31 @@ class AgentRunner:
             recover_failed = True
             code, msg = _format_error(e)
             logger.exception(f"Local recover failed for task {inject_task_id}")
+            # Reason channel: the same cause string the user-facing envelope
+            # carries, stashed for the finally's finalize to deposit into a
+            # reason-less projection (graph state wins when it has one).
+            _terminal_reason = f"internal_error: Recovery failed: {msg}"
             from chaos_agent.agent.result.operation_result import (
                 build_recover_cli_failure_data_from_state,
             )
+
+            # a82984a3 root cure (recover arm): read the recover graph's OWN
+            # final checkpoint so the crash envelope reflects what was MEASURED
+            # — a destroy that landed before the verifier loop died reads
+            # "unverified" via the durable-evidence floor, not a hard-coded
+            # "failed". Fail-soft to no checkpoint: a state-read error must
+            # never mask the original crash (mirrors the inject crash arm).
+            try:
+                _recover_crash_snap = await self._agents["recover"].aget_state(
+                    recover_config
+                )
+                _recover_crash_values = (
+                    _recover_crash_snap.values
+                    if _recover_crash_snap and _recover_crash_snap.values
+                    else {}
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never mask crash
+                _recover_crash_values = {}
 
             return JSONEnvelope.fail(
                 code=code,
@@ -1394,7 +1555,8 @@ class AgentRunner:
                     inject_task_id,
                     state_values,
                     experiment_uid=experiment_uid or "",
-                    error=f"internal_error: Recovery failed: {msg}",
+                    error=_terminal_reason,
+                    recover_state_values=_recover_crash_values,
                 ),
             )
         finally:
@@ -1410,7 +1572,7 @@ class AgentRunner:
                 await finalize_recover_session(
                     self._session_store,
                     self._agents["recover"],
-                    config,
+                    recover_config,
                     record_task_id,
                     inject_task_id,
                     state_values,
@@ -1423,6 +1585,9 @@ class AgentRunner:
                     default_status=(
                         abort_word or ("failed" if recover_failed else "completed")
                     ),
+                    # Reason channel: fill a reason-less projection with the
+                    # cause the crash arm witnessed (graph state wins).
+                    error_override=_terminal_reason or None,
                 )
             done_event.set()
             await printer_task
@@ -1459,7 +1624,42 @@ class AgentRunner:
 
         inject_task_id = task_id
         record_task_id = new_recover_task_id()
-        config = {"configurable": {"thread_id": inject_task_id}, "recursion_limit": settings.recursion_limit}
+        # Expand a human-supplied short prefix to the full task id BEFORE the
+        # thread_id / config / aget_state / store / session writes below key on
+        # it (twin of recover()'s expansion). record_task_id is already minted so
+        # the ambiguous terminal can be emitted on the recover session's id.
+        from chaos_agent.agent.result.task_snapshot import resolve_full_task_id
+
+        _id_res = await resolve_full_task_id(inject_task_id)
+        if _id_res.status == "ambiguous":
+            _amb_msg = (
+                f"Task id prefix '{inject_task_id}' matches "
+                f"{len(_id_res.candidates)} tasks — pass the full id. "
+                f"Candidates: {', '.join(_id_res.candidates)}"
+            )
+            yield StreamEvent(type="error", content=_amb_msg, task_id=record_task_id)
+            yield StreamEvent(
+                type="result",
+                content=json.dumps(JSONEnvelope.fail(
+                    code=ResponseCode.AMBIGUOUS_TASK_ID, message=_amb_msg,
+                ), ensure_ascii=False),
+                task_id=record_task_id,
+            )
+            return
+        if _id_res.status == "resolved" and _id_res.task_id != inject_task_id:
+            logger.info(
+                "recover: expanded task-id prefix %r → %s",
+                inject_task_id, _id_res.task_id,
+            )
+            inject_task_id = _id_res.task_id
+        # not_found → leave inject_task_id unchanged; the resolver below still
+        # tries the checkpoint/session fallback and emits the 2001.
+        # Two threads, two jobs — twin of recover()'s split (see the comment
+        # there): inject_config only READS inject's checkpoint; the recover graph
+        # RUNS on record_task_id's own thread so attempts never inherit each
+        # other's stale messages off the shared add_messages ledger.
+        inject_config = {"configurable": {"thread_id": inject_task_id}, "recursion_limit": settings.recursion_limit}
+        recover_config = {"configurable": {"thread_id": record_task_id}, "recursion_limit": settings.recursion_limit}
 
         status_queue = subscribe(record_task_id)
         done_event = asyncio.Event()
@@ -1477,6 +1677,10 @@ class AgentRunner:
         # an interrupt is the THIRD terminal case the boolean cannot
         # spell, and it outranks both boolean exits.
         abort_word = ""
+        # Reason channel (error_override): the streaming twin of recover()'s
+        # crash-cause stash — the generic except arm below fills it for the
+        # finally's finalize to deposit into a reason-less projection.
+        _terminal_reason = ""
 
         # Orphan-row guard: SIGTERM's default kill disposition leaves the
         # inject row AND this run's recover session at their last mid-run
@@ -1484,7 +1688,7 @@ class AgentRunner:
         _sigterm_cleanup = _install_sigterm_cancel_guard()
 
         try:
-            current_state = await self._agents["pipeline"].aget_state(config)
+            current_state = await self._agents["pipeline"].aget_state(inject_config)
             checkpoint_values = current_state.values if current_state and current_state.values else {}
 
             from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
@@ -1497,16 +1701,20 @@ class AgentRunner:
                 kubeconfig_override=kwargs.get("kubeconfig") or None,
             )
             if resolution is None:
+                _nf_msg = (
+                    f"Task not recoverable: {inject_task_id} "
+                    f"(no task matches this id or prefix — pass the full task UUID)"
+                )
                 yield StreamEvent(
                     type="error",
-                    content=f"Task not recoverable: {inject_task_id}",
+                    content=_nf_msg,
                     task_id=record_task_id,
                 )
                 yield StreamEvent(
                     type="result",
                     content=json.dumps(JSONEnvelope.fail(
                         code=ResponseCode.TASK_NOT_FOUND,
-                        message=f"Task not recoverable: {inject_task_id}",
+                        message=_nf_msg,
                     ), ensure_ascii=False),
                     task_id=record_task_id,
                 )
@@ -1536,7 +1744,7 @@ class AgentRunner:
 
             # Stream the recover graph (includes two-layer verification).
             async for event in self._agents["recover"].astream_events(
-                initial_state, config, version="v2"
+                initial_state, recover_config, version="v2"
             ):
                 for stream_evt in parse_stream_events(event):
                     stream_evt.task_id = record_task_id
@@ -1544,7 +1752,7 @@ class AgentRunner:
 
             # astream_events does not return final values the way ainvoke
             # does — rebuild them from the checkpoint.
-            final_snapshot = await self._agents["recover"].aget_state(config)
+            final_snapshot = await self._agents["recover"].aget_state(recover_config)
             result_values = (
                 final_snapshot.values if final_snapshot and final_snapshot.values else {}
             )
@@ -1594,9 +1802,31 @@ class AgentRunner:
             recover_failed = True
             code, msg = _format_error(e)
             logger.exception(f"Local recover_stream failed for task {inject_task_id}")
+            # Reason channel: the same cause string the user-facing result
+            # carries, stashed for the finally's finalize to deposit into a
+            # reason-less projection (graph state wins when it has one).
+            _terminal_reason = f"internal_error: Recovery failed: {msg}"
             from chaos_agent.agent.result.operation_result import (
                 build_recover_cli_failure_data_from_state,
             )
+
+            # a82984a3 root cure (recover arm): read the recover graph's OWN
+            # final checkpoint so the crash result reflects what was MEASURED
+            # — a destroy that landed before the verifier loop died reads
+            # "unverified" via the durable-evidence floor, not a hard-coded
+            # "failed". Fail-soft to no checkpoint: a state-read error must
+            # never mask the original crash (mirrors the inject crash arm).
+            try:
+                _recover_crash_snap = await self._agents["recover"].aget_state(
+                    recover_config
+                )
+                _recover_crash_values = (
+                    _recover_crash_snap.values
+                    if _recover_crash_snap and _recover_crash_snap.values
+                    else {}
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never mask crash
+                _recover_crash_values = {}
 
             yield StreamEvent(
                 type="error",
@@ -1612,7 +1842,8 @@ class AgentRunner:
                         inject_task_id,
                         state_values,
                         experiment_uid=experiment_uid or "",
-                        error=f"internal_error: Recovery failed: {msg}",
+                        error=_terminal_reason,
+                        recover_state_values=_recover_crash_values,
                     ),
                 ), ensure_ascii=False),
                 task_id=record_task_id,
@@ -1629,7 +1860,7 @@ class AgentRunner:
                 await finalize_recover_session(
                     self._session_store,
                     self._agents["recover"],
-                    config,
+                    recover_config,
                     record_task_id,
                     inject_task_id,
                     state_values,
@@ -1642,6 +1873,9 @@ class AgentRunner:
                     default_status=(
                         abort_word or ("failed" if recover_failed else "completed")
                     ),
+                    # Reason channel: fill a reason-less projection with the
+                    # cause the crash arm witnessed (graph state wins).
+                    error_override=_terminal_reason or None,
                 )
             done_event.set()
             await printer_task
@@ -1886,7 +2120,7 @@ class AgentRunner:
         """
         if self._registry is None:
             self._registry = SkillRegistry()
-            self._registry.load_from_directory(get_skills_dir())
+            self._registry.load_from_roots(get_skill_roots())
         return JSONEnvelope.ok(
             data={
                 "version": __version__,

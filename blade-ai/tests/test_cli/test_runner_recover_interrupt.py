@@ -79,6 +79,16 @@ class _StubTaskStore:
     async def update_task_state(self, *args, **kwargs):
         return None
 
+    # recover() now expands a short task-id prefix through resolve_full_task_id
+    # BEFORE the recover lookup; these keep the stub on the not_found path so
+    # inject_task_id passes through unchanged (resolve_recover_initial_state is
+    # patched separately below).
+    async def get(self, *args, **kwargs):
+        return None
+
+    async def find_ids_by_prefix(self, *args, **kwargs):
+        return []
+
 
 def _build_runner(
     tmp_path: Path, recover_graph
@@ -219,3 +229,83 @@ async def test_completed_recover_keeps_completed(tmp_path):
     assert session is not None
     assert session["status"] == "completed"
     assert session["result_summary"]["data"]["result"] == "recovered"
+
+
+class _RecordingPipeline:
+    """Records the thread_id its ``aget_state`` is called with."""
+
+    def __init__(self, values: dict | None = None):
+        self.values = values or {}
+        self.seen_thread_ids: list[str] = []
+
+    async def aget_state(self, config):
+        self.seen_thread_ids.append(config["configurable"]["thread_id"])
+        return SimpleNamespace(values=self.values)
+
+
+class _RecordingRecoverGraph:
+    """A finishing recover graph that records every thread_id it is run /
+    read on (``ainvoke`` for the run, ``aget_state`` for the finalizer)."""
+
+    def __init__(self, values: dict):
+        self.values = values
+        self.seen_thread_ids: list[str] = []
+
+    async def ainvoke(self, state, config):
+        self.seen_thread_ids.append(config["configurable"]["thread_id"])
+        return self.values
+
+    async def aget_state(self, config):
+        self.seen_thread_ids.append(config["configurable"]["thread_id"])
+        return SimpleNamespace(values=self.values)
+
+
+@pytest.mark.asyncio
+async def test_recover_runs_on_its_own_thread_not_injects(tmp_path):
+    """Root-fix invariant for cross-attempt message poisoning.
+
+    The recover graph must RUN on its own ``record_task_id`` thread, while
+    inject's checkpoint is only READ through the ``inject_task_id`` thread.
+    Sharing one thread parks every recover attempt on the same append-only
+    ``add_messages`` ledger, so attempt N re-inherits attempt N-1's stale
+    messages (capability violations, "profile unsupported" notes) — a failed
+    recover poisons the next. This mirrors the L4/HTTP recover paths, which
+    already split inject_config / recover_config.
+
+    Drives the real ``AgentRunner.recover()`` and captures the thread_id each
+    graph is actually invoked with.
+    """
+    pipeline = _RecordingPipeline({})
+    recover_graph = _RecordingRecoverGraph(_RECOVER_DONE)
+    runner = AgentRunner()
+    runner._initialized = True
+    runner._agents = {"pipeline": pipeline, "recover": recover_graph}
+    runner._session_store = SessionStore(tmp_path / "sessions")
+    runner._checkpointer_conn = None
+
+    with (
+        patch(
+            "chaos_agent.cli.runner.new_recover_task_id",
+            return_value="recover-split-1",
+        ),
+        patch(
+            "chaos_agent.agent.result.task_snapshot.resolve_recover_initial_state",
+            new=AsyncMock(return_value=_resolution()),
+        ),
+        patch(
+            "chaos_agent.persistence.task_store.get_task_store",
+            new=AsyncMock(return_value=_StubTaskStore()),
+        ),
+    ):
+        envelope = await runner.recover("inject-split-1")
+
+    assert envelope["status"] == "success", envelope
+    # inject's checkpoint is READ on the inject thread ...
+    assert pipeline.seen_thread_ids == ["inject-split-1"]
+    # ... but the recover graph RUNS (and is finalized) on its OWN thread.
+    assert "recover-split-1" in recover_graph.seen_thread_ids
+    # Reverse assertion — the bug form: recover must NEVER run on the inject
+    # thread, or the two attempts share one accumulating ledger.
+    assert "inject-split-1" not in recover_graph.seen_thread_ids
+    # The two graphs touch disjoint threads: no shared checkpoint ledger.
+    assert set(pipeline.seen_thread_ids).isdisjoint(recover_graph.seen_thread_ids)
