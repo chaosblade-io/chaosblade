@@ -20,14 +20,15 @@ from chaos_agent.agent.execution_artifacts import (
 )
 from chaos_agent.agent.capabilities import (
     build_capability_context,
+    explain_unsupported_environment,
     filter_tools_for_context,
+    resolve_profile_verdict,
 )
 from chaos_agent.agent.spec.fault_spec import read_fault_spec
 from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
     inject_task_id_into_tool_calls,
-    sync_kubewiz_runtime,
 )
 # Baseline-pair lifecycle (change stale-baseline-pair-seam-cleanup): the
 # replan seam must remove the synthetic pair by its stable ids — imported
@@ -2480,6 +2481,41 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         if early_exit is not None:
             return early_exit
 
+        # Fail-fast capability gate. ``profile=UNKNOWN`` is a DETERMINISTIC
+        # dead-end: the environment cannot dispatch any provider tool, and the
+        # LLM can neither repair that nor converge on it by retrying — yet
+        # execute_loop previously ran its ReAct step with ``bind_tools([])``
+        # (line ~2684) and spun until MAX_EXECUTE_LOOP, burning the whole
+        # budget on turns that could not mutate anything. agent_loop already
+        # hard-stops before its FIRST LLM call for the same fact
+        # (nodes/execute/agent_loop.py: ``if not capability_context.supported``);
+        # this is the execute-phase twin, reached by paths that skip that gate
+        # (checkpoint resumes, batch replans). O(1), zero tokens, and the cause
+        # is named off the SAME verdict the per-tool refusal uses — no
+        # re-derivation. No mutation has happened yet, so this terminates as a
+        # pre-execution rejection, mirroring agent_loop's PLANNING_REJECTED.
+        _verdict = resolve_profile_verdict(state)
+        if not _verdict.supported:
+            _msg = explain_unsupported_environment(_verdict, state)
+            logger.warning(
+                "execute_loop fail-fast: environment profile unresolved "
+                "(reason=%s) on task %s — terminating before the LLM step",
+                _verdict.reason, task_id,
+            )
+            tracker.fail(_msg)
+            result = {
+                "execute_loop_count": count,
+                "safety_reason": _msg,
+                **fail_state(
+                    FailureCategory.PLANNING_REJECTED,
+                    _msg,
+                    state.get("messages", []),
+                    llm_analysis=_msg,
+                ),
+            }
+            await sync_to_store(state, result)
+            return result
+
         # Freeze the progress-ledger anchor on the first execute iteration.
         # Lazy (execute_loop runs AFTER confirmation_gate, so fault_spec here is
         # the APPROVED goal, not a pre-confirmation draft) and idempotent (only
@@ -2638,6 +2674,18 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 _ledger_msg = HumanMessage(content=wrap_system_reminder(_ledger_tail))
                 messages.append(_ledger_msg)
                 _hints_for_state.append(_ledger_msg)
+
+            # --- Authoritative system clock (the one time fact no message carries) ---
+            # The execute-loop LLM has no wall clock and its context channels
+            # carried no timestamp, so it reverse-engineered today's date from a
+            # binary's build year (inject-14fdcd15). The fault-window position is
+            # left to the verifier — a blind phase reading injection_start_time
+            # would anchor a phantom window. Rides the SAME volatile tail
+            # as the ledger — never the cacheable head — and is appended to the
+            # transient ``messages`` copy ONLY (not ``_hints_for_state``), so it
+            # re-renders fresh each round and never accumulates stale clocks.
+            from chaos_agent.agent.evidence_clock import append_time_facts_reminder
+            append_time_facts_reminder(messages, state)
 
             # --- Convergence hints (last-iteration conclusion prompts) ---
             messages.extend(_build_convergence_hints(
@@ -2987,7 +3035,6 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             kubeconfig = _resolve_kubeconfig(state)
             inject_kubeconfig_into_tool_calls(response, kubeconfig)
             inject_task_id_into_tool_calls(response, task_id)
-            sync_kubewiz_runtime(state)
 
             # Output-limit truncation: the tool calls in this response may carry
             # silently incomplete arguments, so none of them may run against the
@@ -3103,10 +3150,12 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             merged_artifacts = result.get("execution_artifacts")
             if merged_artifacts is None:
                 merged_artifacts = state.get("execution_artifacts")
+            from chaos_agent.transports import resolve_transport_target
             cleaned_artifacts, _ = await cleanup_debug_pod_artifacts(
                 merged_artifacts,
                 kubeconfig=_resolve_kubeconfig(state),
                 task_id=task_id,
+                target=resolve_transport_target(state),
             )
             if cleaned_artifacts != (merged_artifacts or []):
                 result["execution_artifacts"] = cleaned_artifacts

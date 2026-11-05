@@ -142,6 +142,56 @@ class TestSafetyCheck:
         assert result["safety_status"] == "rejected"
 
     @pytest.mark.asyncio
+    async def test_unregistered_scope_rejected_at_gate(self, sample_agent_state):
+        # Defect A (#34-R): a NON-EMPTY but UNREGISTERED fault scope (the case
+        # catalogue's organizational category "workload" mistaken for a concrete
+        # resource scope) must be rejected HERE at the freeze gate — fail-fast —
+        # naming the offending scope and the valid vocabulary. Before the fix it
+        # sailed through the truthiness-only check and surfaced much later as
+        # PROFILE_UNKNOWN → empty toolset → kubeconfig-misattributed refusals.
+        state = sample_agent_state
+        state["skill_name"] = "pod-delete"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="workload", fault_target="replicas",
+            fault_action="scale-down", namespace="default", names=("d",),
+        )
+
+        result = await safety_check(state)
+        assert result["safety_status"] == "rejected"
+        assert "workload" in result["safety_reason"]
+        assert "not a registered fault domain" in result["safety_reason"]
+        # The valid vocabulary is surfaced so the authoring error is actionable.
+        assert "deployment" in result["safety_reason"]
+
+    @pytest.mark.asyncio
+    async def test_registered_scope_passes_the_vocabulary_gate(
+        self, sample_agent_state, monkeypatch,
+    ):
+        # Regression guard for A1: a REGISTERED scope must not be tripped by the
+        # new vocabulary check — it proceeds to the downstream gates exactly as
+        # before (here: no kubeconfig → the "cluster access" warning path).
+        from unittest.mock import AsyncMock, patch
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
+        state = sample_agent_state
+        state["skill_name"] = "pod-delete"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="deployment", fault_target="replicas",
+            fault_action="scale-down", namespace="default", names=("d",),
+        )
+
+        with patch(
+            "chaos_agent.agent.nodes.gates.safety_check.check_blade_conflicts",
+            new_callable=AsyncMock,
+            return_value=([], []),
+        ):
+            result = await safety_check(state)
+        assert result["safety_status"] != "rejected"
+        assert "not a registered fault domain" not in (result.get("safety_reason") or "")
+
+    @pytest.mark.asyncio
     async def test_check_order_namespace_first(self, sample_agent_state, monkeypatch):
         monkeypatch.setattr(settings, "safety_blacklist_namespaces", "kube-system")
 
@@ -610,7 +660,7 @@ class TestConfirmVictimPodsAbsent:
         # caller condition is not met and no replan fires on partial evidence.
         answers = {"gone-pod": _NOT_FOUND, "flaky-pod": _TRANSIENT}
 
-        async def fake_query(args, kubeconfig="", *, log_name=""):
+        async def fake_query(args, kubeconfig="", *, log_name="", target=None):
             return answers[args[1]]
 
         with patch(

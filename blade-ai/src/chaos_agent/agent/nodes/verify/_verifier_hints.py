@@ -22,6 +22,7 @@ def _extract_baseline_key_metrics(
     baseline: dict,
     fault_target: str,
     fault_action: str,
+    target_paths: tuple = (),
 ) -> dict[str, str]:
     """Extract structured key metrics from baseline observations.
 
@@ -30,9 +31,15 @@ def _extract_baseline_key_metrics(
     verification can reuse the same per-format parsers on
     post-injection kubectl output, not just baseline. Returns the
     fault-filtered dict the existing Layer 2 prompt builder expects.
+
+    ``target_paths`` (D4/B2) is the declared disk-fault mount path
+    (``disk_target_paths(spec)``, delegated to the FaultSpec authority)
+    threaded to the df parser so the baseline key metric is keyed on the
+    TARGET filesystem (``/drill-disk``), not the root overlay the old static
+    whitelist fell back to.
     """
     from chaos_agent.agent.nodes.verify._metric_extractor import extract_baseline_metrics
-    return extract_baseline_metrics(baseline, fault_target, fault_action)
+    return extract_baseline_metrics(baseline, fault_target, fault_action, target_paths)
 
 
 # Baseline-comparison integrity rules, injected into the Layer 2 first

@@ -35,9 +35,16 @@ class TestParseBladeStatusOutput:
         assert status == "passed"
 
     def test_destroyed_expired(self):
+        """Bug3 root fix: a bare Destroyed record (no --timeout/timestamps to
+        attribute it) is an ABSTENTION, not a counter-verdict — it now carries
+        ``warning`` + ``expired=True`` so infer_task_state defers to Layer 2 via
+        the lenient warning branches. It used to be labeled ``failed``, which
+        overloaded the word meaning "the fault did NOT take effect" and made
+        two physically-identical expired records diverge on a sub-second
+        destroy-timing coin-flip."""
         raw = json.dumps({"code": 200, "success": True, "result": {"Status": "Destroyed"}})
         status, details, expired = _parse_blade_status_output(raw)
-        assert status == "failed"
+        assert status == "warning"
         assert expired is True
         assert "expired" in details.lower()
 
@@ -58,8 +65,14 @@ class TestParseBladeStatusOutput:
         # Must not carry the misleading "increase --duration" advice.
         assert "increasing" not in details.lower()
 
-    def test_destroyed_after_timeout_is_failed(self):
-        """Record lived out its full --timeout window ⇒ genuine expiry stays failed."""
+    def test_destroyed_after_timeout_is_warning(self):
+        """Bug3 root fix: a record that lived out its full --timeout window is
+        the SAME abstention as an early destroy — Layer 1 liveness cannot judge
+        the fault's actual effects either way — so it now yields ``warning``
+        (was ``failed``). The narrative distinction survives in the details
+        string ("--timeout elapsed"); the verdict word no longer encodes it.
+        This is the horn that made ce40e733 (elapsed 180.775s vs timeout 180s)
+        diverge from f57e631e (elapsed 94.1s) on a 0.775s knife-edge."""
         raw = json.dumps({"code": 200, "success": True, "result": {
             "Status": "Destroyed",
             "CreateTime": "2026-08-16T16:22:07.000000Z",
@@ -67,14 +80,16 @@ class TestParseBladeStatusOutput:
             "Flag": " --timeout=600 --signal=15",
         }})
         status, details, expired = _parse_blade_status_output(raw)
-        assert status == "failed"
+        assert status == "warning"
         assert expired is True
         assert "--timeout elapsed" in details
 
     def test_revoked_expired(self):
+        """Bug3 root fix: Revoked is another expired (record-gone) state — an
+        abstention, so ``warning`` + ``expired=True`` (was ``failed``)."""
         raw = json.dumps({"code": 200, "success": True, "result": {"Status": "Revoked"}})
         status, details, expired = _parse_blade_status_output(raw)
-        assert status == "failed"
+        assert status == "warning"
         assert expired is True
 
     def test_api_failure(self):
@@ -288,9 +303,14 @@ class TestMapQueryK8sToLayer1:
         assert r.status == "passed"
 
     def test_expired(self):
+        """Bug3 root fix: the k8s query path unifies with the host blade_status
+        path — an expired record (Destroyed/Revoked) is an abstention, so the
+        mapped Layer 1 status is ``warning`` (was ``failed``) with ``expired``
+        still the machine flag. This path had no early-destroy nuance; it
+        labeled ALL expiry ``failed``, the harsher half of the old split."""
         q = _QueryK8sResult("failed", "expired", [], 1, True)
         r = _map_query_k8s_to_layer1(q, "{}", "pod-1", "discovery")
-        assert r.status == "failed"
+        assert r.status == "warning"
         assert r.expired is True
 
     def test_failed_not_expired(self):

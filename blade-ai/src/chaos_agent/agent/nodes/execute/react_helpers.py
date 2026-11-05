@@ -494,9 +494,28 @@ _STAGNATION_HINTS: dict[str, str] = _LOOP_HINTS  # Same reflection body for both
 
 
 def _build_loop_hint(fp: str, count: int, phase: str) -> str:
-    """Build phase-specific loop detection hint."""
+    """Build phase-specific loop detection hint.
+
+    The advisory clause is load-bearing, not decoration: this detector is
+    HINT-ONLY in every phase (all four callers — execute/verify/intent/
+    planning — inject the string and never filter bindings; only the separate
+    ``detect_action_stagnation`` soft-blocks), and it fires solely when the
+    repeated calls already produced identical ToolMessage outputs, i.e. they
+    all ran. Without saying so, the bare "LOOP DETECTED ... repeated N times"
+    reads as "the runtime caught and stopped a loop", and a model that sees an
+    unexpected downstream state then mis-attributes it to a suppressed call.
+    Ground truth inject-b3d0df6e (host端口占用案 Step-8): the model concluded
+    "the loop guard suppressed the repeated systemctl start, so the victim
+    never came up" and switched verbs to dodge a guard that never blocked
+    anything — the real cause was a same-turn concurrency race. State the fact;
+    do not issue a planning directive (hint-is-not-verdict discipline).
+    """
     detection = (
-        f"**LOOP DETECTED**: `{fp}` repeated {count} times with identical results.\n\n"
+        f"**LOOP DETECTED**: `{fp}` repeated {count} times with identical results.\n"
+        f"(Advisory only: each of those calls DID run and returned these "
+        f"results — this detection flags the repetition for you to reconsider, "
+        f"it never blocks or suppresses a call. So an unexpected state "
+        f"downstream was not caused by a suppressed call.)\n\n"
     )
     body = _LOOP_HINTS.get(phase, _LOOP_HINTS["intent"])
     return detection + body

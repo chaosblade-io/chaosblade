@@ -2,7 +2,6 @@
 
 import json
 import logging
-import shlex
 from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -10,16 +9,17 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from chaos_agent.agent.env_info import compute_env_info
 from chaos_agent.agent.capabilities import (
     build_capability_context,
+    explain_unsupported_environment,
     filter_tools_for_context,
+    resolve_profile_verdict,
 )
-from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+from chaos_agent.agent.spec.fault_spec import read_fault_spec
 from chaos_agent.agent.state_mgmt.state_lifecycle import replan_reset_state
 from chaos_agent.agent.node_names import AGENT_LOOP
 from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
     inject_task_id_into_tool_calls,
-    sync_kubewiz_runtime,
 )
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store
 from chaos_agent.agent.nodes.execute.llm_step_helpers import (
@@ -46,6 +46,7 @@ from chaos_agent.agent.prompts import (
     PromptMode,
 )
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
+from chaos_agent.agent.evidence_clock import append_time_facts_reminder
 from chaos_agent.agent.spec.skill_identity import has_active_skill, read_active_skill_name
 from chaos_agent.agent.state import AgentState
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
@@ -58,12 +59,6 @@ from chaos_agent.observability.status_tracker import (
 from chaos_agent.utils.time import parse_iso_timestamp
 
 logger = logging.getLogger(__name__)
-
-_WORKLOAD_SCOPES = frozenset({
-    "container", "pod", "deployment", "service",
-    "statefulset", "daemonset",
-})
-_INFRA_SCOPES = frozenset({"node"})
 
 
 def _ledger_tail_for_planning(state) -> str:
@@ -208,166 +203,6 @@ def _build_replan_context_message(
         content="\n".join(lines),
         additional_kwargs={"kind": "replan_context", "attempt": attempt},
     )
-
-
-def _derive_spec_fields_from_kubectl_get(
-    v_args: str,
-    blacklist: list[str],
-) -> dict:
-    """Parse a ``kubectl get`` v_args string into FaultSpec field updates.
-
-    Returns a dict of fields that can be passed to ``FaultSpec.replace(**dict)``.
-    Each field is only included if successfully parsed; the caller
-    applies write-once semantics (don't override a spec field that
-    already has a value).
-
-    What we parse:
-      - ``namespace`` from ``-n NS`` / ``--namespace NS`` / ``--namespace=NS``
-      - ``labels`` from ``-l selector`` / ``--selector selector`` (dict-typed,
-        unlike the old code which stored raw str)
-      - ``scope`` from the first non-flag positional (``pods`` / ``nodes`` / etc.)
-      - ``names`` from positional 2+ (``kubectl get pod my-pod``)
-
-    The previous code in this slot stored labels as a raw string and
-    never extracted names — those gaps are what made the original
-    NL-mode bug silent. Both are fixed here.
-
-    Used by CLI NL path where ``intent_clarification`` doesn't run,
-    so the spec must be built lazily from the LLM's planning actions.
-    """
-    updates: dict = {}
-    v_parts = _split_args(v_args)
-
-    # namespace
-    for i, p in enumerate(v_parts):
-        if p in ("-n", "--namespace") and i + 1 < len(v_parts):
-            ns = v_parts[i + 1]
-        elif p.startswith("--namespace="):
-            ns = p.split("=", 1)[1]
-        else:
-            continue
-        if ns and ns not in blacklist:
-            updates["namespace"] = ns
-            break
-
-    # labels — parse selector into dict[str, str] (not the raw str
-    # the old code stored, which violated the FaultSpec.labels contract)
-    for i, p in enumerate(v_parts):
-        if p in ("-l", "--selector") and i + 1 < len(v_parts):
-            sel = v_parts[i + 1]
-        elif p.startswith("--selector="):
-            sel = p.split("=", 1)[1]
-        else:
-            continue
-        parsed: dict = {}
-        for piece in sel.split(","):
-            piece = piece.strip()
-            if "=" in piece:
-                k, _, v = piece.partition("=")
-                parsed[k.strip()] = v.strip()
-        if parsed:
-            updates["labels"] = parsed
-        break
-
-    # scope + names from positionals (skip flag tokens AND their values)
-    _SCOPE_ALIASES = {
-        "pods": "pod", "pod": "pod", "po": "pod",
-        "nodes": "node", "node": "node", "no": "node",
-        "deployments": "deployment", "deployment": "deployment", "deploy": "deployment",
-        "services": "service", "service": "service", "svc": "service",
-    }
-    positionals: list[str] = []
-    _SHELL_OPERATORS = {"|", "||", "&&", ";", ">", ">>", "<"}
-    i = 0
-    while i < len(v_parts):
-        p = v_parts[i]
-        if p in _SHELL_OPERATORS:
-            break
-        if p in ("-n", "--namespace", "-l", "--selector",
-                 "-o", "--output", "--field-selector", "--kubeconfig"):
-            i += 2  # skip flag + value
-            continue
-        if p.startswith("--") and "=" not in p:
-            # Unknown --flag with separate value: skip flag + value
-            # to prevent flag values from leaking into names.
-            i += 2
-            continue
-        if p.startswith("-"):
-            i += 1
-            continue
-        positionals.append(p)
-        i += 1
-    if positionals:
-        canonical = _SCOPE_ALIASES.get(positionals[0].lower())
-        if canonical:
-            # Only infer scope if the command targets a SPECIFIC resource
-            # (has names or labels). A bare "kubectl get nodes" is an
-            # environment probe, not a target declaration.
-            names = [n for n in positionals[1:] if not n.startswith("-")]
-            has_labels = "labels" in updates
-            if names or has_labels:
-                updates["scope"] = canonical
-                if names:
-                    updates["names"] = tuple(names)
-    return updates
-
-
-def _probe_raw_namespace(v_args: str) -> str:
-    """The namespace a probe command explicitly carries, RAW (pre-blacklist).
-
-    ``_derive_spec_fields_from_kubectl_get`` filters a blacklisted namespace
-    out of its ``updates`` dict, so the caller cannot read the probe's true
-    ``-n`` value from there. The namespace-consistency gate below needs the
-    RAW value: a mechanism-target probe (``kubectl get pod kube-proxy-xxx -n
-    kube-system``) must be recognised as foreign-ns even if ``kube-system``
-    happens to be blacklisted — otherwise its name would slip into the victim
-    ``names`` slot (inject-b6b02ebd). Returns ``""`` when the command carries
-    no explicit namespace flag.
-    """
-    parts = _split_args(v_args)
-    for i, p in enumerate(parts):
-        if p in ("-n", "--namespace") and i + 1 < len(parts):
-            return parts[i + 1]
-        if p.startswith("--namespace="):
-            return p.split("=", 1)[1]
-    return ""
-
-
-def _drop_vehicle_names(updates: dict, state: dict, v_args: str) -> None:
-    """Strip vehicle names from lazy-derived spec updates in place.
-
-    task-29848471: an exploratory ``kubectl get`` against a debug/tool pod
-    must never promote that transient vehicle into the fault target. When
-    any derived name is a known injection vehicle the whole ``names``
-    update is dropped (other derived fields are kept) and a warning is
-    logged for post-mortem attribution.
-    """
-    if "names" not in updates:
-        return
-    from chaos_agent.agent.execution_artifacts import is_vehicle_name
-
-    vehicle_hits = [n for n in updates["names"] if is_vehicle_name(n, state)]
-    if vehicle_hits:
-        logger.warning(
-            "spec-write blocked: writer=agent_loop lazy derivation "
-            "vehicle name(s) %s rejected (v_args=%r)",
-            vehicle_hits, v_args,
-        )
-        del updates["names"]
-
-
-def _split_args(args: str) -> list[str]:
-    """Split args string respecting shell quoting.
-
-    Uses shlex.split to properly handle quoted arguments.
-    Falls back to str.split() if shlex encounters unmatched quotes.
-    """
-    if not args:
-        return []
-    try:
-        return shlex.split(args)
-    except ValueError:
-        return args.split()
 
 
 MAX_AGENT_LOOP = settings.max_agent_loop
@@ -550,58 +385,18 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             #       P2 tool_result injection removed (3× redundancy eliminated)
             capability_context = build_capability_context(state, "plan", tools)
             if not capability_context.supported:
-                spec = read_fault_spec(state)
-                selected_domain = spec.scope if spec and spec.scope else "unknown"
-                # Two distinct causes, previously reported with one sentence that
-                # named neither: the old wording said intent recognition finished
-                # "without choosing a transport", which is wrong for the common
-                # case — a transport WAS resolved, it just cannot run this domain.
-                # That sent readers looking for a missing selection instead of an
-                # incompatible pair.
-                #
-                # A session with no connection field at all is the other cause. Its
-                # resolved channel is a process-wide ``settings`` default the user
-                # never chose, so naming that channel would mislead just as badly;
-                # say the environment has no transport configured instead.
-                #
-                # Reached mainly by paths that skip the earlier submit-time gate in
-                # ``intent_clarification`` (batch replans, checkpoint resumes), so
-                # the message still has to stand on its own.
-                _has_conn_field = any(
-                    state.get(k)
-                    for k in (
-                        "kube_connection_mode", "host_name", "ssh_host",
-                        "kubeconfig", "kubewiz_cluster_uuid",
-                    )
-                )
-                if _has_conn_field:
-                    from chaos_agent.agent.spec.fault_registry import (
-                        family_for_scope,
-                    )
-                    from chaos_agent.transports.registry import (
-                        profile_of,
-                        resolve_channel_name,
-                    )
-
-                    _family = family_for_scope(selected_domain or "")
-                    _domain_profile = _family.profile if _family else "unknown"
-                    _channel = resolve_channel_name(state)
-                    message = (
-                        f"The requested fault domain '{selected_domain}' "
-                        f"(profile: {_domain_profile}) cannot run through the "
-                        f"configured transport '{_channel}' "
-                        f"(profile: {profile_of(_channel)}). Select an "
-                        f"environment matching this domain, or revise the intent "
-                        f"to a fault type this environment supports."
-                    )
-                else:
-                    message = (
-                        "The drill environment has no usable transport "
-                        "configured (no kubeconfig, KubeWiz cluster, KubeWiz host "
-                        "or SSH target). Configure a connection method on the "
-                        "environment, or bind an environment that already has "
-                        f"one. Selected domain: {selected_domain}."
-                    )
+                # Deterministic dead-end: the environment cannot dispatch any
+                # provider tool, and the LLM can neither repair that nor converge
+                # on it by retrying, so stop BEFORE the first LLM call. The cause
+                # is named off the SAME single-source verdict + renderer the
+                # execute_loop / recover entry gates consume
+                # (``explain_unsupported_environment``) — this gate no longer
+                # re-derives ``family_for_scope`` / ``resolve_channel_name`` /
+                # ``profile_of`` inline, so all three entry gates speak ONE
+                # vocabulary (3-way: scope-unregistered / conflict / channel)
+                # instead of this gate's old 2-way "cannot run through" wording.
+                _verdict = resolve_profile_verdict(state)
+                message = explain_unsupported_environment(_verdict, state)
                 result = _planning_termination(
                     FailureCategory.PLANNING_REJECTED,
                     message,
@@ -863,6 +658,13 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             # centre and the prime suspect for any non-generation latency.
             tracker.mark("prompt-build")
 
+            # Authoritative system clock on the transient tail: this loop's LLM has
+            # no wall clock, so it gets the current date — the one time fact no
+            # message carries. The fault-window position is left to the verifier (a
+            # blind phase reading injection_start_time would anchor a phantom
+            # window). Fresh each node entry, never persisted.
+            append_time_facts_reminder(messages, state)
+
             response = await llm_with_tools.ainvoke(
                 [SystemMessage(content=system_prompt)] + messages
             )
@@ -897,7 +699,6 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             kubeconfig = _resolve_kubeconfig(state)
             inject_kubeconfig_into_tool_calls(response, kubeconfig)
             inject_task_id_into_tool_calls(response, state.get("task_id", ""))
-            sync_kubewiz_runtime(state)
 
             result["messages"] = _injections_for_state + [response]
             fold_hint_state(result, state, _hint_counts, _hinted_calls)
@@ -962,193 +763,26 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                     if br_detail:
                         result["blast_radius_detail"] = br_detail
 
-                # Lazy spec derivation from LLM's kubectl get probes.
-                #
-                # Why this exists: CLI NL mode (``blade-ai inject
-                # --input "..."``) doesn't go through
-                # intent_clarification (route_pipeline_start keys
-                # on interaction_mode). The entry-point spec is a
-                # placeholder with empty scope/names/namespace.
-                # Without lazy derivation, safety_check rejects every
-                # CLI NL turn with "No target specified".
-                #
-                # Why this is safe vs target_guard: this only fires
-                # in the PLANNING phase (before confirmation_gate
-                # freezes approved_target). target_guard's drift
-                # protection runs in execute_loop (post-confirm),
-                # where the spec is locked and any mid-loop change
-                # to the approval gets caught.
-                #
-                # Write-once semantics: only fill fields the spec
-                # is missing, never overwrite. If intent_clarification
-                # already populated the spec (TUI path), this block
-                # finds nothing to update and is effectively a no-op.
-                # Catch ``get`` / ``describe`` / ``top`` — all three share
-                # the same positional shape (``kind [name] -n ns -l sel``)
-                # and the LLM uses any of them to probe. Without
-                # ``describe`` / ``top`` here, CLI NL flows where the LLM
-                # prefers ``kubectl describe pod foo`` over ``kubectl get
-                # pod foo`` would never get namespace/names derived.
-                if (
-                    tc_name in ("kubectl", "kubectl_read")
-                    and tc_args.get("subcommand") in ("get", "describe", "top")
-                ):
-                    _spec_now = (
-                        FaultSpec.from_dict(result["fault_spec"])
-                        if "fault_spec" in result
-                        else read_fault_spec(state)
-                    )
-                    if _spec_now is not None and not _spec_now.is_complete:
-                        derived = _derive_spec_fields_from_kubectl_get(
-                            v_args=tc_args.get("v_args", ""),
-                            blacklist=settings.blacklist_namespaces,
-                        )
-                        # Strict write-once: only fill fields the spec
-                        # is missing. Scope is NOT overridden here —
-                        # extract_planning_metadata derives the
-                        # authoritative scope from the skill case.
-                        # Allowing kubectl queries to override scope
-                        # (the old has_precise_scope logic) caused
-                        # exploratory node queries to corrupt the scope
-                        # from "deployment" to "node".
-                        updates: dict = {}
-                        for k, v in derived.items():
-                            if k == "labels":
-                                # Name-kind-consistent labels (B31): CLI
-                                # NL flows have NO other labels writer
-                                # ("validated extraction" never runs on
-                                # this route), so the blanket skip left
-                                # label-declared targets with an
-                                # empty selector. Write labels ONLY when
-                                # the command's own scope matches the
-                                # locked spec scope AND neither names nor
-                                # labels are set yet — a ``kubectl get
-                                # pods -l app=x`` probe under a
-                                # pod-scope spec is declaring its
-                                # selector. Fail-closed on mismatch:
-                                # a wrong lock is rejected by the guard
-                                # downstream, never silently widened.
-                                if (
-                                    derived.get("scope")
-                                    and _spec_now.scope
-                                    and derived["scope"] == _spec_now.scope
-                                    and not _spec_now.names
-                                    and not _spec_now.labels
-                                ):
-                                    updates["labels"] = v
-                                continue
-                            current = getattr(_spec_now, k, None)
-                            if not current:
-                                if (
-                                    k == "names"
-                                    and derived.get("scope")
-                                    and _spec_now.scope
-                                    and derived["scope"] != _spec_now.scope
-                                ):
-                                    # Name-kind consistency (B31): the
-                                    # command names a resource of a
-                                    # DIFFERENT kind than the locked
-                                    # scope (e.g. ``get deploy X`` under
-                                    # a pod-scope spec) — X is a
-                                    # workload name, not a pod instance
-                                    # name. Writing it produced
-                                    # approved.names that no exec'd pod
-                                    # name can ever match (REJECT_DRIFT
-                                    # on every injection attempt).
-                                    logger.info(
-                                        "spec-write blocked: writer=agent_loop "
-                                        "lazy derivation names %s rejected — "
-                                        "kind mismatch (command scope=%s, "
-                                        "locked scope=%s)",
-                                        list(v), derived.get("scope"),
-                                        _spec_now.scope,
-                                    )
-                                    continue
-                                if k == "names":
-                                    _probe_ns = _probe_raw_namespace(
-                                        tc_args.get("v_args", ""),
-                                    )
-                                    # Blacklist backstop (inject-b6b02ebd F2): a
-                                    # resource in a system/infra namespace is
-                                    # NEVER a drill victim (safety_check rejects
-                                    # any blacklisted-ns target outright), so its
-                                    # name must not lock even while the victim ns
-                                    # is still UNANCHORED. Without this, a
-                                    # mechanism case whose mechanism-target probe
-                                    # lands BEFORE any ns-anchoring probe — and
-                                    # whose user text names no unique ns, so the
-                                    # t2 anchor leaves namespace="" and the
-                                    # ns-consistency gate below is inactive —
-                                    # freezes the mechanism name (kube-proxy)
-                                    # into ``names``; the victim ns is anchored
-                                    # later by write-once, producing the franken
-                                    # target that safety_check then fail-fast
-                                    # rejects — a false rejection of a plannable
-                                    # drill (verified by _probe_f2_unanchored.py).
-                                    # The raw ``-n`` is used so a blacklisted ns
-                                    # is caught even though the derive filter
-                                    # dropped it from ``derived``.
-                                    if (
-                                        _probe_ns
-                                        and _probe_ns in settings.blacklist_namespaces
-                                    ):
-                                        logger.info(
-                                            "spec-write blocked: writer=agent_loop "
-                                            "lazy derivation names %s rejected — "
-                                            "probe ns=%s is a blacklisted "
-                                            "system/infra namespace (never a "
-                                            "victim)",
-                                            list(v), _probe_ns,
-                                        )
-                                        continue
-                                    # Name-namespace consistency (extends B31
-                                    # from kind to kind+namespace, root fix for
-                                    # inject-b6b02ebd): the per-field write-once
-                                    # derivation locks ``namespace`` and
-                                    # ``names`` INDEPENDENTLY, so a mechanism
-                                    # case that probes two same-kind pods can
-                                    # freeze a franken target — the victim
-                                    # namespace from one probe, a MECHANISM
-                                    # target's name (e.g. kube-proxy in
-                                    # kube-system) from another. The kind guard
-                                    # above cannot catch it (both are pods).
-                                    # A probe naming a resource in a DIFFERENT
-                                    # namespace than the locked victim ns is
-                                    # probing a foreign-ns resource and must not
-                                    # donate the victim name.
-                                    if (
-                                        _spec_now.namespace
-                                        and _probe_ns
-                                        and _probe_ns != _spec_now.namespace
-                                    ):
-                                        logger.info(
-                                            "spec-write blocked: writer=agent_loop "
-                                            "lazy derivation names %s rejected — "
-                                            "namespace mismatch (probe ns=%s, "
-                                            "locked victim ns=%s)",
-                                            list(v), _probe_ns, _spec_now.namespace,
-                                        )
-                                        continue
-                                updates[k] = v
-                        if "names" in updates:
-                            _drop_vehicle_names(updates, state, tc_args.get("v_args", ""))
-                        if updates:
-                            new_spec = _spec_now.replace(**updates)
-                            result["fault_spec"] = new_spec.to_dict()
-                            if "names" in updates:
-                                logger.debug(
-                                    "spec-write: writer=agent_loop lazy "
-                                    "derivation names %s -> %s "
-                                    "basis=kubectl %s v_args=%r",
-                                    list(_spec_now.names),
-                                    list(updates["names"]),
-                                    tc_args.get("subcommand"),
-                                    tc_args.get("v_args", ""),
-                                )
-                            logger.info(
-                                "agent_loop: derived spec fields from "
-                                "LLM kubectl get: %s", updates,
-                            )
+                # D1 (cli-nl-identity-from-declaration): probe-order identity
+                # derivation REMOVED. The victim's scope / names / namespace /
+                # labels are DECLARED by the planner on finish_planning
+                # (fault_scope / fault_target / fault_action / fault_namespace /
+                # fault_names / fault_labels) and consumed by
+                # extract_planning_metadata — the authoritative chain. Inferring
+                # identity from whichever resource a kubectl probe happened to
+                # read first made the victim depend on probe ORDER (Case #70:
+                # probing the backend service first locked the fault onto the
+                # service instead of the ingress the user named; the correct
+                # propose_plan_change(ingress) was then rejected by a node-only
+                # gate and the run silently switched mechanism). An undeclared
+                # identity now fails safety_check honestly with "No target
+                # specified" instead of executing a probe-order guess. The
+                # blacklist / name-kind / name-namespace consistency gates that
+                # policed this race were removed with it: safety_check
+                # independently rejects blacklisted namespaces, and the
+                # declaration carries namespace+names atomically (no franken
+                # race), while a declaration scope-change clears stale
+                # names/labels in extract_planning_metadata (B76 lesson).
 
 
             post_invoke_debug(tracker, response, count, "Iteration")

@@ -1,4 +1,4 @@
-"""Host-profile diagnostic sampling.
+"""Host-profile diagnostic delivery.
 
 When a fault targets a bare host (``scope == "host"`` / host channel) there is
 no cluster tool pod to ``kubectl exec`` into — the diagnostic must run directly
@@ -6,9 +6,9 @@ on the host. ``_run_host_diagnostic`` dispatches a read-only shell diagnostic
 through the transport layer (mirroring the ``baseline_capture._exec_host_simple``
 pattern with ``skip_guard=True``).
 
-Post-injection effect judgment (fill markers, diskstats deltas) lives in
-``_effect_checks``; the per-scope sampling mechanism — including the host path,
-which wraps this helper — lives in ``_effect_channels.HostSampleChannel``.
+It is the sanctioned host-delivery seam: the ``host_http_probe`` tool wraps it
+to run a bounded read-only GET directly on the target host, reusing this single
+implementation rather than re-deriving the transport call.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ import shlex
 from chaos_agent.config.settings import settings
 from chaos_agent.transports import (
     PROFILE_HOST,
-    TransportTarget,
     execute_via_transport,
+    resolve_transport_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,10 @@ logger = logging.getLogger(__name__)
 
 async def _run_host_diagnostic(command: str, state: dict | None, task_id: str):
     """Run one read-only diagnostic verbatim on the target host."""
-    target = TransportTarget.from_state(state or {})
+    # Single authoritative seam (ground-truth-single-authority D2): a raw
+    # ``from_state(state)`` orphan reads the truthy ssh_port placeholder and
+    # masks settings.ssh_port — the same B3 class as the verify supplement.
+    target = resolve_transport_target(state or {})
     try:
         argv = shlex.split(command)
     except ValueError:

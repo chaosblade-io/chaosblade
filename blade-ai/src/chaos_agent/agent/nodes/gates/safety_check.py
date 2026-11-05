@@ -8,7 +8,7 @@ from chaos_agent.agent.nodes.side_effect._conflict_check import (
     check_blade_conflicts,
 )
 from chaos_agent.tools.request_identity import build_request_fingerprint
-from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
+from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
@@ -38,11 +38,14 @@ from chaos_agent.agent.target_guard.mechanism_writes import (
     entries_needing_discovery,
     load_case_mechanism_writes,
     load_case_recovery_channel,
+    load_case_network_mechanism,
+    load_case_deterministic_verdict,
     materialize_derived_entries,
 )
 from chaos_agent.agent.target_guard.freeze import approved_from_dict
 from chaos_agent.agent.result.verdict import FailureCategory
 from chaos_agent.config.settings import settings
+from chaos_agent.transports import TransportTarget, resolve_transport_target
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -51,7 +54,9 @@ from chaos_agent.observability.status_tracker import (
 logger = logging.getLogger(__name__)
 
 
-async def _get_topology_deep_signal(spec, kubeconfig: str) -> tuple[int, str]:
+async def _get_topology_deep_signal(
+    spec, kubeconfig: str, *, target: TransportTarget | None = None,
+) -> tuple[int, str]:
     """Optional async kubectl query for deployment replica count.
 
     Only applies to deployment scope with a named target. Returns
@@ -67,6 +72,7 @@ async def _get_topology_deep_signal(spec, kubeconfig: str) -> tuple[int, str]:
             ["deployment", spec.names[0], "-n", spec.namespace, "-o", "jsonpath={.spec.replicas}"],
             kubeconfig=kubeconfig,
             timeout=5.0,
+            target=target,
         )
         if result.exit_code != 0:
             return (0, "")
@@ -154,6 +160,7 @@ def _attach_safety_score(
 
 async def _confirm_victim_pods_absent(
     namespace: str, names: tuple[str, ...], kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[str, ...]:
     """Return the subset of ``names`` DEFINITIVELY absent from ``namespace``.
 
@@ -172,6 +179,7 @@ async def _confirm_victim_pods_absent(
             ["pod", name, "-n", namespace, "-o", "name"],
             kubeconfig,
             log_name=f"victim-existence {name}",
+            target=target,
         )
         if out.ok:
             continue  # exists → not absent
@@ -276,10 +284,65 @@ async def safety_check(state: AgentState) -> dict:
         await sync_to_store(state, result)
         return result
 
+    # 3b. Scope VOCABULARY validation — fail-fast at the freeze gate. The check
+    # above is pure truthiness, so a NON-EMPTY but UNREGISTERED scope (e.g. the
+    # case catalogue's organizational category "workload" mistaken for a
+    # concrete resource scope like "deployment") sails through here and only
+    # surfaces much later as resolve_profile_for_state → PROFILE_UNKNOWN →
+    # empty provider toolset → every tool (control-plane reads included)
+    # REJECT_UNKNOWN, with a refusal message that misattributes the cause to
+    # kubeconfig/transport. Reject at the source instead, naming the offending
+    # scope and the valid vocabulary so the authoring error is actionable.
+    #
+    # Rejected (fail-fast), NOT retry — deliberately. A retry routing back to
+    # the planner is MECHANICALLY FUTILE for this field, by the exact three-lock
+    # mechanism the sibling victim_absent block below documents: (1) once the
+    # bad scope is frozen into the reviewed FaultSpec, extract_planning_metadata's
+    # IDENTITY SPLIT guard treats a corrected re-declaration as a conflict and
+    # DISCARDS it ("a reviewed identity is never rewritten by a declaration");
+    # (2) the lazy-derivation rewrite branch is gated by ``not identity_complete``
+    # (scope is non-empty, so it is skipped); (3) a safety retry never sets
+    # replan_context/replan_count, so replan_reset_state() never clears the
+    # frozen scope. A "re-declare a registered scope" nudge therefore asks the
+    # LLM for something the state machine cannot honour — the loop spins to
+    # MAX_AGENT_LOOP → PLANNING_TIMEOUT (memory fd4f4f0e). The malformed scope
+    # originates in the case frontmatter / planner declaration, so the fix is a
+    # HUMAN correcting the authoring, which a clear terminal message surfaces
+    # and a futile retry would only mask for one run.
+    # ``family_for_scope`` is the SAME single-source vocabulary authority
+    # ``resolve_profile_for_state`` and ``FaultSpec.is_complete`` already
+    # consult — this only wires it into the gate (no new source of truth).
+    from chaos_agent.agent.spec.fault_registry import family_for_scope
+    from chaos_agent.agent.spec.fault_spec import INTENT_SCOPES
+    if family_for_scope(spec.scope) is None:
+        _reason = (
+            f"Fault scope '{spec.scope}' is not a registered fault domain "
+            f"(valid scopes: {', '.join(INTENT_SCOPES)})"
+        )
+        tracker.fail(_reason)
+        sync_node_status_to_session(state, "safety_check",
+            f"Safety check rejected: {_reason}",
+            detail={"safety_status": "rejected", "reason": "unregistered_scope"})
+        result = {
+            "safety_status": "rejected",
+            "safety_reason": _reason,
+            **fail_state(FailureCategory.PREREQUISITE_FAILED,
+                         f"unregistered fault scope={spec.scope}"),
+        }
+        result = _attach_safety_score(result, spec, state)
+        await sync_to_store(state, result)
+        return result
+
     # Resolve kubeconfig once — used by both the E10 deep topology
     # signal (optional) and the blade conflict detection below.
     kubeconfig = _resolve_kubeconfig(state)
-    sync_kubewiz_runtime(state)
+    # Single-authority transport target resolved from THIS node's state (the
+    # seam replaces the settings side-effect that ``sync_kubewiz_runtime`` used
+    # to establish). Named ``_xport_target`` to avoid the ``fault_target`` /
+    # ``target`` fault-dimension strings bound below. Threaded into every
+    # discovery / health / feasibility / conflict leaf so they read per-session
+    # kubewiz values from state, not settings.
+    _xport_target = resolve_transport_target(state)
 
     # E10 — optional deep K8s topology signal (replica count). Fetched
     # once here so all downstream return paths use the same signal.
@@ -288,7 +351,7 @@ async def safety_check(state: AgentState) -> dict:
     deep_signal: tuple[int, str] | None = None
     if settings.safety_score_topology_deep:
         await dispatch_node_message("safety_check", "Collecting topology signals (replica count)...\n\n")
-        deep_signal = await _get_topology_deep_signal(spec, kubeconfig or "")
+        deep_signal = await _get_topology_deep_signal(spec, kubeconfig or "", target=_xport_target)
 
     # 4. Blade conflict detection — record result, do NOT early-return.
     # Health/feasibility checks below always run regardless of conflicts
@@ -340,6 +403,7 @@ async def safety_check(state: AgentState) -> dict:
         uids, conflict_details = await check_blade_conflicts(
             kubeconfig, task_id,
             **fingerprint.as_query_kwargs(),
+            target=_xport_target,
         )
         if uids:
             conflict_uids = uids
@@ -420,7 +484,7 @@ async def safety_check(state: AgentState) -> dict:
                 "labels": dict(spec.labels),
                 "resource_type": spec.scope,
             }
-            health = await assess_target_health(spec.scope, target_payload, kubeconfig or "")
+            health = await assess_target_health(spec.scope, target_payload, kubeconfig or "", xport_target=_xport_target)
             target_health_report = health.to_dict()
             logger.info(
                 "target health pre-check: scope=%s overall=%s issues=%d",
@@ -447,7 +511,23 @@ async def safety_check(state: AgentState) -> dict:
             await dispatch_node_message("safety_check", "Assessing injection feasibility...\n\n")
             from chaos_agent.agent.spec.feasibility import assess_feasibility, FeasibilitySeverity
 
-            feas = await assess_feasibility(spec, kubeconfig or "")
+            # Case-file network-mechanism legislation (SAME deterministic
+            # re-read discipline as ``recovery_channel`` below): code reads the
+            # settled case file, so neither the Agent's prose reading nor any
+            # LLM planning declaration is an input. The network checker uses it
+            # to skip netfilter-only probes (iptables/interface) for a declared
+            # non-netfilter mechanism (userspace-bind / resolver) — probing them
+            # would emit a factually wrong advisory steering away from the
+            # working kubectl-native path. Empty for every case without the
+            # declaration → the checker FAILS SAFE to netfilter (probes run,
+            # byte-identical to pre-declaration behaviour).
+            network_mechanism = load_case_network_mechanism(
+                skill_name, getattr(spec, "case_resource_path", "") or "",
+            )
+            feas = await assess_feasibility(
+                spec, kubeconfig or "", xport_target=_xport_target,
+                network_mechanism=network_mechanism,
+            )
             if feas is not None:
                 feasibility_report = feas.to_dict()
                 logger.info(
@@ -562,6 +642,7 @@ async def safety_check(state: AgentState) -> dict:
         # approval must also freeze the ownerReferences chain so the
         # drift guard recognises deleted-and-recreated successors.
         names=tuple(spec.names or ()),
+        target=_xport_target,
     )
     # Resolve a LABEL selector (node AZ zone, or pod app labels) to its
     # concrete resource names so the drift guard can validate per-name batches
@@ -569,6 +650,7 @@ async def safety_check(state: AgentState) -> dict:
     # spurious drift.
     resolved_names = await discover_names_by_labels(
         spec.scope, spec.namespace, dict(spec.labels), kubeconfig,
+        target=_xport_target,
     )
     # Freeze the PVC claim names the approved target references — the anchor
     # for the drill-occupancy-vehicle exception (a resource-occupancy drill
@@ -583,6 +665,7 @@ async def safety_check(state: AgentState) -> dict:
         pod_identities = tuple(spec.names) if spec.names else resolved_names
         pvc_claims = await discover_pod_pvc_claims(
             spec.namespace, pod_identities, kubeconfig,
+            target=_xport_target,
         )
     elif _scope_l in WORKLOAD_TEMPLATE_SCOPES:
         # Template channel: the claimName authored in the pod template is
@@ -591,6 +674,7 @@ async def safety_check(state: AgentState) -> dict:
         pvc_claims = await discover_workload_pvc_claims(
             _scope_l, spec.namespace, tuple(spec.names or ()),
             dict(spec.labels or {}), kubeconfig,
+            target=_xport_target,
         )
     elif _scope_l == "statefulset":
         # STS channel: claims are per-replica instances of
@@ -601,6 +685,7 @@ async def safety_check(state: AgentState) -> dict:
         pvc_claims = await discover_statefulset_pvc_claims(
             spec.namespace, tuple(spec.names or ()),
             dict(spec.labels or {}), kubeconfig,
+            target=_xport_target,
         )
     # Case-manifest mechanism writes: deterministic load at case
     # settlement. Code re-reads the SAME case file the Agent showed the
@@ -642,6 +727,7 @@ async def safety_check(state: AgentState) -> dict:
                 spec.scope, spec.namespace, tuple(spec.names or ()),
                 dict(spec.labels or {}), kubeconfig,
                 resolved_names=resolved_names,
+                target=_xport_target,
             )
             # Fail-closed on an incoherent victim (inject-b6b02ebd / memory
             # f2ad82d2): a ``name_from: victim_node`` bridge needs a REAL
@@ -663,6 +749,7 @@ async def safety_check(state: AgentState) -> dict:
             ):
                 _absent = await _confirm_victim_pods_absent(
                     spec.namespace, tuple(spec.names), kubeconfig,
+                    target=_xport_target,
                 )
                 if _absent and len(_absent) == len(set(spec.names)):
                     _names_s = ", ".join(_absent)
@@ -735,6 +822,17 @@ async def safety_check(state: AgentState) -> dict:
     recovery_channel = load_case_recovery_channel(
         skill_name, getattr(spec, "case_resource_path", "") or "",
     )
+    # Case-file verdict-binding legislation (openspec mechanism-invariant-
+    # trust-boundary, decision C): the SAME deterministic re-read discipline
+    # as ``recovery_channel`` — code reads the settled case file, so neither
+    # the Agent's prose reading nor any LLM planning declaration is an input.
+    # Frozen into the snapshot so the verify finalize layer can bind a
+    # deterministic rule by a STABLE author-declared key (not the drift-prone
+    # LLM triple) and read the expected effect value N. Empty for every case
+    # without the declaration (verify behaviour unchanged → byte-identical).
+    deterministic_verdict = load_case_deterministic_verdict(
+        skill_name, getattr(spec, "case_resource_path", "") or "",
+    )
     # #39 time-dimension gap: live claim discovery only finds PVCs that
     # ALREADY exist; a #38-shaped case applies its PVC during execution.
     # The in-band PVC is already legislated in mechanism_writes (an
@@ -772,6 +870,7 @@ async def safety_check(state: AgentState) -> dict:
             pvc_claims=pvc_claims,
             mechanism_entries=mechanism_entries,
             recovery_channel=recovery_channel,
+            deterministic_verdict=deterministic_verdict,
         ) or {})
         if _probe is not None:
             _widening = entries_beyond_victim(_probe)
@@ -782,6 +881,7 @@ async def safety_check(state: AgentState) -> dict:
         pvc_claims=pvc_claims,
         mechanism_entries=mechanism_entries,
         recovery_channel=recovery_channel,
+        deterministic_verdict=deterministic_verdict,
         widening_pending_approval=bool(_widening),
     )
     if _widening:

@@ -28,7 +28,6 @@ from chaos_agent.agent.nodes.recover.recover_verifier import (
     _count_recovery_steps_in_skill_case,
     _detect_recovery_checklist_inconsistency,
     _detect_recovery_contradiction,
-    _detect_primary_evidence_generic_contradiction,
     _parse_layer1_recovery_result,
     _build_recover_verifier_prompt,
     _build_layer1_recovery_prompt,
@@ -2595,9 +2594,16 @@ class TestMakeRecoverVerifierKubectlExecRouting:
         assert "kubectl(subcommand=" not in all_content
         assert "blade status" not in all_content
         assert "blade query" not in all_content
-        # Kubeconfig mandate is tool-agnostic too
+        # Kubeconfig is a runtime-injected connection fact, never an LLM
+        # planning parameter (InjectedToolArg hides it from the tool schema;
+        # see TestKubeconfigSchemaInvisibleToLLM). The recover prompt must
+        # therefore carry NO kubeconfig mandate in ANY wording — the model
+        # cannot name the arg, so it cannot typo its path. This asserts the
+        # mandate the prompt used to emit ("pass it to EVERY cluster tool
+        # call") stays gone.
         assert "EVERY kubectl tool call" not in all_content
-        assert "cluster tool call" in all_content
+        assert "cluster tool call" not in all_content
+        assert "kubeconfig" not in all_content.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -2861,236 +2867,89 @@ class TestParseRecoveryVerificationResultPartial:
 # ---------------------------------------------------------------------------
 
 class TestDetectRecoveryContradiction:
-    """Tests for recovery-side contradiction detection function."""
+    """Structural-only contradiction detection (Phase 2c / D14).
 
-    # --- Text-based contradiction ---
-
-    def test_disk_recovery_evidence(self):
-        result = _detect_recovery_contradiction("disk usage back to 16%")
-        assert result is not None
-        assert "recovery effects" in result.lower()
-
-    def test_cpu_recovery_evidence(self):
-        result = _detect_recovery_contradiction("cpu usage normal, back to baseline")
-        assert result is not None
-
-    def test_diskpressure_false_evidence(self):
-        result = _detect_recovery_contradiction("diskpressure is false on node")
-        assert result is not None
-
-    def test_network_recovery_evidence(self):
-        result = _detect_recovery_contradiction("connectivity restored, no packet loss")
-        assert result is not None
-
-    def test_process_recovery_evidence(self):
-        result = _detect_recovery_contradiction("pod is running with no restarts")
-        assert result is not None
-
-    def test_absence_phrase_blocks(self):
-        """Absence phrase 'still elevated' blocks contradiction even with recovery indicator."""
-        result = _detect_recovery_contradiction("disk usage back to normal but still elevated")
-        assert result is None
-
-    def test_high_percentage_blocks(self):
-        """High percentage 'at 95%' blocks contradiction."""
-        result = _detect_recovery_contradiction("cpu usage at 95%")
-        assert result is None
-
-    def test_diskpressure_true_blocks(self):
-        result = _detect_recovery_contradiction("diskpressure is true, disk usage normal")
-        assert result is None
-
-    def test_no_indicators(self):
-        result = _detect_recovery_contradiction("verification could not complete")
-        assert result is None
-
-    def test_empty_details(self):
-        result = _detect_recovery_contradiction("")
-        assert result is None
-
-    # --- Checklist-based contradiction ---
+    The program compares ChecklistItemStatus enums only; the retired free-text
+    path that reverse-inferred "recovery looks effective" from l2_details
+    ("disk usage back to 16%", "cpu usage normal") no longer exists. The sole
+    trigger is: L2 concluded 'failed' but ALL checklist steps are 'passed'.
+    """
 
     def test_all_checklist_passed(self):
-        """ALL checklist passed but L2 says failed — structural contradiction."""
+        """ALL checklist passed → structural contradiction."""
         items = [
             {"step": 1, "status": "passed"},
             {"step": 2, "status": "passed"},
             {"step": 3, "status": "passed"},
         ]
-        result = _detect_recovery_contradiction("some details", items)
+        result = _detect_recovery_contradiction(items)
         assert result is not None
         assert "ALL checklist" in result
 
-    def test_all_checklist_passed_no_details(self):
-        """ALL checklist passed with no details — still a contradiction."""
+    def test_single_passed_checklist(self):
+        """A single all-passed checklist is still 'ALL passed' → contradiction."""
         items = [{"step": 1, "status": "passed"}]
-        result = _detect_recovery_contradiction("", items)
+        result = _detect_recovery_contradiction(items)
         assert result is not None
         assert "ALL checklist" in result
-
-    def test_all_checklist_passed_with_absence_blocked(self):
-        """ALL checklist passed but details have absence phrase — not a contradiction."""
-        items = [{"step": 1, "status": "passed"}]
-        result = _detect_recovery_contradiction("cpu still at 95%", items)
-        assert result is None
 
     def test_mixed_checklist_no_contradiction(self):
-        """Mixed checklist (passed + failed) — failed item justifies L2=failed."""
+        """Mixed checklist (passed + failed) — the failed item justifies L2=failed."""
         items = [
             {"step": 1, "status": "passed"},
             {"step": 2, "status": "failed"},
         ]
-        result = _detect_recovery_contradiction("some details", items)
-        assert result is None
+        assert _detect_recovery_contradiction(items) is None
 
-    # --- No trigger ---
+    def test_non_dict_items_ignored(self):
+        """Structural comparison guards non-dict items: only 'passed' dicts count,
+        so a mixed junk list is not 'all passed'."""
+        assert _detect_recovery_contradiction(["passed", {"status": "passed"}]) is None
 
-    def test_no_details_no_checklist(self):
-        result = _detect_recovery_contradiction("", None)
-        assert result is None
+    def test_empty_and_none_no_contradiction(self):
+        assert _detect_recovery_contradiction(None) is None
+        assert _detect_recovery_contradiction([]) is None
 
-
-# ---------------------------------------------------------------------------
-# _detect_primary_evidence_generic_contradiction
-# ---------------------------------------------------------------------------
-
-class TestDetectPrimaryEvidenceGenericContradiction:
-    """Tests for P2-1: PrimaryEvidenceObserved=true but evidence is all generic."""
-
-    # --- Trigger cases: PrimaryEvidenceObserved=true + generic evidence only ---
-
-    def test_generic_pod_running(self):
-        """PrimaryEvidenceObserved=true + 'pod running' = contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "pod is running, no errors"
-        )
-        assert result is not None
-        assert "generic" in result.lower()
-
-    def test_generic_no_restarts(self):
-        """PrimaryEvidenceObserved=true + 'no new restarts' = contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "no new restarts, deployment available"
-        )
-        assert result is not None
-
-    def test_generic_healthy(self):
-        """PrimaryEvidenceObserved=true + 'healthy, pods ready' = contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "healthy, pods ready, 1/1"
-        )
-        assert result is not None
-
-    def test_generic_node_ready(self):
-        """PrimaryEvidenceObserved=true + 'node ready' = contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "node ready, not evicted"
-        )
-        assert result is not None
-
-    # --- No trigger cases: PrimaryEvidenceObserved=false ---
-
-    def test_primary_observed_false_skips(self):
-        """PrimaryEvidenceObserved=false → never triggers (already handled elsewhere)."""
-        result = _detect_primary_evidence_generic_contradiction(
-            False, "pod is running, no errors"
-        )
-        assert result is None
-
-    # --- No trigger cases: fault-specific evidence present ---
-
-    def test_cpu_evidence_not_generic(self):
-        """Fault-specific CPU evidence → no contradiction even if generic also present."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "cpu usage back to baseline, pod running"
-        )
-        assert result is None
-
-    def test_disk_evidence_not_generic(self):
-        """Fault-specific disk evidence → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "disk usage normal, diskpressure=false"
-        )
-        assert result is None
-
-    def test_memory_evidence_not_generic(self):
-        """Fault-specific memory evidence → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "memory usage returned to normal, pod running"
-        )
-        assert result is None
-
-    def test_network_evidence_not_generic(self):
-        """Fault-specific network evidence → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "latency back to normal, no packet loss"
-        )
-        assert result is None
-
-    def test_io_evidence_not_generic(self):
-        """Fault-specific I/O evidence → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "iowait reduced, /proc/diskstats normal"
-        )
-        assert result is None
-
-    # --- No trigger cases: pod-kill skills (pod running IS primary evidence) ---
-
-    def test_pod_kill_skill_exempt(self):
-        """pod-kill skill: 'pod running' IS primary evidence → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "pod is running, no restarts", skill_name="pod-kill"
-        )
-        assert result is None
-
-    def test_pod_terminating_skill_exempt(self):
-        """pod-terminating skill: generic evidence is primary → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "pod running, healthy", skill_name="pod-terminating"
-        )
-        assert result is None
-
-    def test_pod_delete_skill_exempt(self):
-        """pod-delete skill: generic evidence is primary → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "pod running, ready", skill_name="pod-delete"
-        )
-        assert result is None
-
-    def test_cpu_stress_skill_not_exempt(self):
-        """cpu-stress skill: generic evidence triggers contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "pod running, no restarts", skill_name="cpu-stress"
-        )
-        assert result is not None
-
-    # --- No trigger cases: ambiguous evidence ---
-
-    def test_ambiguous_evidence_no_false_positive(self):
-        """No generic indicators AND no fault-specific → skip (avoid false positives)."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, "verification completed"
-        )
-        assert result is None
-
-    def test_empty_details_no_trigger(self):
-        """Empty L2 details → no contradiction."""
-        result = _detect_primary_evidence_generic_contradiction(
-            True, ""
-        )
-        assert result is None
+    def test_free_text_no_longer_consulted(self):
+        """Retired capability pinned: recovery-flavoured prose alone (no checklist)
+        produces no contradiction — the program never reads l2_details text."""
+        # The old signature took l2_details as the first positional arg and
+        # scanned it for indicators; the new signature takes only checklist_items.
+        assert _detect_recovery_contradiction(None) is None
 
 
 # ---------------------------------------------------------------------------
-# P2-1 integration: PrimaryEvidenceObserved=true + generic → auto-downgrade
+# _detect_primary_evidence_generic_contradiction — RETIRED (Phase 2c / D14)
+# ---------------------------------------------------------------------------
+# The generic-primary-evidence text detector was deleted. Whether observed
+# evidence is fault-specific vs generic health is the LLM's judgement, carried
+# by the structured primary_evidence_observed flag; the program no longer
+# reverse-infers it from l2_details keyword matching. The retained structural
+# gate (primary_evidence_observed=false → downgrade) is covered by
+# TestPrimaryEvidenceGenericIntegration below.
+
+
+
+# ---------------------------------------------------------------------------
+# primary_evidence_observed structural gate (generic-prose downgrade RETIRED)
 # ---------------------------------------------------------------------------
 
 class TestPrimaryEvidenceGenericIntegration:
-    """Integration tests: PrimaryEvidenceObserved=true + generic evidence
-    triggers downgrade from recovered to partial via _parse_recovery_verification_result."""
+    """Phase 2c / D14: the generic-prose auto-downgrade is retired.
 
-    def test_generic_evidence_downgrade_to_partial(self):
-        """PrimaryEvidenceObserved=true + generic evidence → level=partial, not recovered."""
+    The only structural gate on primary evidence is the LLM's declared
+    primary_evidence_observed flag: false + recovered → partial. Whether the
+    evidence text is 'generic' vs 'fault-specific' is no longer re-derived by
+    the program, so generic prose with the flag TRUE stays recovered.
+    """
+
+    def test_generic_prose_no_longer_downgrades(self):
+        """PrimaryEvidenceObserved=true + generic prose → stays recovered.
+
+        Retired behaviour pinned: the old path scanned l2_details for generic
+        health phrases ('pod is running', 'no new restarts') and downgraded;
+        that reverse-inference is gone.
+        """
         text = (
             "RECOVERY_VERIFICATION_RESULT:\n"
             "- Layer1 (blade_destroy): passed - success\n"
@@ -3101,8 +2960,8 @@ class TestPrimaryEvidenceGenericIntegration:
             "- Warnings: none"
         )
         result = _parse_recovery_verification_result(text, skill_name="cpu-stress")
-        assert result["level"] == "partial"
-        assert any("generic" in w.lower() for w in result["warnings"])
+        assert result["level"] == "recovered"
+        assert not any("generic" in w.lower() for w in result["warnings"])
 
     def test_fault_specific_evidence_no_downgrade(self):
         """PrimaryEvidenceObserved=true + fault-specific evidence → stays recovered."""
@@ -3119,22 +2978,8 @@ class TestPrimaryEvidenceGenericIntegration:
         assert result["level"] == "recovered"
         assert not any("generic" in w.lower() for w in result["warnings"])
 
-    def test_pod_kill_no_downgrade(self):
-        """pod-kill skill: PrimaryEvidenceObserved=true + generic → stays recovered."""
-        text = (
-            "RECOVERY_VERIFICATION_RESULT:\n"
-            "- Layer1 (blade_destroy): passed - success\n"
-            "- Layer2 (fault-specific): passed - pod running, no restarts\n"
-            "- PrimaryEvidenceObserved: true\n"
-            "- BaselineUsed: false\n"
-            "- Overall: recovered\n"
-            "- Warnings: none"
-        )
-        result = _parse_recovery_verification_result(text, skill_name="pod-kill")
-        assert result["level"] == "recovered"
-
-    def test_primary_false_still_downgraded_separately(self):
-        """PrimaryEvidenceObserved=false → separate downgrade (not by P2-1)."""
+    def test_primary_false_still_downgraded(self):
+        """Retained structural gate: PrimaryEvidenceObserved=false → partial."""
         text = (
             "RECOVERY_VERIFICATION_RESULT:\n"
             "- Layer1 (blade_destroy): passed - success\n"
@@ -3145,13 +2990,16 @@ class TestPrimaryEvidenceGenericIntegration:
             "- Warnings: none"
         )
         result = _parse_recovery_verification_result(text, skill_name="cpu-stress")
-        # Downgraded by existing PrimaryEvidenceObserved=false check, NOT by P2-1
+        # Downgraded by the structural PrimaryEvidenceObserved=false gate.
         assert result["level"] == "partial"
         assert any("incompatible" in w.lower() for w in result["warnings"])
-        assert not any("generic" in w.lower() for w in result["warnings"])
 
-    def test_no_skill_name_defaults_to_checking(self):
-        """No skill_name → generic contradiction still detected (pod-kill exemption not applied)."""
+    def test_no_skill_name_generic_prose_no_downgrade(self):
+        """No skill_name + generic prose + flag TRUE → stays recovered.
+
+        The pod-kill skill exemption is moot now that generic-prose detection
+        is retired entirely; skill_name no longer changes this outcome.
+        """
         text = (
             "RECOVERY_VERIFICATION_RESULT:\n"
             "- Layer1 (blade_destroy): passed - success\n"
@@ -3161,8 +3009,7 @@ class TestPrimaryEvidenceGenericIntegration:
             "- Warnings: none"
         )
         result = _parse_recovery_verification_result(text)
-        # Without skill_name="pod-kill", generic evidence triggers downgrade
-        assert result["level"] == "partial"
+        assert result["level"] == "recovered"
 
 
 # ---------------------------------------------------------------------------
@@ -3172,8 +3019,10 @@ class TestPrimaryEvidenceGenericIntegration:
 class TestRecoveryContradictionIntegration:
     """Integration tests for contradiction detection in _parse_recovery_verification_result."""
 
-    def test_text_contradiction_overrides_l2(self):
-        """L2=failed with recovery evidence in details → L2 overridden to partial."""
+    def test_free_text_no_longer_overrides_l2(self):
+        """Phase 2c / D14: L2=failed with recovery-flavoured prose in details is
+        NO LONGER overridden — the program never re-derives a contradiction from
+        free text. With no checklist to compare structurally, 'failed' stands."""
         text = (
             "RECOVERY_VERIFICATION_RESULT:\n"
             "- Layer1: passed\n"
@@ -3181,12 +3030,12 @@ class TestRecoveryContradictionIntegration:
             "- Overall: unrecovered\n"
         )
         result = _parse_recovery_verification_result(text)
-        assert result["layer2"]["status"] == "partial"
-        assert result["level"] == "partial"
-        assert any("contradiction" in w.lower() for w in result["warnings"])
+        assert result["layer2"]["status"] == "failed"
+        assert result["level"] == "unrecovered"
+        assert not any("contradiction" in w.lower() for w in result["warnings"])
 
     def test_checklist_contradiction_overrides_l2(self):
-        """L2=failed but ALL checklist passed → L2 overridden to partial."""
+        """Retained structural path: L2=failed but ALL checklist passed → partial."""
         text = (
             "RECOVERY_VERIFICATION_CHECKLIST:\n"
             "1. [passed] DiskPressure=False\n"
@@ -3201,8 +3050,9 @@ class TestRecoveryContradictionIntegration:
         assert result["level"] == "partial"
         assert any("contradiction" in w.lower() for w in result["warnings"])
 
-    def test_absence_phrase_prevents_override(self):
-        """L2=failed with absence phrase → no contradiction override."""
+    def test_l2_failed_without_checklist_stays_failed(self):
+        """L2=failed, fault-still-present prose, no checklist → stays failed
+        (no structural contradiction to act on; free text is not consulted)."""
         text = (
             "RECOVERY_VERIFICATION_RESULT:\n"
             "- Layer1: passed\n"
@@ -5238,7 +5088,7 @@ class TestFinalizeResidualLiabilitySweep:
         provider = FaultProviderRegistry.resolve_by_method("host_blade")
         calls: list[str] = []
 
-        async def _fake_destroy(uid, kubeconfig=""):
+        async def _fake_destroy(uid, kubeconfig="", *, state=None):
             calls.append(uid)
             return destroy_output
 
@@ -5313,7 +5163,7 @@ class TestFinalizeResidualLiabilitySweep:
 
         provider = FaultProviderRegistry.resolve_by_method("host_blade")
 
-        async def _destroyed_true(uid, kubeconfig=""):
+        async def _destroyed_true(uid, kubeconfig="", *, state=None):
             return True
 
         monkeypatch.setattr(provider, "experiment_destroyed", _destroyed_true)
@@ -5411,7 +5261,7 @@ class TestFinalizeIdentityExemptionGate:
         provider = FaultProviderRegistry.resolve_by_method("host_blade")
         calls: list[str] = []
 
-        async def _fake_destroy(uid, kubeconfig=""):
+        async def _fake_destroy(uid, kubeconfig="", *, state=None):
             calls.append(uid)
             return '{"code":200,"success":true}'
 
@@ -5531,3 +5381,72 @@ class TestFinalizeIdentityExemptionGate:
             None,
         ):
             assert _sweep_exempts_identity_uid(status) is False, status
+
+
+class TestRecoverVerifierCapabilityGate:
+    """The recover entry gate fail-fasts on an unresolved profile and lands on a
+    LIABILITY-PRESERVING terminal — never a silent skip or a false success.
+
+    Recovery is a liability path: the fault was injected and may still be live.
+    An unresolved profile (the #87 shape — injected on k8s, the ambient channel
+    drifted to host, so scope and transport conflict) means no provider tool can
+    dispatch, so neither Layer 1 (execute recovery) nor Layer 2 (verify) can run.
+    The gate must terminate BEFORE any LLM turn, keep ``recovered=False`` +
+    ``level=unverified`` + a "fault may still be active" warning (which is what
+    keeps ``tasks.liability_live`` True and the recovery entrance open once the
+    channel is fixed), and name the cause through the SAME shared renderer the
+    execute / agent_loop gates use.
+    """
+
+    @pytest.mark.asyncio
+    async def test_conflict_terminates_before_llm_preserving_liability(self):
+        mock_llm = MagicMock()
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+        # host scope × k8s(kubeconfig) transport → CONFLICT.
+        state = {
+            "task_id": "t-recover-conflict",
+            "experiment_uid": "abc",
+            "skill_name": "cpu-stress",
+            "fault_spec": {"scope": "host"},
+            "kube_connection_mode": "kubeconfig",
+            "verifier_loop_count": 0,
+            "messages": [],
+        }
+
+        result = await node(state)
+
+        # fail-fast: no LLM turn, no Layer 1 recovery attempted
+        mock_llm.ainvoke.assert_not_called()
+        # liability preserved, not a false success and not a silent skip
+        assert result["result"]["recovered"] is False
+        verification = result["recover_verification"]
+        assert verification["level"] == "unverified"
+        assert any("fault may still be active" in w for w in verification["warnings"])
+        # cause named off the shared renderer: a conflict, not a broken kubeconfig
+        assert "channel/scope mismatch" in verification["layer1"]["details"]
+
+    @pytest.mark.asyncio
+    async def test_supported_profile_does_not_trip_the_gate(self):
+        # A consistent host scope + ssh channel resolves, so the gate must NOT
+        # fire — the loop proceeds past the entry into Layer 1.
+        mock_llm = MagicMock()
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+        state = {
+            "task_id": "t-recover-ok",
+            "experiment_uid": "abc",
+            "skill_name": "cpu-stress",
+            "fault_spec": {"scope": "host"},
+            "kube_connection_mode": "ssh",
+            "ssh_host": "host.example",
+            "verifier_loop_count": 0,
+            "messages": [],
+        }
+
+        with patch(
+            "chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider"
+        ) as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="destroyed")
+            result = await node(state)
+
+        # the gate did not short-circuit: it fell through to Layer 1
+        assert "channel/scope mismatch" not in str(result)

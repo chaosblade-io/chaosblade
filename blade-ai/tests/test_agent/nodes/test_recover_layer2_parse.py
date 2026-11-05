@@ -5,46 +5,42 @@ from chaos_agent.agent.nodes.recover._recover_layer2_parse import (
     _detect_recovery_contradiction,
     _detect_recovery_checklist_inconsistency,
     _parse_recovery_verification_result,
-    _detect_primary_evidence_generic_contradiction,
     _count_recovery_steps_in_skill_case,
     _extract_recovery_verification_section,
 )
 
 
 class TestDetectRecoveryContradiction:
-    def test_text_contradiction(self):
-        warning = _detect_recovery_contradiction("cpu usage normal, cpu back to normal")
-        assert warning is not None
-        assert "Contradiction" in warning
+    """Structural-only contradiction detection (Phase 2c / D14).
 
-    def test_no_contradiction_with_absence(self):
-        warning = _detect_recovery_contradiction("still elevated, cpu remains high")
-        assert warning is None
+    The program compares ChecklistItemStatus enums only; it no longer
+    reverse-infers "recovery looks effective" from free-text l2_details.
+    """
 
-    def test_checklist_all_passed_contradiction(self):
+    def test_all_passed_checklist_contradicts_failed(self):
         items = [
             {"step": 1, "status": "passed"},
             {"step": 2, "status": "passed"},
         ]
-        warning = _detect_recovery_contradiction("some details", items)
+        warning = _detect_recovery_contradiction(items)
         assert warning is not None
         assert "ALL checklist steps" in warning
 
-    def test_checklist_not_all_passed_no_contradiction(self):
+    def test_not_all_passed_no_contradiction(self):
         items = [
             {"step": 1, "status": "passed"},
             {"step": 2, "status": "failed"},
         ]
-        warning = _detect_recovery_contradiction("some details", items)
-        assert warning is None
+        assert _detect_recovery_contradiction(items) is None
 
-    def test_empty_inputs(self):
-        assert _detect_recovery_contradiction("", None) is None
+    def test_empty_checklist_no_contradiction(self):
+        assert _detect_recovery_contradiction(None) is None
+        assert _detect_recovery_contradiction([]) is None
 
-    def test_absence_phrase_blocks_checklist_check(self):
-        items = [{"step": 1, "status": "passed"}]
-        warning = _detect_recovery_contradiction("still elevated, remains high", items)
-        assert warning is None
+    def test_non_dict_items_ignored(self):
+        # A structural comparison guards against non-dict items; only 'passed'
+        # dicts count, so a mixed junk list is not "all passed".
+        assert _detect_recovery_contradiction(["passed", {"status": "passed"}]) is None
 
 
 class TestDetectRecoveryChecklistInconsistency:
@@ -115,8 +111,26 @@ class TestParseRecoveryVerificationResult:
         assert result["level"] == "partial"
         assert any("PrimaryEvidenceObserved" in w for w in result["warnings"])
 
-    def test_contradiction_overrides_to_partial(self):
+    def test_free_text_recovery_indicators_no_longer_override(self):
+        # Phase 2c / D14: the program no longer reverse-infers a contradiction
+        # from free-text l2_details ("cpu usage normal"). With no checklist to
+        # compare structurally, layer2 'failed' is authoritative and stays.
         text = "Layer2: failed — cpu usage normal, cpu back to normal\nOverall: unrecovered"
+        result = _parse_recovery_verification_result(text)
+        assert result["layer2"]["status"] == "failed"
+        assert result["level"] == "unrecovered"
+
+    def test_structural_all_passed_checklist_overrides_failed(self):
+        # Retained structural path: layer2 'failed' but ALL checklist steps
+        # 'passed' is an enum-level self-contradiction → downgrade to partial.
+        text = (
+            "RECOVERY_VERIFICATION_CHECKLIST:\n"
+            "Step 1: passed\n"
+            "Step 2: passed\n"
+            "RECOVERY_VERIFICATION_RESULT:\n"
+            "Layer2: failed\n"
+            "Overall: unrecovered"
+        )
         result = _parse_recovery_verification_result(text)
         assert result["layer2"]["status"] == "partial"
         assert result["level"] == "partial"
@@ -146,38 +160,35 @@ class TestParseRecoveryVerificationResult:
         assert result["level"] == "partial"
 
 
-class TestDetectPrimaryEvidenceGenericContradiction:
-    def test_generic_only_triggers(self):
-        warning = _detect_primary_evidence_generic_contradiction(
-            True, "pod running, no new restarts, healthy",
-        )
-        assert warning is not None
-        assert "generic" in warning.lower()
+class TestGenericPrimaryEvidenceRetired:
+    """Phase 2c / D14: generic-primary-evidence text detection is retired.
 
-    def test_fault_specific_no_trigger(self):
-        warning = _detect_primary_evidence_generic_contradiction(
-            True, "cpu usage back to baseline, pod running",
-        )
-        assert warning is None
+    Whether observed evidence is fault-specific vs generic health is the LLM's
+    judgement (carried by primary_evidence_observed). The program no longer
+    reverse-infers it from l2_details keyword matching, so a 'recovered' verdict
+    with primary_evidence_observed=true is NOT downgraded on generic prose.
+    """
 
-    def test_primary_false_no_trigger(self):
-        warning = _detect_primary_evidence_generic_contradiction(
-            False, "pod running, no restarts",
+    def test_generic_prose_no_longer_downgrades(self):
+        text = (
+            "Layer2: passed — pod running, no new restarts, healthy\n"
+            "PrimaryEvidenceObserved: true\n"
+            "Overall: recovered"
         )
-        assert warning is None
+        result = _parse_recovery_verification_result(text)
+        # The structural gate only downgrades when the flag is FALSE; the
+        # generic-prose downgrade is retired, so 'recovered' stands.
+        assert result["level"] == "recovered"
 
-    def test_pod_kill_exemption(self):
-        warning = _detect_primary_evidence_generic_contradiction(
-            True, "pod running, no new restarts",
-            skill_name="pod-kill",
+    def test_structural_false_flag_still_downgrades(self):
+        # Retained structural gate: recovered + primary_evidence_observed=false.
+        text = (
+            "Layer2: passed — pod running\n"
+            "PrimaryEvidenceObserved: false\n"
+            "Overall: recovered"
         )
-        assert warning is None
-
-    def test_no_indicators_no_trigger(self):
-        warning = _detect_primary_evidence_generic_contradiction(
-            True, "something ambiguous happened",
-        )
-        assert warning is None
+        result = _parse_recovery_verification_result(text)
+        assert result["level"] == "partial"
 
 
 class TestCountRecoverySteps:

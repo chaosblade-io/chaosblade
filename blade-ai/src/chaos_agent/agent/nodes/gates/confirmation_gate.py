@@ -378,10 +378,10 @@ def _freeze_from_state(state: AgentState) -> dict | None:
 
     Reuses ``owner_names``, ``resolved_names``, ``pvc_claims``, the
     case-manifest ``mechanism_entries`` AND the case-file
-    ``recovery_channel`` from the ``approved_target`` that safety_check
-    already froze (avoiding a redundant cluster query and re-read of
-    the case file — both were legislated at settlement and must
-    survive re-freeze unchanged).
+    ``recovery_channel`` / ``deterministic_verdict`` from the
+    ``approved_target`` that safety_check already froze (avoiding a
+    redundant cluster query and re-read of the case file — all were
+    legislated at settlement and must survive re-freeze unchanged).
 
     This re-freeze is the SINGLE approval point for the widened
     contract: ``widening_pending_approval`` deliberately defaults to
@@ -401,9 +401,17 @@ def _freeze_from_state(state: AgentState) -> dict | None:
     # (same rationale as the manifest entries: legislated at settlement,
     # orthogonal to whatever the human just approved).
     recovery_channel = str(existing.get("recovery_channel") or "")
+    # The case-file verdict-binding legislation survives re-freeze verbatim
+    # for the SAME reason (openspec mechanism-invariant-trust-boundary): it
+    # was legislated at settlement and is orthogonal to whatever the human
+    # just approved. Dropping it here would silently demote the verify layer
+    # back to the drift-prone LLM-triple rule resolution for EVERY drill that
+    # passes the confirmation gate's approved re-freeze.
+    deterministic_verdict = existing.get("deterministic_verdict") or {}
     return freeze_approved_target_from_spec(
         spec, owner_names=owner_names, resolved_names=resolved_names,
         pvc_claims=pvc_claims, mechanism_entries=mechanism_entries,
         recovery_channel=recovery_channel,
+        deterministic_verdict=deterministic_verdict,
         widening_pending_approval=False,
     )

@@ -67,6 +67,7 @@ from chaos_agent.agent.execution_artifacts import (
     _exec_pod_identity,
     RECOVERY_CARRIER_TYPES,
     is_vehicle_name,
+    is_vehicle_rbac_verb_patch,
     is_vehicle_teardown_delete,
     vehicle_artifact_types,
 )
@@ -202,34 +203,37 @@ async def _resolve_exec_pod_node(
     if pod_name in cached:
         return cached[pod_name]
 
-    from chaos_agent.transports import (
-        PROFILE_K8S,
-        TransportTarget,
-        execute_via_transport,
-    )
-    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
+    from chaos_agent.agent.target_identity import resolve_node_of_pod
 
     kubeconfig = str(state.get("kubeconfig") or "")
-    node = ""
-    try:
-        cmd = build_kubectl_cmd(
-            "get",
-            ["pod", pod_name, "-n", pod_ns or "default",
-             "-o", "jsonpath={.spec.nodeName}"],
-            kubeconfig=kubeconfig,
+
+    async def _node_binding_executor(
+        cmd, target, *, timeout, task_id: str = "", expect_profile=None
+    ):
+        # Lazy import so the seam's query runs through the SAME
+        # ``chaos_agent.transports.execute_via_transport`` binding the rest of
+        # the screener IO (and the tests) monkeypatch — a top-level binding
+        # would freeze the original and defeat the patch. Preserves this
+        # lane's ``source="node-binding-check"`` tag; the ``pod → node`` query
+        # shape itself is single-sourced in the seam (#83 audit).
+        from chaos_agent.transports import execute_via_transport
+
+        return await execute_via_transport(
+            cmd, target, timeout=timeout, task_id=task_id,
+            source="node-binding-check", expect_profile=expect_profile,
         )
-        result = await execute_via_transport(
-            cmd, TransportTarget.from_state({}),
-            timeout=settings.timeout_kubectl,
-            task_id=str(state.get("task_id") or ""),
-            source="node-binding-check",
-            expect_profile=PROFILE_K8S,
-        )
-        if getattr(result, "exit_code", 1) == 0:
-            node = str(getattr(result, "stdout", "") or "").strip()
-    except Exception:
+
+    resolved = await resolve_node_of_pod(
+        pod_name=pod_name, namespace=pod_ns or "default",
+        kubeconfig=kubeconfig, task_id=str(state.get("task_id") or ""),
+        executor=_node_binding_executor,
+    )
+    # Fail closed: an unresolvable binding (severed API path / no such pod)
+    # yields "" so the caller keeps the drift review — never a guessed node.
+    node = resolved or ""
+    if not node:
         logger.warning(
-            "target_guard: exec-pod node binding probe failed for %s/%s; "
+            "target_guard: exec-pod node binding unresolved for %s/%s; "
             "keeping identity review (fail closed)", pod_ns, pod_name,
         )
 
@@ -277,44 +281,30 @@ async def _resolve_label_pod_names(
     if key in cached:
         return tuple(cached[key])
 
-    from chaos_agent.transports import (
-        PROFILE_K8S,
-        TransportTarget,
-        execute_via_transport,
-    )
-    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
+    from chaos_agent.agent.target_identity import resolve_pods_by_selector
+    from chaos_agent.transports import resolve_transport_target
 
     kubeconfig = str(state.get("kubeconfig") or "")
-    selector = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
-    names: tuple[str, ...] = ()
-    try:
-        cmd = build_kubectl_cmd(
-            "get",
-            ["pods", "-n", namespace or "default", "-l", selector,
-             "-o", "jsonpath={.items[*].metadata.name}"],
-            kubeconfig=kubeconfig,
-        )
-        result = await execute_via_transport(
-            cmd, TransportTarget.from_state({}),
-            timeout=settings.timeout_kubectl,
-            task_id=str(state.get("task_id") or ""),
-            source="selector-name-probe",
-            expect_profile=PROFILE_K8S,
-        )
-        if getattr(result, "exit_code", 1) == 0:
-            names = tuple(
-                str(getattr(result, "stdout", "") or "").split()
-            )
-    except Exception:
-        logger.warning(
-            "target_guard: selector name probe failed for %s -l %s; "
-            "keeping identity review (fail closed)", namespace, selector,
-        )
+    # The query+parse primitive is single-sourced in the target_identity seam
+    # (the SET twin ``resolve_pods_by_selector``); this wrapper keeps only its
+    # own concerns — the per-(namespace, selector) probe cache, the fail-CLOSED
+    # policy (seam's ``()`` on error/empty means "no pass" → the caller keeps
+    # the static drift review), the ``selector-name-probe`` attribution, and the
+    # vehicle_cache write-back so later screener rounds never re-probe.
+    names = await resolve_pods_by_selector(
+        selector=labels,
+        namespace=namespace or "default",
+        kubeconfig=kubeconfig,
+        task_id=str(state.get("task_id") or ""),
+        target=resolve_transport_target(state),
+        source="selector-name-probe",
+    )
 
     vehicle_cache["selector_name_probes"] = (
         tuple(cached.items()) + ((key, names),)
     )
     if names:
+        selector = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
         logger.info(
             "target_guard: resolved selector %s -l %s -> %s",
             namespace, selector, sorted(names),
@@ -444,6 +434,39 @@ def _vehicle_delete_is_cleanup(
     return is_vehicle_teardown_delete(
         effective, artifacts,
         v_args=str(tool_args.get("v_args") or ""),
+    )
+
+
+def _vehicle_rbac_patch_is_construction(
+    tool_args: Any, vehicle_cache: dict[str, Any], state: AgentState,
+) -> bool:
+    """A patch adding verbs to the carrier's OWN registered Role is CONSTRUCTION.
+
+    Symmetric to :func:`_vehicle_delete_is_cleanup`: a thin wrapper over
+    the shared core
+    (:func:`execution_artifacts.is_vehicle_rbac_verb_patch`) that adds the
+    screening-round cache as the artifacts source and the ``patch``
+    subcommand gate. The standard's two-step carrier RBAC build
+    (``create role`` then ``patch role`` to append a second resource
+    family's verbs — unavoidable when the restore payload spans two
+    families with non-uniform verbs, since one ``create role`` makes one
+    rule) targets machinery this task built, not a fault object, so it MUST
+    bypass the armed-before-inject carrier gate. Otherwise the gate
+    deadlocks against the B85 arming-time verb reconciliation
+    (:func:`_screen_carrier_restore_verbs`), which refuses to arm until
+    that very patch has widened the grant — and whose own remediation text
+    prescribes exactly this patch. Only the carrier's OWN registered
+    Role/ClusterRole with an add-only verb payload qualifies; every other
+    patch (victim, fault object, unregistered/sibling Role, replace/remove)
+    still hits the gate.
+    """
+    if not isinstance(tool_args, dict) or tool_args.get("subcommand") != "patch":
+        return False
+    artifacts = vehicle_cache.get(
+        "execution_artifacts", state.get("execution_artifacts") or [],
+    )
+    return is_vehicle_rbac_verb_patch(
+        artifacts, v_args=str(tool_args.get("v_args") or ""),
     )
 
 
@@ -597,7 +620,38 @@ _NO_STATE_POST_URL_RE = re.compile(
 )
 
 
-def _verbs_in_payload_text(payload: str) -> set[str]:
+def _segment_targets_carrier_own_asset(
+    segment: str, own_names: frozenset[str] | set[str],
+) -> bool:
+    """True when a payload segment addresses the carrier's OWN rbac asset.
+
+    Recognises the §9 self-teardown tail step — the ``curl -sf -X DELETE
+    .../rolebindings/<its own name>`` the carrier appends (fail-open)
+    AFTER the main recovery so no privileged Binding outlives the fire.
+    The name is matched as a URL path segment against the carrier's
+    REGISTERED ``rbac_family`` member names — the SAME authoritative
+    registrations :func:`execution_artifacts.is_vehicle_teardown_delete`
+    reads for a ``kubectl delete`` (this is its payload-internal twin; the
+    matching logic differs necessarily because the input form differs — a
+    curl URL inside a shell payload, not a delete argv — but the data
+    source is single). Precise by construction: the synthetic
+    ``drill-rc-<hash>`` name never collides with a fault target, so a
+    MAIN-recovery DELETE (``#65``'s ``delete networkpolicies``, or a
+    binding-recreate case's delete of the ``drill-rb-*`` target) keeps its
+    verb — only the self-referential teardown matches.
+    """
+    if not own_names:
+        return False
+    return any(
+        re.search(r"/" + re.escape(name) + r"(?![A-Za-z0-9_.-])", segment)
+        for name in own_names
+    )
+
+
+def _verbs_in_payload_text(
+    payload: str,
+    exempt_teardown_names: frozenset[str] | set[str] = frozenset(),
+) -> set[str]:
     """REST write verbs carried by ``curl -X`` spellings in raw text.
 
     The payload is split into shell command segments (``;`` / ``&&`` /
@@ -605,25 +659,41 @@ def _verbs_in_payload_text(payload: str) -> set[str]:
     invocation's URL: a POST aimed at a review-family resource is a
     query-shaped call (no cluster state changes) and carries no write verb
     the grant must cover; every other method keeps the §2 form-agnostic
-    method→verb mapping. Residual fail-open edge (same family as the
-    documented shard-split boundary): one curl invocation listing BOTH a
-    real write URL and a review URL keeps its POST exempt — layer-2 SSAR
-    at arm time owns the remainder.
+    method→verb mapping. A DELETE aimed at the carrier's OWN registered
+    rbac asset (``exempt_teardown_names``) is the §9 fail-open self-teardown
+    tail step — §3 L177 keeps its verb out of the arm-time SSAR hard gate,
+    so it reconciles to nothing here too (else the two arming gates drift).
+    Residual fail-open edge (same family as the documented shard-split
+    boundary): one curl invocation listing BOTH a real write URL and a
+    review/teardown URL keeps its exempt verb — layer-2 SSAR at arm time
+    owns the remainder.
     """
     verbs: set[str] = set()
     for segment in _CURL_CMD_SPLIT_RE.split(payload):
         no_state_post = _NO_STATE_POST_URL_RE.search(segment) is not None
+        self_teardown = _segment_targets_carrier_own_asset(
+            segment, exempt_teardown_names,
+        )
         for method in _CURL_METHOD_RE.findall(segment):
             verb = _REST_WRITE_VERB_BY_METHOD.get(method.upper())
             if verb == "create" and no_state_post:
+                continue
+            if verb == "delete" and self_teardown:
                 continue
             if verb:
                 verbs.add(verb)
     return verbs
 
 
-def _carrier_restore_write_verbs(v_args: str) -> set[str]:
+def _carrier_restore_write_verbs(
+    v_args: str,
+    exempt_teardown_names: frozenset[str] | set[str] = frozenset(),
+) -> set[str]:
     """Write verbs the exec payload AFTER ``--`` actually uses (curl -X).
+
+    ``exempt_teardown_names`` (the carrier's OWN registered rbac asset
+    names) drops the §9 self-teardown tail step's DELETE from BOTH the
+    plain and the decoded reading — see :func:`_verbs_in_payload_text`.
 
     Everything past the first ``--`` is the pod-side payload (``sh -c
     '...'`` with its restore curls inside); only its REST WRITE methods
@@ -642,13 +712,15 @@ def _carrier_restore_write_verbs(v_args: str) -> set[str]:
     _, _, payload = v_args.partition("--")
     if not payload:
         return set()
-    verbs = _verbs_in_payload_text(payload)
+    verbs = _verbs_in_payload_text(payload, exempt_teardown_names)
     for run in _B64_RUN_RE.findall(payload):
         try:
             decoded = base64.b64decode(run + "=" * (-len(run) % 4))
         except (ValueError, TypeError):
             continue
-        verbs |= _verbs_in_payload_text(decoded.decode("utf-8", "replace"))
+        verbs |= _verbs_in_payload_text(
+            decoded.decode("utf-8", "replace"), exempt_teardown_names,
+        )
     return verbs
 
 
@@ -676,6 +748,25 @@ def _registered_recovery_carrier(
     return None
 
 
+def _carrier_own_rbac_names(carrier: dict[str, Any]) -> frozenset[str]:
+    """Names of a carrier's OWN registered ``rbac_family`` members.
+
+    Single-source projection of the authoritative ``rbac_family`` member
+    list (the same registrations :func:`is_vehicle_teardown_delete` and
+    ``_extend_recovery_carrier_rbac_verbs`` consume). A DELETE in the
+    arming payload aimed at one of THESE names is the §9 fail-open
+    self-teardown tail step, exempt from the arm-time hard gate (§3 L177);
+    B85 must exempt it too or the two arming gates drift — see the
+    recovery-carrier.md invariant: main-recovery verbs granted BEFORE arm,
+    the optional self-teardown tail step granted AFTER.
+    """
+    return frozenset(
+        str(member.get("name"))
+        for member in (carrier.get("rbac_family") or [])
+        if isinstance(member, dict) and member.get("name")
+    )
+
+
 def _screen_carrier_restore_verbs(
     tool_args: Any,
     vehicle_cache: dict[str, Any],
@@ -701,6 +792,15 @@ def _screen_carrier_restore_verbs(
     carrier with no Role member on record (manifest-built stack, resumed
     pre-verbs artifact), or an empty grant parse — each reconciles
     nothing and passes with a warning where the blind spot is real.
+
+    The §9 self-teardown tail step (the carrier DELETEs its OWN Binding
+    after fire, fail-open) is EXEMPT — its verb is granted only AFTER arm
+    (recovery-carrier.md §3 L177 keeps it out of the arm-time SSAR hard
+    gate too), so reconciling it here would refuse a create/patch-shaped
+    recovery whose MAIN verbs are already granted, for a delete it needs
+    only post-arm (the #75 live form: grant {get,create,bind}, main verb
+    POST=create, tail-step DELETE of drill-rc-* — the two arming gates
+    must not drift). Only the MAIN-recovery verbs are reconciled.
     """
     if not isinstance(tool_args, dict) or tool_args.get("subcommand") != "exec":
         return None
@@ -717,11 +817,16 @@ def _screen_carrier_restore_verbs(
     pod_name, _namespace = _exec_pod_identity(tokens[:separator])
     if not pod_name:
         return None
-    payload_verbs = _carrier_restore_write_verbs(v_args)
-    if not payload_verbs:
-        return None
     carrier = _registered_recovery_carrier(vehicle_cache, state, pod_name)
     if carrier is None:
+        return None
+    # Reconcile ONLY the main-recovery verbs: the §9 self-teardown tail
+    # step (DELETE of the carrier's OWN registered Binding) is granted
+    # after arm and exempt here exactly as it is from the §3 SSAR gate.
+    payload_verbs = _carrier_restore_write_verbs(
+        v_args, exempt_teardown_names=_carrier_own_rbac_names(carrier),
+    )
+    if not payload_verbs:
         return None
     granted: set[str] = set()
     has_role_member = False
@@ -1103,9 +1208,12 @@ async def _refresh_carrier_images_if_starved(state: AgentState) -> None:
     from chaos_agent.agent.nodes.gates.preplan_probe import (
         refresh_carrier_image_discovery,
     )
+    from chaos_agent.transports import resolve_transport_target
 
     try:
-        await refresh_carrier_image_discovery(resolve_kubeconfig(state))
+        await refresh_carrier_image_discovery(
+            resolve_kubeconfig(state), target=resolve_transport_target(state),
+        )
     except Exception:  # noqa: BLE001 — admission enrichment, never fatal
         logger.debug(
             "carrier-image lazy refresh failed (non-fatal)", exc_info=True,
@@ -1934,6 +2042,9 @@ async def tool_screener(state: AgentState) -> dict:
                     and not _vehicle_delete_is_cleanup(
                         tool_args, effective, vehicle_cache, state,
                     )
+                    and not _vehicle_rbac_patch_is_construction(
+                        tool_args, vehicle_cache, state,
+                    )
                 ):
                     decision = GuardDecision(
                         verdict=GuardVerdict.REJECT_BANNED,
@@ -2450,13 +2561,25 @@ def _format_deferred_for_llm(decision: dict[str, Any]) -> str:
 
     Kept status="error" upstream: the call did not succeed and replan
     failure-collection treats it accordingly.
+
+    W-70-4 (Case #70 Phase B): the body now surfaces this call's own
+    verdict and states the rejection landed on a DIFFERENT sibling. The
+    prior wording ("the screener found nothing wrong with this call")
+    was true but gave no reconciling model — the LLM had just seen a
+    namespace-scoped REJECT署名 target_guard, could not tell why this
+    call differs from the refused sibling, and hedged ("it might also be
+    rejected as namespace drift") before abandoning it. Naming the
+    verdict (allow/readonly) tells it the guard already cleared THIS
+    call, so re-issuing alone is safe.
     """
     return (
         f"[screener] DEFERRED — {decision['tool_name']} was NOT rejected; "
-        "the screener found nothing wrong with this call. A sibling call "
-        "in the same batch was rejected, so the whole batch was returned "
-        "unexecuted. Re-issue this call (with the corrected siblings, or "
-        "on its own) and it will run normally."
+        f"the guard cleared THIS call (verdict={decision['verdict']}: it does "
+        "not drift from the approved target). A DIFFERENT sibling call in the "
+        "same batch was rejected, and the batch is atomic, so nothing in it "
+        "ran. That rejection applies to the sibling, NOT to this call — "
+        "re-issue this one (with the corrected siblings, or on its own) and it "
+        "will run normally."
     )
 
 
@@ -2640,11 +2763,19 @@ def _apply_drift_correction(
     # it would demote the route gate back to its verb-vocabulary proxy.
     recovery_channel = str(existing.get("recovery_channel") or "")
 
+    # The case-file ``deterministic_verdict`` legislation is carried forward
+    # verbatim for the same reason: it binds the CASE's deterministic rule key
+    # + expected value, not the victim identity — a names/labels correction
+    # never stales it, and dropping it would demote the verify layer back to
+    # the drift-prone LLM-triple rule resolution.
+    deterministic_verdict = existing.get("deterministic_verdict") or {}
+
     result: dict = {"fault_spec": new_spec.to_dict()}
     result["approved_target"] = freeze_approved_target_from_spec(
         new_spec, owner_names=owner_names, resolved_names=resolved_names,
         pvc_claims=pvc_claims, mechanism_entries=mechanism_entries,
         recovery_channel=recovery_channel,
+        deterministic_verdict=deterministic_verdict,
         # The drift-correction card ran under a human's eyes, so the
         # rebuild counts as an approval: the pending marker clears
         # (explicit here to document the semantics; the sentinel would

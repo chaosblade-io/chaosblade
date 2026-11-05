@@ -39,15 +39,18 @@ async def cleanup_planning_debug_pods(state: AgentState) -> dict:
         parse_debug_pod_info,
     )
     from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
+    from chaos_agent.transports import resolve_transport_target
 
     result_update: dict = {}
     kubeconfig = _resolve_kubeconfig(state) or ""
     task_id = state.get("task_id", "") or ""
+    _xport_target = resolve_transport_target(state)
 
     tracked_artifacts, artifact_cleaned = await cleanup_debug_pod_artifacts(
         state.get("execution_artifacts"),
         kubeconfig=kubeconfig,
         task_id=task_id,
+        target=_xport_target,
     )
     if tracked_artifacts != (state.get("execution_artifacts") or []):
         result_update["execution_artifacts"] = tracked_artifacts
@@ -89,7 +92,9 @@ async def cleanup_planning_debug_pods(state: AgentState) -> dict:
             "planning cleanup: deleting probe debug pod %s in namespace %s",
             pod_name, ns,
         )
-        await delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
+        await delete_debug_pod(
+            pod_name, kubeconfig, task_id, namespace=ns, target=_xport_target,
+        )
     if pods_to_delete or artifact_cleaned:
         result_update["cleaned_debug_pods"] = sorted(already_cleaned | pods_to_delete)
 

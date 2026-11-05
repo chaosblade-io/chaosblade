@@ -11,7 +11,11 @@ from chaos_agent.agent.nodes.store._store_sync import sync_to_store, sync_node_s
 from chaos_agent.persistence.task_identity import is_real_task_id
 from chaos_agent.agent.result.operation_outcome import read_inject_verification, read_operation_outcome
 from chaos_agent.agent.result.verdict import INJECT_VETO_VALUES
-from chaos_agent.agent.state import AgentState, has_active_fault
+from chaos_agent.agent.state import (
+    AgentState,
+    has_active_fault,
+    layer1_expired_override_applies,
+)
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.operational_memory import OperationalMemory
 from chaos_agent.observability.status_tracker import (
@@ -310,18 +314,16 @@ def _infer_failure_detail(state: AgentState) -> dict:
         level = verification.get("level", "")
         l1_status = l1.get("status", "unknown")
         l2_status = l2.get("status", "unknown")
-        # Defense-in-depth exemption: an expired Layer1 record (Destroyed before
-        # or after its timeout) only proves the RECORD is gone, not that the
+        # Defense-in-depth exemption, SINGLE-SOURCED with infer_task_state /
+        # infer_phase (see layer1_expired_override_applies) so the three
+        # terminal-failure faces can never drift: an expired Layer1 record
+        # (Destroyed before or after its timeout, or a false-positive carrier
+        # the agent cleaned up) only proves the RECORD is gone, not that the
         # fault never took effect. When Layer 2 independently verified the fault
         # effects on the cluster (verified + passed), the Layer1 failure must
         # not veto the verdict (task inject-e47de3e8: executor cleanup destroyed
         # the record, Layer2 verified the restarts, task was wrongly failed).
-        layer1_expired_overridden = (
-            l1_status == "failed"
-            and bool(l1.get("expired"))
-            and l2_status == "passed"
-            and level == "verified"
-        )
+        layer1_expired_overridden = layer1_expired_override_applies(verification)
         if (
             # Honest ignorance is never success (round-15: the unverified
             # veto was a bare single-word tuple hand copy).

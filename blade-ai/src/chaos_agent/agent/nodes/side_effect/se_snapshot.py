@@ -9,7 +9,7 @@ from chaos_agent.agent.nodes.side_effect._side_effect_detectors import resolve_o
 from chaos_agent.agent.nodes.store._store_sync import sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
-from chaos_agent.transports import PROFILE_K8S
+from chaos_agent.transports import PROFILE_K8S, resolve_transport_target
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,11 @@ async def se_snapshot_node(state: AgentState) -> dict:
     namespace = spec.namespace if spec else ""
     kubeconfig = state.get("kubeconfig", "")
     task_id = state.get("task_id", "")
+    # Single-authority transport target from THIS node's state (replaces the
+    # settings side-effect ``sync_kubewiz_runtime`` used to establish). Threaded
+    # into the observer so its kubectl/host-diag leaves read per-session kubewiz
+    # values from state, not settings.
+    _xport_target = resolve_transport_target(state)
 
     profile = profile_for_spec(spec) if spec else PROFILE_K8S
     observer = resolve_observer(profile)
@@ -41,7 +46,9 @@ async def se_snapshot_node(state: AgentState) -> dict:
     await dispatch_node_message("se_snapshot", "Capturing the pre-injection side-effect snapshot...\n\n")
 
     try:
-        snapshot = await observer.capture_base_snapshot(spec, kubeconfig, task_id=task_id)
+        snapshot = await observer.capture_base_snapshot(
+            spec, kubeconfig, task_id=task_id, xport_target=_xport_target,
+        )
     except Exception as e:
         logger.warning("se_snapshot: capture failed: %s", e)
         tracker.complete(f"Side-effect snapshot failed: {e}")

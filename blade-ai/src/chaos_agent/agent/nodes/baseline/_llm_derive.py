@@ -439,6 +439,43 @@ def _identity_rules_block(
     return ""
 
 
+# Shared prose for the binary-absence guidance the derive/retry prompts carry.
+# The fallback examples (/proc/net/tcp, /proc/stat, /proc/meminfo) are the same
+# three the preplan host-toolkit probe publishes (see that module's comment
+# flagging the cross-file duplicate) — kept in ONE constant here so the primary
+# derive and the reactive retry never drift apart.
+_ABSENCE_FALLBACK_HINT = (
+    "Do NOT propose any command that invokes them, with ANY arguments: it "
+    "will fail identically. For that observation dimension, read the "
+    "kernel/interface directly instead (e.g. /proc/net/tcp for sockets, "
+    "/proc/stat for CPU, /proc/meminfo for memory), or use a binary that is "
+    "present"
+)
+
+
+def _absent_binary_guidance(binaries: tuple[str, ...], *, framing: str) -> str:
+    """Prompt guidance steering the derive/retry LLM off absent host binaries.
+
+    ``framing`` states HOW the absence is known — a pre-task probe for the
+    primary derive (nothing has run yet), an earlier exit-127 for the reactive
+    retry. The fallback advice and the binary list are identical, so they live
+    here once.
+
+    GUIDANCE ONLY on the primary derive path: it must NOT gate on this. A
+    command the primary derive rejects never executes, so it never becomes an
+    observation, and with no failed observation the reactive retry has nothing
+    to recover — the observation dimension would be silently lost. (The retry
+    path avoids this by keeping the original obs when it rejects a replacement;
+    the primary derive has no such original.) The hard gate lives only in the
+    reactive retry's ``_validate_and_filter_commands`` call, where a rejected
+    command's original observation is preserved for the next round.
+    """
+    if not binaries:
+        return ""
+    lines = "\n".join(f"- `{b}`" for b in sorted(set(binaries)))
+    return f"\n{framing} {_ABSENCE_FALLBACK_HINT}:\n{lines}\n"
+
+
 async def _llm_derive_baseline_commands(
     llm,
     skill_case_content: str,
@@ -453,6 +490,7 @@ async def _llm_derive_baseline_commands(
     labels: dict[str, str] | None = None,
     pod_selector: dict[str, str] | None = None,
     task_id: str = "",
+    poisoned_binaries: tuple[str, ...] = (),
 ) -> list[BaselineCommand]:
     """Let LLM derive baseline collection commands from full skill content.
 
@@ -461,6 +499,17 @@ async def _llm_derive_baseline_commands(
     the concrete task context (actual namespace / resource names / labels).
     The LLM emits concrete commands directly (no template variables, except
     ``{debug_pod}`` for k8s node host-level metrics).
+
+    ``poisoned_binaries`` carries the host observation binaries a pre-task
+    probe proved ABSENT on the target (mirrored to state by preplan_probe).
+    It is injected as prompt GUIDANCE so the model picks the /proc kernel
+    interface on this FIRST round instead of an absent ``ss``/``netstat`` that
+    exits 127 and costs a reactive retry round. Deliberately NOT passed to
+    ``_validate_and_filter_commands`` as a gate here — see
+    ``_absent_binary_guidance``: gating the primary derive would silently drop
+    the observation dimension (a rejected command never executes, so there is
+    no failed observation for the retry to recover). The reactive retry keeps
+    the hard gate as the safety net for a model that ignores this guidance.
 
     Falls back to empty list on any failure (triggers Registry fallback).
     """
@@ -482,6 +531,18 @@ async def _llm_derive_baseline_commands(
     )
     _identity_rules = _identity_rules_block(scope, names, pod_selector)
 
+    # Pre-task absence guidance (proactive twin of the retry poison block).
+    # Empty unless preplan proved binaries absent — then it steers this FIRST
+    # round to the /proc form. Guidance only, never a gate (see docstring).
+    _absence_block = _absent_binary_guidance(
+        poisoned_binaries,
+        framing=(
+            "A pre-task environment probe found these observation binaries are "
+            "NOT INSTALLED on the target — a command invoking any of them exits "
+            "127 / 'command not found', so proposing one wastes a round."
+        ),
+    )
+
     human_prompt = (
         f"{target_context}\n\n"
         f"{_identity_rules}"
@@ -492,6 +553,7 @@ async def _llm_derive_baseline_commands(
         "Generate read-only commands to capture the pre-injection baseline for "
         "each affected state, using the ACTUAL resource values above (embed them "
         "directly — do not emit placeholders).\n"
+        f"{_absence_block}"
     )
 
     try:
@@ -515,6 +577,23 @@ async def _llm_derive_baseline_commands(
             duration_ms=_dt_ms,
         )
         commands = _parse_llm_json_output(raw)
+        if commands is None:
+            # Receive failure (essence-B): the LLM produced output but no JSON
+            # structure was recoverable. Fail loud — do NOT let it read as "the
+            # LLM derived no commands". raw is preserved in the aux-call audit
+            # above; fall back to the registry strategy with an explicit trace.
+            logger.error(
+                "baseline derive: LLM output unparseable (receive failure), "
+                "raw preserved in aux-call audit; 0 commands derived, "
+                "registry fallback will cover",
+            )
+            return []
+        # NOTE: poisoned_binaries is deliberately NOT threaded into this gate.
+        # The primary derive has no failed observation to fall back on, so a
+        # gate-rejected command here would vanish (never executed → never an
+        # observation → the reactive retry cannot recover the dimension). The
+        # absence fact is applied as prompt guidance above; the hard gate lives
+        # only in the retry path, where the original obs is preserved.
         accepted, rejected = _validate_and_filter_commands(commands, profile)
         _surface_rejected_derivations(task_id, rejected)
         return accepted
@@ -542,6 +621,7 @@ async def _llm_retry_failed_commands(
     pod_selector: dict[str, str] | None = None,
     task_id: str = "",
     already_tried: tuple[str, ...] = (),
+    poisoned_binaries: tuple[str, ...] = (),
 ) -> dict:
     """Judge and re-derive failed or empty baseline commands with feedback.
 
@@ -663,6 +743,22 @@ async def _llm_retry_failed_commands(
             "approach of one kind has failed (e.g. every command needing a debug "
             f"pod), change approach:\n{_tried_lines}\n"
         )
+    # Binary-absence guidance (Case #6). The gate in
+    # ``_validate_and_filter_commands`` ENFORCES this (a replacement invoking an
+    # absent binary is refused pre-execution), but telling the model up front
+    # lets it pick a working form on the FIRST retry instead of discovering the
+    # absence one doomed round at a time. Constraint lives in the gate
+    # signature, not the prompt alone — prompt text is guidance, the gate is the
+    # block (the lesson from the already_tried dimension). Shares its prose with
+    # the primary derive's pre-task block via ``_absent_binary_guidance``; only
+    # the framing differs (here: an earlier command already exited 127).
+    _poison_block = _absent_binary_guidance(
+        poisoned_binaries,
+        framing=(
+            "These binaries are NOT INSTALLED on the target — an earlier "
+            "baseline command invoking each exited 127 / 'command not found'."
+        ),
+    )
     human_prompt = (
         f"{target_context}\n\n"
         f"{_identity_rules}"
@@ -687,6 +783,7 @@ async def _llm_retry_failed_commands(
         "the actual fault target.\n\n"
         f"{error_feedback}\n"
         f"{_tried_block}\n"
+        f"{_poison_block}\n"
         "For EACH failed-or-empty command above, output ONE JSON entry "
         "judging its semantics against the skill case:\n"
         "- {\"verdict\": \"expected_absence\", \"reason\": \"<why the non-zero "
@@ -750,13 +847,40 @@ async def _llm_retry_failed_commands(
             reasoning=str(getattr(response, "reasoning_content", "") or ""),
             duration_ms=_dt_ms,
         )
+        decisions = _parse_llm_json_output(raw)
+        if decisions is None:
+            # Receive failure (essence-B / #78-R2): the LLM answered but we
+            # could not recover a verdict. Do NOT collapse this into the same
+            # "no verdict" path as a legitimate empty — that collapse is what
+            # 降级ed a correctly-judged expected_absence into the empty bucket.
+            # Fail loud and hand the observations back marked UNDETERMINED so
+            # the caller keeps them out of the empty bucket. raw is preserved
+            # in the aux-call audit recorded just above.
+            logger.error(
+                "LLM baseline retry (task=%s): output unparseable (receive "
+                "failure); %d observation(s) marked undetermined, raw "
+                "preserved in aux-call audit",
+                task_id or "-", len(failed_observations),
+            )
+            return {
+                "expected": [], "replace": [], "rejected_replacements": [],
+                "receive_failure": True,
+                "undetermined": list(failed_observations),
+            }
         return _split_retry_decisions(
-            _parse_llm_json_output(raw), failed_observations, profile, task_id,
+            decisions, failed_observations, profile, task_id,
             already_tried=already_tried,
+            poisoned_binaries=poisoned_binaries,
         )
     except Exception as e:
         logger.warning("LLM baseline retry failed: %s", e)
-        return {"expected": [], "replace": []}
+        # An exception is the same epistemic state as a parse receive-failure:
+        # no usable verdict was received. Mark undetermined, never empty.
+        return {
+            "expected": [], "replace": [], "rejected_replacements": [],
+            "receive_failure": True,
+            "undetermined": list(failed_observations),
+        }
 
 
 def _split_retry_decisions(
@@ -765,6 +889,7 @@ def _split_retry_decisions(
     profile: str,
     task_id: str = "",
     already_tried: tuple[str, ...] = (),
+    poisoned_binaries: tuple[str, ...] = (),
 ) -> dict:
     """Split retry LLM output into semantic verdicts.
 
@@ -880,6 +1005,7 @@ def _split_retry_decisions(
     for obs, raw, relabel_note in replace_raw_pairs:
         accepted_one, rejected_one = _validate_and_filter_commands(
             [raw], profile, already_tried=already_tried,
+            poisoned_binaries=poisoned_binaries,
         )
         if accepted_one:
             if relabel_note:
@@ -927,20 +1053,53 @@ def _split_retry_decisions(
     }
 
 
-def _parse_llm_json_output(raw: str) -> list[dict]:
-    """Robustly parse JSON from LLM output.
+def _parse_llm_json_output(raw: str) -> list[dict] | None:
+    """Robustly parse a JSON list of decision/command objects from LLM output.
 
-    Handles: pure JSON, JSON in markdown code blocks, trailing text.
+    Returns (essence-B three-state — #78-R2, user-adjudicated):
+      * ``list[dict]`` — a parsed list. This includes the legitimate EMPTY
+        list ``[]`` (the LLM decided there was nothing to emit) AND a single
+        bare object normalised to a one-element list (see salvage below).
+      * ``None`` — RECEIVE FAILURE: ``raw`` was non-empty but no JSON
+        structure could be recovered from it. Deliberately distinct from
+        ``[]`` so callers can fail loud instead of laundering "the program
+        did not catch the output" into "the LLM decided nothing" — the exact
+        collapse that dropped a correctly-formed ``{"verdict":
+        "expected_absence"}`` and降级ed the observation into the empty bucket.
+
+    Closed-set salvage: when ``json.loads`` succeeds but yields a bare
+    ``dict`` instead of a ``list`` — the high-probability shape when the
+    prompt asks for exactly ONE entry (N==1) — normalise it to ``[dict]``.
+    JSON's legal top-level shapes are a CLOSED set (list / object /
+    markdown-fenced / trailing-text), so this is deterministic syntax
+    recovery, NOT semantic guessing: we never infer what a malformed
+    fragment "meant", we only re-wrap an object the parser already accepted.
+    Anything we cannot parse at all stays a loud ``None`` (fail-loud beats
+    whack-a-mole over unknown future shapes).
     """
     if not raw:
+        # Nothing was sent → legitimately nothing to parse (NOT a receive
+        # failure: there was no output to fail to catch).
         return []
 
-    # Try direct parse
-    text = raw.strip()
-    try:
-        result = json.loads(text)
+    def _coerce(result):
+        # A parsed list is the contract shape; a bare object is the N==1
+        # shape the model emits despite the "JSON list" instruction. Both
+        # are legitimate structured output — normalise the object to a
+        # one-element list so the verdict inside is not silently dropped.
         if isinstance(result, list):
             return result
+        if isinstance(result, dict):
+            return [result]
+        return None
+
+    text = raw.strip()
+
+    # Try direct parse
+    try:
+        coerced = _coerce(json.loads(text))
+        if coerced is not None:
+            return coerced
     except json.JSONDecodeError:
         pass
 
@@ -948,9 +1107,9 @@ def _parse_llm_json_output(raw: str) -> list[dict]:
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
     if m:
         try:
-            result = json.loads(m.group(1).strip())
-            if isinstance(result, list):
-                return result
+            coerced = _coerce(json.loads(m.group(1).strip()))
+            if coerced is not None:
+                return coerced
         except json.JSONDecodeError:
             pass
 
@@ -959,13 +1118,28 @@ def _parse_llm_json_output(raw: str) -> list[dict]:
     end = text.rfind("]")
     if start >= 0 and end > start:
         try:
-            result = json.loads(text[start:end + 1])
-            if isinstance(result, list):
-                return result
+            coerced = _coerce(json.loads(text[start:end + 1]))
+            if coerced is not None:
+                return coerced
         except json.JSONDecodeError:
             pass
 
-    return []
+    # Try finding first { ... } block — a bare object wrapped in prose that
+    # the direct parse missed (e.g. "Here you go: {...} hope that helps").
+    obj_start = text.find("{")
+    obj_end = text.rfind("}")
+    if obj_start >= 0 and obj_end > obj_start:
+        try:
+            coerced = _coerce(json.loads(text[obj_start:obj_end + 1]))
+            if coerced is not None:
+                return coerced
+        except json.JSONDecodeError:
+            pass
+
+    # raw was non-empty but NOTHING structured was recoverable: this is a
+    # RECEIVE FAILURE, not a legitimate empty verdict. Return None so the
+    # caller fails loud and keeps the observation out of the empty bucket.
+    return None
 
 
 def _surface_rejected_derivations(
@@ -1044,10 +1218,79 @@ def _command_fingerprint(command: str) -> str:
     return " ".join(positional) + " | " + " ".join(sorted(flags))
 
 
+# A shell's "command not found" signature. Captures the executable NAME that
+# precedes it, so ``bash: line 1: ss: command not found`` yields ``ss`` and
+# ``OCI runtime exec failed: ... iotop: not found`` yields ``iotop``. The name
+# is taken from the message — NOT the command's first token — because a wrapper
+# (``kubectl exec <pod> -- iotop``) must poison the INNER binary, never kubectl.
+_NOT_FOUND_RE = re.compile(
+    r"([A-Za-z0-9_.+\-/]+):\s*(?:command\s+)?not found", re.IGNORECASE,
+)
+
+
+def _missing_binary_from_observation(obs: dict, profile: str = "") -> str | None:
+    """Name the absent binary when an observation failed as command-not-found.
+
+    exit 127 / ``<name>: [command] not found`` is a BINARY-granularity fact: the
+    executable is not installed on the target, so EVERY invocation of it — with
+    any arguments — fails identically. The string-fingerprint attempt gate
+    (``_command_fingerprint``) cannot see this: ``ss -tnp`` and ``ss -tnp state
+    established dst :3306`` fingerprint differently, so a retry is free to
+    re-propose the same missing binary with new args and burn a full round trip.
+    Case #6 (mysql delay) is the field sample — the initial batch's ``ss ...``
+    exited 127, then retry 2 re-proposed ``ss -tnp`` and exited 127 again; the
+    ss/netstat/mpstat absence recurs across the whole python-app ledger
+    (O-P2 / O-C3-4 / O-C6-2) because minimal ubuntu targets ship none of them.
+
+    Returns the bare binary name (basename, no path) or ``None`` when the
+    failure is NOT a command-not-found signature (a real error, an expected
+    absence, a timeout) — those must poison nothing.
+    """
+    stderr = str(obs.get("stderr") or "")
+    stdout = str(obs.get("stdout") or "")
+    # Authoritative signal: the shell names the missing executable. Check both
+    # streams — the kubewiz channel merges stderr into stdout.
+    for stream in (stderr, stdout):
+        m = _NOT_FOUND_RE.search(stream)
+        if m:
+            return m.group(1).rsplit("/", 1)[-1]
+    # exit 127 with no parseable message: trust the command's own first token
+    # ONLY on the host profile, where there is no exec wrapper to misattribute
+    # (a bare host diagnostic's first token IS the binary, and shell
+    # metacharacters are already rejected upstream so there is no ``sh -c``).
+    if obs.get("exit_code") == 127 and profile == PROFILE_HOST:
+        cmd = str(obs.get("command") or "").strip()
+        tokens = cmd.split()
+        if tokens:
+            return tokens[0].rsplit("/", 1)[-1]
+    return None
+
+
+def _command_invoked_binaries(command: str) -> set[str]:
+    """The binary basenames a command would invoke.
+
+    The first token, plus — for exec-style wrappers ``kubectl exec <pod> --
+    <cmd>`` — the token immediately after the ``--`` separator. Basenames only.
+    Deliberately narrow: matching every token would false-positive on argument
+    values (a path, a resource name), and a false positive here would refuse a
+    legitimate replacement and permanently lose a baseline dimension.
+    """
+    tokens = command.split()
+    invoked: set[str] = set()
+    if tokens:
+        invoked.add(tokens[0].rsplit("/", 1)[-1])
+    if "--" in tokens:
+        idx = tokens.index("--")
+        if idx + 1 < len(tokens):
+            invoked.add(tokens[idx + 1].rsplit("/", 1)[-1])
+    return invoked
+
+
 def _validate_and_filter_commands(
     commands: list[dict],
     profile: str,
     already_tried: tuple[str, ...] = (),
+    poisoned_binaries: tuple[str, ...] = (),
 ) -> tuple[list[BaselineCommand], list[tuple[str, str]]]:
     """Validate and filter LLM-generated commands for *profile*.
 
@@ -1095,6 +1338,7 @@ def _validate_and_filter_commands(
     tried_index = {
         _command_fingerprint(c): c for c in already_tried if c and c.strip()
     }
+    poisoned_set = {b for b in poisoned_binaries if b and b.strip()}
     for cmd in commands:
         if not isinstance(cmd, dict):
             continue
@@ -1126,6 +1370,36 @@ def _validate_and_filter_commands(
             )
             rejected.append((command, _bound_reason))
             continue
+
+        # ── Binary-absence gate ── a binary that already returned "command not
+        # found" (exit 127) is ABSENT from the target; re-invoking it with
+        # different arguments cannot succeed. This is binary-granularity memory
+        # the string-fingerprint attempt gate below structurally cannot provide
+        # (Case #6: ``ss -tnp`` and ``ss -tnp state established dst :3306``
+        # fingerprint differently but both die on the missing ``ss``). Runs
+        # after the whitelist/bound gates — a command that is not even legal is
+        # refused for THAT more actionable reason first — and routes through the
+        # SAME rejected channel so the original observation stays visible and the
+        # reason reaches the next round's error_feedback.
+        if poisoned_set:
+            _hit = sorted(_command_invoked_binaries(command) & poisoned_set)
+            if _hit:
+                reason = (
+                    f"the binary '{_hit[0]}' is NOT installed on this target "
+                    "(an earlier baseline command exited 127 / 'command not "
+                    f"found'). Re-invoking '{_hit[0]}' with different arguments "
+                    "cannot produce a different result. Change approach for the "
+                    "SAME observation dimension: read the kernel/interface "
+                    "directly (e.g. /proc/net/tcp for sockets, /proc/stat or "
+                    "/proc/meminfo for CPU/memory), or use a binary that is "
+                    "present."
+                )
+                logger.warning(
+                    "LLM baseline: rejected command %r (profile=%s): invokes "
+                    "absent binary %s", command, profile, _hit,
+                )
+                rejected.append((command, reason))
+                continue
 
         # ── Attempt gate ── runs after the whitelist so a command that is not
         # even legal is refused for THAT reason (the more actionable one), and

@@ -168,6 +168,38 @@ def test_golden_receipt_shape_for_every_verdict():
             assert receipt.startswith(f"[target_guard] {verdict.name} — "), receipt
 
 
+def test_deferred_body_surfaces_own_verdict_w704():
+    """W-70-4 (Case #70 Phase B): the DEFERRED body must name THIS call's
+    own verdict and state the rejection landed on a DIFFERENT sibling. The
+    prior wording ("the screener found nothing wrong with this call") was
+    true but gave the model no reconciling reason — it had just seen a
+    namespace-scoped REJECT署名 target_guard and hedged ("it might also be
+    rejected as namespace drift") before abandoning a call the guard had
+    already cleared. Surfacing verdict=allow/readonly tells it the guard
+    cleared THIS call, so re-issuing alone is safe.
+    """
+    verdict = "readonly"
+    decision = {
+        "verdict": verdict,
+        "tool_name": "kubectl",
+        "reason": "golden deferred receipt",
+        "suggestion": "reshape the call",
+        "is_hard_floor": False,
+        "effective": None,
+    }
+    receipt = _format_deferred_for_llm(decision)
+    # Prefix preserved — the death-verdict classifier gates on it
+    # (test_registry.TestDeathVerdictFrameworkReceipts).
+    assert receipt.startswith("[screener] DEFERRED")
+    # ① consistency invariant: the call's OWN runtime verdict is surfaced
+    #    (tracks decision['verdict'], not a dead literal).
+    assert f"verdict={verdict}" in receipt
+    # The disambiguator: the sibling's rejection does not apply to this call.
+    assert "NOT to this call" in receipt
+    # ② old-value reverse assertion: the model-less prior wording is gone.
+    assert "found nothing wrong" not in receipt
+
+
 def test_golden_chain_collects_form_level_verdicts_only():
     """Real receipts through the real collector: DRIFT/BANNED/UNKNOWN enter
     the hard-constraint set; STAGNANT (alternates by design) and the cleared

@@ -9,8 +9,9 @@ here. This node:
      as a fallback, by parsing the last AIMessage's free text.
   2. Runs ALL post-processing that used to live in verifier_loop's
      no-tool_calls branch: evidence cross-check, programmatic enforcement
-     (disk-burn), step coverage, P2 verification-integrity gaps
-     (re-verification), and baseline enforcement.
+     (the deterministic verdict rules), step coverage, P2
+     verification-integrity gaps (re-verification), and baseline
+     enforcement.
   3. On gaps with remaining budget → re-prompts and routes back to
      verifier_loop (``route_after_finalize`` keys on ``verification`` being
      unset). Otherwise sets ``verification`` → ``se_detect``.
@@ -31,7 +32,7 @@ from chaos_agent.agent.spec.fault_spec import read_fault_spec
 from chaos_agent.agent.evidence import EvidenceProfile, host_evidence_supplements
 from chaos_agent.agent.replan import ReplanRequest
 from chaos_agent.agent.providers.base import DestroyOutcome
-from chaos_agent.transports import PROFILE_HOST, profile_of, resolve_channel_name
+from chaos_agent.transports import PROFILE_HOST, profile_of, resolve_channel_name, resolve_transport_target
 from chaos_agent.agent.node_names import FINALIZE_VERIFICATION
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.result.operation_outcome import write_inject_verification
@@ -46,7 +47,7 @@ from chaos_agent.agent.result.verdict import (
     Layer1Result,
 )
 from chaos_agent.agent.nodes.execute._debug_pod import parse_debug_pod_info, delete_debug_pod
-from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
+from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.nodes.verify._deterministic_rules import (
     DeterministicVerdict,
@@ -57,6 +58,7 @@ from chaos_agent.agent.nodes.verify._verification_profiles import (
 )
 from chaos_agent.agent.nodes.verify._verifier_layer1 import _restore_layer1_from_state
 from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
+    _apply_all_dissipated_override,
     _collect_evidence_text,
     _count_verification_steps_in_skill_case,
     _detect_checklist_conclusion_inconsistency,
@@ -72,7 +74,10 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
     extract_submit_args,
     last_ai_text,
 )
-from chaos_agent.agent.nodes.verify._verifier_submit import SUBMIT_VERIFICATION_TOOL_NAME
+from chaos_agent.agent.nodes.verify._verifier_submit import (
+    SUBMIT_VERIFICATION_TOOL_NAME,
+    _coerce_list_arg,
+)
 from chaos_agent.agent.execution_artifacts import cleanup_debug_pod_artifacts
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.config.settings import settings
@@ -102,10 +107,16 @@ async def _cleanup_debug_pods(
     new ones, and writes the merged set back into ``result_update`` so the
     next re-entry sees them as already-handled.
     """
+    # Single-authority transport target from THIS node's state (replaces the
+    # settings side-effect ``sync_kubewiz_runtime`` used to establish). Resolved
+    # once and threaded to every debug-pod leaf below so the deletes honour
+    # per-session kubewiz values, not settings-only fallback.
+    _xport_target = resolve_transport_target(state)
     tracked_artifacts, artifact_cleaned = await cleanup_debug_pod_artifacts(
         state.get("execution_artifacts"),
         kubeconfig=kubeconfig,
         task_id=task_id,
+        target=_xport_target,
     )
     if tracked_artifacts != (state.get("execution_artifacts") or []):
         result_update["execution_artifacts"] = tracked_artifacts
@@ -149,7 +160,7 @@ async def _cleanup_debug_pods(
     for pod_name in pods_to_delete:
         ns = discovered_pods[pod_name]
         logger.info(f"Programmatic cleanup: deleting debug pod {pod_name} in namespace {ns}")
-        await _delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
+        await _delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns, target=_xport_target)
     if pods_to_delete or artifact_cleaned:
         result_update["cleaned_debug_pods"] = sorted(already_cleaned | pods_to_delete)
 
@@ -170,12 +181,19 @@ def _verification_from_submit_args(args: dict) -> dict:
     yield, so all downstream post-processing is source-agnostic. Also runs the
     checklist↔conclusion inconsistency check (mirrors the JSON-mode path).
     """
-    checklist = args.get("checklist") or []
+    # A model may JSON-stringify the list args (qwen-class quirk — see
+    # _coerce_list_arg). Coerce BEFORE the isinstance guard: this reads the RAW
+    # AIMessage tool_call args, which the @tool BeforeValidator does not rewrite,
+    # so without this a stringified checklist is silently dropped to [] and the
+    # whole verdict loses its per-step evidence.
+    checklist = _coerce_list_arg(args.get("checklist")) or []
     if not isinstance(checklist, list):
         checklist = []
     raw_l2_status = args.get("layer2_status", "unknown")
     overall = args.get("overall", "unverified")
-    warnings = list(args.get("warnings") or [])
+    # Coerce too: ``list("...")`` on a JSON-string would explode into chars.
+    _warnings = _coerce_list_arg(args.get("warnings"))
+    warnings = list(_warnings) if isinstance(_warnings, list) else []
     # Closed sets derive from the legislation enums (B76 round-14
     # root-cause fix): out-of-set layer2 claims clamp to 'unknown' and
     # stay visible instead of flowing verbatim into the task JSON.
@@ -197,6 +215,12 @@ def _verification_from_submit_args(args: dict) -> dict:
         "primary_evidence_observed": bool(args.get("primary_evidence_observed", False)),
         "baseline_used": bool(args.get("baseline_used", False)),
     }
+    # Structured metric claims (W-77R-5): the LLM-declared baseline→post
+    # bindings cross_check_evidence consumes. Carried verbatim (dicts only)
+    # so the cross-check does exact-key lookup instead of parsing free text.
+    metric_claims = _coerce_list_arg(args.get("metric_claims")) or []
+    if isinstance(metric_claims, list):
+        result["metric_claims"] = [c for c in metric_claims if isinstance(c, dict)]
     if checklist:
         # Guard: LLM may pass non-dict items (e.g. plain strings); filter to
         # dicts only to prevent AttributeError in downstream .get() calls.
@@ -223,12 +247,10 @@ def _verification_from_submit_args(args: dict) -> dict:
                 f"Checklist item statuses outside the closed vocabulary: {_outside}."
             )
         if l2_status == "passed":
-            _non_passed_ev = " ".join(
-                c.get("evidence", "") for c in checklist
-                if isinstance(c, dict) and c.get("status") in CHECKLIST_NON_PASSED_STATUSES
-            )
+            # Structured status-enum comparison only (D14): no free-text
+            # evidence is collected or reverse-parsed for absence semantics.
             inc_warning, should_downgrade = _detect_checklist_conclusion_inconsistency(
-                checklist, l2_status, _non_passed_ev,
+                checklist, l2_status,
             )
             if inc_warning:
                 result["warnings"].append(inc_warning)
@@ -252,6 +274,15 @@ def _verification_from_submit_args(args: dict) -> dict:
         )
     if result["layer2"]["status"] == "partial" and result["level"] in ("verified", "unverified"):
         result["level"] = "partial"
+    # All-dissipated structured override (single-sourced with the text-parse
+    # path in _verifier_layer2_parse): applied last so "every checklist item
+    # recovered_before_observation ⇒ nothing observable ⇒ unverified" is the
+    # final word, overriding an LLM-declared verified/partial. Enum-only.
+    result["level"], _rbo_warning = _apply_all_dissipated_override(
+        checklist, result["level"]
+    )
+    if _rbo_warning:
+        result["warnings"].append(_rbo_warning)
     return result
 
 
@@ -535,7 +566,6 @@ async def _supplement_host_verification_evidence(
     """
     from chaos_agent.transports import (
         PROFILE_HOST,
-        TransportTarget,
         execute_via_transport,
     )
 
@@ -548,7 +578,11 @@ async def _supplement_host_verification_evidence(
     if not probes:
         return []
 
-    target = TransportTarget.from_state(dict(state))
+    # Route through the single authoritative seam (ground-truth-single-authority
+    # D2/B3): the raw ``from_state(dict(state))`` orphan read the truthy
+    # ``ssh_port`` placeholder and masked settings.ssh_port, dropping ``-p`` from
+    # the probe's SSH command (exit=255, target_identity never covered).
+    target = resolve_transport_target(dict(state))
     _task_id = dict(state).get("task_id", "")
     records: list[dict] = []
     for description, argv in probes:
@@ -579,8 +613,8 @@ def _lift_verdict_to_passed(
 ) -> bool:
     """Quadrant-2 body: lift every degraded verdict the LLM emitted.
 
-    Lift semantics (inherited from the disk_burn precedent — design
-    decision 3, quadrant "program passed × LLM degraded"):
+    Lift semantics (design decision 3, quadrant "program passed × LLM
+    degraded"):
       * checklist items in a degraded status (failed /
         recovered_before_observation / partial) flip to ``passed`` with
         ``[OVERRIDE]`` evidence;
@@ -863,13 +897,33 @@ def _apply_deterministic_verdicts(
     without a declared rule return immediately — zero interference, the
     LLM verdict stands exactly as before this layer existed.
 
-    Returns whether a programmatic lift was applied (the same contract
-    ``_enforce_disk_burn_facts`` had: ``True`` suppresses downstream
-    gap-triggered downgrades, e.g. step-coverage partials).
+    Returns whether a programmatic lift was applied (``True`` suppresses
+    downstream gap-triggered downgrades, e.g. step-coverage partials).
     """
     spec = read_fault_spec(state)
     target = spec.fault_target if spec else ""
     action = spec.fault_action if spec else ""
+    # Frozen verdict-binding declaration (openspec mechanism-invariant-trust-
+    # boundary, decision C). When the settled case declared a
+    # ``deterministic_verdict``, its STABLE author-declared key selects the
+    # rule INSTEAD of the drift-prone LLM triple (forensics memory 66425653:
+    # #77's runtime triple is rollingupdate/partition-stuck, decided on the fly
+    # and unstable), and its ``expected`` map carries the effect value N the
+    # rule compares against (spec_params is empty for this family). Absent or
+    # malformed → fall back to the LLM-triple path byte-identically. It NEVER
+    # overrides the triple as the victim/scope authority (#49) — only the rule
+    # selection key.
+    declared_expected: dict = {}
+    _approved = state.get("approved_target")
+    _dv = _approved.get("deterministic_verdict") if isinstance(_approved, dict) else None
+    if isinstance(_dv, dict):
+        _dv_target = str(_dv.get("target") or "").strip()
+        _dv_action = str(_dv.get("action") or "").strip()
+        if _dv_target and _dv_action:
+            target, action = _dv_target, _dv_action
+            _expected = _dv.get("expected")
+            if isinstance(_expected, dict):
+                declared_expected = {str(k): str(v) for k, v in _expected.items()}
     rules = resolve_deterministic_rules(target, action)
     if not rules:
         return False
@@ -883,23 +937,22 @@ def _apply_deterministic_verdicts(
         # The fault window has closed (timeout expiry or early destroy) and
         # Layer 1 recorded it as a known cause — the rules measure effects-
         # in-presence, but their evidence outlives the window: timeline peaks
-        # (fill), cumulative counters (kill RestartCount) and the injection-
-        # time post-check snapshot (burn) are historical traces. Lifting an
-        # honest recovered_before_observation here would assert "Fault is
-        # still in effect" over a window that verifiably closed — the LLM
-        # keeps the call (re-audit finding 12; same stance as the L1-only
-        # entry, which records expiry instead of adjudicating it).
+        # (fill) and cumulative counters (kill RestartCount) are historical
+        # traces. Lifting an honest recovered_before_observation here would
+        # assert "Fault is still in effect" over a window that verifiably
+        # closed — the LLM keeps the call (re-audit finding 12; same stance
+        # as the L1-only entry, which records expiry instead of adjudicating
+        # it).
         return False
     applied = False
     for rule in rules:
-        post_check = state.get(rule.post_check_key) if rule.post_check_key else None
         ctx = RuleContext(
             metric_observations=list(state.get("metric_observations") or []),
             fault_handle=handle,
             layer1_passed=bool(l1.is_passed()),
-            post_check=post_check,
             spec_names=tuple(spec.names) if spec else (),
             spec_params=dict(spec.params) if spec else {},
+            declared_expected=declared_expected,
         )
         verdict = rule.evaluate(ctx)
         if verdict.is_passed:
@@ -1099,7 +1152,6 @@ def make_finalize_verification(registry=None):
         _, _identity = _resolve_fault_dispatch(state)
         experiment_uid = _experiment_uid_of(_identity) or _experiment_uid_of(_handle)
         kubeconfig = _resolve_kubeconfig(state)
-        sync_kubewiz_runtime(state)
         messages = state.get("messages", [])
 
         tracker = get_tracker(task_id)
@@ -1126,15 +1178,20 @@ def make_finalize_verification(registry=None):
         result_update: dict = {}
 
         # E2 Phase 3 — cross-check LLM evidence numbers vs observation timeline.
+        # D17: also pass the format-agnostic value fingerprints so an absent-key
+        # claim (free-form exec output the extractor never parsed) can still be
+        # corroborated by value-presence instead of only warned about.
         verification = cross_check_evidence(
             verification, state.get("metric_observations"),
+            state.get("evidence_fingerprints"),
         )
         verification["layer1"] = layer1_to_dict(layer1)
 
         # ---- Programmatic Fact Enforcement: deterministic rules (Layer 1.5) ----
-        # disk_burn's legacy direct call migrated onto the rule registry
-        # pipeline; behaviour is byte-identical for the burn family and a
-        # no-op for every family without a declared rule.
+        # The rule registry pipeline is a no-op for every family without a
+        # declared rule; a family with one (disk fill, process kill, ...)
+        # lifts the LLM verdict only when the measured numbers AND a
+        # mechanism anchor both hold.
         _enforcement_applied = _apply_deterministic_verdicts(
             verification, state, layer1=layer1, fault_handle=_handle,
         )

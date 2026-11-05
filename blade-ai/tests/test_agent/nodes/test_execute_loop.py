@@ -4131,6 +4131,8 @@ class TestIssueTimeHostArmAttribution:
         )
 
     def _state(self, sample_agent_state, **extra):
+        from tests._helpers import replace_fault_spec
+
         state = sample_agent_state
         state["task_id"] = "test-task"
         state["execute_loop_count"] = 0
@@ -4139,6 +4141,16 @@ class TestIssueTimeHostArmAttribution:
         # Host channel is a hard, known fact of the attribution scope:
         # host_native is only attributed on a resolved host channel.
         state["kube_connection_mode"] = "ssh"
+        # Keep the spec's scope CONSISTENT with that host channel. The shared
+        # sample_agent_state carries scope="pod" (k8s), which against an ssh
+        # transport is a genuine scope/transport conflict — the execute_loop
+        # entry gate now fail-fasts on it (correctly: a pod fault cannot be
+        # injected over ssh). A real host-native injection (``kill -STOP`` on a
+        # host process) carries scope="host", so align the fixture with the
+        # channel it deliberately sets. Attribution keys on the CHANNEL
+        # (is_host), not the scope, so this does not perturb what these tests
+        # assert — it just stops the fixture from tripping the conflict gate.
+        replace_fault_spec(state, scope="host", namespace="")
         state.update(extra)
         return state
 
@@ -4238,3 +4250,80 @@ class TestIssueTimeHostArmAttribution:
         result = await self._node(self._TextOnlyLLM())(state)
 
         assert result.get("injection_method") == "host_native"
+
+
+class TestExecuteLoopCapabilityGate:
+    """The execute_loop entry gate fail-fasts on an unresolved profile.
+
+    ``profile=UNKNOWN`` is a deterministic dead-end the ReAct loop can neither
+    repair nor converge on by retrying; agent_loop already hard-stops on it
+    before its first LLM call, and this is the execute-phase twin for the paths
+    that skip agent_loop (checkpoint resume / batch replan). It must terminate
+    BEFORE any LLM turn (no budget burned on ``bind_tools([])``) and name the
+    cause through the SAME single-source renderer agent_loop / recover use.
+    """
+
+    class _NeverCalledLLM:
+        def __init__(self):
+            self.invoked = False
+
+        def bind_tools(self, tools):
+            return self
+
+        async def ainvoke(self, messages):
+            self.invoked = True
+            raise AssertionError("gate must fail fast before any LLM turn")
+
+    def _node(self, llm, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        import chaos_agent.agent.nodes.execute.execute_loop as loop_mod
+        from chaos_agent.agent.nodes.execute.execute_loop import make_execute_loop
+
+        # The gate syncs its terminal to the store; keep the test hermetic and
+        # restore the module attribute afterwards (monkeypatch, not a bare
+        # assignment that would leak a mock into every later test in the file).
+        monkeypatch.setattr(loop_mod, "sync_to_store", AsyncMock())
+        return make_execute_loop(hook=None, llm=llm, tools=[], env_info={"context": "test"})
+
+    @pytest.mark.asyncio
+    async def test_conflict_terminates_before_llm_as_planning_rejected(self, monkeypatch):
+        from chaos_agent.agent.result.verdict import FailureCategory
+
+        llm = self._NeverCalledLLM()
+        # host scope × k8s(kubeconfig) transport → CONFLICT (#87 shape).
+        state = {
+            "task_id": "t-exec-conflict",
+            "operation": "inject",
+            "execute_loop_count": 0,
+            "messages": [],
+            "fault_spec": {"scope": "host"},
+            "kube_connection_mode": "kubeconfig",
+        }
+
+        result = await self._node(llm, monkeypatch)(state)
+
+        assert llm.invoked is False
+        assert result["failure_detail"]["category"] == FailureCategory.PLANNING_REJECTED.value
+        # cause named off the shared renderer: a conflict, not a broken kubeconfig
+        assert "channel/scope mismatch" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_supported_profile_does_not_trip_the_gate(self, monkeypatch):
+        # A consistent k8s scope + kubeconfig channel resolves, so the gate must
+        # NOT fire; the loop proceeds to its (tool-less) LLM step instead.
+        llm = self._NeverCalledLLM()
+        state = {
+            "task_id": "t-exec-ok",
+            "operation": "inject",
+            "execute_loop_count": 0,
+            "messages": [],
+            "fault_spec": {"scope": "pod", "namespace": "default", "names": ["my-pod"]},
+            "kube_connection_mode": "kubeconfig",
+        }
+
+        # The sentinel LLM raises if invoked — but here the gate lets the loop
+        # run, so ainvoke IS reached. Catch it to prove the gate did not fire.
+        with pytest.raises(AssertionError, match="fail fast"):
+            await self._node(llm, monkeypatch)(state)
+        assert llm.invoked is True

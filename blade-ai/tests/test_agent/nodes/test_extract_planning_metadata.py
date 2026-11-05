@@ -17,6 +17,7 @@ from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
     _extract_plan_verification_slices,
     _find_saved_plan,
     _has_browsed_catalogue,
+    _scope_candidates_hint,
     _user_stated_duration_hint,
     extract_planning_metadata,
 )
@@ -1104,6 +1105,99 @@ class TestFinishPlanningFaultIdentityDeclaration:
         assert new_spec.fault_action == "hold"
 
     @pytest.mark.asyncio
+    async def test_declaration_carries_victim_selector_names_namespace(self):
+        """D2 (cli-nl-identity-from-declaration): the finish_planning
+        declaration is the authoritative source of the victim's
+        name/namespace. An empty CLI NL spec + a full declaration lands
+        names/namespace from the declaration, not from probe order."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = AgentState(
+            task_id="t-d2a",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec().to_dict(),
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                    "fault_namespace": "drill",
+                    "fault_names": ["my-pod"],
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        new_spec = read_fault_spec({**state, **result})
+        assert new_spec is not None
+        assert new_spec.scope == "pod"
+        assert new_spec.names == ("my-pod",)
+        assert new_spec.namespace == "drill"
+
+    @pytest.mark.asyncio
+    async def test_declaration_selector_overrides_stale_probe_names(self):
+        """D2 / Case #70 at unit level: a stale probe-derived selector (the
+        backend service the planner happened to read first) is overridden by
+        the declaration's authoritative victim name. Same scope, so this is a
+        selector fill-in, not a scope change — the declared name wins."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        # Spec born with a wrong probe-derived name under the SAME scope the
+        # declaration will confirm (identity still incomplete: no target/action).
+        state = AgentState(
+            task_id="t-d2b",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec(scope="pod", names=("backend",)).to_dict(),
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                    "fault_names": ["entry"],
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        new_spec = read_fault_spec({**state, **result})
+        assert new_spec is not None
+        assert new_spec.names == ("entry",)
+        assert "backend" not in new_spec.names
+
+    @pytest.mark.asyncio
+    async def test_declaration_rejects_vehicle_name_keeps_prior(self):
+        """D4 (task-29848471 MIGRATED, not dropped): the vehicle-name defense
+        that lived in the retired ``agent_loop._drop_vehicle_names`` now guards
+        the DECLARATION consumption point. A transient debug/tool pod the
+        planner quotes as the victim must never be persisted — the prior
+        selector is kept so the confirmation gate / verifier anchor stay on the
+        real target. Mirrors defense 1 (plan_builder._build_spec_from_submit)."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        vehicle = "node-debugger-node-a-xp8nc"
+        state = AgentState(
+            task_id="t-d4-vehicle",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec(scope="pod", names=("mysql-abc",)).to_dict(),
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                    "fault_names": [vehicle],
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        new_spec = read_fault_spec({**state, **result})
+        assert new_spec is not None
+        assert new_spec.names == ("mysql-abc",)
+        assert vehicle not in new_spec.names
+
+    @pytest.mark.asyncio
     async def test_case_doc_blade_command_no_longer_derives_identity(self):
         """B83 hijack killed: no declaration → the case-menu blade command
         must NOT be copied into the spec; the planner is nudged once to
@@ -1959,3 +2053,196 @@ class TestPlanBannedVerbGuard:
         state = self._state_with_plan(plan)
         result = await extract_planning_metadata(state)
         assert result.get("planning_rejected") is not True
+
+
+class TestFaultScopeVocabularyGuard:
+    """fault_scope is validated against the registered-domain vocabulary at the
+    WRITE boundary — before the write-once freeze — so an unregistered guess is
+    corrected in-loop instead of freezing and killing the run terminally
+    downstream.
+
+    Root defect (retest1): a host file-append drill's blade command
+    (``blade create file append``) carries NO domain token — unlike k8s
+    ``pod-cpu`` — so the planner backfilled the target word ``file`` into
+    fault_scope. Freezing that guess is fatal AND uncorrectable: safety_check
+    rejects post-freeze, where the write-once locks make a corrected
+    re-declaration futile (fd4f4f0e). Refusing it pre-freeze keeps spec.scope
+    empty so the corrected round-2 declaration lands. Mirrors the sibling
+    banned-verb / identity-split nudges; safety_check's terminal fail-fast
+    (defect A1) stays the untouched backstop.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_experiment_timeout(self):
+        from chaos_agent.config.settings import blade_ai_context
+        from chaos_agent.utils.fault_type import _DEFAULT_MIN_DURATION
+
+        with blade_ai_context(experiment_timeout=_DEFAULT_MIN_DURATION):
+            yield
+
+    def _state(self, declared: dict, **extra):
+        return AgentState(
+            task_id="t-scope-vocab",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec().to_dict(),
+            messages=[_make_finish_call(declared), _make_finish_tm()],
+            **extra,
+        )
+
+    @staticmethod
+    def _merged_scope(state, result):
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        merged = read_fault_spec(
+            {**state, **{k: v for k, v in result.items() if k != "messages"}}
+        )
+        assert merged is not None
+        return merged.scope
+
+    @pytest.mark.asyncio
+    async def test_unregistered_scope_is_not_frozen_and_nudges_once(self):
+        """retest1 shape: fault_scope='file' (a target token, not a domain).
+        The guard REFUSES to freeze it (scope stays empty) and routes one
+        anchored correction back to the planner."""
+        state = self._state({
+            "fault_scope": "file",
+            "fault_target": "content",
+            "fault_action": "append",
+        })
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        assert result.get("_scope_vocab_nudged") is True
+        # The invalid scope must NOT be frozen — an empty scope stays
+        # correctable, a frozen one does not (fd4f4f0e). This is the invariant.
+        assert self._merged_scope(state, result) != "file"
+        msg_text = " ".join(m.content for m in result.get("messages", []))
+        assert "UNREGISTERED fault_scope" in msg_text
+        assert "host" in msg_text
+        # Plan family re-opened so the corrected round-2 plan can land (same
+        # seam the sibling nudges use).
+        assert result.get("plan") is None
+
+    @pytest.mark.asyncio
+    async def test_corrected_scope_lands_after_nudge(self):
+        """Non-futility proof (the crux vs fd4f4f0e): round 1 never froze the
+        scope, so the round-2 declaration of a REGISTERED domain lands through
+        the same fill branch — the _scope_vocab_nudged flag does not block a
+        valid correction."""
+        state = self._state(
+            {"fault_scope": "host", "fault_target": "file",
+             "fault_action": "append"},
+            _scope_vocab_nudged=True,
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        assert self._merged_scope(state, result) == "host"
+
+    @pytest.mark.asyncio
+    async def test_still_invalid_after_nudge_freezes_for_backstop(self):
+        """Single-shot + fail-open: a SECOND unregistered declaration is not
+        nudged again (no spin to PLANNING_TIMEOUT); it falls through and freezes
+        so safety_check's terminal fail-fast names the offending scope precisely
+        (defect A1 backstop preserved, not bypassed)."""
+        state = self._state(
+            {"fault_scope": "file", "fault_target": "content",
+             "fault_action": "append"},
+            _scope_vocab_nudged=True,
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        assert self._merged_scope(state, result) == "file"
+
+    @pytest.mark.asyncio
+    async def test_valid_scopes_are_untouched(self):
+        """Negative control / no-regression: registered domains (host AND the
+        k8s mainline pod) write normally with no nudge — the guard fires only on
+        an unregistered value."""
+        for scope, target, action in (
+            ("host", "file", "append"),
+            ("pod", "cpu", "fullload"),
+        ):
+            state = self._state({
+                "fault_scope": scope, "fault_target": target,
+                "fault_action": action,
+            })
+            result = await extract_planning_metadata(state)
+            assert result.get("planning_rejected") is not True
+            assert "_scope_vocab_nudged" not in result
+            assert self._merged_scope(state, result) == scope
+
+    def test_candidates_hint_never_mixes_profiles(self):
+        """Invariant: the hint is narrowed to the ONE transport profile the
+        task's channel resolves to, so it never mixes a k8s-only kind with a
+        bare-host scope. Pinned across all three channel outcomes (host /
+        k8s / unresolvable-fallback) so it is deterministic and never coupled
+        to the ambient config.json default channel.
+        """
+        from chaos_agent.agent.spec.fault_spec import INTENT_SCOPES
+
+        def _listed(state):
+            hint = _scope_candidates_hint(state)
+            listed = [s for s in INTENT_SCOPES if s in hint]
+            assert listed  # never empty
+            return listed
+
+        # Host channel → narrowed to the PROFILE_HOST families only.
+        host_listed = _listed({"kube_connection_mode": "ssh"})
+        assert "host" in host_listed and "python" in host_listed
+        assert "deployment" not in host_listed and "pod" not in host_listed
+
+        # k8s channel → narrowed to the PROFILE_K8S kinds only.
+        k8s_listed = _listed({"kube_connection_mode": "kubeconfig"})
+        assert "pod" in k8s_listed and "deployment" in k8s_listed
+        assert "host" not in k8s_listed and "python" not in k8s_listed
+
+        # Unresolvable channel → fail-safe fallback names the FULL vocabulary
+        # (safety_check stays the backstop); this is the one path that
+        # legitimately spans both profiles, and it must never be empty.
+        unknown_listed = _listed({"kube_connection_mode": "not-a-real-mode"})
+        assert "host" in unknown_listed and "deployment" in unknown_listed
+
+
+class TestScopeVocabFlagGraphPersistence:
+    """The single-shot guard only holds if ``_scope_vocab_nudged`` survives a
+    REAL langgraph channel round-trip (a node return merged through
+    ``StateGraph(AgentState)``), not a manual ``state.update(result)``.
+
+    langgraph silently DROPS a node-return key that is not declared on the
+    state schema (memory 86051eee / ad146f17). The function-level guard tests
+    above pre-set the flag on a plain dict, so they are blind to this link: had
+    the AgentState declaration been missing, the flag would vanish between
+    rounds, the guard would re-nudge every round, and the loop would spin to
+    PLANNING_TIMEOUT — the exact fd4f4f0e failure mode the guard claims to
+    avoid. This test drives the real graph to pin the persistence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_declared_flag_survives_channel_undeclared_is_dropped(self):
+        from langgraph.graph import END, START, StateGraph
+
+        from chaos_agent.agent.state import AgentState
+
+        async def _writer(state):
+            return {
+                "_scope_vocab_nudged": True,     # declared in AgentState
+                "_undeclared_probe_xyz": True,   # NOT declared → must vanish
+            }
+
+        graph = StateGraph(AgentState)
+        graph.add_node("writer", _writer)
+        graph.add_edge(START, "writer")
+        graph.add_edge("writer", END)
+        final = await graph.compile().ainvoke({"task_id": "t-scope-persist"})
+
+        # The declared nudge flag persists across the real channel merge, so
+        # round-2 sees it and the guard stays single-shot.
+        assert final.get("_scope_vocab_nudged") is True, (
+            "declared nudge flag did not survive the graph channel — the "
+            "single-shot guard would re-nudge every round and spin to "
+            "PLANNING_TIMEOUT"
+        )
+        # Teeth / counterfactual: an UNDECLARED key is dropped by langgraph,
+        # which is exactly the fate the flag would have suffered WITHOUT the
+        # AgentState declaration. This is why the assertion above is about the
+        # declaration, not about langgraph echoing arbitrary return keys.
+        assert "_undeclared_probe_xyz" not in final

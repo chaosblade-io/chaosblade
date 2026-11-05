@@ -2054,10 +2054,17 @@ class TestVerificationResultChecklistDowngrade:
 # ---------------------------------------------------------------------------
 
 class TestDetectChecklistConclusionInconsistency:
-    """Tests for _detect_checklist_conclusion_inconsistency()."""
+    """Tests for _detect_checklist_conclusion_inconsistency() (Phase 2c / D14).
+
+    Structural status-enum consistency only: a 'failed' item contradicting a
+    'passed' Layer2 conclusion is a hard self-contradiction → downgrade. The
+    program never reads evidence free text; absence / benign semantics are the
+    LLM's status choice (expected/partial/recovered_before_observation), not
+    re-derived from prose.
+    """
 
     def test_failed_step_with_passed_conclusion_returns_warning(self):
-        """Checklist item 'failed' + Layer2 'passed' → inconsistency detected."""
+        """Checklist item 'failed' + Layer2 'passed' → structural inconsistency."""
         items = [
             {"step": 1, "status": "passed"},
             {"step": 2, "status": "failed"},
@@ -2067,7 +2074,7 @@ class TestDetectChecklistConclusionInconsistency:
         assert warning is not None
         assert "2" in warning
         assert "inconsistency" in warning.lower()
-        assert should_downgrade is False  # no absence evidence → timing delay scenario
+        assert should_downgrade is True  # enum-level contradiction → downgrade
 
     def test_all_passed_no_inconsistency(self):
         """All checklist items passed + Layer2 'passed' → no inconsistency."""
@@ -2094,7 +2101,7 @@ class TestDetectChecklistConclusionInconsistency:
         assert should_downgrade is False
 
     def test_multiple_failed_steps(self):
-        """Multiple failed steps → all listed in warning."""
+        """Multiple failed steps → all listed in warning, downgrade triggered."""
         items = [
             {"step": 1, "status": "failed"},
             {"step": 2, "status": "passed"},
@@ -2104,38 +2111,35 @@ class TestDetectChecklistConclusionInconsistency:
         assert warning is not None
         assert "1" in warning
         assert "3" in warning
+        assert should_downgrade is True
 
-    def test_absence_evidence_triggers_auto_downgrade(self):
-        """Failed step with absence evidence (metric far below threshold) → auto-downgrade."""
+    def test_evidence_text_is_not_consulted(self):
+        """Retired free-text absence path: a 'failed' item WITHOUT any absence
+        phrase still downgrades — the decision is enum-based, not prose-driven."""
         items = [
             {"step": 1, "status": "passed"},
-            {"step": 2, "status": "failed", "evidence": "disk usage at 16%, no change"},
+            {"step": 2, "status": "failed", "evidence": "disk usage at 87%, fully filled"},
         ]
         warning, should_downgrade = _detect_checklist_conclusion_inconsistency(items, "passed")
         assert warning is not None
         assert should_downgrade is True
-        assert "absence" in warning.lower() or "auto-downgrading" in warning.lower()
 
-    def test_absence_evidence_via_param(self):
-        """Absence evidence passed via failed_evidence parameter also triggers downgrade."""
+    @pytest.mark.parametrize("benign_status", [
+        "recovered_before_observation", "expected", "partial",
+        "skipped", "not_applicable",
+    ])
+    def test_benign_non_passed_statuses_do_not_downgrade(self, benign_status):
+        """A1 retirement: non-'failed' non-passed statuses express "non-passed
+        but not a real failure"; with no 'failed' item there is no structural
+        contradiction, so no downgrade — even when their evidence text carries
+        absence phrases the old path would have matched."""
         items = [
             {"step": 1, "status": "passed"},
-            {"step": 2, "status": "failed"},
-        ]
-        warning, should_downgrade = _detect_checklist_conclusion_inconsistency(
-            items, "passed", failed_evidence="CPU remains normal, no increase observed"
-        )
-        assert warning is not None
-        assert should_downgrade is True
-
-    def test_non_absence_evidence_no_downgrade(self):
-        """Failed step without absence evidence → warning but no auto-downgrade."""
-        items = [
-            {"step": 1, "status": "passed"},
-            {"step": 2, "status": "failed", "evidence": "disk usage at 87%, slightly below 90%"},
+            {"step": 2, "status": benign_status,
+             "evidence": "no change observed, far below threshold at 1%"},
         ]
         warning, should_downgrade = _detect_checklist_conclusion_inconsistency(items, "passed")
-        assert warning is not None
+        assert warning is None
         assert should_downgrade is False
 
 
@@ -2432,13 +2436,19 @@ class TestValidateStepNumberCoverage:
 # ---------------------------------------------------------------------------
 
 class TestChecklistConclusionInconsistencyIntegration:
-    """Integration tests: checklist item 'failed' + Layer2 'passed' → warning only (LLM's Overall is authority)."""
+    """Integration: checklist item 'failed' + Layer2 'passed' → structural
+    self-contradiction → downgraded to 'partial' (Phase 2c / D14).
+
+    A 'failed' item is the LLM declaring a genuine unmet effect; concluding
+    'passed' on top of it is an enum-level contradiction the program resolves
+    deterministically. Timing-delay / benign cases must be declared with a
+    non-'failed' status (expected / recovered_before_observation / partial),
+    which never triggers the downgrade.
+    """
 
     def test_failed_step_with_passed_conclusion_downgraded(self):
-        """Checklist has a failed step but LLM concludes 'passed' → inconsistency warning, not downgrade.
-        
-        The LLM may know that a 'failed' checklist item is due to timing delays.
-        Overall field is the final authority; inconsistency is recorded as warning."""
+        """Checklist has a failed step but LLM concludes 'passed' → structural
+        contradiction → L2 downgraded to 'partial', level synced to 'partial'."""
         text = (
             "VERIFICATION_CHECKLIST:\n"
             "Step 1: passed — iowait elevated\n"
@@ -2450,9 +2460,9 @@ class TestChecklistConclusionInconsistencyIntegration:
             "- Warnings: none"
         )
         result = _parse_verification_result(text)
-        # L2 no longer force-downgraded — LLM's Overall: verified is the authority
-        assert result["layer2"]["status"] == "passed"
-        assert result["level"] == "verified"
+        # 'failed' item under a 'passed' conclusion is a hard self-contradiction.
+        assert result["layer2"]["status"] == "partial"
+        assert result["level"] == "partial"
         assert any("inconsistency" in w.lower() for w in result["warnings"])
 
     def test_skipped_step_no_inconsistency_warning(self):
@@ -2595,7 +2605,9 @@ class TestL2DowngradeLevelSync:
     """
 
     def test_absence_evidence_downgrade_syncs_level_text_mode(self):
-        """Text-mode: failed checklist with absence evidence → L2=partial, level=partial."""
+        """Text-mode: a 'failed' checklist item under a 'passed' conclusion →
+        structural contradiction → L2=partial, level=partial (Phase 2c / D14).
+        The downgrade is enum-driven; the evidence text is not consulted."""
         text = (
             "VERIFICATION_CHECKLIST:\n"
             "Step 1: passed — DiskPressure=True\n"
@@ -2608,12 +2620,13 @@ class TestL2DowngradeLevelSync:
         )
         result = _parse_verification_result(text)
         assert result["layer2"]["status"] == "partial", \
-            f"L2 should be 'partial' after auto-downgrade, got '{result['layer2']['status']}'"
+            f"L2 should be 'partial' after structural downgrade, got '{result['layer2']['status']}'"
         assert result["level"] == "partial", \
             f"level should be 'partial' after L2 downgrade, got '{result['level']}'"
 
     def test_absence_evidence_downgrade_syncs_level_json_mode(self):
-        """JSON-mode: failed checklist with absence evidence → L2=partial, level=partial."""
+        """JSON-mode: a 'failed' checklist item under a 'passed' conclusion →
+        structural contradiction → L2=partial, level=partial."""
         data = {
             "verification_checklist": [
                 {"step": 1, "status": "passed", "evidence": "DiskPressure=True"},
@@ -2628,16 +2641,19 @@ class TestL2DowngradeLevelSync:
         result = _try_parse_json(json.dumps(data))
         assert result is not None
         assert result["layer2"]["status"] == "partial", \
-            f"L2 should be 'partial' after auto-downgrade, got '{result['layer2']['status']}'"
+            f"L2 should be 'partial' after structural downgrade, got '{result['layer2']['status']}'"
         assert result["level"] == "partial", \
             f"level should be 'partial' after L2 downgrade, got '{result['level']}'"
 
-    def test_no_absence_evidence_keeps_level_verified(self):
-        """No absence evidence → L2 stays 'passed', level stays 'verified'."""
+    def test_benign_non_passed_statuses_keep_level_verified(self):
+        """No 'failed' item → no structural contradiction → L2 stays 'passed',
+        level stays 'verified'. Timing-delay / benign steps are declared with a
+        non-'failed' status (recovered_before_observation / expected), which the
+        LLM uses instead of 'failed' — so the conclusion is self-consistent."""
         text = (
             "VERIFICATION_CHECKLIST:\n"
             "Step 1: passed — iowait elevated\n"
-            "Step 2: failed — no dd process found\n"
+            "Step 2: recovered_before_observation — dd process ended before check\n"
             "VERIFICATION_RESULT:\n"
             "- Layer1: passed\n"
             "- Layer2: passed - fault effect observed\n"
@@ -3882,7 +3898,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
+        async def _fake_delete(pod_name, _kc, _tid, namespace="", target=None):
             deleted.append(pod_name)
 
         with patch(
@@ -3921,7 +3937,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
+        async def _fake_delete(pod_name, _kc, _tid, namespace="", target=None):
             deleted.append(pod_name)
 
         with patch(
@@ -3959,7 +3975,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
+        async def _fake_delete(pod_name, _kc, _tid, namespace="", target=None):
             deleted.append(pod_name)
 
         with patch(
@@ -3989,7 +4005,7 @@ class TestCleanupDebugPodsDedup:
         }
         result_update: dict = {}
 
-        async def _failing_delete(pod_name, _kc, _tid, namespace=""):
+        async def _failing_delete(pod_name, _kc, _tid, namespace="", target=None):
             # _delete_debug_pod internally swallows exceptions and logs
             # a warning — it returns None either way. We simulate that
             # contract here (silent failure).
@@ -4023,7 +4039,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
+        async def _fake_delete(pod_name, _kc, _tid, namespace="", target=None):
             deleted.append(pod_name)
 
         with patch(
@@ -4057,7 +4073,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
+        async def _fake_delete(pod_name, _kc, _tid, namespace="", target=None):
             deleted.append(pod_name)
 
         with patch(
@@ -4087,7 +4103,7 @@ class TestCleanupDebugPodsDedup:
         }
         deleted: list[str] = []
 
-        async def _fake_delete(name, _kc, _tid, namespace=""):
+        async def _fake_delete(name, _kc, _tid, namespace="", target=None):
             deleted.append(name)
 
         with patch(
@@ -4160,7 +4176,7 @@ class TestCleanupSpareArmedRecoveryCarrier:
         result_update: dict = {}
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid, namespace="", kind="pod"):
+        async def _fake_delete(pod_name, _kc, _tid, namespace="", kind="pod", target=None):
             deleted.append(f"{kind}/{pod_name}")
 
         with patch(
@@ -4186,7 +4202,7 @@ class TestCleanupSpareArmedRecoveryCarrier:
         result_update: dict = {}
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid, namespace="", kind="pod"):
+        async def _fake_delete(pod_name, _kc, _tid, namespace="", kind="pod", target=None):
             deleted.append(pod_name)
 
         with patch(
@@ -5136,6 +5152,38 @@ class TestInjectionWindowClock:
         now = 1_000_000.0
         state = {"injection_start_time": "not-a-timestamp"}
         assert build_injection_window_clock(state, now=now) == ""
+
+    def test_anchor_is_issue_time_lower_bound_not_landing(self):
+        """inject-9ca80c95: injection_start_time is an ISSUE-time marker (a
+        lower bound on landing), never the landing itself. Every rendering must
+        say so and defer to live evidence, and must NOT assert the false
+        finality ("injection committed at T0") that forced the model to
+        override its own clock five times."""
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            build_injection_window_clock,
+        )
+        now = 1_000_000.0
+        for kwargs in (
+            {"offset": 101, "duration": 300},   # in-window
+            {"offset": 400, "duration": 300},   # closed
+            {"offset": 50, "duration": None},   # no duration
+        ):
+            text = build_injection_window_clock(self._state(now, **kwargs), now=now)
+            assert text, kwargs
+            # honest anchor: issued, not committed; landing is at-or-after.
+            assert "ISSUED at" in text, kwargs
+            assert "at or after" in text, kwargs
+            # reverse assertion: the false landing-finality wording is gone.
+            assert "injection committed at" not in text, kwargs
+            assert "committed at" not in text, kwargs
+        # The closed rendering must downgrade CLOSED to an earliest-possible
+        # close that live evidence outranks (descriptive, not imperative).
+        closed = build_injection_window_clock(
+            self._state(now, offset=400, duration=300), now=now,
+        )
+        assert "earliest possible close" in closed
+        assert "not a certainty" in closed
+        assert "outranks this estimate" in closed
 
 
 class TestCarrierStatusLedger:

@@ -657,6 +657,94 @@ async def test_cli_auto_applies_in_domain_action_adjustment():
     assert spec.revision == 1
 
 
+# ── Fix1 路 A: non-node victim correction re-opens the CLI auto-approval ──
+
+_INGRESS_INTENT = (
+    "对 default 命名空间下的 ingress entry 注入后端服务不存在故障"
+)
+
+
+def _ingress_degraded_current() -> FaultSpec:
+    """The Case #70 degradation shape: the user named an ingress but the
+    frozen contract locked a service victim (wrong target, unexecutable
+    without tampering with a healthy Service)."""
+    return FaultSpec(
+        scope="service", namespace="default", names=("drill-svc",),
+        labels={}, fault_target="config", fault_action="patch",
+        duration_seconds=360, source="cli_nl",
+        user_description=_INGRESS_INTENT,
+        objective="backend service missing",
+        boundaries=("test only",), constraints=("one logical experiment",),
+    ).replace(revision=0)
+
+
+def _ingress_fix_call() -> dict:
+    """The executor's correct fix: re-point at the ingress the user named."""
+    proposed = _ingress_degraded_current().to_intent_dict() | {
+        "scope": "ingress", "names": ["entry"], "labels": {},
+    }
+    return {
+        "name": "propose_plan_change", "id": "fix-ing-1",
+        "args": {
+            "reason": "the frozen service victim is wrong; the user named the ingress",
+            "fault_revision": 0,
+            "proposed_fault": proposed,
+        },
+    }
+
+
+def _ingress_state(*, mode="cli", call=None, spec=None) -> dict:
+    call = call or _ingress_fix_call()
+    spec = spec or _ingress_degraded_current()
+    return {
+        "messages": [
+            AIMessage(content="", tool_calls=[call]),
+            ToolMessage(content="ok", name=call["name"], tool_call_id=call["id"]),
+        ],
+        "interaction_mode": mode,
+        "replan_context": {"error_summary": "service selector resolves to a healthy service"},
+        "plan_change_reject_count": 0,
+        "fault_spec": spec.to_dict(),
+        "batch_submit_args": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cli_auto_applies_nonnode_correction_corroborated_by_user_text():
+    """Fix1 路 A end-to-end: the user's own entry text names the ingress, so a
+    non-node correction re-pointing at it substitutes no human decision — it
+    aligns WITH the user and CLI auto-approves. Before this change EVERY
+    non-node proposal was a structural dead end (the node-only anchor gate
+    returned 'kind'/'anchorless')."""
+    with patch(
+        "chaos_agent.agent.nodes.planning.plan_change_confirm.interrupt",
+        side_effect=AssertionError("a corroborated non-node fix must not interrupt"),
+    ):
+        result = await plan_change_confirm(_ingress_state(mode="cli"))
+
+    spec = FaultSpec.from_dict(result["fault_spec"])
+    assert spec is not None
+    assert spec.revision == 1
+    assert spec.scope == "ingress"
+    assert spec.names == ("entry",)
+    assert "CLI non-interactive" in result["messages"][0].content
+
+
+@pytest.mark.asyncio
+async def test_cli_rejects_nonnode_correction_the_user_never_named():
+    """Fail-closed twin at the graph seam: a correction to a resource the
+    user's text does NOT name is refused, and the receipt forbids substituting
+    a different mechanism to force the effect (the Case #70 harm)."""
+    forged = _ingress_fix_call()
+    forged["args"]["proposed_fault"]["scope"] = "configmap"
+    forged["args"]["proposed_fault"]["names"] = ["drill-cm"]
+    result = await plan_change_confirm(_ingress_state(mode="cli", call=forged))
+    assert result["plan_change_reject_count"] == 1
+    assert "fault_spec" not in result
+    assert "cannot confirm" in result["messages"][0].content
+    assert "Do NOT substitute a different" in result["messages"][0].content
+
+
 def _candidate(intent: dict) -> FaultSpec:
     """Intent dict -> FaultSpec the same way _extract_proposal builds it."""
     return FaultSpec.from_intent_args(
@@ -680,9 +768,13 @@ def test_alignment_violation_tokens_are_pinned():
     anchorless = _node_current().replace(user_description="validate packet loss on pods")
     assert _alignment_violation(anchorless, anchorless) == "anchorless"
 
-    # kind — pod-scope proposal echoing the anchored node name
+    # A pod-scope proposal echoing the anchored NODE name is a DIFFERENT
+    # resource. The retired "kind" token no longer applies: non-node kinds now
+    # route through corroboration (Fix1 路 A), and the node intent text names
+    # no pod kind word, so it fails closed to "identity" — still rejected, the
+    # security property is unchanged, only the receipt-selecting token moved.
     kind_swap = _node_fix_call()["args"]["proposed_fault"] | {"scope": "pod"}
-    assert _alignment_violation(_candidate(kind_swap), current) == "kind"
+    assert _alignment_violation(_candidate(kind_swap), current) == "identity"
 
     # identity — a node the user never named
     other = _node_fix_call()["args"]["proposed_fault"] | {
@@ -735,7 +827,7 @@ def _patch_destroy(monkeypatch, method: str) -> list[str]:
     provider = FaultProviderRegistry.resolve_by_method(method)
     calls: list[str] = []
 
-    async def _fake_destroy(uid, kubeconfig=""):
+    async def _fake_destroy(uid, kubeconfig="", *, state=None):
         calls.append(uid)
         return _json.dumps({"code": 200, "success": True, "result": uid})
 

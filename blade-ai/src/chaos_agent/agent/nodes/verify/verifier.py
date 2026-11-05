@@ -24,7 +24,6 @@ from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
     inject_task_id_into_tool_calls,
-    sync_kubewiz_runtime,
 )
 from chaos_agent.agent.nodes.execute.react_helpers import record_ai_message
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store
@@ -77,7 +76,10 @@ from chaos_agent.agent.nodes.execute.react_helpers import (
     extract_tool_call_fields,
     record_system_prompt,
 )
-from chaos_agent.agent.result.operation_outcome import write_inject_verification
+from chaos_agent.agent.result.operation_outcome import (
+    verification_floor_from_layer1,
+    write_inject_verification,
+)
 from chaos_agent.agent.result.verdict import layer1_to_dict
 from chaos_agent.agent.prompts import build_system_prompt, PromptMode
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
@@ -262,63 +264,18 @@ async def verifier(state: AgentState) -> dict:
         except Exception:
             pass  # Session persistence is best-effort
 
-    # Status-reverse inference (skipped ⇒ non-experiment carrier), NOT an
-    # identity check — phase-4 explicit Non-Goal: splitting the skipped
+    # Verification floor — SINGLE SOURCE (operation_outcome.
+    # verification_floor_from_layer1). The deterministic Layer-1-only
+    # derivation (skipped ⇒ non-experiment carrier → unverified; expired →
+    # partial; else partial iff Layer 1 passed, else unverified) is shared
+    # verbatim with ``terminal_task_state``'s crash path, so a run that ends
+    # WITHOUT an LLM verdict and this no-LLM node produce the SAME honest
+    # word. Status-reverse inference (skipped ⇒ non-experiment carrier), NOT
+    # an identity check — phase-4 explicit Non-Goal: splitting the skipped
     # double meaning ("carrier not applicable" vs "infrastructure failure")
     # is a behaviour change deferred to its own task. Kept as-is on purpose.
-    _is_non_chaosblade = layer1.status == "skipped"
-    _is_expired = layer1.expired
-    if _is_non_chaosblade:
-        # Non-ChaosBlade fault: cannot verify without LLM (Layer 2)
-        # Layer 1 is not applicable, and without LLM there's no Layer 2 check
-        _verification_level = "unverified"
-        _verified = False
-    elif _is_expired:
-        # Experiment expired before verification — known cause
-        _verification_level = "partial"
-        _verified = False
-    else:
-        # Layer 1 passed but Layer 2 not performed (no LLM).
-        # "partial" level means we cannot confirm the fault effect is actually observable.
-        _verification_level = "partial" if layer1.is_passed() else "unverified"
-        _verified = False  # Cannot confirm fault effect without Layer 2
-    verification = {
-        "level": _verification_level,
-        "layer1": layer1_to_dict(layer1),
-        "layer2": {
-            "status": "recovered_before_observation" if _is_expired else "skipped",
-            "details": (
-                "Fault expired before Layer 2 observation — "
-                "recovered_before_observation (no LLM available for specific verification)"
-                if _is_expired
-                else "No LLM available for specific verification"
-            ),
-        },
-        "baseline_confidence": _compute_baseline_confidence(state),
-        "warnings": (
-            [
-                "Layer 2 (fault-specific) verification was skipped. "
-                "Only Layer 1 (programmatic) verification was performed."
-            ]
-            if layer1.is_passed()
-            else (
-                [
-                    "Fault experiment record expired (Destroyed/Revoked) before or during "
-                    "verification, so live fault effects could not be observed by Layer 1. "
-                    "Layer 2 was unavailable (no LLM) to judge cluster-level evidence."
-                ]
-                if _is_expired
-                else (
-                    [
-                        "Native fault: Layer 1 not applicable, Layer 2 skipped (no LLM). "
-                        "Fault injection could NOT be verified — the fault may not have been injected."
-                    ]
-                    if _is_non_chaosblade
-                    else []
-                )
-            )
-        ),
-    }
+    verification = verification_floor_from_layer1(state, layer1)
+    _verified = False  # Cannot confirm fault effect without Layer 2 (no LLM)
 
     result = {
         "task_id": task_id,
@@ -679,7 +636,6 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         # has the correct kubeconfig, even if the LLM forgot to include it.
         inject_kubeconfig_into_tool_calls(response, kubeconfig)
         inject_task_id_into_tool_calls(response, task_id)
-        sync_kubewiz_runtime(state)
 
         # Immediate archival with loop attribution — same record_ai_message
         # pattern as execute_loop/agent_loop (which is why their AI turns

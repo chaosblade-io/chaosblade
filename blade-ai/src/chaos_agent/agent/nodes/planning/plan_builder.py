@@ -32,6 +32,7 @@ from chaos_agent.agent.capabilities import (
     filter_tools_for_context,
 )
 from chaos_agent.agent.prompts.builders import build_system_prompt
+from chaos_agent.agent.evidence_clock import append_time_facts_reminder
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.planning.mode import (
     PLANNING_MODE_EXPERT,
@@ -223,8 +224,16 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
                 # Bounding context belongs to the compaction hook invoked above.
                 # ``accumulated`` stays appended: it holds this invocation's
                 # interrupt/resume turns, which are NOT yet in ``messages``.
+                # Authoritative system clock on a fresh per-round list (never
+                # mutating ``messages``/``accumulated``, so no cross-round
+                # accumulation). Planning is pre-injection; the clock is the one
+                # time fact no message carries. The fault-window position is left
+                # to the verifier — a blind phase reading injection_start_time
+                # would anchor a phantom window (see render_time_facts).
+                invoke_messages = messages + accumulated
+                append_time_facts_reminder(invoke_messages, state)
                 response = await llm_bound.ainvoke(
-                    [system_msg] + messages + accumulated
+                    [system_msg] + invoke_messages
                 )
             except Exception as e:
                 logger.error("Plan builder LLM failed: %s", e)

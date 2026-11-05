@@ -20,7 +20,7 @@ from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.nodes.store._store_sync import sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
-from chaos_agent.transports import PROFILE_K8S
+from chaos_agent.transports import PROFILE_K8S, resolve_transport_target
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,11 @@ async def se_detect_node(state: AgentState) -> dict:
     kubeconfig = state.get("kubeconfig", "")
     injection_start = state.get("injection_start_time", "")
     task_id = state.get("task_id", "")
+    # Single-authority transport target from THIS node's state (replaces the
+    # settings side-effect ``sync_kubewiz_runtime`` used to establish). Threaded
+    # into the observer so its kubectl/host-diag leaves read per-session kubewiz
+    # values from state, not settings.
+    _xport_target = resolve_transport_target(state)
 
     profile = profile_for_spec(spec) if spec else PROFILE_K8S
     observer = resolve_observer(profile)
@@ -63,7 +68,10 @@ async def se_detect_node(state: AgentState) -> dict:
 
     try:
         after = await asyncio.wait_for(
-            observer.fetch_post_inject_state(spec, kubeconfig, injection_start, task_id=task_id),
+            observer.fetch_post_inject_state(
+                spec, kubeconfig, injection_start, task_id=task_id,
+                xport_target=_xport_target,
+            ),
             timeout=_DETECT_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -89,7 +97,8 @@ async def se_detect_node(state: AgentState) -> dict:
     )
 
     try:
-        detected = run_all_detectors(snapshot, after, ctx)
+        skipped: dict[str, str] = {}
+        detected = run_all_detectors(snapshot, after, ctx, skipped_out=skipped)
     except Exception as e:
         logger.warning("se_detect: run_all_detectors failed: %s", e)
         tracker.complete(f"Side-effect detectors failed: {e}")
@@ -138,6 +147,11 @@ async def se_detect_node(state: AgentState) -> dict:
             f"({', '.join(sorted(unreadable))}) — findings over them are "
             "not adjudicated"
         )
+    if skipped:
+        summary += (
+            f"; {len(skipped)} detector(s) NOT adjudicated "
+            f"({', '.join(sorted(skipped))})"
+        )
     await dispatch_node_message("se_detect", summary + "\n\n")
     sync_node_status_to_session(
         state, "se_detect",
@@ -154,6 +168,14 @@ async def se_detect_node(state: AgentState) -> dict:
         # and postmortem see it verbatim, so "not captured" stays auditable
         # instead of masquerading as "captured, found nothing".
         existing_se["_unreadable_probes"] = unreadable
+    if skipped:
+        # W-83-5 root-fix: a {detector_key: reason} map of every detector the
+        # B77 gate SKIPPED because a channel it reads was Unreadable. Without
+        # this, a skipped detector is key-absent from ``detected`` and the
+        # summary renders it as ``Label: 0`` — a clean zero that hides a lost
+        # capability (the "八项计数全零 → cosmetic" mislabel, ≥6 cases). Layer2,
+        # postmortem and the summary all read this to say "NOT adjudicated".
+        existing_se["_skipped_detectors"] = skipped
     verification["side_effects"] = existing_se
 
     return write_inject_verification(verification=verification)

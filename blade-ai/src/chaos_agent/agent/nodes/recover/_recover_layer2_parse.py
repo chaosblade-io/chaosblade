@@ -81,38 +81,11 @@ _RECOVERY_CHECKLIST_PATTERNS = [
     ),
 ]
 
-# Recovery-side contradiction detection: mirrors injection verifier's
-# _CONTRADICTION_INDICATORS + _ABSENCE_PHRASES but with INVERTED semantics.
-# Injection detects: L2="failed" but details show fault IS present (injection worked).
-# Recovery detects:  L2="failed" but details show recovery IS effective.
-
-_RECOVERY_CONTRADICTION_INDICATORS = {
-    "cpu": ["cpu usage normal", "cpu back to normal", "cpu utilization normal",
-            "cpu utilization back to", "cpu returned to normal"],
-    "network": ["connectivity restored", "network recovered", "network back to normal",
-                "latency back to normal", "latency back to baseline",
-                "no packet loss", "no network delay", "packet loss resolved"],
-    "disk": ["disk usage back to", "diskpressure is false", "diskpressure false",
-             "disk usage normal", "disk back to normal", "no disk pressure"],
-    "process": ["pod running", "pod is running", "no restarts",
-                "pod healthy", "restart count 0", "no crashloop"],
-}
-
-# Phrases indicating the fault is STILL present — block contradiction detection.
-# Mirrors injection _ABSENCE_PHRASES but inverted: injection uses low percentages
-# (at 16%/17%/18%/19%) to indicate fault is absent; recovery uses high percentages
-# (at 80%/85%/90%/95%) to indicate fault is still present.
-# NOTE: "still running" is intentionally EXCLUDED — in recovery L2 context it
-# typically means a pod is healthy (recovery evidence), not that a ChaosBlade
-# experiment is still active (that's Layer 1's concern).
-_RECOVERY_ABSENCE_PHRASES = (
-    "still elevated", "remains high", "still at 95%", "not recovered",
-    "still present", "persisting", "not yet recovered",
-    "still high", "remains elevated", "at 95%", "at 90%", "at 85%", "at 80%",
-    "diskpressure is true", "diskpressure true",
-    "still not", "not yet", "still active",
-    "still stressed", "remains at 95%", "remains at 90%", "remains at 85%",
-)
+# Recovery-side free-text contradiction indicators (_RECOVERY_CONTRADICTION_INDICATORS
+# / _RECOVERY_ABSENCE_PHRASES) removed (Phase 2c / D14): the program no longer
+# reverse-infers "recovery looks effective" or "fault still present" from
+# free-text l2_details. Recovery contradiction detection is now a pure
+# ChecklistItemStatus enum comparison (see _detect_recovery_contradiction).
 
 
 def _parse_recovery_checklist_items(text: str) -> list[dict]:
@@ -230,178 +203,49 @@ def _detect_recovery_checklist_inconsistency(
 
 
 def _detect_recovery_contradiction(
-    l2_details: str,
     checklist_items: list[dict] | None = None,
 ) -> str | None:
-    """Detect when L2 says 'failed' but evidence describes recovery effects.
+    """Detect a STRUCTURAL contradiction: Layer2 concluded 'failed' but ALL
+    checklist steps are 'passed'.
 
-    Two evidence sources, checked in priority order:
-    1. Checklist-based: ALL items are 'passed' (structural contradiction in
-       LLM's own output — strongest evidence)
-    2. Text-based: L2 details contain recovery indicator keywords without
-       absence phrases (weaker, keyword-matching evidence)
+    Pure closed-set ``ChecklistItemStatus`` enum comparison (D14, structured-
+    evidence-binding spec) — the program never reverse-infers "recovery looks
+    effective" from free-text ``l2_details``. The LLM's structured status is
+    authoritative; if every step is 'passed' while the conclusion says 'failed',
+    that is the LLM contradicting itself at the enum level.
 
-    Absence phrases in L2 details block BOTH checks: if details explicitly
-    describe the fault as still present, the LLM's 'failed' conclusion may
-    be justified by evidence outside the checklist.
+    The former text-based Check 2 (``_RECOVERY_CONTRADICTION_INDICATORS`` keyword
+    match) and the ``_RECOVERY_ABSENCE_PHRASES`` exemption are removed:
+    still-present / recovered semantics are the LLM's to declare via status, not
+    the program's to guess from prose.
     """
-    if not l2_details and not checklist_items:
+    if not checklist_items:
         return None
 
-    # Check absence phrases first — they apply to both evidence sources
-    has_absence = False
-    l2d_lower = ""
-    if l2_details:
-        l2d_lower = l2_details.lower()
-        has_absence = any(phrase in l2d_lower for phrase in _RECOVERY_ABSENCE_PHRASES)
-
-    # Check 1: Checklist-based (stronger — structural contradiction)
-    if checklist_items and len(checklist_items) > 0 and not has_absence:
-        passed_count = sum(1 for item in checklist_items if item.get("status") == "passed")
-        if passed_count == len(checklist_items):
-            # ALL checklist steps passed but L2 says failed — contradiction
-            if l2_details:
-                return (
-                    "Contradiction: Layer2 concluded 'failed' but ALL checklist steps "
-                    "are 'passed' and details describe no ongoing fault. "
-                    "Overriding to 'partial'."
-                )
-            return (
-                "Contradiction: Layer2 concluded 'failed' but ALL checklist steps "
-                "are 'passed'. Overriding to 'partial'."
-            )
-
-    # Check 2: Text-based (weaker — keyword matching)
-    if l2_details and not has_absence:
-        for _, indicators in _RECOVERY_CONTRADICTION_INDICATORS.items():
-            if any(ind in l2d_lower for ind in indicators):
-                return (
-                    "Contradiction: Layer2 concluded 'failed' but details describe "
-                    "observable recovery effects. Overriding to 'partial'."
-                )
-
+    passed_count = sum(
+        1 for item in checklist_items
+        if isinstance(item, dict) and item.get("status") == "passed"
+    )
+    if passed_count == len(checklist_items):
+        return (
+            "Contradiction: Layer2 concluded 'failed' but ALL checklist steps "
+            "are 'passed' — a structural contradiction in the LLM's own status "
+            "declarations. Overriding to 'partial'."
+        )
     return None
 
 
 # ---------------------------------------------------------------------------
-# Detect PrimaryEvidenceObserved=true but evidence is generic (not fault-specific)
+# Generic-primary-evidence text detection removed (Phase 2c / D14).
+# _GENERIC_HEALTH_INDICATORS / _FAULT_SPECIFIC_EVIDENCE /
+# _detect_primary_evidence_generic_contradiction reverse-inferred "the LLM said
+# primary_evidence_observed=true but its prose looks generic" from free-text
+# l2_details keyword matching — a program-side semantic guess that overrides the
+# LLM's structured declaration. Per the structured-evidence-binding spec the
+# "is the evidence fault-specific or generic" judgement belongs to the LLM and is
+# carried by its primary_evidence_observed bool; the program only enforces the
+# structural 'recovered' + primary_evidence_observed=false gate.
 # ---------------------------------------------------------------------------
-
-# Generic health indicators that are NOT primary evidence of fault removal.
-# These indicate the target is "alive" but do not prove the specific fault
-# effect (CPU spike, disk fill, network delay, etc.) is gone.
-_GENERIC_HEALTH_INDICATORS = frozenset({
-    "pod running", "pod is running", "pod running", "pods running",
-    "no new restarts", "restart count", "restarts: 0",
-    "healthy", "health check", "healthcheck",
-    "pod status: running", "status: running", "phase: running",
-    "ready", "1/1", "pods ready", "deployment available",
-    "no errors", "no error", "error-free",
-    "service responding", "responding", "reachable",
-    "uptime", "container running", "containers running",
-    "no crash", "no oom", "not evicted", "not restarting",
-    "node ready", "nodes ready",
-})
-
-# Fault-specific evidence keywords that ARE primary evidence.
-# These prove the specific fault effect has been removed.
-_FAULT_SPECIFIC_EVIDENCE = frozenset({
-    # CPU metrics
-    "cpu usage", "cpu percent", "cpu load", "cpu back", "cpu returned",
-    "cpu normal", "cpu baseline", "cpu utilization", "cpu metric",
-    "top node", "top pod",
-    # Disk / storage metrics
-    "disk usage", "disk percent", "disk fill", "disk back", "disk returned",
-    "disk normal", "disk baseline", "disk utilization", "disk metric",
-    "diskpressure", "diskpressure=false", "diskpressure false",
-    "/proc/diskstats", "iowait", "io wait", "%util", "disk io",
-    "storage usage", "volume usage",
-    # Memory metrics
-    "memory usage", "memory percent", "memory back", "memory returned",
-    "memory normal", "memory baseline", "memory utilization",
-    "memorypressure", "memorypressure=false",
-    "rss", "working set",
-    # Network metrics
-    "latency", "packet loss", "delay", "network delay", "rtt",
-    "connectivity restored", "packet drop", "dns resolution",
-    "networkpolicy", "network back", "network normal",
-    # Process metrics
-    "process killed", "process removed", "blade process", "chaosblade process",
-    # Pod lifecycle (for pod-kill where restart IS primary evidence)
-    "restart observed", "pod restarted", "pod recreated",
-    "finalizers removed", "finalizer removed",
-    # IO metrics
-    "io throughput", "read latency", "write latency",
-    "iops", "throughput",
-})
-
-
-def _detect_primary_evidence_generic_contradiction(
-    primary_observed: bool,
-    l2_details: str,
-    *,
-    skill_name: str = "",
-) -> str | None:
-    """Detect when LLM claims PrimaryEvidenceObserved=true but all evidence is generic.
-
-    This is a programmatic guard that catches a specific LLM failure pattern:
-    the LLM correctly sets PrimaryEvidenceObserved=true (following the prompt rule)
-    but then lists generic health indicators ("Pod Running", "no new restarts")
-    instead of fault-specific metrics ("CPU returned to baseline", "disk usage normal").
-
-    The rule from the prompt states:
-      "PrimaryEvidenceObserved: true ONLY if you directly observed the specific fault
-       effect being absent. If only generic indicators observed, set PrimaryEvidenceObserved: false."
-
-    When PrimaryEvidenceObserved=true but the evidence text contains only generic
-    indicators and zero fault-specific indicators, this is a semantic contradiction.
-
-    Special case: for pod-kill/pod-terminating skills, pod restart IS primary evidence
-    (the fault effect IS the pod being killed), so generic indicators like "pod running"
-    are actually primary evidence in this context.
-
-    Args:
-        primary_observed: The parsed PrimaryEvidenceObserved value (True/False).
-        l2_details: The Layer2 details text (evidence summary after the status keyword).
-        skill_name: The skill name (used for pod-kill exception).
-
-    Returns:
-        Warning string if contradiction detected, None otherwise.
-    """
-    # Only check when PrimaryEvidenceObserved=true
-    if not primary_observed:
-        return None
-
-    # Special case: pod-kill/pod-terminating skills — "pod running" IS primary evidence
-    pod_kill_skills = {"pod-kill", "pod-terminating", "pod-delete"}
-    if skill_name and skill_name.lower() in pod_kill_skills:
-        return None
-
-    l2d_lower = l2_details.lower()
-
-    # Check if any fault-specific evidence keyword appears in L2 details
-    has_fault_specific = any(kw in l2d_lower for kw in _FAULT_SPECIFIC_EVIDENCE)
-
-    # If at least one fault-specific indicator is present, no contradiction
-    if has_fault_specific:
-        return None
-
-    # Check if generic health indicators appear (confirming the evidence is generic)
-    has_generic = any(kw in l2d_lower for kw in _GENERIC_HEALTH_INDICATORS)
-
-    # If no generic indicators either, the evidence text is unclear —
-    # don't flag contradiction on ambiguous evidence (avoid false positives)
-    if not has_generic:
-        return None
-
-    # Contradiction detected: PrimaryEvidenceObserved=true but evidence is purely generic
-    return (
-        "PrimaryEvidenceObserved=true contradicts evidence: all evidence items are "
-        "generic health indicators (pod Running, no restarts, etc.) rather than "
-        "fault-specific metrics (CPU/disk/memory/network returned to baseline). "
-        "Per prompt rules, PrimaryEvidenceObserved should be false when only generic "
-        "indicators are observed. Downgrading to 'partial'."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -490,12 +334,11 @@ def _parse_recovery_verification_result(text: str, *, skill_name: str = "") -> d
             "Recovery verification completeness cannot be confirmed."
         )
 
-    # Contradiction detection: L2="failed" but evidence describes recovery effects.
-    # Checks both L2 details text AND checklist items (if available).
-    # Absence phrases in details block detection when fault is still present.
+    # Contradiction detection (structured only, D14): L2="failed" but ALL
+    # checklist steps are 'passed' — a structural enum contradiction. The former
+    # free-text keyword check is removed; the LLM's status is authoritative.
     if result["layer2"]["status"] == "failed":
         contradiction_warning = _detect_recovery_contradiction(
-            result["layer2"]["details"],
             checklist_items if checklist_items else None,
         )
         if contradiction_warning:
@@ -557,17 +400,11 @@ def _parse_recovery_verification_result(text: str, *, skill_name: str = "") -> d
             "that fault effects are gone. Downgraded to 'partial'."
         )
 
-    # P2-1: Detect PrimaryEvidenceObserved=true but all evidence is generic
-    # (not fault-specific). This catches LLMs that correctly set the flag
-    # but fail to actually observe fault-specific metrics.
-    if primary_observed is True and result["level"] == "recovered":
-        l2_details = result["layer2"].get("details", "")
-        generic_warning = _detect_primary_evidence_generic_contradiction(
-            primary_observed, l2_details, skill_name=skill_name,
-        )
-        if generic_warning:
-            result["level"] = "partial"
-            result["warnings"].append(generic_warning)
+    # Generic-primary-evidence text detection removed (Phase 2c / D14): whether
+    # the observed evidence is fault-specific vs generic health is the LLM's
+    # judgement, declared via primary_evidence_observed. The program no longer
+    # reverse-infers it from l2_details keyword matching. The structural
+    # 'recovered' + primary_evidence_observed=false gate above is retained.
 
     # Warnings: only match explicit "Warnings:" line, not any mention of the word
     for line in text_lower.split("\n"):

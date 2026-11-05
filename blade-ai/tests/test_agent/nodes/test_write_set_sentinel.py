@@ -195,6 +195,15 @@ class TestSafetyCheckStampsPending:
     ):
         skill_dir = tmp_path / "demo-skill"
         (skill_dir / "cases").mkdir(parents=True)
+        # A′: resolve_skill_dir keys on the frontmatter ``name`` (mirroring
+        # the registry, which only loads dirs carrying a valid SKILL.md), so
+        # a realistic skill dir must declare its name in SKILL.md — otherwise
+        # the case manifest silently fails to load and the assertions below
+        # would pass vacuously.
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
         (skill_dir / "cases" / "widened.md").write_text(
             _WIDENED_CASE, encoding="utf-8",
         )
@@ -251,6 +260,15 @@ class TestSafetyCheckStampsPending:
         # forced, the snapshot carries no marker.
         skill_dir = tmp_path / "demo-skill"
         (skill_dir / "cases").mkdir(parents=True)
+        # A′: resolve_skill_dir keys on the frontmatter ``name`` (mirroring
+        # the registry, which only loads dirs carrying a valid SKILL.md), so
+        # a realistic skill dir must declare its name in SKILL.md — otherwise
+        # the case manifest silently fails to load and the assertions below
+        # would pass vacuously.
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
         (skill_dir / "cases" / "covered.md").write_text(
             _COVERED_CASE, encoding="utf-8",
         )

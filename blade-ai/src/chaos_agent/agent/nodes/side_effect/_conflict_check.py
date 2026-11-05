@@ -10,6 +10,7 @@ import json as _json
 import logging
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from chaos_agent.observability.status_tracker import (
     get_tracker,
@@ -25,6 +26,9 @@ from chaos_agent.tools.request_identity import (  # noqa: F401 — re-export
     RequestFingerprint,
     build_request_fingerprint,
 )
+
+if TYPE_CHECKING:
+    from chaos_agent.transports import TransportTarget
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +220,7 @@ async def check_blade_conflicts(
     namespace: str = "", labels: str = "",
     target_names: str = "",
     request_scope_target_action: str = "",
+    *, target: "TransportTarget | None" = None,
 ) -> tuple[list[str], list[ConflictInfo]]:
     """Best-effort check for active ChaosBlade experiments on the cluster.
 
@@ -280,15 +285,15 @@ async def check_blade_conflicts(
         from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
         from chaos_agent.transports import (
             PROFILE_K8S,
-            TransportTarget,
             execute_via_transport,
+            resolve_transport_target,
         )
         from chaos_agent.tools.pod_discovery import (
             discover_tool_pods_cluster_wide,
         )
 
         # Step 1: Discover running tool pods (all-namespaces, multiple label candidates)
-        pods_with_ns = await discover_tool_pods_cluster_wide(kubeconfig, task_id)
+        pods_with_ns = await discover_tool_pods_cluster_wide(kubeconfig, task_id, target=target)
         if not pods_with_ns:
             _msg = "Pre-injection conflict check: no tool pods found (skipped)"
             if tracker:
@@ -304,11 +309,11 @@ async def check_blade_conflicts(
         # Any single pod suffices: blade status --type create queries
         # ChaosBlade CRDs via the K8s API, returning cluster-wide results.
         pod_name, pod_ns = pods_with_ns[0]
+        _target = target if target is not None else resolve_transport_target(None)
         status_cmd = build_kubectl_cmd("exec", [
             pod_name, "-n", pod_ns,
             "--", "blade", "status", "--type", "create",
-        ], kubeconfig=kubeconfig)
-        _target = TransportTarget.from_state({})
+        ], kubeconfig=kubeconfig, target=_target)
         status_result = await execute_via_transport(
             status_cmd, _target, task_id=task_id, source="conflict-check", expect_profile=PROFILE_K8S)
         raw = status_result.stdout

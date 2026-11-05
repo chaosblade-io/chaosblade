@@ -37,7 +37,7 @@ _BASELINE = {
 
 
 def _state(*, scope, target, action, parsed, params=None, baseline=None,
-           skill_case="", post_fill=None, post_burn=None):
+           skill_case=""):
     st = {
         "target": {
             "namespace": "default",
@@ -54,10 +54,6 @@ def _state(*, scope, target, action, parsed, params=None, baseline=None,
     }
     if baseline is not None:
         st["baseline_data"] = baseline
-    if post_fill is not None:
-        st["disk_fill_post_check"] = post_fill
-    if post_burn is not None:
-        st["disk_burn_post_check"] = post_burn
     return st
 
 
@@ -87,10 +83,7 @@ _MATRIX = [
      _layer1(), "uid-4", "pod-disk-fill", "/kc", None, ""),
     ("node-disk-burn-toolpod",
      _state(scope="node", target="disk", action="burn", parsed={"size": "1024"},
-            skill_case="## 注入验证\n1. check dd\n",
-            post_burn={"burn_io_detected": True, "active_partitions": [
-                {"name": "/dev/vdb", "write_throughput_mb_s": 120}],
-                "target_pod": "tp", "node": "n1", "scope": "node"}),
+            skill_case="## 注入验证\n1. check dd\n"),
      _layer1(), "uid-5", "node-disk-burn", "/kc", "tool-pod-e", ""),
     ("pod-disk-burn",
      _state(scope="pod", target="disk", action="burn", parsed={},
@@ -115,12 +108,6 @@ _MATRIX = [
             parsed={"path": "/tmp", "size": "3000"}),
      _layer1(status="skipped", details="node is self-destructive and NotReady"),
      "uid-11", "node-disk-fill", "/kc", "tool-pod-k", ""),
-    ("node-disk-fill-postcheck-found",
-     _state(scope="node", target="disk", action="fill",
-            parsed={"path": "/var/lib/docker", "size": "8000"},
-            post_fill={"fill_file_found": True, "target_pod": "tp",
-                       "ls_output": "chaos_filldisk.log.dat", "df_output": "vdb 90%"}),
-     _layer1(), "uid-12", "node-disk-fill", "/kc", "tool-pod-l", ""),
 ]
 
 _BASELINE_MATRIX = [
@@ -187,6 +174,51 @@ class TestLayer2ContextSnapshot:
         msgs = _build_baseline_tool_messages(bl, tgt, act, injection_parsed=parsed)
         ser = [{"type": type(m).__name__, "content": m.content} for m in msgs]
         assert ser == _golden_map()[("baseline", label)]
+
+    def test_baseline_wrapper_is_domain_neutral(self):
+        """The pre-injection baseline wrapper is emitted for EVERY target domain
+        (k8s / host-SSH / python-app), so it must NOT hardcode ``kubectl``.
+
+        Regression for the host-domain leak caught by the Case #7 re-drill: a
+        host run's baseline message told the LLM to re-run "the same kubectl
+        commands you would use for verification". Mirrors the recover-path
+        baseline (``_recover_layer1.py``) which already says "observation
+        methods". Every golden fixture above is k8s (``df`` via ``kubectl
+        exec``) and therefore could NEVER catch this — a HOST baseline message
+        must carry zero kubectl vocabulary anywhere.
+        """
+        host_baseline = {
+            "captured_at": "2026-10-26T10:00:00",
+            "source": "registry",
+            "success_count": 1,
+            "total_count": 1,
+            "observations": [
+                {
+                    "exit_code": 0,
+                    "description": "df -h",
+                    "command": "df -h",
+                    "stdout": (
+                        "Filesystem Size Used Avail Use% Mounted on\n"
+                        "/dev/sda1 40G 6G 34G 16% /"
+                    ),
+                }
+            ],
+        }
+        msgs = _build_baseline_tool_messages(
+            host_baseline, "disk", "fill", injection_parsed={"path": "/"}
+        )
+        content = next(
+            m.content for m in msgs
+            if getattr(m, "name", "") == "baseline_collector"
+        )
+        # reverse-pin the old buggy wording (the leak this guards against)
+        assert "kubectl commands you would use" not in content
+        # a host baseline message must carry ZERO kubectl vocabulary anywhere
+        assert "kubectl" not in content
+        # the new domain-neutral contract (matches the recover-path baseline)
+        assert "observation methods you would use for verification" in content
+        # the tense label the phase-boundary guard relies on is preserved
+        assert "captured BEFORE fault injection" in content
 
     def test_golden_has_no_hardcoded_knowledge_fragments(self):
         # The 7 fault-specific knowledge fragments were removed from code and now

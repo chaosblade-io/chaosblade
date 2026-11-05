@@ -253,56 +253,154 @@ class TestInjectTaskIdIntoToolCalls:
         assert "task_id" not in msg.tool_calls[0]["args"]
 
 
-class TestSyncKubewizRuntime:
-    """Tests for sync_kubewiz_runtime guard behavior.
+class TestResolveTransportTargetSeam:
+    """Tests for the ``resolve_transport_target`` seam (D5).
 
-    The guard must check *settings* (not state) to determine whether
-    the session is in kubewiz mode.  This prevents a stale
-    ``kubewiz_cluster_uuid`` in state from switching the channel.
+    The seam is the single authoritative entry point for obtaining a
+    ``TransportTarget`` from *state*; its canonical home is
+    ``chaos_agent.transports.registry`` (re-exported through
+    ``_kubeconfig_inject`` for execute-side callers).  It must carry the same
+    guard intent that ``sync_kubewiz_runtime`` used to enforce, plus the D1
+    hydration contract:
+
+    * A **stale** ``kubewiz_cluster_uuid`` / ``kubewiz_profile`` lingering in
+      state MUST NOT hijack a session whose *config* resolves to a non-kubewiz
+      channel — the seam drops those state params before field-based inference.
+    * When config *does* resolve to a kubewiz channel, a state kubewiz override
+      is honoured (per-session connection fact).
+    * An unset ``ssh_port`` in state is ``None`` and falls back to the
+      config-authoritative port — the exact regression (B3) that the old
+      truthy ``22`` placeholder masked.
     """
 
-    def test_kubeconfig_mode_does_not_sync(self, monkeypatch):
-        """When settings says kubeconfig, state kubewiz params must NOT be synced."""
-        from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
+    def test_stale_state_kubewiz_stripped_when_config_not_kubewiz(self, monkeypatch):
+        """Non-kubewiz config + stale state kubewiz params → params dropped."""
         from chaos_agent.config.settings import settings as _settings
+        from chaos_agent.transports import registry as reg
 
-        # Settings: kubeconfig mode (no kubewiz_cluster_uuid)
-        monkeypatch.setattr(_settings, "kube_connection_mode", "kubeconfig")
+        monkeypatch.setattr(reg, "is_kubewiz_channel", lambda *a, **k: False)
         monkeypatch.setattr(_settings, "kubewiz_cluster_uuid", "")
         monkeypatch.setattr(_settings, "kubewiz_profile", "")
 
-        # State: has stale kubewiz params (should be ignored)
         state = {"kubewiz_cluster_uuid": "stale-uuid", "kubewiz_profile": "stale-profile"}
-        sync_kubewiz_runtime(state)
+        target = reg.resolve_transport_target(state)
 
-        # Settings must NOT be modified
-        assert _settings.kubewiz_cluster_uuid == ""
-        assert _settings.kubewiz_profile == ""
+        # Stripped → falls back to the (empty) config value, no hijack.
+        assert target.kubewiz_cluster_uuid == ""
+        assert target.kubewiz_profile == ""
 
-    def test_kubewiz_mode_syncs_from_state(self, monkeypatch):
-        """When settings says kubewiz, state params should be synced to settings."""
-        from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
-        from chaos_agent.config.settings import settings as _settings
+    def test_state_kubewiz_preserved_when_config_is_kubewiz(self, monkeypatch):
+        """Kubewiz config → state kubewiz override survives the seam."""
+        from chaos_agent.transports import registry as reg
 
-        # Settings: kubewiz mode (has kubewiz_cluster_uuid already)
-        monkeypatch.setattr(_settings, "kube_connection_mode", "")
-        monkeypatch.setattr(_settings, "kubewiz_cluster_uuid", "old-uuid")
-        monkeypatch.setattr(_settings, "kubewiz_profile", "old-profile")
+        monkeypatch.setattr(reg, "is_kubewiz_channel", lambda *a, **k: True)
 
-        # State: has new kubewiz params (should be synced)
         state = {"kubewiz_cluster_uuid": "new-uuid", "kubewiz_profile": "new-profile"}
-        sync_kubewiz_runtime(state)
+        target = reg.resolve_transport_target(state)
 
-        # Settings should be updated from state
-        assert _settings.kubewiz_cluster_uuid == "new-uuid"
-        assert _settings.kubewiz_profile == "new-profile"
+        assert target.kubewiz_cluster_uuid == "new-uuid"
+        assert target.kubewiz_profile == "new-profile"
 
-    def test_empty_state_does_not_crash(self, monkeypatch):
-        """Empty state should not crash, regardless of mode."""
-        from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
+    def test_unset_state_port_falls_back_to_settings(self, monkeypatch):
+        """B3: state ssh_port=None + settings 2222 → seam resolves 2222."""
         from chaos_agent.config.settings import settings as _settings
+        from chaos_agent.transports import registry as reg
 
-        monkeypatch.setattr(_settings, "kube_connection_mode", "kubeconfig")
-        monkeypatch.setattr(_settings, "kubewiz_cluster_uuid", "")
+        monkeypatch.setattr(reg, "is_kubewiz_channel", lambda *a, **k: False)
+        monkeypatch.setattr(_settings, "ssh_port", 2222)
 
-        sync_kubewiz_runtime({})  # Should not raise
+        target = reg.resolve_transport_target({"ssh_port": None})
+
+        assert target.ssh_port == 2222
+
+    def test_explicit_state_port_overrides_settings(self, monkeypatch):
+        """An explicit state port is a per-session override and wins."""
+        from chaos_agent.config.settings import settings as _settings
+        from chaos_agent.transports import registry as reg
+
+        monkeypatch.setattr(reg, "is_kubewiz_channel", lambda *a, **k: False)
+        monkeypatch.setattr(_settings, "ssh_port", 2222)
+
+        target = reg.resolve_transport_target({"ssh_port": 2200})
+
+        assert target.ssh_port == 2200
+
+    def test_reexport_is_canonical_seam(self):
+        """The execute-side re-export IS the transports-registry seam (one impl)."""
+        from chaos_agent.agent.nodes.execute import _kubeconfig_inject as mod
+        from chaos_agent.transports import registry as reg
+
+        assert mod.resolve_transport_target is reg.resolve_transport_target
+
+    def test_empty_state_does_not_crash(self):
+        """Intent ③ ported from the retired ``TestSyncKubewizRuntime``: an
+        empty (or ``None``) state resolves to the settings-authoritative
+        target without raising — the seam's ``dict(state or {})`` guard."""
+        from chaos_agent.transports import registry as reg
+
+        # Neither shape may raise; both yield a TransportTarget.
+        assert isinstance(reg.resolve_transport_target({}), reg.TransportTarget)
+        assert isinstance(reg.resolve_transport_target(None), reg.TransportTarget)
+
+
+# The six cluster tools whose signature declares ``kubeconfig``. This is the
+# exact set the runtime injector targets (provider-union
+# ``kubeconfig_scoped_tool_names``): kubectl/kubectl_read from the k8s-native
+# provider plus the four chaosblade CLI tools.
+def _kubeconfig_scoped_tools() -> dict:
+    from chaos_agent.agent.providers.chaosblade.cli import (
+        blade_create,
+        blade_destroy,
+        blade_query_k8s,
+        blade_status,
+    )
+    from chaos_agent.tools.kubectl_cli import kubectl, kubectl_read
+
+    return {
+        "kubectl": kubectl,
+        "kubectl_read": kubectl_read,
+        "blade_create": blade_create,
+        "blade_destroy": blade_destroy,
+        "blade_status": blade_status,
+        "blade_query_k8s": blade_query_k8s,
+    }
+
+
+class TestKubeconfigSchemaInvisibleToLLM:
+    """kubeconfig is a runtime-owned connection fact, NOT an LLM planning
+    parameter — the same treatment K7 gives --context/--cluster.
+
+    Root cause this pins shut: kubeconfig used to be an ordinary tool arg
+    exposed in the LLM-facing schema (and prompts told the model to retype it
+    on every cluster call). The model hand-copied the path token-by-token and
+    occasionally typo'd it (``jiangzelin`` -> ``jiangzerin``); the injector
+    only fills an EMPTY kubeconfig and never corrects a wrong one, so the bad
+    path reached kubectl and forced exit-1 detours.
+
+    Marking the parameter ``InjectedToolArg`` hides it from
+    ``convert_to_openai_tool`` — the model can no longer name it, so it can no
+    longer typo it — while the runtime injector still supplies the authoritative
+    value. These assertions pin that the schema stays closed (anti-regression):
+    if anyone drops the ``InjectedToolArg`` annotation, the parameter reappears
+    in the schema and this test flips red.
+    """
+
+    def test_kubeconfig_absent_from_every_llm_facing_schema(self):
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        for name, tool in _kubeconfig_scoped_tools().items():
+            schema = convert_to_openai_tool(tool)
+            props = schema["function"]["parameters"].get("properties", {})
+            assert "kubeconfig" not in props, (
+                f"{name} re-exposes kubeconfig to the LLM — the InjectedToolArg "
+                "annotation was dropped, reopening the typo surface"
+            )
+
+    def test_provider_union_still_covers_every_scoped_tool(self):
+        """Hiding the arg from the schema must NOT un-target the runtime
+        injector: the provider union still names all six, so injection keeps
+        supplying the authoritative kubeconfig at dispatch time."""
+        from chaos_agent.agent.providers.registry import FaultProviderRegistry
+
+        union = FaultProviderRegistry.union_tool_names("kubeconfig_scoped_tool_names")
+        assert set(_kubeconfig_scoped_tools()) <= union

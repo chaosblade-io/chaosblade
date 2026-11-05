@@ -6,10 +6,8 @@ import pytest
 
 from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
     _parse_numeric,
-    _metric_alias,
-    _pick_metric_by_context,
-    _build_truth_deltas,
-    _find_contradictions,
+    _build_truth_series,
+    _check_metric_claims,
     cross_check_evidence,
     _determine_level,
     _detect_checklist_conclusion_inconsistency,
@@ -48,122 +46,99 @@ class TestParseNumeric:
         assert _parse_numeric("True") is None
 
 
-class TestMetricAlias:
-    def test_strips_parenthetical(self):
-        assert _metric_alias("Disk usage (overlay)") == "disk usage"
-
-    def test_no_parenthetical(self):
-        assert _metric_alias("CPU usage") == "cpu usage"
-
-    def test_multiple_parentheticals(self):
-        assert _metric_alias("Mem (RSS) (node)") == "mem"
-
-    def test_lowercases(self):
-        assert _metric_alias("RestartCount") == "restartcount"
-
-
-class TestPickMetricByContext:
-    def test_full_name_hit(self):
-        truth = {"Disk usage (overlay)": (10.0, 90.0)}
-        assert _pick_metric_by_context("disk usage (overlay) increased", truth) == "Disk usage (overlay)"
-
-    def test_alias_hit(self):
-        truth = {"Disk usage (overlay)": (10.0, 90.0)}
-        assert _pick_metric_by_context("disk usage went up", truth) == "Disk usage (overlay)"
-
-    def test_ambiguous_alias_returns_none(self):
-        truth = {
-            "Disk usage (overlay)": (10.0, 90.0),
-            "Disk usage (nodefs)": (20.0, 80.0),
-        }
-        assert _pick_metric_by_context("disk usage changed", truth) is None
-
-    def test_no_match(self):
-        truth = {"CPU usage": (5.0, 95.0)}
-        assert _pick_metric_by_context("memory is fine", truth) is None
-
-
-class TestBuildTruthDeltas:
+class TestBuildTruthSeries:
     def test_two_iterations(self):
         obs = [
             {"iteration": 0, "metrics": {"CPU": "10%"}},
             {"iteration": 1, "metrics": {"CPU": "90%"}},
         ]
-        result = _build_truth_deltas(obs)
-        assert result == {"CPU": (10.0, 90.0)}
+        result = _build_truth_series(obs)
+        assert result == {"CPU": [10.0, 90.0]}
+
+    def test_full_series_not_reduced_to_endpoints(self):
+        # A self-recovering metric keeps its whole shape — the cross-check
+        # must see the mid-window deviation, not just first-vs-last (D15).
+        obs = [
+            {"iteration": 0, "metrics": {"Partition": "0"}},
+            {"iteration": 1, "metrics": {"Partition": "2"}},
+            {"iteration": 2, "metrics": {"Partition": "0"}},
+        ]
+        assert _build_truth_series(obs) == {"Partition": [0.0, 2.0, 0.0]}
 
     def test_single_iteration_skipped(self):
         obs = [{"iteration": 0, "metrics": {"CPU": "50%"}}]
-        assert _build_truth_deltas(obs) == {}
+        assert _build_truth_series(obs) == {}
 
     def test_non_numeric_skipped(self):
         obs = [
             {"iteration": 0, "metrics": {"status": "Running"}},
             {"iteration": 1, "metrics": {"status": "Running"}},
         ]
-        assert _build_truth_deltas(obs) == {}
+        assert _build_truth_series(obs) == {}
 
     def test_empty_observations(self):
-        assert _build_truth_deltas([]) == {}
-        assert _build_truth_deltas(None) == {}
+        assert _build_truth_series([]) == {}
+        assert _build_truth_series(None) == {}
 
 
-class TestFindContradictions:
+class TestCheckMetricClaims:
+    """Structured comparator (replaces the retired free-text
+    ``_find_contradictions``). Binding is by exact declared key, so the
+    comma-grouped-text parsing the old tests guarded is structurally
+    moot — baseline/post arrive as numbers, never parsed from prose.
+    Contradiction rule (D15): the observed series is CONSTANT and that
+    constant ≠ the claimed post — a zero first-vs-last delta alone is not
+    enough (self-recovery / single-phase snapshots fake it)."""
+
     def test_contradiction_detected(self):
-        evidence = "CPU usage 10 → 90 (significant increase)"
-        truth = {"CPU usage": (50.0, 50.0)}
-        result = _find_contradictions(evidence, truth, 3)
-        assert len(result) == 1
-        assert "no change" in result[0]
+        truth = {"CPU usage": [50.0, 50.0]}
+        contradictions, unknown = _check_metric_claims(
+            [{"metric": "CPU usage", "baseline": 10, "post": 90}], truth,
+        )
+        assert len(contradictions) == 1
+        assert "no change" in contradictions[0]
+        assert unknown == []
 
     def test_no_contradiction_when_truth_has_delta(self):
-        evidence = "CPU usage 10 → 90"
-        truth = {"CPU usage": (10.0, 90.0)}
-        result = _find_contradictions(evidence, truth, 2)
-        assert result == []
+        truth = {"CPU usage": [10.0, 90.0]}
+        contradictions, _ = _check_metric_claims(
+            [{"metric": "CPU usage", "baseline": 10, "post": 90}], truth,
+        )
+        assert contradictions == []
 
-    def test_llm_claims_no_change_skipped(self):
-        evidence = "CPU usage 50 → 50 (stable)"
-        truth = {"CPU usage": (50.0, 50.0)}
-        result = _find_contradictions(evidence, truth, 2)
-        assert result == []
+    def test_self_recovering_series_not_contradiction(self):
+        # D15 Mode A: series moved and came back [0,2,0] — non-constant, so
+        # the claim 0→2 is corroborated (2 appeared); MUST NOT contradict.
+        truth = {"Partition": [0.0, 2.0, 0.0]}
+        contradictions, _ = _check_metric_claims(
+            [{"metric": "Partition", "baseline": 0, "post": 2}], truth,
+        )
+        assert contradictions == []
 
-    def test_no_matching_metric(self):
-        evidence = "memory 10 → 90"
-        truth = {"CPU usage": (50.0, 50.0)}
-        result = _find_contradictions(evidence, truth, 2)
-        assert result == []
+    def test_single_phase_snapshot_pinned_at_post_not_contradiction(self):
+        # D15 Mode B: baseline read dropped, series constant at the POST
+        # value [2,2,2] for claim 0→2 — the endpoint is corroborated, so
+        # abstain (delta=0 is a data-gap artifact, not "no change").
+        truth = {"Partition": [2.0, 2.0, 2.0]}
+        contradictions, _ = _check_metric_claims(
+            [{"metric": "Partition", "baseline": 0, "post": 2}], truth,
+        )
+        assert contradictions == []
 
-    def test_comma_grouped_delta_parsed_as_whole(self):
-        # LLM evidence often uses human-style comma grouping
-        # ("78,505,306 → 78,697,402"). The old pattern backtracked
-        # past the commas and parsed "306 → 78" — a fabricated delta
-        # whose wrong numbers landed verbatim in the warning text.
-        evidence = "Disk writes (vda3) 78,505,306 → 78,697,402"
-        truth = {"Disk writes (vda3)": (78505306.0, 78505306.0)}
-        result = _find_contradictions(evidence, truth, 2)
-        assert len(result) == 1
-        assert "78,505,306→78,697,402" in result[0]
-        assert "Δ=+192096" in result[0]
+    def test_claim_no_change_skipped(self):
+        truth = {"CPU usage": [50.0, 50.0]}
+        contradictions, _ = _check_metric_claims(
+            [{"metric": "CPU usage", "baseline": 50, "post": 50}], truth,
+        )
+        assert contradictions == []
 
-    def test_comma_grouped_with_units_parsed_as_whole(self):
-        # "3,145Mi → 3,146Mi" used to degrade to "145 → 3" (Δ=-142) —
-        # the exact false-positive shape that would downgrade a faithful
-        # citation to a hallucination warning.
-        evidence = "Memory usage 3,145Mi → 3,146Mi"
-        truth = {"Memory usage": (3145.0, 3145.0)}
-        result = _find_contradictions(evidence, truth, 2)
-        assert len(result) == 1
-        assert "3,145→3,146" in result[0]
-        assert "Δ=+1" in result[0]
-
-    def test_comma_grouped_no_flag_when_truth_changed(self):
-        # Comma-grouped citation of a REAL change must not be flagged
-        # (truth delta non-zero → no contradiction, comma or not).
-        evidence = "Disk writes (vda3) 78,505,306 → 78,697,402"
-        truth = {"Disk writes (vda3)": (78505306.0, 78697402.0)}
-        result = _find_contradictions(evidence, truth, 2)
-        assert result == []
+    def test_unknown_metric_is_warning_not_contradiction(self):
+        truth = {"CPU usage": [50.0, 50.0]}
+        contradictions, unknown = _check_metric_claims(
+            [{"metric": "memory", "baseline": 10, "post": 90}], truth,
+        )
+        assert contradictions == []
+        assert len(unknown) == 1
 
 
 class TestCrossCheckEvidence:
@@ -173,9 +148,12 @@ class TestCrossCheckEvidence:
         assert returned["level"] == "verified"
 
     def test_contradiction_downgrades(self):
+        # Structured binding: the LLM declares CPU usage 10→90 but the
+        # timeline shows it stayed at 50 → deterministic contradiction.
         result = {
             "level": "verified",
             "layer2": {"status": "passed", "details": "CPU usage 10 → 90 (big jump)"},
+            "metric_claims": [{"metric": "CPU usage", "baseline": 10, "post": 90}],
             "warnings": [],
         }
         obs = [
@@ -204,18 +182,28 @@ class TestDetermineLevel:
 
 
 class TestDetectChecklistConclusionInconsistency:
+    """Structural status-enum consistency only (Phase 2c / D14).
+
+    The single downgrade trigger is a 'failed' item contradicting a 'passed'
+    Layer2 conclusion. The program never reads evidence free text; absence /
+    benign / expected-negative semantics are the LLM's status choice, not
+    re-derived from prose.
+    """
+
     def test_no_inconsistency_when_all_passed(self):
         items = [{"step": 1, "status": "passed"}, {"step": 2, "status": "passed"}]
         warning, downgrade = _detect_checklist_conclusion_inconsistency(items, "passed")
         assert warning is None
         assert downgrade is False
 
-    def test_inconsistency_with_failed_and_absence(self):
+    def test_failed_item_triggers_structural_downgrade(self):
+        # A 'failed' item under a 'passed' conclusion is a hard enum-level
+        # self-contradiction — downgraded regardless of any evidence text.
         items = [
             {"step": 1, "status": "passed"},
-            {"step": 2, "status": "failed", "evidence": "disk usage at 2%, no change observed"},
+            {"step": 2, "status": "failed", "evidence": "disk usage at 95%"},
         ]
-        warning, downgrade = _detect_checklist_conclusion_inconsistency(items, "passed", "disk usage at 2%, no change observed")
+        warning, downgrade = _detect_checklist_conclusion_inconsistency(items, "passed")
         assert warning is not None
         assert "inconsistency" in warning.lower()
         assert downgrade is True
@@ -224,39 +212,40 @@ class TestDetectChecklistConclusionInconsistency:
         items = [{"step": 1, "status": "failed"}]
         warning, downgrade = _detect_checklist_conclusion_inconsistency(items, "failed")
         assert warning is None
+        assert downgrade is False
 
-    def test_only_recovered_before_obs_no_trigger(self):
-        items = [{"step": 1, "status": "recovered_before_observation"}]
+    @pytest.mark.parametrize("benign_status", [
+        "recovered_before_observation", "expected", "partial",
+        "skipped", "not_applicable",
+    ])
+    def test_benign_non_passed_statuses_do_not_downgrade(self, benign_status):
+        # A1 retirement: these statuses express "non-passed but not a real
+        # failure"; with no 'failed' item there is no structural contradiction,
+        # so no downgrade — even though the old path scanned their evidence text
+        # for absence phrases ("far below", "at 1%") and could downgrade.
+        items = [
+            {"step": 1, "status": "passed"},
+            {"step": 2, "status": benign_status,
+             "evidence": "no change observed, far below threshold at 1%"},
+        ]
         warning, downgrade = _detect_checklist_conclusion_inconsistency(items, "passed")
         assert warning is None
         assert downgrade is False
 
-    def test_residual_category_key_no_longer_exempts(self):
-        # Single-tier contract: a residual 'category' key (from historical
-        # checkpoints) is inert — the 'impact' exemption is gone, so a
-        # failed step with absence evidence triggers the downgrade like
-        # any other failed step (verifier-core-only D3, accepted risk).
-        items = [
-            {"step": 1, "status": "passed"},
-            {"step": 2, "status": "failed", "category": "impact",
-             "evidence": "no OOMKilled events, no change observed"},
-        ]
-        warning, downgrade = _detect_checklist_conclusion_inconsistency(
-            items, "passed", "no OOMKilled events, no change observed",
-        )
+    def test_evidence_text_is_not_consulted(self):
+        # The retired capability pinned: a 'failed' item WITHOUT any absence
+        # phrase still downgrades (structural), proving the decision is
+        # enum-based, not driven by free-text absence matching.
+        items = [{"step": 1, "status": "failed",
+                  "evidence": "disk usage at 95%, fully filled"}]
+        warning, downgrade = _detect_checklist_conclusion_inconsistency(items, "passed")
         assert warning is not None
         assert downgrade is True
 
-    def test_failed_step_still_triggers_downgrade(self):
-        items = [
-            {"step": 1, "status": "failed",
-             "evidence": "memory at 2%, no increase observed"},
-        ]
-        warning, downgrade = _detect_checklist_conclusion_inconsistency(
-            items, "passed", "memory at 2%, no increase observed",
-        )
-        assert warning is not None
-        assert downgrade is True
+    def test_empty_checklist_no_trigger(self):
+        warning, downgrade = _detect_checklist_conclusion_inconsistency([], "passed")
+        assert warning is None
+        assert downgrade is False
 
 
 class TestSingleTierChecklistParsing:
@@ -373,6 +362,42 @@ class TestParseVerificationResult:
         result = _parse_verification_result(text)
         assert result["layer2"]["status"] == "skipped"
         assert any("skipped" in w.lower() for w in result["warnings"])
+
+    def test_all_recovered_before_observation_forces_unverified(self):
+        # Mirror of the submit-args path (single-sourced helper): EVERY item
+        # dissipated before observation => nothing observable => the declared
+        # 'verified' is forced to 'unverified'. Applied AFTER overall-derivation
+        # (the pre-fix inline copy ran too early and was overwritten => dead).
+        text = (
+            "Layer1: passed\n"
+            "Layer2: passed\n"
+            "VERIFICATION_CHECKLIST:\n"
+            "- Step 1: recovered_before_observation — pod already Running by sample time\n"
+            "- Step 2: recovered_before_observation — no residual observed\n"
+            "VERIFICATION_RESULT:\n"
+            "Overall: verified\n"
+            "PrimaryEvidenceObserved: true\n"
+        )
+        result = _parse_verification_result(text)
+        assert result["level"] == "unverified"
+        assert any("recovered_before_observation" in w for w in result["warnings"])
+
+    def test_mixed_recovered_before_observation_only_warns(self):
+        # A MIXED checklist is the LLM's overall judgement, not a program
+        # override: level stays as declared, only a warning is recorded.
+        text = (
+            "Layer1: passed\n"
+            "Layer2: passed\n"
+            "VERIFICATION_CHECKLIST:\n"
+            "- Step 1: passed — saw the effect in window\n"
+            "- Step 2: recovered_before_observation — dissipated before sample\n"
+            "VERIFICATION_RESULT:\n"
+            "Overall: verified\n"
+            "PrimaryEvidenceObserved: true\n"
+        )
+        result = _parse_verification_result(text)
+        assert result["level"] == "verified"
+        assert any("recovered_before_observation" in w for w in result["warnings"])
 
 
 class TestTryParseJson:

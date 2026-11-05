@@ -41,6 +41,7 @@ from chaos_agent.transports import (
     PROFILE_K8S,
     TransportTarget,
     execute_via_transport,
+    resolve_transport_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,8 @@ async def _execute_observations(
     commands: list[dict],
     kubeconfig: str,
     task_id: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> list[dict]:
     """Execute baseline collection commands, return observation results.
 
@@ -66,6 +69,7 @@ async def _execute_observations(
     """
     tracker = get_tracker(task_id)
     observations = []
+    _target = target if target is not None else resolve_transport_target(None)
 
     # ── Pre-create debug pods for all debug_two_step commands ──
     debug_pods: dict[str, tuple[str, str]] = {}  # node_name -> (pod_name, namespace)
@@ -78,7 +82,7 @@ async def _execute_observations(
         node_names.discard("")
         for node_name in node_names:
             result, reason = await _create_and_wait_debug_pod_with_reason(
-                node_name, kubeconfig, task_id,
+                node_name, kubeconfig, task_id, target=_target,
             )
             if result:
                 debug_pods[node_name] = result
@@ -108,7 +112,7 @@ async def _execute_observations(
             else:
                 # Fallback: try to find a tool pod on this node
                 tool_pod_info = await discover_tool_pod_on_node(
-                    node_name, kubeconfig, task_id,
+                    node_name, kubeconfig, task_id, target=_target,
                 )
                 if tool_pod_info:
                     tool_pod_fallbacks[node_name] = tool_pod_info
@@ -159,18 +163,19 @@ async def _execute_observations(
                     # Host profile: run the diagnostic verbatim on the target
                     # host via the transport layer. No debug pod, no tool pod
                     # discovery — the connected host IS the target.
-                    obs = await _exec_host_simple(cmd_info, task_id)
+                    obs = await _exec_host_simple(cmd_info, task_id, target=_target)
                 elif cmd_info["mode"] == "debug_two_step":
                     node_name = cmd_info.get("_node_name", "")
                     if node_name in debug_pods:
                         obs = await _exec_in_debug_pod(
                             cmd_info, kubeconfig, task_id, debug_pods,
+                            target=_target,
                         )
                     elif node_name in tool_pod_fallbacks:
                         pod_name, pod_ns = tool_pod_fallbacks[node_name]
                         obs = await _exec_in_tool_pod(
                             cmd_info, kubeconfig, task_id,
-                            pod_name, pod_ns,
+                            pod_name, pod_ns, target=_target,
                         )
                     else:
                         obs = {
@@ -190,7 +195,7 @@ async def _execute_observations(
                             ),
                         }
                 else:
-                    obs = await _exec_simple(cmd_info, kubeconfig, task_id)
+                    obs = await _exec_simple(cmd_info, kubeconfig, task_id, target=_target)
                 # Validity stamp (#16 fix C): this append is the single
                 # chokepoint every execution path (including retry
                 # re-execution) funnels through, so it is where "the command
@@ -292,25 +297,28 @@ async def _execute_observations(
     finally:
         # ── Cleanup all debug pods ──
         for pod_name, ns in debug_pods.values():
-            await _delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
+            await _delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns, target=_target)
 
     return observations
 
 
-async def _exec_simple(cmd_info: dict, kubeconfig: str, task_id: str) -> dict:
+async def _exec_simple(
+    cmd_info: dict, kubeconfig: str, task_id: str,
+    *, target: TransportTarget | None = None,
+) -> dict:
     """Execute a simple kubectl command.
 
     When the command is a kubectl exec containing iostat and it fails
     (because sysstat is not installed in the container), automatically
     retries with BusyBox-compatible iostat first, then /proc fallback.
     """
-    cmd = build_kubectl_cmd(cmd_info["subcommand"], cmd_info["v_args"], kubeconfig=kubeconfig)
+    _target = target if target is not None else resolve_transport_target(None)
+    cmd = build_kubectl_cmd(cmd_info["subcommand"], cmd_info["v_args"], kubeconfig=kubeconfig, target=_target)
     timeout = (
         settings.timeout_kubectl_exec
         if cmd_info["subcommand"] == "exec"
         else settings.timeout_kubectl
     )
-    _target = TransportTarget.from_state({})
     result = await execute_via_transport(
         cmd, _target, timeout=timeout, task_id=task_id,
         # kubectl-shaped: a host channel cannot serve cluster reads.
@@ -326,7 +334,7 @@ async def _exec_simple(cmd_info: dict, kubeconfig: str, task_id: str) -> dict:
                     "iostat unavailable in container, retrying with "
                     "fallback: %s", fb_v_args,
                 )
-                fb_cmd = build_kubectl_cmd("exec", fb_v_args, kubeconfig=kubeconfig)
+                fb_cmd = build_kubectl_cmd("exec", fb_v_args, kubeconfig=kubeconfig, target=_target)
                 fb_result = await execute_via_transport(
                     fb_cmd, _target, timeout=settings.timeout_kubectl_exec,
                     task_id=task_id, expect_profile=PROFILE_K8S,
@@ -334,7 +342,7 @@ async def _exec_simple(cmd_info: dict, kubeconfig: str, task_id: str) -> dict:
                 if fb_result.exit_code == 0:
                     return {
                         "description": cmd_info["description"],
-                        "command": display_cmd(fb_cmd),
+                        "command": display_cmd(fb_cmd, target=_target),
                         "exit_code": 0,
                         "stdout": fb_result.stdout,
                         "stderr": fb_result.stderr,
@@ -342,14 +350,17 @@ async def _exec_simple(cmd_info: dict, kubeconfig: str, task_id: str) -> dict:
 
     return {
         "description": cmd_info["description"],
-        "command": display_cmd(cmd),
+        "command": display_cmd(cmd, target=_target),
         "exit_code": result.exit_code,
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
 
 
-async def _exec_host_simple(cmd_info: dict, task_id: str) -> dict:
+async def _exec_host_simple(
+    cmd_info: dict, task_id: str,
+    *, target: TransportTarget | None = None,
+) -> dict:
     """Execute a host-profile diagnostic verbatim on the target host.
 
     The command is a plain read-only shell diagnostic (validated by
@@ -365,7 +376,7 @@ async def _exec_host_simple(cmd_info: dict, task_id: str) -> dict:
     for minimal hosts that lack the primary binary.
     """
     command = cmd_info["command"]
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
 
     async def _run(cmd_str: str):
         try:
@@ -410,6 +421,7 @@ async def _exec_host_simple(cmd_info: dict, task_id: str) -> dict:
 
 async def _exec_debug_two_step(
     cmd_info: dict, kubeconfig: str, task_id: str,
+    *, target: TransportTarget | None = None,
 ) -> dict:
     """Execute debug_two_step: kubectl debug -> wait -> kubectl exec -> kubectl delete.
 
@@ -431,7 +443,7 @@ async def _exec_debug_two_step(
     # with per-candidate fast-fail retry, and namespace auto-discovery, live
     # inside create_and_wait_debug_pod.
     create_result, create_reason = await create_and_wait_debug_pod_with_reason(
-        node_name, kubeconfig, task_id,
+        node_name, kubeconfig, task_id, target=target,
     )
     if not create_result:
         return {
@@ -474,8 +486,8 @@ async def _exec_debug_two_step(
             # No namespace at all — insert after debug pod name
             v_args = v_args.replace(debug_pod, f"{debug_pod} -n {pod_ns}", 1)
 
-        exec_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(v_args), kubeconfig=kubeconfig)
-        _target = TransportTarget.from_state({})
+        _target = target if target is not None else resolve_transport_target(None)
+        exec_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(v_args), kubeconfig=kubeconfig, target=_target)
         exec_result = await execute_via_transport(
             exec_cmd, _target, timeout=settings.timeout_kubectl_exec, task_id=task_id,
             expect_profile=PROFILE_K8S,
@@ -490,7 +502,7 @@ async def _exec_debug_two_step(
                         "iostat unavailable in debug pod, retrying with "
                         "fallback: %s", fb_v_args,
                     )
-                    fb_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(fb_v_args), kubeconfig=kubeconfig)
+                    fb_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(fb_v_args), kubeconfig=kubeconfig, target=_target)
                     fb_result = await execute_via_transport(
                         fb_cmd, _target, timeout=settings.timeout_kubectl_exec,
                         task_id=task_id, expect_profile=PROFILE_K8S,
@@ -498,7 +510,7 @@ async def _exec_debug_two_step(
                     if fb_result.exit_code == 0:
                         return {
                             "description": cmd_info["description"],
-                            "command": display_cmd(fb_cmd),
+                            "command": display_cmd(fb_cmd, target=_target),
                             "exit_code": 0,
                             "stdout": fb_result.stdout,
                             "stderr": fb_result.stderr,
@@ -506,14 +518,14 @@ async def _exec_debug_two_step(
 
         return {
             "description": cmd_info["description"],
-            "command": display_cmd(exec_cmd),
+            "command": display_cmd(exec_cmd, target=_target),
             "exit_code": exec_result.exit_code,
             "stdout": exec_result.stdout,
             "stderr": exec_result.stderr,
         }
     finally:
         # Step 3: cleanup debug pod
-        await _delete_debug_pod(debug_pod, kubeconfig, task_id, namespace=pod_ns)
+        await _delete_debug_pod(debug_pod, kubeconfig, task_id, namespace=pod_ns, target=target)
 
 
 def _parse_debug_pod_name(output: str) -> str:
@@ -531,13 +543,17 @@ _DEBUG_CONTAINER_NAME = DEBUG_CONTAINER_NAME
 
 async def _wait_for_debug_pod_ready(
     pod_name: str, kubeconfig: str, task_id: str, timeout: int = 60,
+    *, target: TransportTarget | None = None,
 ) -> bool:
     """Backward-compat wrapper — delegates to shared _debug_pod module."""
-    return await wait_for_debug_pod_ready(pod_name, kubeconfig, task_id, timeout)
+    return await wait_for_debug_pod_ready(
+        pod_name, kubeconfig, task_id, timeout, target=target,
+    )
 
 
 async def _create_and_wait_debug_pod_with_reason(
     node_name: str, kubeconfig: str, task_id: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[tuple[str, str] | None, str]:
     """Reason-aware wrapper — delegates to shared _debug_pod module.
 
@@ -550,21 +566,25 @@ async def _create_and_wait_debug_pod_with_reason(
     unused one and pass while the real path runs).
     """
     return await create_and_wait_debug_pod_with_reason(
-        node_name, kubeconfig, task_id,
+        node_name, kubeconfig, task_id, target=target,
     )
 
 
 async def _delete_debug_pod(
     pod_name: str, kubeconfig: str, task_id: str,
     namespace: str = "",
+    *, target: TransportTarget | None = None,
 ) -> None:
     """Backward-compat wrapper — delegates to shared _debug_pod module."""
-    await delete_debug_pod(pod_name, kubeconfig, task_id, namespace=namespace)
+    await delete_debug_pod(
+        pod_name, kubeconfig, task_id, namespace=namespace, target=target,
+    )
 
 
 async def _exec_in_tool_pod(
     cmd_info: dict, kubeconfig: str, task_id: str,
     tool_pod_name: str, tool_pod_namespace: str,
+    *, target: TransportTarget | None = None,
 ) -> dict:
     """Execute a baseline command in a tool pod (fallback when debug pod unavailable).
 
@@ -593,8 +613,8 @@ async def _exec_in_tool_pod(
         )
 
     # NOTE: No '-c debugger' — tool pods have a single main container
-    exec_cmd = build_kubectl_cmd("exec", v_args, kubeconfig=kubeconfig)
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
+    exec_cmd = build_kubectl_cmd("exec", v_args, kubeconfig=kubeconfig, target=_target)
     exec_result = await execute_via_transport(
         exec_cmd, _target, timeout=settings.timeout_kubectl_exec, task_id=task_id,
         expect_profile=PROFILE_K8S,
@@ -609,7 +629,7 @@ async def _exec_in_tool_pod(
                     "iostat unavailable in tool pod, retrying with "
                     "fallback: %s", fb_v_args,
                 )
-                fb_cmd = build_kubectl_cmd("exec", fb_v_args, kubeconfig=kubeconfig)
+                fb_cmd = build_kubectl_cmd("exec", fb_v_args, kubeconfig=kubeconfig, target=_target)
                 fb_result = await execute_via_transport(
                     fb_cmd, _target, timeout=settings.timeout_kubectl_exec,
                     task_id=task_id, expect_profile=PROFILE_K8S,
@@ -617,7 +637,7 @@ async def _exec_in_tool_pod(
                 if fb_result.exit_code == 0:
                     return {
                         "description": cmd_info["description"],
-                        "command": display_cmd(fb_cmd),
+                        "command": display_cmd(fb_cmd, target=_target),
                         "exit_code": 0,
                         "stdout": fb_result.stdout,
                         "stderr": fb_result.stderr,
@@ -625,7 +645,7 @@ async def _exec_in_tool_pod(
 
     return {
         "description": cmd_info["description"],
-        "command": display_cmd(exec_cmd),
+        "command": display_cmd(exec_cmd, target=_target),
         "exit_code": exec_result.exit_code,
         "stdout": exec_result.stdout,
         "stderr": exec_result.stderr,
@@ -635,6 +655,7 @@ async def _exec_in_tool_pod(
 async def _exec_in_debug_pod(
     cmd_info: dict, kubeconfig: str, task_id: str,
     debug_pods: dict[str, tuple[str, str]],
+    *, target: TransportTarget | None = None,
 ) -> dict:
     """Execute a command in an existing debug pod (no create/destroy).
 
@@ -669,8 +690,8 @@ async def _exec_in_debug_pod(
         # No namespace at all — insert after pod name
         v_args = v_args.replace(pod_name, f"{pod_name} -n {pod_ns}", 1)
 
-    exec_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(v_args), kubeconfig=kubeconfig)
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
+    exec_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(v_args), kubeconfig=kubeconfig, target=_target)
     exec_result = await execute_via_transport(
         exec_cmd, _target, timeout=settings.timeout_kubectl_exec, task_id=task_id,
         expect_profile=PROFILE_K8S,
@@ -685,7 +706,7 @@ async def _exec_in_debug_pod(
                     "iostat unavailable in debug pod, retrying with "
                     "fallback: %s", fb_v_args,
                 )
-                fb_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(fb_v_args), kubeconfig=kubeconfig)
+                fb_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(fb_v_args), kubeconfig=kubeconfig, target=_target)
                 fb_result = await execute_via_transport(
                     fb_cmd, _target, timeout=settings.timeout_kubectl_exec,
                     task_id=task_id, expect_profile=PROFILE_K8S,
@@ -693,7 +714,7 @@ async def _exec_in_debug_pod(
                 if fb_result.exit_code == 0:
                     return {
                         "description": cmd_info["description"],
-                        "command": display_cmd(fb_cmd),
+                        "command": display_cmd(fb_cmd, target=_target),
                         "exit_code": 0,
                         "stdout": fb_result.stdout,
                         "stderr": fb_result.stderr,
@@ -701,7 +722,7 @@ async def _exec_in_debug_pod(
 
     return {
         "description": cmd_info["description"],
-        "command": display_cmd(exec_cmd),
+        "command": display_cmd(exec_cmd, target=_target),
         "exit_code": exec_result.exit_code,
         "stdout": exec_result.stdout,
         "stderr": exec_result.stderr,

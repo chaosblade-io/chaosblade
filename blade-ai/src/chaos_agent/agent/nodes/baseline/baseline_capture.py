@@ -21,7 +21,6 @@ Design principle: best-effort — any failure does NOT block injection.
 
 import asyncio
 import inspect
-import json
 import logging
 import re
 from dataclasses import dataclass, replace
@@ -34,12 +33,18 @@ from chaos_agent.agent.node_names import BASELINE_CAPTURE
 from chaos_agent.tools.pod_discovery import (  # noqa: F401 — re-exported (imported by tests)
     TOOL_POD_NAMESPACE as _TOOL_POD_NAMESPACE,
 )
-from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
 from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
     _find_saved_plan,
 )
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.target_guard.classifier import canonicalise_kind
+from chaos_agent.agent.target_identity import (
+    POD_OWNER_SELECTOR_JSONPATH as _POD_OWNER_SELECTOR_JSONPATH,
+    discover_pod_selector as _seam_discover_pod_selector,
+    resolve_node_by_selector as _seam_resolve_node_by_selector,
+    resolve_node_of_pod as _seam_resolve_node_of_pod,
+    resolve_pod_by_selector as _seam_resolve_pod_by_selector,
+)
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.session_store import get_global_session_store
@@ -48,14 +53,13 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
-from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
 from chaos_agent.transports import (
     PROFILE_HOST,
     PROFILE_K8S,
-    TransportTarget,
     execute_via_transport,
     profile_of,
     resolve_channel_name,
+    resolve_transport_target,
 )
 from chaos_agent.utils.time import now_iso
 
@@ -128,6 +132,7 @@ from chaos_agent.agent.nodes.baseline._llm_derive import (  # noqa: E402
     _LLM_BASELINE_MAX_RETRIES as _LLM_BASELINE_MAX_RETRIES,
     _llm_derive_baseline_commands as _llm_derive_baseline_commands,
     _llm_retry_failed_commands as _llm_retry_failed_commands,
+    _missing_binary_from_observation as _missing_binary_from_observation,
     _parse_llm_json_output as _parse_llm_json_output,
     _validate_and_filter_commands as _validate_and_filter_commands,
 )
@@ -215,10 +220,21 @@ def _assemble_baseline_result(
         observation for observation in successful_observations
         if _is_empty_observation(observation)
         and not observation.get("expected_absence")
+        and not observation.get("undetermined_verdict")
     ]
     absent_observations = [
         observation for observation in observations
         if observation.get("expected_absence")
+    ]
+    # Essence-B (three-state / #78-R2): observations whose retry verdict was
+    # NEVER RECEIVED — unparseable LLM output, a retry timeout, or a raised
+    # call. Epistemically distinct from an EMPTY observation (which ran and
+    # captured nothing): here the PROGRAM failed to catch a judgment. Kept out
+    # of the empty bucket and counted on its own so "we did not receive a
+    # verdict" is never laundered into "the value was empty".
+    undetermined_observations = [
+        observation for observation in observations
+        if observation.get("undetermined_verdict")
     ]
     # Coverage measures what was OBSERVED, so only value-carrying
     # observations count: an empty-spinning selector query does not cover
@@ -244,6 +260,11 @@ def _assemble_baseline_result(
             # Ship the third component explicitly; the receipt wording below
             # decomposes with it.
             "absent_count": len(absent_observations),
+            # Essence-B: observations with no received retry verdict (parse
+            # receive-failure / timeout / raised call). Shipped alongside the
+            # other components so no consumer reads the aggregate as "every
+            # dimension was measured or judged".
+            "undetermined_count": len(undetermined_observations),
             # Denominator must ship WITH the counts: persistent-layer
             # consumers render "N/M succeeded" from this dict alone
             # (verify/_verifier_messages, recover/_recover_layer1).
@@ -296,6 +317,7 @@ async def _emit_baseline_observability(
     _valid = result["baseline_data"]["valid_count"]
     _empty = result["baseline_data"]["empty_count"]
     _absent = result["baseline_data"].get("absent_count", 0)
+    _undetermined = result["baseline_data"].get("undetermined_count", 0)
     # ``valid_count`` is the USABLE total (measured + judged-absent), so the
     # plain measurement count has to be derived, not read.
     _measured = max(_valid - _absent, 0)
@@ -330,13 +352,15 @@ async def _emit_baseline_observability(
     # receipt (tracker, session status, message history, the verify-phase LLM)
     # can read the aggregate as "every dimension was measured".
     _counts = f"{_success}/{_total} commands succeeded"
-    if _empty > 0 or _absent > 0:
+    if _empty > 0 or _absent > 0 or _undetermined > 0:
         _counts += (
             f" [{_valid} usable = {_measured} measured"
-            f" + {_absent} expected-absence; {_empty} empty]"
-            " — an expected-absence is a judged pre-injection state and an"
-            " empty observation captured no value; neither is a measurement"
-            " that can serve as a comparison baseline"
+            f" + {_absent} expected-absence; {_empty} empty"
+            f"; {_undetermined} undetermined]"
+            " — an expected-absence is a judged pre-injection state, an empty"
+            " observation captured no value, and an undetermined one got NO"
+            " retry verdict back (receive failure); none of these is a"
+            " measurement that can serve as a comparison baseline"
         )
     tracker.complete(
         f"Baseline capture done: {source} strategy, {_counts}",
@@ -346,6 +370,7 @@ async def _emit_baseline_observability(
             "valid_count": _valid,
             "empty_count": _empty,
             "absent_count": _absent,
+            "undetermined_count": _undetermined,
             "total_count": _total,
             "observations": _obs_previews,
         },
@@ -361,6 +386,7 @@ async def _emit_baseline_observability(
             "valid_count": _valid,
             "empty_count": _empty,
             "absent_count": _absent,
+            "undetermined_count": _undetermined,
             "total_count": _total,
         },
     )
@@ -393,6 +419,18 @@ async def _emit_baseline_observability(
                 _obs_parts.append(
                     f"Note: expected pre-injection ABSENCE — "
                     f"{obs['expected_absence']}"
+                )
+            elif obs.get("undetermined_verdict"):
+                # Essence-B: NO retry verdict was received (unparseable output
+                # / timeout / raised call). Rendered ahead of the empty branch
+                # because an undetermined obs may also look empty — but "the
+                # program did not catch a judgment" must never read as "the
+                # value was empty".
+                _obs_parts.append(
+                    f"Note: UNDETERMINED — no retry verdict received "
+                    f"({obs['undetermined_verdict']}); this is a program "
+                    "receive failure, NOT an empty observation, and is not a "
+                    "usable comparison baseline"
                 )
             elif obs.get("empty_observation") or (
                 _is_empty_observation(obs) and _is_observation_success(obs)
@@ -464,8 +502,10 @@ class _BaselineCtx:
 def _build_baseline_ctx(state: AgentState, llm, task_id: str, tracker) -> _BaselineCtx:
     """Phase 1: extract fault params from the spec + resolve channel/profile.
 
-    Preserves the original ordering: read spec fields → ``sync_kubewiz_runtime``
-    → resolve channel/profile (the sync MUST run before channel resolution).
+    Preserves the original ordering: read spec fields → resolve channel/profile.
+    ``resolve_channel_name(state)`` reads the per-session connection facts
+    straight from *state* (single authority), so no settings pre-sync step is
+    required before channel resolution.
     ``read_fault_spec`` returns a typed FaultSpec so we read
     scope/fault_target/fault_action directly instead of from 3 state fields.
     """
@@ -476,7 +516,6 @@ def _build_baseline_ctx(state: AgentState, llm, task_id: str, tracker) -> _Basel
     action = spec.fault_action if spec else ""
     skill_case = state.get("skill_case_content", "")
     kubeconfig = state.get("kubeconfig", "")
-    sync_kubewiz_runtime(state)
 
     # Connection-channel capability profile drives prompt assembly, registry
     # table selection, fallback set, and execution dispatch (k8s = kubectl,
@@ -492,16 +531,11 @@ def _build_baseline_ctx(state: AgentState, llm, task_id: str, tracker) -> _Basel
     )
 
 
-# jsonpath for the pod-owning selector of each workload-kind scope. Service
-# selectors live at ``.spec.selector`` directly (no matchLabels wrapper);
-# workload selectors at ``.spec.selector.matchLabels``. A selectorless
-# service returns an empty/None jsonpath and discovery fail-opens to None.
-_POD_OWNER_SELECTOR_JSONPATH = {
-    "deployment": "{.spec.selector.matchLabels}",
-    "statefulset": "{.spec.selector.matchLabels}",
-    "daemonset": "{.spec.selector.matchLabels}",
-    "service": "{.spec.selector}",
-}
+# ``_POD_OWNER_SELECTOR_JSONPATH`` (the workload-kind → pod-selector jsonpath
+# map) is imported from the shared ``chaos_agent.agent.target_identity`` seam —
+# the single authority for "workload target → observable Pod" resolution
+# (W-83-5 root-fix). Kept under its historical private alias so every existing
+# reference in this module is unchanged.
 
 
 async def _discover_pod_selector(ctx: _BaselineCtx) -> dict[str, str] | None:
@@ -540,36 +574,16 @@ async def _discover_pod_selector(ctx: _BaselineCtx) -> dict[str, str] | None:
         return None
     namespace = spec.namespace or ""
     name = spec.names[0]
-    v_args = [ctx.scope, name]
-    if namespace:
-        v_args += ["-n", namespace]
-    v_args += ["-o", f"jsonpath={_POD_OWNER_SELECTOR_JSONPATH[ctx.scope]}"]
-    try:
-        cmd = build_kubectl_cmd("get", v_args, kubeconfig=ctx.kubeconfig)
-        result = await execute_via_transport(
-            cmd, TransportTarget.from_state({}),
-            timeout=settings.timeout_kubectl, task_id=ctx.task_id,
-            expect_profile=PROFILE_K8S,
-        )
-    except Exception as e:
-        logger.info(
-            "Pod selector discovery for %s %s failed: %s", ctx.scope, name, e,
-        )
-        return None
-    raw = (result.stdout or "").strip()
-    if result.exit_code != 0 or not raw:
-        return None
-    try:
-        selector = json.loads(raw)
-    except ValueError:
-        return None
-    if not isinstance(selector, dict):
-        return None
-    selector = {
-        str(k): str(v)
-        for k, v in selector.items()
-        if v is not None and str(v) != ""
-    }
+    # W-83-5 root-fix: the query+parse is single-sourced in the shared
+    # ``target_identity`` seam (also consumed by the side-effect logs channel).
+    # The derive-specific gates above and the tracker recording below stay here;
+    # ``executor=execute_via_transport`` injects THIS module's binding so the
+    # resolution logic is shared without moving the test patch target.
+    selector = await _seam_discover_pod_selector(
+        scope=ctx.scope, name=name, namespace=namespace,
+        kubeconfig=ctx.kubeconfig, task_id=ctx.task_id, profile=ctx.profile,
+        executor=execute_via_transport,
+    )
     if not selector:
         return None
     selector_str = ", ".join(f"{k}={v}" for k, v in selector.items())
@@ -649,24 +663,16 @@ async def _resolve_target_pod(ctx: _BaselineCtx) -> str | None:
     selector_str = ",".join(f"{k}={v}" for k, v in selector.items())
     namespace = spec.namespace or ""
 
-    v_args = ["pods", "-l", selector_str]
-    if namespace:
-        v_args += ["-n", namespace]
-    v_args += ["-o", "jsonpath={.items[0].metadata.name}"]
-    try:
-        cmd = build_kubectl_cmd("get", v_args, kubeconfig=ctx.kubeconfig)
-        result = await execute_via_transport(
-            cmd, TransportTarget.from_state({}),
-            timeout=settings.timeout_kubectl, task_id=ctx.task_id,
-            expect_profile=PROFILE_K8S,
-        )
-    except Exception as e:
-        logger.info(
-            "Target pod resolution for %s failed: %s", scope, e,
-        )
-        return None
-    pod = (result.stdout or "").strip()
-    if result.exit_code != 0 or not pod:
+    # W-83-5 root-fix: the ``selector → literal pod`` query is single-sourced
+    # in the shared ``target_identity`` seam — the exact primitive the
+    # side-effect logs channel was missing (it hand-rolled ``logs <workload>``).
+    # ``executor=execute_via_transport`` injects THIS module's binding so the
+    # logic is shared without moving the existing test patch target.
+    pod = await _seam_resolve_pod_by_selector(
+        selector=selector, namespace=namespace, kubeconfig=ctx.kubeconfig,
+        task_id=ctx.task_id, profile=ctx.profile, executor=execute_via_transport,
+    )
+    if pod is None:
         return None
     ctx.tracker.update(
         f"Target pod ({scope} scope, selector {selector_str}): {pod}",
@@ -744,11 +750,18 @@ async def _resolve_target_node(ctx: _BaselineCtx) -> str | None:
     if scope == "pod":
         if not spec.names:
             return None
-        v_args = ["pod", spec.names[0]]
-        if namespace:
-            v_args += ["-n", namespace]
-        v_args += ["-o", "jsonpath={.spec.nodeName}"]
         via = f"pod {spec.names[0]}"
+        # W-83-5 / #83 root-fix: the ``pod → node`` read is single-sourced in
+        # the shared ``target_identity`` seam (its node-axis primitive) — the
+        # exact query feasibility's ``_fetch_pod_node`` and the planning
+        # ``tool_screener`` also consume.
+        # ``executor=execute_via_transport`` injects THIS module's binding so
+        # the logic is shared without moving the existing test patch target.
+        node = await _seam_resolve_node_of_pod(
+            pod_name=spec.names[0], namespace=namespace,
+            kubeconfig=ctx.kubeconfig, task_id=ctx.task_id,
+            profile=ctx.profile, executor=execute_via_transport,
+        )
     else:
         selector = ctx.pod_selector or (
             dict(spec.labels) if spec.labels else None
@@ -756,27 +769,15 @@ async def _resolve_target_node(ctx: _BaselineCtx) -> str | None:
         if not selector:
             return None
         selector_str = ",".join(f"{k}={v}" for k, v in selector.items())
-        v_args = ["pods", "-l", selector_str]
-        if namespace:
-            v_args += ["-n", namespace]
-        v_args += ["-o", "jsonpath={.items[0].spec.nodeName}"]
         via = f"{scope} selector {selector_str}"
-
-    try:
-        cmd = build_kubectl_cmd("get", v_args, kubeconfig=ctx.kubeconfig)
-        result = await execute_via_transport(
-            cmd, TransportTarget.from_state({}),
-            timeout=settings.timeout_kubectl, task_id=ctx.task_id,
-            expect_profile=PROFILE_K8S,
+        node = await _seam_resolve_node_by_selector(
+            selector=selector, namespace=namespace,
+            kubeconfig=ctx.kubeconfig, task_id=ctx.task_id,
+            profile=ctx.profile, executor=execute_via_transport,
         )
-    except Exception as e:
-        logger.info("Target node resolution for %s failed: %s", scope, e)
-        return None
-    node = (result.stdout or "").strip()
-    if result.exit_code != 0 or not node:
+    if not node:
         logger.info(
-            "Target node resolution for %s yielded no node (exit=%s)",
-            scope, result.exit_code,
+            "Target node resolution for %s yielded no node", scope,
         )
         return None
     ctx.tracker.update(
@@ -813,6 +814,13 @@ def _build_strategy_chain(ctx: _BaselineCtx) -> list:
                     labels=dict(ctx.spec.labels) if ctx.spec and ctx.spec.labels else None,
                     pod_selector=ctx.pod_selector,
                     task_id=ctx.task_id,
+                    # Preplan-probed host binaries proven absent on the target.
+                    # Guidance only (see _llm_derive_baseline_commands): steers
+                    # the FIRST derive round to the /proc form instead of an
+                    # absent ``ss``/``netstat`` that would exit 127 and cost a
+                    # reactive retry. Empty on k8s channels and fully-tooled
+                    # hosts — the derive behaves exactly as before.
+                    poisoned_binaries=tuple(ctx.state.get("absent_host_binaries") or ()),
                 ),
                 timeout=settings.timeout_baseline_llm,
             )
@@ -1116,6 +1124,12 @@ async def _collect_observations(
     kubeconfig, task_id = ctx.kubeconfig, ctx.task_id
     llm, skill_case, tracker = ctx.llm, ctx.skill_case, ctx.tracker
     scope, target, action, channel = ctx.scope, ctx.target, ctx.action, ctx.channel
+    # Single-authority transport target resolved from THIS node's state (the
+    # seam replaces the settings side-effect that ``sync_kubewiz_runtime`` used
+    # to establish). Named ``_xport_target`` to avoid the ``target`` fault-target
+    # string bound above. Threaded into every ``_execute_observations`` call so
+    # the leaf executors read per-session kubewiz values from state, not settings.
+    _xport_target = resolve_transport_target(state)
 
     # 3. Resolve template variables
     resolved = _resolve_templates(
@@ -1143,7 +1157,9 @@ async def _collect_observations(
         "baseline_capture",
         f"Running {len(resolved)} baseline-capture command(s)...\n\n",
     )
-    observations = await _execute_observations(resolved, kubeconfig, task_id)
+    observations = await _execute_observations(
+        resolved, kubeconfig, task_id, target=_xport_target,
+    )
 
     # 4.0.4 #16 fix B (Temporal axiom): read the approved plan's temporal
     # contract and machine-mark absence observations on assets the plan
@@ -1181,6 +1197,23 @@ async def _collect_observations(
         # resample — task-fc64c982 spent two of its three retries re-emitting
         # the same debug-pod command against a node that had none.
         tried_commands: list[str] = []
+        # Binary-granularity failure memory (Case #6). exit 127 / "command not
+        # found" means the executable is ABSENT from the target — every
+        # invocation fails identically, yet the string-fingerprint attempt gate
+        # cannot see that (``ss -tnp`` and ``ss -tnp state established dst
+        # :3306`` fingerprint differently but both die on the missing ``ss``).
+        # Seed the poisoned-binary set from the INITIAL batch's failures (which
+        # ``tried_commands`` deliberately does not record — it only tracks
+        # retry-round proposals) and grow it each round, then thread it into the
+        # retry gate so a doomed re-invocation is refused BEFORE it burns an
+        # SSH/kubectl round trip. Recurs across the python-app ledger
+        # (O-P2 / O-C3-4 / O-C6-2): minimal ubuntu targets ship no
+        # ss/netstat/mpstat.
+        poisoned_binaries: set[str] = set()
+        for _r0, _o0 in all_pairs:
+            _mb0 = _missing_binary_from_observation(_o0, profile)
+            if _mb0:
+                poisoned_binaries.add(_mb0)
 
         for retry_num in range(1, _LLM_BASELINE_MAX_RETRIES + 1):
             # Single source of truth for "needs retry judgment": the same
@@ -1229,6 +1262,7 @@ async def _collect_observations(
                         pod_selector=ctx.pod_selector,
                         task_id=task_id,
                         already_tried=tuple(tried_commands),
+                        poisoned_binaries=tuple(sorted(poisoned_binaries)),
                     ),
                     timeout=settings.timeout_baseline_llm,
                 )
@@ -1237,9 +1271,20 @@ async def _collect_observations(
                     "LLM baseline retry %d timed out after %ds",
                     retry_num, settings.timeout_baseline_llm,
                 )
+                # Essence-B: a timed-out retry received NO verdict — the same
+                # epistemic state as an unparseable answer. Mark the still-
+                # failed observations UNDETERMINED so the final count never
+                # launders "we did not get a judgment" into the empty bucket.
+                for _o in failed_obs:
+                    _o["undetermined_verdict"] = (
+                        f"retry {retry_num} timed out after "
+                        f"{settings.timeout_baseline_llm}s — verdict not received"
+                    )
                 await dispatch_node_message(
                     "baseline_capture",
-                    f"LLM self-correction retry {retry_num} timed out, giving up\n\n",
+                    f"LLM self-correction retry {retry_num} timed out, giving up "
+                    f"({len(failed_obs)} observation(s) marked undetermined — "
+                    "no verdict received, not counted as empty)\n\n",
                 )
                 break
 
@@ -1267,6 +1312,33 @@ async def _collect_observations(
             rejected_replacements = (
                 retry_decisions.get("rejected_replacements") or []
             )
+
+            # Essence-B (receive failure): the retry LLM answered but NO verdict
+            # was recoverable (unparseable output, or the call raised). This is
+            # NOT "the LLM found nothing to fix" — that legitimate case is the
+            # ``not retry_commands and not expected_pairs`` branch below. Mark
+            # the observations UNDETERMINED so they stay out of the empty
+            # bucket, fail loud, and stop retrying (re-parsing the same
+            # unparseable shape is futile; raw is preserved in the aux audit).
+            if retry_decisions.get("receive_failure"):
+                _und = retry_decisions.get("undetermined") or failed_obs
+                for _o in _und:
+                    _o.setdefault("undetermined_verdict", (
+                        f"retry {retry_num} returned no parseable verdict — "
+                        "receive failure, not an empty observation"
+                    ))
+                logger.error(
+                    "LLM baseline retry %d: receive failure — %d observation(s) "
+                    "marked undetermined (kept out of the empty bucket)",
+                    retry_num, len(_und),
+                )
+                await dispatch_node_message(
+                    "baseline_capture",
+                    f"LLM self-correction retry {retry_num} produced no parseable "
+                    f"verdict (receive failure); {len(_und)} observation(s) marked "
+                    "undetermined — NOT counted as empty\n\n",
+                )
+                break
 
             if not retry_commands and not rejected_replacements:
                 if not expected_pairs:
@@ -1336,10 +1408,20 @@ async def _collect_observations(
 
             retry_obs = (
                 await _execute_observations(
-                    retry_resolved, kubeconfig, task_id,
+                    retry_resolved, kubeconfig, task_id, target=_xport_target,
                 )
                 if retry_resolved else []
             )
+
+            # Grow the poisoned-binary set from anything this round executed and
+            # found missing, so the NEXT round's gate refuses it too (Case #6:
+            # retry 1's ``netstat`` exit 127 poisons netstat for retries 2-3).
+            # Replacements the gate already refused never reach ``retry_obs`` —
+            # they are in ``rejected_replacements`` and never executed.
+            for _o1 in retry_obs:
+                _mb1 = _missing_binary_from_observation(_o1, profile)
+                if _mb1:
+                    poisoned_binaries.add(_mb1)
 
             # Keep original VALID successes, keep judged-expected-absence
             # pairs, replace true failures AND empty successes with retry
@@ -1511,7 +1593,7 @@ async def _collect_observations(
                     target_pod=ctx.target_pod, target_node=ctx.target_node,
                 )
             observations = await _execute_observations(
-                resolved, kubeconfig, task_id,
+                resolved, kubeconfig, task_id, target=_xport_target,
             )
             _attempted.add(_fb_name)
 

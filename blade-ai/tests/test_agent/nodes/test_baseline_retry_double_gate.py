@@ -35,7 +35,9 @@ import pytest
 
 from chaos_agent.agent.nodes.baseline._llm_derive import (
     _command_fingerprint,
+    _command_invoked_binaries,
     _llm_retry_failed_commands,
+    _missing_binary_from_observation,
     _split_retry_decisions,
     _validate_and_filter_commands,
 )
@@ -649,3 +651,169 @@ class TestCommandFingerprint:
         a = _command_fingerprint("kubectl top node -n kube-system")
         b = _command_fingerprint("kubectl top node   -n   kube-system")
         assert a == b
+
+
+# ---------------------------------------------------------------------------
+# Binary-absence gate: exit 127 is a BINARY-granularity fact
+# ---------------------------------------------------------------------------
+
+
+class TestMissingBinaryExtraction:
+    """``_missing_binary_from_observation`` names the absent executable.
+
+    It must read the binary from the shell's "not found" message — never blindly
+    from the command's first token — so an exec wrapper poisons the INNER binary,
+    not kubectl. And it must poison NOTHING for a real error or an expected
+    absence (a non-zero exit that is itself the baseline value).
+    """
+
+    def test_stderr_command_not_found(self):
+        obs = {"command": "ss -tnp", "exit_code": 127,
+               "stderr": "bash: line 1: ss: command not found", "stdout": ""}
+        assert _missing_binary_from_observation(obs, "host") == "ss"
+
+    def test_names_the_inner_binary_of_an_exec_wrapper(self):
+        obs = {"command": "kubectl exec pod-x -- iotop -bn1", "exit_code": 127,
+               "stderr": "OCI runtime exec failed: exec: iotop: not found",
+               "stdout": ""}
+        # Must be iotop, NEVER kubectl.
+        assert _missing_binary_from_observation(obs, "k8s") == "iotop"
+
+    def test_message_wins_over_first_token_on_k8s(self):
+        """kubewiz merges stderr into stdout; parse from either stream."""
+        obs = {"command": "kubectl exec pod-x -- mpstat 1 1", "exit_code": 127,
+               "stderr": "", "stdout": "bash: mpstat: command not found"}
+        assert _missing_binary_from_observation(obs, "k8s") == "mpstat"
+
+    def test_exit127_no_message_falls_back_to_first_token_on_host_only(self):
+        obs = {"command": "/usr/bin/dstat -t", "exit_code": 127,
+               "stderr": "", "stdout": ""}
+        assert _missing_binary_from_observation(obs, "host") == "dstat"
+        # On k8s the first token is a wrapper — do NOT poison it.
+        assert _missing_binary_from_observation(obs, "k8s") is None
+
+    def test_real_error_poisons_nothing(self):
+        obs = {"command": "curl http://x", "exit_code": 7,
+               "stderr": "curl: (7) Failed to connect", "stdout": ""}
+        assert _missing_binary_from_observation(obs, "host") is None
+
+    def test_expected_absence_poisons_nothing(self):
+        """A non-zero exit reporting absence IS the baseline value — it must not
+        poison the binary (the binary exists and worked)."""
+        obs = {"command": "ls /etc/hosts.bak", "exit_code": 2,
+               "stderr": "ls: cannot access '/etc/hosts.bak': No such file or "
+                         "directory", "stdout": ""}
+        assert _missing_binary_from_observation(obs, "host") is None
+
+
+class TestInvokedBinaries:
+    def test_first_token_basename(self):
+        assert _command_invoked_binaries("/usr/bin/ss -tnp") == {"ss"}
+
+    def test_exec_wrapper_inner_binary(self):
+        assert _command_invoked_binaries("kubectl exec p -- ss -tnp") == {
+            "kubectl", "ss",
+        }
+
+    def test_argument_paths_are_not_binaries(self):
+        assert _command_invoked_binaries("cat /proc/net/tcp") == {"cat"}
+
+
+class TestBinaryAbsenceGate:
+    """Fifth gate: a replacement invoking an already-absent binary is refused
+    BEFORE execution, through the same ``rejected_replacements`` channel.
+
+    Case #6 (mysql delay) is the field sample: the initial batch's
+    ``ss -tnp state established dst :3306`` exited 127, then retry 2 re-proposed
+    ``ss -tnp`` — a DIFFERENT string, so the fingerprint gate waved it through —
+    and it exited 127 again, burning a full round trip. The absence recurs across
+    the python-app ledger (O-P2 / O-C3-4 / O-C6-2) on minimal ubuntu targets.
+    """
+
+    @staticmethod
+    def _cmd(command: str, description: str = "d") -> dict:
+        return {"description": description, "command": command, "mode": "simple"}
+
+    def test_fingerprint_gate_alone_cannot_catch_case6(self):
+        """The regression that motivates the binary gate: a re-proposed missing
+        binary with different args slips past the string-fingerprint gate."""
+        initial = "ss -tnp state established dst :3306"
+        reproposed = "ss -tnp"
+        acc, rej = _validate_and_filter_commands(
+            [self._cmd(reproposed)], "host", already_tried=(initial,),
+        )
+        # Fingerprint gate MISSES it (different args → different fingerprint).
+        assert len(acc) == 1
+        assert rej == []
+
+    def test_binary_gate_catches_case6(self):
+        """... but the binary-absence gate refuses it."""
+        initial = "ss -tnp state established dst :3306"
+        reproposed = "ss -tnp"
+        acc, rej = _validate_and_filter_commands(
+            [self._cmd(reproposed)], "host",
+            already_tried=(initial,), poisoned_binaries=("ss",),
+        )
+        assert acc == []
+        assert len(rej) == 1
+        assert "NOT installed" in rej[0][1]
+        # The reason must point at a way out.
+        assert "/proc" in rej[0][1]
+
+    def test_a_different_binary_is_still_accepted(self):
+        acc, rej = _validate_and_filter_commands(
+            [self._cmd("cat /proc/net/tcp")], "host", poisoned_binaries=("ss",),
+        )
+        assert len(acc) == 1
+        assert rej == []
+
+    def test_empty_poison_set_leaves_the_gate_off(self):
+        """The primary derive path passes no poison set and must be untouched."""
+        acc, rej = _validate_and_filter_commands([self._cmd("ss -tnp")], "host")
+        assert len(acc) == 1
+        assert rej == []
+
+    def test_exec_wrapper_inner_binary_is_refused(self):
+        acc, rej = _validate_and_filter_commands(
+            [self._cmd("kubectl exec pod-x -- iotop -bn1")], "k8s",
+            poisoned_binaries=("iotop",),
+        )
+        assert acc == []
+        assert len(rej) == 1
+        assert "iotop" in rej[0][1]
+
+    def test_wrapper_itself_is_not_refused_when_only_inner_poisoned(self):
+        """Poisoning an inner binary must never refuse the kubectl wrapper."""
+        acc, _rej = _validate_and_filter_commands(
+            [self._cmd("kubectl get pods -n kube-system")], "k8s",
+            poisoned_binaries=("iotop",),
+        )
+        assert len(acc) == 1
+
+    def test_whitelist_rejection_takes_precedence(self):
+        illegal = "rm -rf /"
+        acc, rej = _validate_and_filter_commands(
+            [self._cmd(illegal)], "host", poisoned_binaries=("rm",),
+        )
+        assert acc == []
+        assert len(rej) == 1
+        assert "NOT installed" not in rej[0][1]
+
+    def test_routes_through_rejected_replacements(self):
+        """End to end through the splitter: the obs is PAIRED with the refusal so
+        baseline_capture keeps the dimension in the failed set."""
+        obs = {"description": "TCP connections", "command": "ss -tnp",
+               "exit_code": 127, "stdout": "", "stderr": "ss: command not found",
+               "_class": "host_level"}
+        decisions = [{"verdict": "replace", "command": "ss -tnp",
+                      "mode": "simple", "class": "host_level"}]
+        result = _split_retry_decisions(
+            decisions, [obs], "host", "t-poison", poisoned_binaries=("ss",),
+        )
+        assert result["replace"] == []
+        assert len(result["rejected_replacements"]) == 1
+        refused_obs, refused_cmd, refused_reason = result["rejected_replacements"][0]
+        assert refused_obs is obs
+        assert refused_cmd == "ss -tnp"
+        assert "NOT installed" in refused_reason
+

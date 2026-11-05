@@ -47,7 +47,7 @@ async def test_cleanup_deletes_probe_pod_and_records(monkeypatch):
     """A kubectl_read debug probe pod in history is deleted and recorded."""
     deleted: list[tuple[str, str]] = []
 
-    async def _fake_delete(pod_name, kubeconfig, task_id, namespace=""):
+    async def _fake_delete(pod_name, kubeconfig, task_id, namespace="", target=None):
         deleted.append((pod_name, namespace))
         return "confirmed"
 
@@ -74,7 +74,7 @@ async def test_cleanup_skips_already_cleaned(monkeypatch):
     """Pods already in cleaned_debug_pods are not re-deleted (idempotent)."""
     deleted: list[str] = []
 
-    async def _fake_delete(pod_name, kubeconfig, task_id, namespace=""):
+    async def _fake_delete(pod_name, kubeconfig, task_id, namespace="", target=None):
         deleted.append(pod_name)
         return "confirmed"
 

@@ -66,6 +66,7 @@ async def _generate_postmortem(
         from chaos_agent.agent.postmortem import (
             build_postmortem_context,
             generate_postmortem,
+            render_postmortem_markdown,
             save_postmortem,
             should_generate_postmortem,
         )
@@ -149,13 +150,31 @@ async def _generate_postmortem(
                 markdown_body = ""
 
             if markdown_body:
+                from chaos_agent.agent.result.operation_summary import (
+                    format_summary_target,
+                )
                 from chaos_agent.agent.spec.fault_spec import (
                     fault_type_from_state,
+                    legacy_params_dict,
+                    legacy_target_dict,
                     read_fault_spec,
                 )
                 _spec = read_fault_spec(state)
                 verification = read_inject_verification(state) or {}
                 outcome = read_operation_outcome(state)
+                # Deterministic facts the framework ALREADY knows. The
+                # program renders these into the report header (single
+                # source: render_postmortem_markdown) so they reach BOTH
+                # the disk file and the platform-consumed payload verbatim,
+                # with zero transcription variance. The generator prompt
+                # tells the LLM these facts are already written above its
+                # ``## Summary`` and to NOT restate them — the model owns
+                # only the judgment sections plus the injection / recovery
+                # ACTIONS and the resolved target that only the execution
+                # trace reveals. Target/params reuse the canonical
+                # legacy_*_dict projectors + format_summary_target so there
+                # is no second, drifting rendering of the selector.
+                _params = legacy_params_dict(dict(state))
                 header_meta = {
                     "fault_type": fault_type_from_state(state) or "unknown",
                     "namespace": (_spec.namespace if _spec else "") or "unknown",
@@ -164,18 +183,39 @@ async def _generate_postmortem(
                         outcome.result.get("duration_ms", 0)
                     ) if isinstance(outcome.result, dict) else "",
                     "generated_at": now_iso(),
+                    "user_request": (
+                        state.get("input")
+                        or (_spec.user_description if _spec else "")
+                        or ""
+                    ).strip(),
+                    "target": format_summary_target(
+                        legacy_target_dict(dict(state))
+                    ),
+                    "params": ", ".join(
+                        f"{k}={v}" for k, v in _params.items()
+                    ) if _params else "",
                 }
+                # Render ONCE here for the payload; save_postmortem re-
+                # renders the SAME string from the SAME inputs (pure
+                # function) for disk. That is what makes the on-disk file
+                # and payload["markdown"] byte-identical — replacing the
+                # old divergence where the disk carried a header the
+                # payload never saw and the platform read a body-only
+                # report missing every fact above.
+                full_markdown = render_postmortem_markdown(
+                    task_id, markdown_body, header_meta=header_meta,
+                )
                 try:
                     pm_path = save_postmortem(
                         task_id, markdown_body, header_meta=header_meta,
                     )
                     postmortem_payload = {
                         "path": str(pm_path),
-                        "markdown": markdown_body,
-                        "summary": make_summary(markdown_body),
+                        "markdown": full_markdown,
+                        "summary": make_summary(full_markdown),
                     }
                     tracker.update(
-                        f"Postmortem saved ({len(markdown_body)} chars)",
+                        f"Postmortem saved ({len(full_markdown)} chars)",
                     )
                 except Exception as e:
                     logger.warning(

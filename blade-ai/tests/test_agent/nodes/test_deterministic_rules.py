@@ -4,9 +4,7 @@ Anchors the frozen contract of the deterministic verdict layer:
   * the verdict enum is CLOSED to {passed, unknown} — no downgrade branch
     exists anywhere in the module's public surface;
   * families without a declared rule resolve to zero rules (the finalize
-    pipeline then applies zero rule interference);
-  * the migrated disk_burn rule adjudicates exactly the signal the legacy
-    ``_enforce_disk_burn_facts`` consumed.
+    pipeline then applies zero rule interference).
 """
 
 import pytest
@@ -14,10 +12,11 @@ import pytest
 from chaos_agent.agent.nodes.verify import _deterministic_rules as rules_mod
 from chaos_agent.agent.nodes.verify._deterministic_rules import (
     CPU_FULLLOAD_RULE,
-    DISK_BURN_RULE,
+    DEPLOYMENT_SCALE_DOWN_RULE,
     DISK_FILL_RULE,
     MEM_LOAD_RULE,
     PROCESS_KILL_RULE,
+    STS_PARTITION_RULE,
     DeterministicRule,
     DeterministicVerdict,
     RuleContext,
@@ -27,6 +26,7 @@ from chaos_agent.agent.nodes.verify._deterministic_rules import (
 from chaos_agent.agent.nodes.verify._verification_profiles import (
     resolve_deterministic_rules,
 )
+from chaos_agent.agent.nodes.verify._metric_extractor import extract_metrics
 
 
 class TestVerdictEnumClosed:
@@ -67,22 +67,18 @@ class TestVerdictEnumClosed:
 
 class TestRuleContextAnchoring:
     """Design decision 5: mechanism anchor is a precondition of passed —
-    the context names which of the three signals is in play."""
+    the context names which of the two signals is in play."""
 
     def test_fault_handle_wins_first(self):
         ctx = RuleContext(
             fault_handle={"experiment_uid": "x"},
             layer1_passed=True,
-            post_check={"burn_io_detected": True},
         )
         assert ctx.anchoring_signal() == "fault_handle"
 
     def test_layer1_when_no_handle(self):
-        ctx = RuleContext(layer1_passed=True, post_check={"any": True})
+        ctx = RuleContext(layer1_passed=True)
         assert ctx.anchoring_signal() == "layer1_success"
-
-    def test_post_check_last(self):
-        assert RuleContext(post_check={"any": 1}).anchoring_signal() == "post_check"
 
     def test_no_anchor(self):
         assert RuleContext().anchoring_signal() == ""
@@ -91,10 +87,6 @@ class TestRuleContextAnchoring:
 class TestRuleResolution:
     """Families without a declared rule must resolve to zero rules — the
     guarantee behind 'no-rule family: zero behaviour change'."""
-
-    def test_disk_burn_matches(self):
-        resolved = resolve_deterministic_rules("disk", "burn")
-        assert resolved == (DISK_BURN_RULE,)
 
     def test_process_kill_matches(self):
         resolved = resolve_deterministic_rules("process", "kill")
@@ -130,6 +122,7 @@ class TestRuleResolution:
             ("process", "hang"),    # declared family, undeclared action
             ("node", "fill"),
             ("cpu", "burn"),       # declared family, undeclared action
+            ("disk", "burn"),      # declared family, action carries no rule
             ("mem", "fill"),
             ("", "burn"),           # missing identity
             ("disk", ""),
@@ -153,37 +146,6 @@ class TestRuleResolution:
                 verdict = rule.evaluate(RuleContext())
                 assert isinstance(verdict, DeterministicVerdict)
                 assert verdict.kind in ("passed", "unknown")
-
-
-class TestDiskBurnRuleEvaluation:
-    """Judgement half of the disk_burn migration — mirrors the exact
-    signal the legacy _enforce_disk_burn_facts gated on."""
-
-    def test_active_io_yields_passed_with_throughput_evidence(self):
-        ctx = RuleContext(post_check={
-            "burn_io_detected": True,
-            "active_partitions": [
-                {"name": "/dev/vdb", "write_throughput_mb_s": 120},
-                {"name": "/dev/vdb3", "write_throughput_mb_s": 45},
-            ],
-        })
-        verdict = DISK_BURN_RULE.evaluate(ctx)
-        assert verdict.is_passed
-        assert verdict.rule_name == "disk_burn_io_active"
-        assert any("/dev/vdb: ~120 MB/s" in line for line in verdict.evidence_lines)
-
-    def test_active_io_without_partitions_falls_back_to_measured(self):
-        ctx = RuleContext(post_check={"burn_io_detected": True, "active_partitions": []})
-        verdict = DISK_BURN_RULE.evaluate(ctx)
-        assert verdict.is_passed
-        assert any("measured" in line for line in verdict.evidence_lines)
-
-    def test_post_check_without_detection_is_unknown(self):
-        ctx = RuleContext(post_check={"burn_io_detected": False})
-        assert DISK_BURN_RULE.evaluate(ctx).kind == "unknown"
-
-    def test_missing_post_check_is_unknown(self):
-        assert DISK_BURN_RULE.evaluate(RuleContext()).kind == "unknown"
 
 
 class TestProcessKillRuleEvaluation:
@@ -227,7 +189,7 @@ class TestProcessKillRuleEvaluation:
                 self._obs(1, 8, "containerd://aaaaaaaa"),
                 self._obs(5, 10, "containerd://bbbbbbbb"),
             ],
-            # no fault_handle, no layer1, no post_check — the numeric delta
+            # no fault_handle, no layer1 — the numeric delta
             # may be an unrelated OOMKill (#25-R iter-5 attribution nuance)
         )
         verdict = PROCESS_KILL_RULE.evaluate(ctx)
@@ -620,21 +582,6 @@ class TestDiskFillRuleEvaluation:
         )
         assert DISK_FILL_RULE.evaluate(ctx).is_passed
 
-    def test_post_check_result_is_a_valid_anchor(self):
-        # #29's fallocate shape names its fill file app-archive.log —
-        # fill_file_found=False — yet the PostCheckSpec RESULT being in
-        # play is the anchor; the usage numbers carry the judgement.
-        ctx = RuleContext(
-            metric_observations=[
-                self._obs(1, "11% (1/100)"), self._obs(2, "86% (86/100)"),
-            ],
-            post_check={"fill_file_found": False, "df_output": "..."},
-            spec_params={"percent": "85"},
-        )
-        v = DISK_FILL_RULE.evaluate(ctx)
-        assert v.is_passed
-        assert "mechanism anchor: post_check" in " ".join(v.evidence_lines)
-
 
 class TestMultiReplicaFlatTimeline:
     """Multi-replica shapes under the FLAT (pod-identity-less) timeline.
@@ -713,3 +660,466 @@ class TestMultiReplicaFlatTimeline:
         assert not cpu_v.is_passed and not mem_v.is_passed
         assert "not calibrated" in cpu_v.reason
         assert "not calibrated" in mem_v.reason
+
+
+# ---------------------------------------------------------------------------
+# STS partition rule (openspec mechanism-invariant-trust-boundary): the rule
+# binds to a FROZEN author-declared key and is now ACTIVE — its three-leg
+# criteria are wired live (pin LIFTED by the re-scoped calibration gate).
+# ---------------------------------------------------------------------------
+
+def _partition_ctx(*, expected="2", with_revisions=True, partition="2", anchor=True):
+    """Build a RuleContext whose timeline already satisfies every leg."""
+    metrics = {"Partition": partition}
+    if with_revisions:
+        metrics["Current revision"] = "web-abc111"
+        metrics["Update revision"] = "web-def222"
+    observations = [{"iteration": 1, "metrics": metrics}]
+    return RuleContext(
+        metric_observations=observations,
+        fault_handle={"experiment_uid": "exp"} if anchor else None,
+        declared_expected={"Partition": expected} if expected else {},
+    )
+
+
+class TestStsPartitionRuleSelection:
+    def test_frozen_key_resolves_the_rule(self):
+        rules = resolve_deterministic_rules("statefulset", "partition-stall")
+        assert STS_PARTITION_RULE in rules
+
+    def test_llm_triple_resolves_to_zero_rules(self):
+        # Forensics (memory 66425653): #77's runtime LLM triple is
+        # rollingupdate/partition-stuck — NOT the frozen key. Without the
+        # declaration the verify layer resolves zero rules (byte-identical
+        # to the pre-change behaviour).
+        assert resolve_deterministic_rules("rollingupdate", "partition-stuck") == ()
+
+    def test_match_key_is_the_frozen_declaration(self):
+        assert STS_PARTITION_RULE.match == ("statefulset", "partition-stall")
+
+
+class TestStsPartitionActive:
+    """Pin LIFTED (gate re-scoped, tasks 5.1/5.4/5.5) — the production rule now
+    delegates to the three-leg criteria: it PASSES when every leg holds, and
+    still ABSTAINS to unknown when any leg is unmet (fail-safe, never a
+    downgrade, never a guessed pass)."""
+
+    def test_active_passes_with_all_legs_satisfied(self):
+        v = STS_PARTITION_RULE.evaluate(_partition_ctx())
+        assert v.is_passed
+        assert v.kind == "passed"
+
+    def test_active_abstains_without_expected_or_observations(self):
+        # No declared N, no observations, no anchor — the ACTIVE rule still
+        # abstains to unknown (fail-safe: unmet legs never manufacture a pass).
+        assert STS_PARTITION_RULE.evaluate(RuleContext()).kind == "unknown"
+
+
+class TestStsPartitionLegs:
+    """Unit tests of the three-leg criteria directly (now wired live via
+    _evaluate_sts_partition). Exercises each leg's pass/abstain boundary."""
+
+    _legs = staticmethod(rules_mod._sts_partition_legs)
+
+    def test_all_legs_hold_yields_passed(self):
+        assert self._legs(_partition_ctx()).is_passed
+
+    def test_missing_anchor_yields_unknown(self):
+        v = self._legs(_partition_ctx(anchor=False))
+        assert not v.is_passed and "anchor" in v.reason
+
+    def test_missing_declared_expected_yields_unknown(self):
+        # N comes from the frozen declaration, never spec_params.
+        v = self._legs(_partition_ctx(expected=""))
+        assert not v.is_passed and "declared" in v.reason
+
+    def test_partition_below_declared_n_yields_unknown(self):
+        v = self._legs(_partition_ctx(expected="2", partition="1"))
+        assert not v.is_passed and "never reached" in v.reason
+
+    def test_partition_series_across_timeline_reaches_n(self):
+        # Baseline 0 → post 2: the timeline must contain the declared N.
+        ctx = RuleContext(
+            metric_observations=[
+                {"iteration": 1, "metrics": {"Partition": "0"}},
+                {"iteration": 2, "metrics": {
+                    "Partition": "2", "Current revision": "a", "Update revision": "b"}},
+            ],
+            fault_handle={"experiment_uid": "exp"},
+            declared_expected={"Partition": "2"},
+        )
+        assert self._legs(ctx).is_passed
+
+    def test_no_partition_observations_yields_unknown(self):
+        ctx = RuleContext(
+            metric_observations=[{"iteration": 1, "metrics": {}}],
+            fault_handle={"experiment_uid": "exp"},
+            declared_expected={"Partition": "2"},
+        )
+        v = self._legs(ctx)
+        assert not v.is_passed and "no Partition" in v.reason
+
+    def test_missing_revision_observations_yields_unknown(self):
+        v = self._legs(_partition_ctx(with_revisions=False))
+        assert not v.is_passed and "revision" in v.reason
+
+    def test_revisions_not_split_yields_unknown(self):
+        # current == update means the rollout converged, not stalled.
+        ctx = RuleContext(
+            metric_observations=[{"iteration": 1, "metrics": {
+                "Partition": "2", "Current revision": "same", "Update revision": "same"}}],
+            fault_handle={"experiment_uid": "exp"},
+            declared_expected={"Partition": "2"},
+        )
+        v = self._legs(ctx)
+        assert not v.is_passed and "no rollout split" in v.reason
+
+    def test_baseline_revision_read_does_not_mask_a_real_split(self):
+        # Regression, REAL cluster data (drill-sts-partition-target, openspec
+        # mechanism-invariant-trust-boundary Phase 2 re-test). A pre-injection
+        # baseline read carries currentRevision == updateRevision == 7c99c5c4d
+        # (the new revision does not exist yet). The pre-fix distinct-union
+        # leg-2 read unioned that baseline value into updateRevision, so the
+        # sets overlapped and a GENUINE stall (partition=2, updateRevision
+        # advanced to 898f79484 while currentRevision stayed 7c99c5c4d) was
+        # masked as "no rollout split" -> false unknown. The as-of-latest
+        # snapshot read is immune: the latest observation carries the split.
+        baseline = {
+            "Partition": "0",
+            "Update revision": "drill-sts-partition-target-7c99c5c4d",
+            "Current revision": "drill-sts-partition-target-7c99c5c4d",
+        }
+        stalled = {
+            "Partition": "2",
+            "Update revision": "drill-sts-partition-target-898f79484",
+            "Current revision": "drill-sts-partition-target-7c99c5c4d",
+        }
+        ctx = RuleContext(
+            metric_observations=[
+                {"iteration": 0, "metrics": baseline},
+                {"iteration": 1, "metrics": stalled},
+                {"iteration": 2, "metrics": stalled},
+            ],
+            fault_handle={"experiment_uid": "exp"},
+            declared_expected={"Partition": "2"},
+        )
+        assert self._legs(ctx).is_passed
+
+    def test_latest_snapshot_converged_after_a_split_yields_unknown(self):
+        # The as-of-latest semantic is a snapshot, not "a split ever existed":
+        # if the latest read shows currentRevision == updateRevision again
+        # (rollout converged), the split is no longer in effect -> unknown.
+        ctx = RuleContext(
+            metric_observations=[
+                {"iteration": 1, "metrics": {
+                    "Partition": "2", "Current revision": "a", "Update revision": "b"}},
+                {"iteration": 2, "metrics": {
+                    "Partition": "2", "Current revision": "b", "Update revision": "b"}},
+            ],
+            fault_handle={"experiment_uid": "exp"},
+            declared_expected={"Partition": "2"},
+        )
+        v = self._legs(ctx)
+        assert not v.is_passed and "no rollout split" in v.reason
+
+
+class TestStsPartitionFullChainCalibration:
+    """Phase 3 (task 5.3) BINDING calibration — REAL stdout through the FULL
+    chain ``parser -> metrics -> rule -> verdict`` in ONE assertion. The
+    deterministic rule consumes the extractor's output trustingly (no raw
+    stdout survives to cross-check at rule time), so the two MUST be
+    calibrated together, never against synthetic parser output (the classes
+    above feed pre-built metric dicts; this one feeds real bytes).
+
+    Fixtures are VERBATIM from task ``inject-92493ad8`` (#77-R4, 2026-10-15):
+    the real shell-QUOTED labeled-jsonpath command (the ``{"\n"}`` separators
+    force the single quotes — the dominant production form this change's
+    quote-gate fix un-starved), its real stdout, and the REAL production
+    ``fault_handle`` (``kind=faultdrill_cr`` / ``method=faultdrill_carrier``,
+    from result_summary) — so leg 3's anchor is a genuine carrier handle, not
+    a synthetic ``experiment_uid`` stand-in.
+
+    Calibration outcome (task 5.5, gate RE-SCOPED): the pin is LIFTED. The legs
+    evaluate correctly on real data (stalled -> passed, converged -> unknown).
+    Partition is a SINGLE case (#77) and the catalogue is one-case-per-form by
+    design, so the original multi-CASE bar was structurally unsatisfiable; the
+    gate is re-scoped for fail-safe unique-field families to multi-RUN real data
+    (#77: 5 runs) + the fail-safe abstain structure (an unmet leg can never
+    manufacture a false pass). ``STS_PARTITION_RULE`` is now ACTIVE.
+    """
+
+    _legs = staticmethod(rules_mod._sts_partition_legs)
+
+    # VERBATIM real command (task inject-92493ad8, msg108) — machine-specific
+    # kubeconfig path retained verbatim to keep the fixture byte-faithful.
+    _REAL_CMD = (
+        "get statefulset drill-sts-partition-target -n default -o "
+        "'jsonpath=partition={.spec.updateStrategy.rollingUpdate.partition}"
+        '{"\\n"}updateRevision={.status.updateRevision}'
+        '{"\\n"}currentRevision={.status.currentRevision}'
+        '{"\\n"}status.replicas={.status.replicas}'
+        '{"\\n"}readyReplicas={.status.readyReplicas}'
+        '{"\\n"}currentReplicas={.status.currentReplicas}'
+        '{"\\n"}updatedReplicas={.status.updatedReplicas}'
+        '{"\\n"}observedGeneration={.status.observedGeneration}'
+        '{"\\n"}templateAnn={.spec.template.metadata.annotations}'
+        '{"\\n"}\''
+        " /Users/jiangzelin/.kube/config"
+    )
+    # VERBATIM real stdout — STALLED: partition=2, currentRevision != updateRevision.
+    _REAL_STALLED_STDOUT = (
+        "partition=2\n"
+        "updateRevision=drill-sts-partition-target-c7fdff7c\n"
+        "currentRevision=drill-sts-partition-target-7c99c5c4d\n"
+        "status.replicas=3\n"
+        "readyReplicas=3\n"
+        "currentReplicas=2\n"
+        "updatedReplicas=1\n"
+        "observedGeneration=13\n"
+        'templateAnn={"drill-partition-tick":"partition-stall-20261015T144247",'
+        '"drill.example.com/baseline":"v0"}\n'
+    )
+    # REAL production fault_handle for this carrier injection (result_summary).
+    _REAL_HANDLE = {"kind": "faultdrill_cr", "method": "faultdrill_carrier"}
+
+    def _chain(self, stdout, *, anchor=True, expected="2"):
+        """Run the real bytes through the full chain into a RuleContext."""
+        metrics = extract_metrics("kubectl", self._REAL_CMD, stdout)
+        return RuleContext(
+            metric_observations=[{"iteration": 1, "metrics": metrics}],
+            fault_handle=self._REAL_HANDLE if anchor else None,
+            declared_expected={"Partition": expected} if expected else {},
+        )
+
+    def test_real_stalled_stdout_full_chain_passes(self):
+        ctx = self._chain(self._REAL_STALLED_STDOUT)
+        # sanity: the extractor really surfaced the three rule-critical keys
+        # from the real quoted template (this is the un-starved data flow).
+        m = ctx.metric_observations[0]["metrics"]
+        assert m["Partition"] == "2"
+        assert m["Current revision"] == "drill-sts-partition-target-7c99c5c4d"
+        assert m["Update revision"] == "drill-sts-partition-target-c7fdff7c"
+        assert self._legs(ctx).is_passed
+
+    def test_real_carrier_handle_is_a_genuine_anchor(self):
+        # leg 3 fires on the REAL carrier handle, not a synthetic experiment_uid.
+        ctx = self._chain(self._REAL_STALLED_STDOUT)
+        assert ctx.anchoring_signal() == "fault_handle"
+
+    def test_no_anchor_on_real_data_yields_unknown(self):
+        v = self._legs(self._chain(self._REAL_STALLED_STDOUT, anchor=False))
+        assert not v.is_passed and "anchor" in v.reason
+
+    def test_converged_real_shape_yields_unknown(self):
+        # The recovered snapshot (partition back to 0, rollout converged): the
+        # chain abstains on real bytes — never a false pass after recovery.
+        converged = (
+            "partition=0\n"
+            "updateRevision=drill-sts-partition-target-7c99c5c4d\n"
+            "currentRevision=drill-sts-partition-target-7c99c5c4d\n"
+        )
+        v = self._legs(self._chain(converged))
+        assert not v.is_passed
+
+    def test_production_rule_active_on_real_passing_data(self):
+        # task 5.5 — the pin is LIFTED (gate re-scoped). The PRODUCTION rule now
+        # fires passed on this VERBATIM real stalled data (inject-92493ad8,
+        # #77-R4): the full chain parser -> metrics -> rule -> verdict yields a
+        # deterministic ``passed``. CALIBRATION EVIDENCE recorded per the flip
+        # discipline: legs proven across #77's 5 real runs (stalled -> passed;
+        # TTL-self-recovered / converged -> unknown), fail-safe abstain structure
+        # (a drifted/absent metric can never manufacture a false pass), and the
+        # single case is structural (one-case-per-form catalogue) not a data gap.
+        v = STS_PARTITION_RULE.evaluate(self._chain(self._REAL_STALLED_STDOUT))
+        assert v.kind == "passed" and v.is_passed
+
+
+# ---------------------------------------------------------------------------
+# Deployment scale-down rule (openspec mechanism-invariant-trust-boundary task
+# 6.3): second declarative field-state family. Binds to a FROZEN author-declared
+# key and is now ACTIVE — three-leg criteria wired live (pin LIFTED by the
+# re-scoped calibration gate), mirroring the STS partition rule.
+# ---------------------------------------------------------------------------
+
+def _scaledown_ctx(*, expected="1", series=("3", "1", "1"), anchor=True):
+    """Build a RuleContext whose Replicas timeline already satisfies every leg
+    (baseline 3 -> declared N=1 -> held at 1)."""
+    observations = [
+        {"iteration": i + 1, "metrics": {"Replicas": v}}
+        for i, v in enumerate(series)
+    ]
+    return RuleContext(
+        metric_observations=observations,
+        fault_handle={"experiment_uid": "exp"} if anchor else None,
+        declared_expected={"Replicas": expected} if expected else {},
+    )
+
+
+class TestDeploymentScaleDownRuleSelection:
+    def test_frozen_key_resolves_the_rule(self):
+        rules = resolve_deterministic_rules("deployment", "scale-down")
+        assert DEPLOYMENT_SCALE_DOWN_RULE in rules
+
+    def test_match_key_is_the_frozen_declaration(self):
+        assert DEPLOYMENT_SCALE_DOWN_RULE.match == ("deployment", "scale-down")
+
+    def test_wrong_action_resolves_to_zero_rules(self):
+        # The rule fires only for its calibrated (target, action) key; a
+        # different deployment action resolves nothing (byte-identical to the
+        # pre-rule-layer fallback).
+        assert resolve_deterministic_rules("deployment", "scale-up") == ()
+
+
+class TestDeploymentScaleDownActive:
+    """Pin LIFTED (gate re-scoped, tasks 5.1/5.4/5.5) — the production rule now
+    delegates to the three-leg criteria: it PASSES when every leg holds, and
+    still ABSTAINS to unknown when any leg is unmet (fail-safe, never a
+    downgrade, never a guessed pass)."""
+
+    def test_active_passes_with_all_legs_satisfied(self):
+        v = DEPLOYMENT_SCALE_DOWN_RULE.evaluate(_scaledown_ctx())
+        assert v.is_passed
+        assert v.kind == "passed"
+
+    def test_active_abstains_without_expected_or_observations(self):
+        # No declared N, no observations, no anchor — the ACTIVE rule still
+        # abstains to unknown (fail-safe: unmet legs never manufacture a pass).
+        assert DEPLOYMENT_SCALE_DOWN_RULE.evaluate(RuleContext()).kind == "unknown"
+
+
+class TestDeploymentScaleDownLegs:
+    """Unit tests of the three-leg criteria directly (now wired live via
+    _evaluate_deployment_scale_down). Exercises each leg's pass/abstain
+    boundary."""
+
+    _legs = staticmethod(rules_mod._deployment_scale_down_legs)
+
+    def test_all_legs_hold_yields_passed(self):
+        assert self._legs(_scaledown_ctx()).is_passed
+
+    def test_missing_anchor_yields_unknown(self):
+        v = self._legs(_scaledown_ctx(anchor=False))
+        assert not v.is_passed and "anchor" in v.reason
+
+    def test_missing_declared_expected_yields_unknown(self):
+        # N comes from the frozen declaration, never spec_params.
+        v = self._legs(_scaledown_ctx(expected=""))
+        assert not v.is_passed and "declared" in v.reason
+
+    def test_replicas_never_reaching_n_yields_unknown(self):
+        # baseline 3 -> 2, declared N=1: the series never reached N.
+        v = self._legs(_scaledown_ctx(expected="1", series=("3", "2", "2")))
+        assert not v.is_passed and "never reached" in v.reason
+
+    def test_no_replicas_observations_yields_unknown(self):
+        ctx = RuleContext(
+            metric_observations=[{"iteration": 1, "metrics": {}}],
+            fault_handle={"experiment_uid": "exp"},
+            declared_expected={"Replicas": "1"},
+        )
+        v = self._legs(ctx)
+        assert not v.is_passed and "no Replicas" in v.reason
+
+    def test_always_at_n_yields_unknown_no_came_down_proof(self):
+        # NEGATIVE CONTROL: the target sat at N=1 the whole time (series
+        # [1, 1]) — no descent from a higher baseline, so this is a no-op,
+        # NOT a passed scale-down. The direction leg abstains.
+        v = self._legs(_scaledown_ctx(expected="1", series=("1", "1")))
+        assert not v.is_passed and "came-down" in v.reason
+
+    def test_came_down_from_higher_baseline_yields_passed(self):
+        # baseline 5 -> declared N=2 -> held: descended from above, reached N.
+        assert self._legs(
+            _scaledown_ctx(expected="2", series=("5", "2", "2"))
+        ).is_passed
+
+
+class TestDeploymentScaleDownFullChainCalibration:
+    """BINDING calibration — REAL #34 stdout through the FULL chain
+    ``parser -> metrics -> rule -> verdict`` in ONE assertion. The rule
+    consumes the extractor's output trustingly (no raw stdout survives to
+    cross-check at rule time), so the two MUST be calibrated together, never
+    against synthetic parser output (the classes above feed pre-built metric
+    dicts; this one feeds real bytes).
+
+    Fixtures are VERBATIM from task ``inject-238fd5c3`` (#34-R, 2026-10-16):
+    the real labeled-jsonpath read-back commands — both the lowercase
+    ``replicas={.spec.replicas}{"\\n"}`` form (baseline / verifier) and the
+    uppercase direct ``Replicas={.spec.replicas}`` form (landing) — their real
+    stdout, and the real production ``fault_handle``. Both label forms humanize
+    to the SAME named metric ``Replicas``, crossing the injection boundary
+    baseline 3 -> landed 1 -> verified 1.
+
+    Calibration outcome (gate RE-SCOPED): the pin is LIFTED. The legs evaluate
+    correctly on real data (the descent 3 -> declared N=1 passes; an always-at-1
+    timeline abstains). Scale-down is a SINGLE case (#34) — structural under the
+    one-case-per-form catalogue, so the original multi-CASE bar was
+    unsatisfiable; the gate is re-scoped to multi-RUN real data (#34: 3 runs) +
+    the fail-safe abstain structure. ``DEPLOYMENT_SCALE_DOWN_RULE`` is ACTIVE.
+    """
+
+    _legs = staticmethod(rules_mod._deployment_scale_down_legs)
+
+    # VERBATIM real commands + stdout (task inject-238fd5c3, msg21/114/128) —
+    # machine-specific kubeconfig path retained verbatim for byte-faithfulness.
+    _BASE_CMD = 'get deploy drill-scaledown-target -n default -o \'jsonpath=replicas={.spec.replicas}{"\\n"}ready={.status.readyReplicas}{"\\n"}updatedReplicas={.status.updatedReplicas}{"\\n"}available={.status.availableReplicas}{"\\n"}selector={.spec.selector.matchLabels}{"\\n"}uid={.metadata.uid}{"\\n"}generation={.metadata.generation}{"\\n"}\' /Users/jiangzelin/.kube/config'
+    _BASE_STDOUT = 'replicas=3\nready=3\nupdatedReplicas=3\navailable=3\nselector={"app":"drill-scaledown-target"}\nuid=2e67d908-4441-477c-b000-d212142d6b78\ngeneration=1\n'
+    _LAND_CMD = '/Users/jiangzelin/.kube/config get deployment drill-scaledown-target -n default -o \'jsonpath=Replicas={.spec.replicas} Ready={.status.readyReplicas} Updated={.status.updatedReplicas} Available={.status.availableReplicas} Unavailable={.status.unavailableReplicas} Generation={.metadata.generation}{"\\n"}\''
+    _LAND_STDOUT = 'Replicas=1 Ready=1 Updated=1 Available=1 Unavailable= Generation=2\n'
+    _VER_CMD = 'get deployment drill-scaledown-target -n default -o \'jsonpath=replicas={.spec.replicas}{"\\n"}ready={.status.readyReplicas}{"\\n"}updatedReplicas={.status.updatedReplicas}{"\\n"}available={.status.availableReplicas}{"\\n"}generation={.metadata.generation}{"\\n"}\' /Users/jiangzelin/.kube/config'
+    _VER_STDOUT = 'replicas=1\nready=1\nupdatedReplicas=1\navailable=1\ngeneration=2\n'
+    # REAL production fault_handle recorded for this run (result_summary).
+    _REAL_HANDLE = {"kind": "native", "method": "kubectl_native"}
+
+    def _chain(self, *, anchor=True, expected="1"):
+        """Run the three VERBATIM real read-backs through the full chain into a
+        Replicas timeline (baseline 3 -> landed 1 -> verified 1)."""
+        obs = []
+        for i, (cmd, out) in enumerate([
+            (self._BASE_CMD, self._BASE_STDOUT),
+            (self._LAND_CMD, self._LAND_STDOUT),
+            (self._VER_CMD, self._VER_STDOUT),
+        ]):
+            metrics = extract_metrics("kubectl", cmd, out)
+            obs.append({"iteration": i + 1, "metrics": metrics})
+        return RuleContext(
+            metric_observations=obs,
+            fault_handle=self._REAL_HANDLE if anchor else None,
+            declared_expected={"Replicas": expected} if expected else {},
+        )
+
+    def test_real_readbacks_surface_replicas_across_boundary(self):
+        # sanity: the extractor really surfaced the named metric from all three
+        # real read-back forms (both lowercase and uppercase label spellings).
+        ctx = self._chain()
+        series = [o["metrics"].get("Replicas") for o in ctx.metric_observations]
+        assert series == ["3", "1", "1"]
+
+    def test_real_full_chain_descends_to_declared_n_passes(self):
+        assert self._legs(self._chain()).is_passed
+
+    def test_real_handle_is_a_genuine_anchor(self):
+        # leg 1 fires on the REAL production handle, not a synthetic stand-in.
+        assert self._chain().anchoring_signal() == "fault_handle"
+
+    def test_no_anchor_on_real_data_yields_unknown(self):
+        v = self._legs(self._chain(anchor=False))
+        assert not v.is_passed and "anchor" in v.reason
+
+    def test_uppercase_landing_form_alone_produces_replicas(self):
+        # The landing read-back uses the UPPERCASE direct form
+        # ``Replicas={.spec.replicas}`` — humanize still yields "Replicas".
+        m = extract_metrics("kubectl", self._LAND_CMD, self._LAND_STDOUT)
+        assert m["Replicas"] == "1"
+
+    def test_production_rule_active_on_real_passing_data(self):
+        # The pin is LIFTED (gate re-scoped). The PRODUCTION rule now fires
+        # passed on this VERBATIM real scale-down data (inject-238fd5c3, #34-R):
+        # baseline 3 -> landed 1 -> verified 1, with the real label drift
+        # (ready=/updatedReplicas= vs Ready=/Updated=) confined to NON-consumed
+        # keys while ``Replicas`` stays stable across all three read-back forms.
+        # CALIBRATION EVIDENCE per the flip discipline: legs proven across #34's
+        # 3 real runs (descent -> passed; always-at-N / no-anchor -> unknown),
+        # fail-safe abstain structure, single case is structural not a data gap.
+        v = DEPLOYMENT_SCALE_DOWN_RULE.evaluate(self._chain())
+        assert v.kind == "passed" and v.is_passed

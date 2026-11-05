@@ -11,13 +11,14 @@ from chaos_agent.agent.execution_artifacts import make_teardown_matcher
 from chaos_agent.transports import PROFILE_K8S
 from chaos_agent.agent.capabilities import (
     build_capability_context,
+    explain_unsupported_environment,
     filter_tools_for_context,
+    resolve_profile_verdict,
 )
 from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
     inject_task_id_into_tool_calls,
-    sync_kubewiz_runtime,
 )
 from chaos_agent.agent.nodes.recover._recover_layer1 import (
     RecoverLayer1Result,
@@ -62,6 +63,7 @@ from chaos_agent.agent.prompts.boundary import (
     INJECT_TO_RECOVER_BOUNDARY_DECLARATION,
 )
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
+from chaos_agent.agent.evidence_clock import append_time_facts_reminder
 from chaos_agent.agent.result.operation_outcome import write_recover_verification
 from chaos_agent.agent.nodes.verify._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
@@ -173,6 +175,7 @@ async def _layer1_destroy_via_provider(
         experiment_uid, kubeconfig,
         messages=messages, injection_method=injection_method,
         artifacts=list((state or {}).get("execution_artifacts") or []),
+        state=state,
     )
 
 
@@ -506,7 +509,6 @@ async def _run_layer1_recovery(
                 if capability_context.profile == PROFILE_K8S:
                     layer1_human_content += (
                         f"Target namespace: {_spec_rvl.namespace if _spec_rvl else ''}\n"
-                        f"Kubeconfig: {kubeconfig or '(default)'}\n"
                     )
                 else:
                     layer1_human_content += (
@@ -572,12 +574,6 @@ async def _run_layer1_recovery(
                     "Use the recovery mechanism supported by the current environment. "
                     "Restore the original state from the Impact description when no experiment UID is available.\n\n"
                 )
-                if kubeconfig and capability_context.profile == PROFILE_K8S:
-                    layer1_human_content += (
-                        f"**IMPORTANT**: You MUST pass `kubeconfig='{kubeconfig}'` to EVERY "
-                        f"cluster tool call. The default kubeconfig cannot access this cluster. "
-                        f"Do NOT omit the kubeconfig parameter.\n"
-                    )
                 layer1_human_content += (
                     "\nPlease execute the above recovery actions now. "
                     "After completing all actions, output your RECOVERY_EXECUTION_RESULT summary."
@@ -637,6 +633,14 @@ async def _run_layer1_recovery(
                 if inject_msg:
                     messages.append(inject_msg)
                 messages.append(HumanMessage(content=layer1_human_content))
+
+                # Authoritative system clock: the recover LLM has no wall clock,
+                # and #46's build_recovery_timer_reminder plus the window/fire
+                # renders live only in the verifier, so recover was time-blind. It
+                # gets the clock only — the window position stays the verifier's (a
+                # blind phase reading injection_start_time anchors a phantom
+                # window). Transient tail, never persisted.
+                append_time_facts_reminder(messages, state)
 
                 # Record system prompt to session store
                 record_system_prompt(hook, state, layer1_system_prompt, node_name=RECOVER_VERIFIER)
@@ -702,7 +706,6 @@ async def _run_layer1_recovery(
                     # Ensure kubeconfig in tool calls
                     inject_kubeconfig_into_tool_calls(response, kubeconfig)
                     inject_task_id_into_tool_calls(response, state.get("task_id", ""))
-                    sync_kubewiz_runtime(state)
 
                     tool_calls = getattr(response, "tool_calls", None) or []
 
@@ -920,6 +923,9 @@ async def _run_layer1_recovery(
 
         # Build messages from state
         messages = list(state.get("messages", []))
+        # Authoritative system clock on the transient tail (see the first-iteration
+        # site): a fresh clock every round, never persisted.
+        append_time_facts_reminder(messages, state)
 
         max_l1 = settings.max_recover_layer1_iterations
 
@@ -955,12 +961,6 @@ async def _run_layer1_recovery(
                 f"If you cannot determine the result, set Status to \"failed\" and explain why in Details."
             )))
 
-        # Per-iteration kubeconfig reminder
-        if kubeconfig and capability_context.profile == PROFILE_K8S:
-            messages.append(HumanMessage(content=wrap_system_reminder(
-                f"**Reminder**: You MUST pass kubeconfig='{kubeconfig}' to every bound tool call."
-            )))
-
         is_last_l1 = layer1_iteration >= max_l1
         # Same filter as first iteration — see comment above.
         _layer1_tools = [
@@ -991,7 +991,6 @@ async def _run_layer1_recovery(
         else:
             inject_kubeconfig_into_tool_calls(response, kubeconfig)
             inject_task_id_into_tool_calls(response, state.get("task_id", ""))
-            sync_kubewiz_runtime(state)
             tool_calls = getattr(response, "tool_calls", None) or []
 
             result_update = {
@@ -1414,19 +1413,12 @@ async def _run_layer2_verification(
         if _is_k8s_profile_rv:
             context += (
                 f"Target namespace: {target.get('namespace', '')}\n"
-                f"Kubeconfig: {kubeconfig or '(default)'}\n"
             )
         else:
             context += f"Target authority: {capability_context.target_authority}\n"
         # Carrier-owned verification facts (parsed operation parameters /
         # auto-expiry note) — owned by the dispatched provider.
         context += _recover_provider.layer2_facts_note(state)
-        if kubeconfig and _is_k8s_profile_rv:
-            context += (
-                f"**IMPORTANT**: You MUST pass `kubeconfig='{kubeconfig}'` to EVERY "
-                f"cluster tool call. The default kubeconfig cannot access this cluster. "
-                f"Do NOT omit the kubeconfig parameter.\n"
-            )
         # Tool pod context: provide accurate information about tool pod capabilities
         _fault_scope = _spec_rvl2.scope if _spec_rvl2 else ""
         _fault_target = _spec_rvl2.fault_target if _spec_rvl2 else ""
@@ -1579,16 +1571,6 @@ async def _run_layer2_verification(
             f"  - **unrecovered**: Fault effect is STILL present despite recovery attempt\n"
         )))
 
-    # Per-iteration kubeconfig reminder (first Layer 2 iteration already has it in the main context)
-    if (
-        state.get("layer2_context_added", False)
-        and kubeconfig
-        and capability_context.profile == PROFILE_K8S
-    ):
-        messages.append(HumanMessage(content=wrap_system_reminder(
-            f"**Reminder**: You MUST pass kubeconfig='{kubeconfig}' to every bound tool call."
-        )))
-
     # Final-iteration conclusion prompt (tools already unbound at max-1)
     if count >= settings.max_recover_verifier_loop:
         # Single source with the system-prompt label (see the builder call
@@ -1653,6 +1635,11 @@ async def _run_layer2_verification(
 
     # Record system prompt to session store (dedup handles repeated prompts)
     record_system_prompt(hook, state, system_prompt, node_name=RECOVER_VERIFIER)
+
+    # Authoritative time facts on the transient tail, appended AFTER the
+    # state-persistence extractions above so it can never enter the persisted
+    # message lists (freshness contract: rendered per call, never persisted).
+    append_time_facts_reminder(messages, state)
 
     try:
         # B35: the verdict call is an idempotent pure-read judgement (messages
@@ -1733,7 +1720,6 @@ async def _run_layer2_verification(
     # has the correct kubeconfig, even if the LLM forgot to include it.
     inject_kubeconfig_into_tool_calls(response, kubeconfig)
     inject_task_id_into_tool_calls(response, state.get("task_id", ""))
-    sync_kubewiz_runtime(state)
 
     # Problem B guard: Layer 2 read-only discipline is enforced by the
     # recover_verifier_screener graph-edge node (graph.py) between this
@@ -1870,6 +1856,64 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
             f"Verifying fault recovery (uid={experiment_uid or 'N/A'}, iteration={count})",
             {"experiment_uid": experiment_uid, "skill_name": skill_name, "iteration": count},
         )
+
+        # Fail-fast capability gate. ``profile=UNKNOWN`` means no provider tool
+        # can dispatch, so neither Layer 1 (execute recovery) nor Layer 2
+        # (verify) can run — previously the loop still bound ``bind_tools([])``
+        # and spun its ReAct step until ``max_recover_verifier_loop``. This is
+        # the recover twin of the execute_loop / agent_loop entry gates, and it
+        # fires BEFORE Layer 1 so no recovery is even attempted on an
+        # environment that cannot carry it (the #87 shape: injected on k8s,
+        # the ambient channel drifted to host, the two profiles conflict).
+        #
+        # Recovery is a LIABILITY path, so the terminal must NOT read as
+        # success or a silent skip: it mirrors the max-iteration backstop's
+        # liability-preserving shape (``recovered=False`` + ``level=unverified``
+        # + an explicit "fault may still be active" warning). That warning is
+        # what keeps ``tasks.liability_live`` True (``may_carry_live_fault`` is
+        # word-blind) and the recovery entrance open once the channel is fixed.
+        # The cause is named off the SAME verdict the per-tool refusal and the
+        # execute gate use — no re-derivation.
+        _verdict = resolve_profile_verdict(state)
+        if not _verdict.supported:
+            _msg = explain_unsupported_environment(_verdict, state)
+            logger.warning(
+                "recover verifier fail-fast: environment profile unresolved "
+                "(reason=%s) on task %s — landing on a liability-preserving "
+                "terminal instead of spinning the ReAct loop",
+                _verdict.reason, task_id,
+            )
+            verification = {
+                "level": "unverified",
+                "layer1": {"status": "skipped", "details": _msg},
+                "layer2": {
+                    "status": "skipped",
+                    "details": "Environment profile unresolved — recovery not attempted",
+                },
+                "baseline_confidence": _compute_baseline_confidence(state),
+                "warnings": [
+                    f"Environment profile unresolved ({_verdict.reason}) — "
+                    f"recovery not attempted, fault may still be active. {_msg}"
+                ],
+            }
+            result = {
+                "task_id": task_id,
+                "skill": skill_name,
+                "experiment_uid": experiment_uid,
+                "recovered": False,
+            }
+            tracker.fail(_msg)
+            result_dict = write_recover_verification(
+                fail_state(
+                    FailureCategory.RECOVERY_VERIFICATION_TIMEOUT,
+                    _msg,
+                ),
+                result=result,
+                verification=verification,
+                finished_at=now_iso(),
+            )
+            await sync_to_store(state, result_dict)
+            return result_dict
 
         # ---- Guard: max iterations exceeded ----
         # Reachability (W-56-8 review round 3): the router cuts at

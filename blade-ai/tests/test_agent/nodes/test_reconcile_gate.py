@@ -272,7 +272,25 @@ class TestScanWiringInExecuteLoop:
         )
 
     @pytest.mark.asyncio
-    async def test_scan_publishes_flag_same_iteration(self, sample_agent_state):
+    async def test_scan_publishes_flag_same_iteration(
+        self, sample_agent_state, monkeypatch,
+    ):
+        # This test's contract is SAME-ITERATION TIMING (blocked_count 0 → 1),
+        # not the probe verdict — that matrix is owned exhaustively by
+        # TestInterceptionProbe below. But the hold path threads the probe's
+        # outcome into gate_reconciled, and the probe reaches the ambient
+        # check_blade_conflicts: on a machine where that query returns a clean
+        # miss it reports True (reconciled), on one where it degrades it reports
+        # False. Pin the degraded path (probe cannot reach a cluster) so the
+        # assertion below is deterministic and environment-independent — the
+        # same monkeypatch test_probe_failure_degrades_without_reconciled uses.
+        async def _unreachable(kubeconfig, task_id, **kwargs):
+            raise TimeoutError("probe timed out")
+
+        monkeypatch.setattr(
+            "chaos_agent.agent.providers.chaosblade.reconcile"
+            ".check_blade_conflicts", _unreachable,
+        )
         node = self._node()
         state = sample_agent_state
         state["execute_loop_count"] = 0

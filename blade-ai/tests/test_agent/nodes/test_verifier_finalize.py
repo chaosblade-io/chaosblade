@@ -142,6 +142,62 @@ class TestVerificationFromSubmitArgs:
         result = _verification_from_submit_args(args)
         assert result["checklist"]["total_count"] == 1
 
+    # --- All-dissipated structured override (D14 wiring gap fix) ---
+    # The submit-args path is the LIVE verdict source; before this fix the
+    # "every checklist item recovered_before_observation => unverified" safety
+    # net existed only (as dead code) in the text-parse fallback. These pin the
+    # net is now wired on the live path and applied last.
+
+    def test_all_recovered_before_observation_forces_unverified(self):
+        """Dishonest overall=verified while EVERY item dissipated before
+        observation => the fault left no observable trace => forced unverified.
+        Enum-only; primary_evidence_observed=true does not rescue it."""
+        args = {
+            "overall": "verified",
+            "layer2_status": "passed",
+            "primary_evidence_observed": True,
+            "checklist": [
+                {"step": 1, "status": "recovered_before_observation",
+                 "evidence": "pod already Running again"},
+                {"step": 2, "status": "recovered_before_observation",
+                 "evidence": "no residual by sample time"},
+            ],
+        }
+        result = _verification_from_submit_args(args)
+        assert result["level"] == "unverified"
+        assert any("recovered_before_observation" in w for w in result["warnings"])
+
+    def test_all_recovered_overrides_declared_partial_too(self):
+        """A declared 'partial' still claims partial confirmation; if EVERY
+        item dissipated there was nothing to confirm => unverified."""
+        args = {
+            "overall": "partial",
+            "layer2_status": "recovered_before_observation",
+            "primary_evidence_observed": False,
+            "checklist": [
+                {"step": 1, "status": "recovered_before_observation"},
+            ],
+        }
+        result = _verification_from_submit_args(args)
+        assert result["level"] == "unverified"
+
+    def test_mixed_recovered_before_observation_only_warns(self):
+        """A MIXED checklist (some criteria genuinely observed) is the LLM's
+        overall judgement, not a program override: level is NOT forced down,
+        only a warning is recorded."""
+        args = {
+            "overall": "verified",
+            "layer2_status": "passed",
+            "primary_evidence_observed": True,
+            "checklist": [
+                {"step": 1, "status": "passed", "evidence": "saw the effect"},
+                {"step": 2, "status": "recovered_before_observation"},
+            ],
+        }
+        result = _verification_from_submit_args(args)
+        assert result["level"] == "verified"
+        assert any("recovered_before_observation" in w for w in result["warnings"])
+
 
 class TestFormatVerificationDetail:
     def test_basic_format(self):
@@ -298,7 +354,14 @@ class TestCleanupResiduals:
             assert cleaned[0]["id"] == uid
             assert cleaned[0]["cleanup_outcome"] == "success"
             mock_destroy.ainvoke.assert_awaited_once_with(
-                {"uid": uid, "kubeconfig": "/fake/kubeconfig"}
+                {
+                    "uid": uid,
+                    "kubeconfig": "/fake/kubeconfig",
+                    # The destroy chain threads the caller's resolved state so
+                    # blade_destroy's InjectedState sees per-session values
+                    # (sweep_live_liabilities merges kubeconfig into state).
+                    "state": {**state, "kubeconfig": "/fake/kubeconfig"},
+                }
             )
 
     @pytest.mark.asyncio
@@ -347,7 +410,7 @@ class TestVerifyReplanDomainAlignment:
         provider = FaultProviderRegistry.resolve_by_method("host_blade")
         calls: list = []
 
-        async def _fake_destroy(uid, kubeconfig=""):
+        async def _fake_destroy(uid, kubeconfig="", *, state=None):
             calls.append(uid)
             return _json.dumps(
                 {"code": 200, "success": True, "result": uid}
@@ -563,170 +626,10 @@ class TestApplyStepCoverageAnswerBased:
         assert v["layer2"]["status"] == "partial"
 
 
-class TestEnforceDiskBurnFactsDiscretionarySteps:
-    """Burn override flips non-passed steps; discretionary statuses survive.
-
-    Regression anchor for the disk_burn migration onto the deterministic
-    rule registry: the SAME inputs must produce the SAME verdict and
-    evidence structure as the legacy direct ``_enforce_disk_burn_facts``
-    call (only the resolver path changed — the state now carries the
-    fault identity so the registry pipeline can resolve the burn rule).
-    """
-
-    def test_override_flips_failed_spares_expected_and_does_not_gate_level(self):
-        verification = {
-            "level": "partial",
-            "layer2": {"status": "failed", "details": ""},
-            "warnings": [],
-            "checklist": {"items": [
-                {"step": 1, "status": "failed",
-                 "evidence": "no I/O delta seen"},
-                {"step": 2, "status": "expected",
-                 "evidence": "no latency increase observed"},
-            ]},
-        }
-        state = {
-            "fault_target": "disk",
-            "fault_action": "burn",
-            "disk_burn_post_check": {
-                "burn_io_detected": True,
-                "active_partitions": [
-                    {"name": "/dev/vdb", "write_throughput_mb_s": 120}],
-            },
-        }
-        applied = _apply_deterministic_verdicts(verification, state)
-        assert applied
-        injection_item, propagated_item = verification["checklist"]["items"]
-        # Injection-effect step overridden by the programmatic I/O evidence.
-        assert injection_item["status"] == "passed"
-        assert "OVERRIDE" in injection_item["evidence"]
-        # Discretionary statuses ('expected') are preserved verbatim —
-        # never flipped into fake passes.
-        assert propagated_item["status"] == "expected"
-        assert "OVERRIDE" not in propagated_item["evidence"]
-        assert verification["layer2"]["status"] == "passed"
-        # 'expected' is not in the failed set → does not gate the level.
-        assert verification["level"] == "verified"
-
-    def test_migration_preserves_legacy_evidence_wording(self):
-        """Byte-level anchor: the migrated pipeline must reproduce the
-        legacy disk_burn phrasing exactly (only the prefix was ever
-        allowed to differ — and we kept [OVERRIDE])."""
-        verification = {
-            "level": "partial",
-            "layer2": {"status": "failed", "details": ""},
-            "warnings": [],
-            "checklist": {"items": [
-                {"step": 1, "status": "failed", "evidence": "no I/O delta"},
-            ]},
-        }
-        state = {
-            "fault_target": "disk",
-            "fault_action": "burn",
-            "disk_burn_post_check": {
-                "burn_io_detected": True,
-                "active_partitions": [
-                    {"name": "/dev/vdb", "write_throughput_mb_s": 120}],
-            },
-        }
-        _apply_deterministic_verdicts(verification, state)
-        item = verification["checklist"]["items"][0]
-        assert item["evidence"] == (
-            "[OVERRIDE] Programmatic I/O check confirmed ACTIVE "
-            "(write throughput: /dev/vdb: ~120 MB/s). "
-            "Fault is still in effect — LLM observation was insufficient, "
-            "not evidence of recovery."
-        )
-        assert verification["layer2"]["details"] == (
-            "Programmatic I/O check: disk burn ACTIVE "
-            "(write throughput: /dev/vdb: ~120 MB/s). LLM conclusion overridden."
-        )
-        assert verification["warnings"] == [
-            "Programmatic override: disk_burn_post_check confirmed I/O ACTIVE "
-            "(write throughput: /dev/vdb: ~120 MB/s), but LLM concluded "
-            "the fault was absent (original status: 'failed')."
-        ]
-
-    def test_all_green_gets_annotation_only_no_verdict_rewrite(self):
-        """Q1 semantics (deliberate, additive divergence from legacy):
-        an already-green LLM verdict stays green — no lift, no warning,
-        no evidence rewrite — but gains the [DETERMINISTIC] dual-source
-        annotation row (the audit contract). Legacy left the verdict
-        byte-untouched; the spec's quadrant-1 requirement supersedes
-        (re-audit finding 6b: the old name claimed "zero interference"
-        while the row WAS being appended — the test only passed because
-        it never looked at items length)."""
-        verification = {
-            "level": "verified",
-            "layer2": {"status": "passed", "details": "all good"},
-            "warnings": [],
-            "checklist": {"items": [
-                {"step": 1, "status": "passed", "evidence": "io delta seen"},
-            ]},
-        }
-        state = {
-            "fault_target": "disk",
-            "fault_action": "burn",
-            "disk_burn_post_check": {
-                "burn_io_detected": True,
-                "active_partitions": [
-                    {"name": "/dev/vdb", "write_throughput_mb_s": 120}],
-            },
-        }
-        assert not _apply_deterministic_verdicts(verification, state)
-        assert verification["level"] == "verified"
-        assert verification["warnings"] == []
-        assert verification["checklist"]["items"][0]["evidence"] == "io delta seen"
-        # The one additive divergence from legacy: the annotation row.
-        rows = verification["checklist"]["items"]
-        assert len(rows) == 2
-        assert rows[1]["step"] == "rule"
-        assert "[DETERMINISTIC] rule 'disk_burn_io_active' passed" in (
-            rows[1]["evidence"]
-        )
-
-    def test_l2_only_degradation_lifted_burn_family(self):
-        """Q2a corner (deliberate divergence from legacy no-op, re-audit
-        finding 6): post-check measured I/O ACTIVE but the LLM concluded
-        degraded with NO checklist items contradicting it. Legacy nested
-        the L2 lift under `if _io_overridden:` — a green/absent checklist
-        left the contradictory state (program says ACTIVE, LLM says
-        failed) standing. The spec's family-agnostic quadrant-2a
-        semantics lifts it; both no-checklist and green-checklist shapes
-        pin the divergence as deliberate."""
-        state = {
-            "fault_target": "disk",
-            "fault_action": "burn",
-            "disk_burn_post_check": {
-                "burn_io_detected": True,
-                "active_partitions": [
-                    {"name": "/dev/vdb", "write_throughput_mb_s": 120}],
-            },
-        }
-        # Shape A: no checklist at all
-        v_a = {
-            "level": "partial",
-            "layer2": {"status": "failed", "details": "LLM saw nothing"},
-            "warnings": [],
-        }
-        assert _apply_deterministic_verdicts(v_a, state)
-        assert v_a["layer2"]["status"] == "passed"
-        assert v_a["level"] == "verified"
-        assert any("Programmatic override" in w for w in v_a["warnings"])
-        # Shape B: all-green checklist + degraded L2
-        v_b = {
-            "level": "partial",
-            "layer2": {"status": "failed", "details": "LLM saw nothing"},
-            "warnings": [],
-            "checklist": {"items": [
-                {"step": 1, "status": "passed", "evidence": "io seen"},
-            ]},
-        }
-        assert _apply_deterministic_verdicts(v_b, state)
-        assert v_b["layer2"]["status"] == "passed"
-        assert v_b["level"] == "verified"
-        # Green item untouched (nothing to flip — only the L2 was degraded)
-        assert v_b["checklist"]["items"][0]["evidence"] == "io seen"
+class TestNoRuleFamilyZeroInterference:
+    """A family without a declared deterministic rule passes through the
+    finalize lift byte-identical — zero interference (quadrant 4 of the
+    five-quadrant synthesis below)."""
 
     def test_no_rule_family_zero_interference(self):
         """A family without a declared rule must pass through byte-identical."""
@@ -765,8 +668,8 @@ class TestFiveQuadrantSynthesis:
       Q2b program passed × LLM degraded
           WITH a specific counter-proof    → LLM respected, withheld noted;
       Q3  program unknown (rule family)    → zero interference;
-      Q4  no rule family                  → zero interference (anchored
-                                             by the migration tests above);
+      Q4  no rule family                  → zero interference (anchored by
+                                             TestNoRuleFamilyZeroInterference);
       Q5  cross_check contradiction        → its downgrade semantics are
                                              unchanged and a program pass
                                              does not roll them back.
@@ -847,6 +750,32 @@ class TestFiveQuadrantSynthesis:
         assert item["status"] == "passed"
         assert item["evidence"].startswith("[OVERRIDE] RestartCount 8 → 10")
         assert "not evidence of recovery" in item["evidence"]
+        assert v["level"] == "verified"
+
+    def test_quadrant2a_discretionary_expected_item_preserved(self):
+        """Q2a nuance: the lift flips DEGRADED checklist items but never a
+        discretionary one — an 'expected' item (a benign status) survives
+        verbatim rather than being rewritten into a fake pass, and so does
+        not gate the level."""
+        v = {
+            "level": "partial",
+            "layer2": {"status": "failed", "details": ""},
+            "warnings": [],
+            "checklist": {"items": [
+                {"step": 1, "status": "failed", "evidence": "no restart delta"},
+                {"step": 2, "status": "expected",
+                 "evidence": "MemoryPressure=False anticipated"},
+            ]},
+        }
+        assert _synthesize_passed(v, self._verdict()) is True
+        injection_item, propagated_item = v["checklist"]["items"]
+        # Degraded step lifted by the program evidence.
+        assert injection_item["status"] == "passed"
+        assert injection_item["evidence"].startswith("[OVERRIDE]")
+        # Discretionary 'expected' preserved verbatim — never a fake pass.
+        assert propagated_item["status"] == "expected"
+        assert "OVERRIDE" not in propagated_item["evidence"]
+        assert v["layer2"]["status"] == "passed"
         assert v["level"] == "verified"
 
     def test_quadrant2b_crosscheck_contradiction_respected(self):
@@ -1803,3 +1732,111 @@ class TestMode2CoverageDisabledContract:
         assert not missing
         assert v["layer2"]["status"] == "passed"
         assert not any("never attempted" in w for w in v["warnings"])
+
+
+class TestFrozenVerdictBindingIntegration:
+    """openspec mechanism-invariant-trust-boundary task 3.2: the finalize
+    layer prefers the FROZEN author-declared key over the drift-prone LLM
+    triple, and threads the declared expected value N into the rule."""
+
+    # #77's runtime LLM triple (forensics memory 66425653) — resolves to
+    # ZERO rules on its own.
+    _LLM_STATE = {
+        "fault_target": "rollingupdate",
+        "fault_action": "partition-stuck",
+        "params": {},
+        "metric_observations": [
+            {"iteration": 1, "metrics": {
+                "Partition": "2", "Current revision": "web-abc",
+                "Update revision": "web-def"}},
+        ],
+        "fault_handle": {"experiment_uid": "exp"},
+    }
+    _FROZEN_DV = {
+        "target": "statefulset",
+        "action": "partition-stall",
+        "expected": {"Partition": "2"},
+    }
+
+    @staticmethod
+    def _failed_verification():
+        return {
+            "level": "failed",
+            "layer2": {"status": "failed", "details": "rollout stalled"},
+            "warnings": [],
+            "checklist": {"items": []},
+        }
+
+    def test_llm_triple_without_declaration_resolves_zero_rules(self):
+        # Baseline: no frozen declaration → the LLM triple finds no profile
+        # → no lift (byte-identical to pre-change behaviour).
+        v = self._failed_verification()
+        assert not _apply_deterministic_verdicts(v, dict(self._LLM_STATE))
+        assert v["layer2"]["status"] == "failed"
+
+    def test_active_rule_lifts_with_frozen_key(self):
+        # Pin LIFTED (gate re-scoped, tasks 5.1/5.4/5.5): the frozen key routes
+        # to the now-ACTIVE STS rule. This setup satisfies all three legs
+        # (anchor=fault_handle, declared Partition N=2 reached, revision split
+        # web-abc != web-def), so the rule returns ``passed`` and LIFTS the
+        # LLM's ``failed`` verdict to ``passed`` — the end-to-end proof that
+        # enabling works (program evidence overrides an LLM under-call). The
+        # lift can ONLY have come via the frozen key: the LLM triple
+        # (rollingupdate/partition-stuck) alone resolves zero rules (see
+        # test_llm_triple_without_declaration_resolves_zero_rules above).
+        state = dict(self._LLM_STATE)
+        state["approved_target"] = {
+            "scope": "statefulset", "deterministic_verdict": self._FROZEN_DV,
+        }
+        v = self._failed_verification()
+        assert _apply_deterministic_verdicts(v, state)
+        assert v["layer2"]["status"] == "passed"
+
+    def test_frozen_key_routes_and_threads_declared_expected(self, monkeypatch):
+        # Spy the profile's rule to prove BOTH halves of the wiring: the
+        # frozen key (not the LLM triple) selected the rule, and the declared
+        # expected map reached RuleContext.declared_expected.
+        from chaos_agent.agent.nodes.verify import _verification_profiles as vp
+        from chaos_agent.agent.nodes.verify._deterministic_rules import (
+            DeterministicRule,
+            verdict_unknown,
+        )
+
+        captured: dict = {}
+
+        def _spy(ctx):
+            captured["declared"] = dict(ctx.declared_expected)
+            captured["anchor"] = ctx.anchoring_signal()
+            return verdict_unknown("spy — no lift")
+
+        spy_rule = DeterministicRule(
+            name="spy_sts", match=("statefulset", "partition-stall"),
+            evaluate=_spy,
+        )
+        monkeypatch.setattr(
+            vp._StatefulSetProfile, "deterministic_rules",
+            lambda self: (spy_rule,),
+        )
+
+        state = dict(self._LLM_STATE)
+        state["approved_target"] = {
+            "scope": "statefulset", "deterministic_verdict": self._FROZEN_DV,
+        }
+        v = self._failed_verification()
+        assert not _apply_deterministic_verdicts(v, state)
+        # The frozen key routed to the spy and the declared N was threaded
+        # through — proving the LLM triple was overridden for rule selection.
+        assert captured["declared"] == {"Partition": "2"}
+        assert captured["anchor"] == "fault_handle"
+
+    def test_malformed_frozen_declaration_falls_back(self):
+        # A partial declaration (no action) is inert → the LLM triple path
+        # stands → zero rules → no lift.
+        state = dict(self._LLM_STATE)
+        state["approved_target"] = {
+            "scope": "statefulset",
+            "deterministic_verdict": {"target": "statefulset"},
+        }
+        v = self._failed_verification()
+        assert not _apply_deterministic_verdicts(v, state)
+        assert v["layer2"]["status"] == "failed"

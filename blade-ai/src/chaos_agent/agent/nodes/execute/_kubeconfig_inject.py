@@ -6,9 +6,9 @@ Provides:
   graph-wide single source the settlement primitives resolve through too;
   this private name stays as the execute-side alias for its callers)
 - inject_kubeconfig_into_tool_calls: Programmatic kubeconfig injection into LLM tool calls
-- _resolve_kubewiz_cluster_uuid / _resolve_kubewiz_profile: kubewiz param resolution
-- resolve_transport_target: Construct TransportTarget from AgentState (replaces sync_kubewiz_runtime)
-- sync_kubewiz_runtime: Deprecated — syncs per-session kubewiz params into settings
+- resolve_transport_target: Construct TransportTarget from AgentState (re-export of the
+  canonical ``chaos_agent.transports.registry`` seam — the single authority that
+  replaced the retired ``sync_kubewiz_runtime`` settings side-effect)
 """
 
 import logging
@@ -16,8 +16,16 @@ import logging
 from langchain_core.messages import AIMessage
 
 from chaos_agent.agent.state import AgentState
-from chaos_agent.config.settings import settings
-from chaos_agent.transports import TransportTarget, is_kubewiz_channel
+from chaos_agent.transports import is_kubewiz_channel
+from chaos_agent.transports import (
+    resolve_transport_target as resolve_transport_target,  # re-export (D2)
+)
+
+# ``resolve_transport_target`` (the single authoritative transport-target seam)
+# canonically lives in ``chaos_agent.transports.registry`` so tools, graph nodes
+# and the registry all resolve through one import with no layering inversion.
+# It is re-exported here so existing execute-side callers keep their import
+# path unchanged (ground-truth-single-authority D2).
 
 logger = logging.getLogger(__name__)
 
@@ -169,61 +177,3 @@ def inject_task_id_into_tool_calls(response: AIMessage, task_id: str) -> None:
             continue
         args["task_id"] = task_id
 
-
-def _resolve_kubewiz_cluster_uuid(state: AgentState) -> str:
-    """Resolve kubewiz cluster UUID: state > settings."""
-    uuid = state.get("kubewiz_cluster_uuid", "")
-    if uuid:
-        return uuid
-    return settings.kubewiz_cluster_uuid
-
-
-def _resolve_kubewiz_profile(state: AgentState) -> str:
-    """Resolve kubewiz profile: state > settings."""
-    profile = state.get("kubewiz_profile", "")
-    if profile:
-        return profile
-    return settings.kubewiz_profile
-
-
-def resolve_transport_target(state: AgentState) -> TransportTarget:
-    """Construct a TransportTarget from AgentState.
-
-    This is the preferred API for obtaining a TransportTarget — it reads
-    per-session overrides from *state* and falls back to *settings* for
-    any missing field.  Replaces the old ``sync_kubewiz_runtime`` which
-    mutated global settings as a side effect.
-
-    .. note::
-        Not yet wired into all graph nodes — 10+ callers still use
-        ``sync_kubewiz_runtime(state)`` which mutates settings as a side
-        effect.  Once those callers are migrated to pass a TransportTarget
-        directly to tools, ``sync_kubewiz_runtime`` can be removed.
-    """
-    return TransportTarget.from_state(state)
-
-
-def sync_kubewiz_runtime(state: AgentState) -> None:
-    """Sync per-session kubewiz params from state into settings.
-
-    .. deprecated::
-        Use ``resolve_transport_target(state)`` instead.  This function
-        is retained because tools still call ``TransportTarget.from_state({})``
-        which reads from *settings*; syncing ensures per-session values
-        are visible.  Once all tools accept a TransportTarget parameter
-        this function will be removed.
-
-    Guard: only syncs when the resolved transport channel (from *settings*,
-    not from state) is a kubewiz channel.  Checking settings — not state —
-    prevents a stale ``kubewiz_cluster_uuid`` in state from accidentally
-    switching the channel from kubeconfig to kubewiz in a session that
-    was explicitly configured for kubeconfig mode.
-    """
-    if not is_kubewiz_channel():
-        return
-    uuid = _resolve_kubewiz_cluster_uuid(state)
-    if uuid:
-        settings.kubewiz_cluster_uuid = uuid
-    profile = _resolve_kubewiz_profile(state)
-    if profile:
-        settings.kubewiz_profile = profile

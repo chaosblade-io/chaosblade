@@ -170,6 +170,7 @@ def _build_baseline_tool_messages(
     fault_target: str,
     fault_action: str,
     injection_parsed: dict | None = None,
+    target_paths: tuple = (),
 ) -> list:
     """Build synthetic AIMessage + ToolMessage pairs for pre-injection baseline data.
 
@@ -304,8 +305,12 @@ def _build_baseline_tool_messages(
     raw_content = (
         f"Pre-injection baseline collected at {captured_at} "
         f"(strategy: {source}, {_quality}).\n\n"
+        # Domain-neutral wording: this baseline message is emitted for EVERY
+        # target domain (k8s / host-SSH / python-app), so it must NOT name a
+        # specific tool like "kubectl" — mirrors the recover-path baseline
+        # message (_recover_layer1.py) which already says "observation methods".
         f"These metrics were captured BEFORE fault injection using the same "
-        f"kubectl commands you would use for verification. "
+        f"observation methods you would use for verification. "
         f"This is your authoritative reference — compare every post-injection "
         f"observation against these values using delta format: "
         f"\"baseline: X → current: Y (ΔZ)\".\n\n"
@@ -332,7 +337,9 @@ def _build_baseline_tool_messages(
     # ── Pair 2: Extracted key metrics + comparison semantics ──
     # Pre-extracted metrics so LLM doesn't need to parse raw kubectl output
     # to find key numbers.  Includes mandatory comparison format instructions.
-    key_metrics = _extract_baseline_key_metrics(baseline, fault_target, fault_action)
+    key_metrics = _extract_baseline_key_metrics(
+        baseline, fault_target, fault_action, target_paths,
+    )
     metrics_parts = []
     if key_metrics:
         metrics_lines = "\n".join(f"- {k}: {v}" for k, v in key_metrics.items())
@@ -482,6 +489,28 @@ def build_injection_window_clock(state: AgentState, *, now: float | None = None)
       timer reminder's TRIGGERED-not-completed neutrality);
     - no duration on record: T0 + elapsed only (still kills the archaeology).
 
+    ANCHOR SEMANTICS — T0 is ISSUE time, a LOWER BOUND on landing, NOT the
+    landing itself. ``injection_start_time`` is stamped write-once the moment
+    the FIRST UID-less native mutating-looking call goes out (execute_loop:
+    "the attempt IS the injection"), and is never advanced to the true onset.
+    In a multi-step carrier/native injection the executor runs many
+    legitimately-mutating SETUP commands (``apk add``, ``delete pod``, building
+    a mini-CA) minutes before the fault actually lands, so T0 can precede onset
+    by minutes. inject-9ca80c95 proved this: a read-only ``openssl ca -help``
+    capability probe (10:23:20) grabbed the stamp, the real fault landed via a
+    degraded path at 10:33:47, and the clock rendered "committed 10:23:20 /
+    window CLOSED ~438s ago" — forcing the model to override its own
+    "authoritative" clock five times and file verdict Warning #1. Because onset
+    >= T0, the true elapsed is AT MOST ``current - T0`` and the true remaining
+    is AT LEAST what is shown: a computed "CLOSED" is the EARLIEST possible
+    close, never a certainty. Every rendering below therefore states T0 as the
+    FIRST MUTATING COMMAND's issue time — never as "the injection", which the
+    model reads as the fault action (the #75 W-75-2 effect-lag misattribution:
+    T0 was a bind-rule SETUP patch, and "injection command ISSUED at T0" led the
+    verifier to call the gap to the first 403 a "propagation delay") — and
+    defers onset to live evidence. The clock kills the message-order
+    archaeology of Case #58 without asserting a landing it cannot know.
+
     Returns ``""`` when T0 is absent or unparseable — replan seams clear
     ``injection_start_time`` until the next injection re-stamps it, and the
     clock must stay silent rather than anchor on a stale T0.
@@ -501,32 +530,42 @@ def build_injection_window_clock(state: AgentState, *, now: float | None = None)
 
     if duration <= 0:
         return (
-            f"**INJECTION CLOCK (system-computed, authoritative)**: injection "
-            f"committed at {t0}; ~{elapsed}s have elapsed since injection. "
-            f"(No fault duration on record — window position cannot be "
-            f"computed; do not infer it from message order.)"
+            f"**INJECTION CLOCK (system-computed, from ISSUE time)**: "
+            f"first mutating command ISSUED at {t0} (issue-time anchor — in a "
+            f"multi-step injection this may be a SETUP command, not the fault "
+            f"action). Fault onset is at or after this and is UNOBSERVED by the "
+            f"framework — derive it from the first receipt evidencing the fault "
+            f"signature. ~{elapsed}s have elapsed since issuance. (No fault "
+            f"duration on record — window position cannot be computed here, "
+            f"and message order carries no reliable signal for it.)"
         )
     remaining = duration - elapsed
     if remaining > 0:
         return (
-            f"**INJECTION WINDOW CLOCK (system-computed, authoritative)**: "
-            f"injection committed at {t0}; fault duration {duration}s; "
-            f"~{elapsed}s elapsed, ~{remaining}s remaining in the fault "
-            f"window. Evidence semantics: the fault is expected to be "
-            f"observable NOW; a missing fault signature at this point is "
-            f"evidence the injection did NOT take effect, not that it "
-            f"already recovered."
+            f"**INJECTION WINDOW CLOCK (system-computed, lower bound from "
+            f"ISSUE time)**: first mutating command ISSUED at {t0} (issue-time "
+            f"anchor — may be a SETUP command, not the fault action; fault "
+            f"onset is UNOBSERVED by the framework). Fault duration "
+            f"{duration}s; counting from issuance ~{elapsed}s elapsed, "
+            f"~{remaining}s remaining in the fault window — a lower bound, "
+            f"since the fault landed at or after {t0}. Evidence semantics: the "
+            f"fault is expected to be observable NOW; a missing fault "
+            f"signature at this point is evidence the injection did NOT take "
+            f"effect, not that it already recovered."
         )
     return (
-        f"**INJECTION WINDOW CLOCK (system-computed, authoritative)**: "
-        f"injection committed at {t0}; fault duration {duration}s; the fault "
-        f"window CLOSED ~{elapsed - duration}s ago — any bounded "
-        f"self-recovery was due by then (triggered, not necessarily "
-        f"converged). Evidence semantics: absence of the fault signature "
-        f"from now on is EXPECTED and is not persistence evidence; a "
-        f"still-present signature means recovery has NOT converged (record "
-        f"it); the in-window verdict rests on evidence gathered before the "
-        f"close."
+        f"**INJECTION WINDOW CLOCK (system-computed, lower bound from ISSUE "
+        f"time)**: first mutating command ISSUED at {t0} (issue-time anchor — "
+        f"may be a SETUP command, not the fault action; fault onset is "
+        f"UNOBSERVED by the framework). Fault duration "
+        f"{duration}s; counting from issuance the window would be CLOSED "
+        f"~{elapsed - duration}s ago (triggered, not necessarily converged) — "
+        f"the earliest possible close, not a certainty, since the fault landed "
+        f"at or after {t0}: live evidence of a present signature outranks this "
+        f"estimate. Evidence semantics: absence of the fault signature once "
+        f"the window has truly closed is EXPECTED and is not persistence "
+        f"evidence; a still-present signature means recovery has NOT converged "
+        f"— a finding worth carrying into the verdict."
     )
 
 
@@ -757,6 +796,17 @@ def _build_layer2_messages(
     _fault_target = _spec_vm.fault_target if _spec_vm else ""
     _fault_action = _spec_vm.fault_action if _spec_vm else ""
     _injection_parsed = state.get("injection_parsed_params") or {}
+    # D4/B2: the FaultSpec is the single authority for the declared disk-fault
+    # mount path (it resolves params["path"] → names absolute paths, because
+    # the real NL host disk-fill stores the mount in names, not params). An
+    # earlier version passed _spec_vm.params and threaded an empty target,
+    # silently dropping the /drill-disk row and reporting the root overlay as
+    # the target metric. Passing the spec lands the baseline key metric on the
+    # TARGET filesystem (/drill-disk) instead of the root overlay.
+    from chaos_agent.agent.nodes.verify._metric_extractor import (
+        disk_target_paths as _dtp_vm,
+    )
+    _target_paths = _dtp_vm(_spec_vm)
 
     _baseline = state.get("baseline_data")
     if _baseline and _baseline.get("success_count", 0) > 0:
@@ -786,6 +836,7 @@ def _build_layer2_messages(
             _SYNTHETIC_TOOL_CALL_IDS,
             lambda: _build_baseline_tool_messages(
                 _baseline, _fault_target, _fault_action, _injection_parsed,
+                _target_paths,
             ),
             phase="verify",
         )
@@ -1033,13 +1084,7 @@ def _build_first_iteration_context(
         fault_metadata = " | ".join(parts)
 
     from chaos_agent.transports import is_kubewiz_channel
-    from chaos_agent.transports.registry import is_host_scope_channel
     _is_kubewiz = is_kubewiz_channel()
-    # The programmatic post-check blocks below (disk fill / disk burn) describe
-    # K8s CRD-mode concepts (container overlay, imagefs vs nodefs, tool pod) and
-    # must NEVER surface for host-channel verification. Guard explicitly instead
-    # of relying on the post-check artifacts merely happening to be k8s-only.
-    _is_host_channel = is_host_scope_channel(state)
     context = (
         f"{layer1_context}"
         f"{coverage_context}"
@@ -1048,7 +1093,6 @@ def _build_first_iteration_context(
         f"Target namespace: {target.get('namespace', '')}\n"
         f"Target names: {target.get('names', [])}\n"
         f"Blade params: {params}\n"
-        f"Kubeconfig: {'(kubewiz)' if _is_kubewiz else (kubeconfig or '(default)')}\n"
     )
     # task-29848471: if the target names contain a transient injection
     # vehicle (debug/tool pod), the L2 model must be told explicitly not
@@ -1164,89 +1208,6 @@ def _build_first_iteration_context(
             f"API instead (discover the experiment resource kind via the cluster query "
             f"tool itself; knowledge docs provide reference forms).\n"
         )
-    # Programmatic post-check: injection engine already verified the fill effect
-    # during injection. This is authoritative — present it BEFORE verification
-    # instructions so the LLM can use it as primary evidence.
-    _post_check = state.get("disk_fill_post_check") or params.get("disk_fill_post_check")
-    if not _is_host_channel and _post_check and isinstance(_post_check, dict):
-        _fill_found = _post_check.get("fill_file_found", False)
-        _target_pod = _post_check.get("target_pod", "unknown")
-        _ls_out = _post_check.get("ls_output", "")
-        _df_out = _post_check.get("df_output", "")
-        context += (
-            f"\n## Injection Engine Post-Check (already executed)\n"
-            f"The injection engine programmatically verified the fill effect on "
-            f"target node via tool pod `{_target_pod}`:\n"
-        )
-        if _fill_found:
-            context += (
-                f"- **Fill file FOUND** in container overlay — injection is WORKING.\n"
-                f"- `ls` output:\n```\n{_ls_out[:300]}\n```\n"
-            )
-        else:
-            context += (
-                f"- **Fill file NOT found** in container overlay.\n"
-                f"- `ls` output:\n```\n{_ls_out[:300]}\n```\n"
-            )
-        if _df_out:
-            context += (
-                f"- `df -h` output:\n```\n{_df_out[:300]}\n```\n"
-            )
-        context += (
-            "Use this as PRIMARY evidence. If fill file was found, you have direct "
-            "proof the fault is in effect. If not found, the fault may not have "
-            "worked — cross-validate with other checks.\n"
-        )
-    # Programmatic post-check: injection engine already verified the burn I/O effect
-    # during injection. This is authoritative — present it BEFORE verification
-    # instructions so the LLM can use it as primary evidence.
-    _burn_check = state.get("disk_burn_post_check") or params.get("disk_burn_post_check")
-    if not _is_host_channel and _burn_check and isinstance(_burn_check, dict):
-        _burn_detected = _burn_check.get("burn_io_detected", False)
-        _active_parts = _burn_check.get("active_partitions", [])
-        _burn_target_pod = _burn_check.get("target_pod", "unknown")
-        _burn_node = _burn_check.get("node", "unknown")
-        _burn_scope = _burn_check.get("scope", "node")
-        if _burn_scope == "pod":
-            _scope_desc = (
-                f"target pod's node `{_burn_node}` via pod `{_burn_target_pod}`"
-            )
-        else:
-            _scope_desc = (
-                f"target node `{_burn_node}` via tool pod `{_burn_target_pod}`"
-            )
-        if _burn_detected:
-            _parts_str = ", ".join(
-                f"{p['name']}: ~{p['write_throughput_mb_s']} MB/s"
-                for p in _active_parts[:5]
-            )
-            context += (
-                f"\n## Disk Burn I/O Pre-Check (AUTHORITATIVE)\n"
-                f"The injection engine programmatically verified the burn I/O effect on "
-                f"{_scope_desc}.\n"
-                f"Programmatic check confirmed: disk burn I/O is ACTIVE.\n"
-                f"Write throughput on partition(s): {_parts_str}\n"
-                f"This is DEFINITIVE evidence that the disk burn fault is in effect — "
-                f"the dd processes are actively writing to the container overlay.\n"
-                f"The I/O appears on the overlay's backing partition (typically imagefs, "
-                f"e.g. /dev/vdb), NOT on the nodefs partition (e.g. /dev/vda3) where "
-                f"/host/tmp resides. This is expected: CRD-mode burn writes to the "
-                f"container overlay, not the host filesystem.\n"
-                f"DO NOT conclude \"failed\" based on /host/tmp/ having no burn files "
-                f"or nodefs (vda3) showing no I/O — the burn is on a DIFFERENT partition.\n"
-                f"The measured write throughput above is the effect evidence "
-                f"for the disk I/O verification step.\n"
-            )
-        else:
-            context += (
-                f"\n## Disk Burn I/O Pre-Check\n"
-                f"The injection engine programmatically verified the burn I/O effect on "
-                f"{_scope_desc}.\n"
-                f"Burn I/O NOT detected on any partition. "
-                f"Active partitions: {_active_parts[:5] or 'none with measurable I/O'}\n"
-                f"The fault may not be in effect despite blade query reporting Success. "
-                f"Cross-validate with other checks (ps | grep dd, iostat).\n"
-            )
     context += (
         "\n## Injection Verification Instructions\n"
     )

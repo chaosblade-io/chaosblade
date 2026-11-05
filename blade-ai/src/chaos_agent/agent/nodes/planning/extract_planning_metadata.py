@@ -312,6 +312,64 @@ def _extract_planning_fault_identity(messages: list) -> tuple[str, str, str]:
     return "", "", ""
 
 
+def _extract_planning_fault_selectors(
+    messages: list,
+) -> tuple[str, tuple | None, dict | None]:
+    """Read the victim-selector declaration from the LAST finish_planning call.
+
+    The D2 full-identity channel: ``fault_namespace`` / ``fault_names`` /
+    ``fault_labels`` travel on the same carrier as the identity triple (see
+    ``_extract_planning_fault_identity``) — the tool body never consumes them,
+    this node reads them raw from the message history. This is the
+    AUTHORITATIVE source of the target's name/namespace; probe order no longer
+    back-fills them.
+
+    Coercion mirrors ``submit_fault_intent`` (``_coerce_to_list`` /
+    ``_coerce_to_dict``): LLMs emit both real containers and JSON-stringified
+    forms. ``names`` / ``labels`` are ``None`` when the arg is ABSENT (not
+    declared) and an empty tuple/dict when declared-empty — the distinction
+    lets the writer fall back to clearing stale old-scope selectors only when
+    the declaration truly omitted them.
+
+    Returns ``(namespace, names, labels)``; ``("", None, None)`` when no
+    finish_planning call is present.
+    """
+    # Function-local import: intent_clarification is a sibling planning node;
+    # a module-level back-import would risk a cycle (same discipline as the
+    # providers import in drift_policy).
+    from chaos_agent.agent.nodes.planning.intent_clarification import (
+        _coerce_to_dict,
+        _coerce_to_list,
+    )
+
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            name = tc.get("name", "") if isinstance(tc, dict) else ""
+            if name != "finish_planning":
+                continue
+            args = tc.get("args", {}) if isinstance(tc, dict) else {}
+            ns = str(args.get("fault_namespace") or "").strip()
+            raw_names = args.get("fault_names")
+            names = (
+                tuple(str(n) for n in _coerce_to_list(raw_names, "names"))
+                if raw_names is not None
+                else None
+            )
+            raw_labels = args.get("fault_labels")
+            labels = (
+                {
+                    str(k): str(v)
+                    for k, v in _coerce_to_dict(raw_labels, "labels").items()
+                }
+                if raw_labels is not None
+                else None
+            )
+            return ns, names, labels
+    return "", None, None
+
+
 def _identity_nudge_plan_family_reset() -> dict:
     """Plan-family reset carried by both identity nudges (F1).
 
@@ -333,6 +391,35 @@ def _identity_nudge_plan_family_reset() -> dict:
         "is_complex": False,
         "skill_case_content": None,
     }
+
+
+def _scope_candidates_hint(state: dict) -> str:
+    """Registered fault_scope candidates, narrowed by the transport channel.
+
+    The transport profile is resolved INDEPENDENTLY of the (invalid) declared
+    scope — the same axis :func:`resolve_profile_verdict` compares — so a
+    bare-host channel deterministically rules out every k8s kind and vice versa.
+    This only NARROWS the menu the vocabulary nudge shows; the host-vs-python
+    choice (both families share ``PROFILE_HOST``) is never auto-guessed — it
+    stays the planner's, so an unregistered scope is corrected, not silently
+    re-assigned.
+    """
+    from chaos_agent.agent.spec.fault_registry import profile_of_scope
+    from chaos_agent.agent.spec.fault_spec import INTENT_SCOPES
+    from chaos_agent.transports import profile_of, resolve_channel_name
+
+    transport_profile = profile_of(resolve_channel_name(state))
+    candidates = [
+        s for s in INTENT_SCOPES if profile_of_scope(s) == transport_profile
+    ]
+    if not candidates:
+        # Unresolvable channel: fall back to the full vocabulary so the nudge
+        # still names every legal domain (safety_check remains the backstop).
+        candidates = list(INTENT_SCOPES)
+    return (
+        "Registered fault domains reachable over this task's injection channel: "
+        f"{', '.join(candidates)}."
+    )
 
 
 def _derive_scope_target_action(source_text: str) -> tuple[str, str, str]:
@@ -819,6 +906,11 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         )
         decl_scope, decl_target, decl_action = _extract_planning_fault_identity(messages)
         declared = bool(decl_scope or decl_target or decl_action)
+        # D2: the victim selector (namespace/names/labels) rides the same
+        # finish_planning carrier. It is the authoritative name/namespace
+        # source; probe order no longer back-fills it (see cli-nl-identity-
+        # from-declaration).
+        decl_ns, decl_names, decl_labels = _extract_planning_fault_selectors(messages)
 
         if declared:
             conflict = (
@@ -854,16 +946,96 @@ async def extract_planning_metadata(state: AgentState) -> dict:
                 # conflicting declaration is discarded (the guard remains
                 # the final arbiter); fall through without any rewrite.
             elif not identity_complete:
-                if decl_scope and decl_scope != spec.scope:
+                # fault_scope VOCABULARY guard — validate BEFORE the write-once
+                # freeze (mirrors the banned-verb / identity-split nudges above).
+                # A single-scope domain's blade command carries NO domain token
+                # (`blade create file append`, unlike k8s `pod-cpu`), so the
+                # planner sometimes backfills the target word ("file") into
+                # fault_scope. Freezing that guess is fatal AND uncorrectable:
+                # safety_check rejects post-freeze, where the write-once locks
+                # make a corrected re-declaration futile (fd4f4f0e). Refusing it
+                # HERE — while spec.scope is still empty — lets the corrected
+                # round-2 declaration land via this same fill branch. Single-shot
+                # (_scope_vocab_nudged): a still-invalid re-declaration falls
+                # through and freezes, so safety_check's terminal fail-fast
+                # (defect A1) stays the untouched backstop and the loop cannot
+                # spin to PLANNING_TIMEOUT.
+                from chaos_agent.agent.spec.fault_registry import family_for_scope
+
+                if (
+                    decl_scope
+                    and family_for_scope(decl_scope) is None
+                    and not state.get("_scope_vocab_nudged")
+                ):
+                    result["planning_rejected"] = True
+                    result["_scope_vocab_nudged"] = True
+                    result.update(_identity_nudge_plan_family_reset())
+                    result["messages"] = [HumanMessage(content=wrap_system_reminder(
+                        "**UNREGISTERED fault_scope**: you declared "
+                        f"fault_scope={decl_scope!r}, which is not a registered "
+                        "fault domain. fault_scope is the RESOURCE-FAMILY DOMAIN "
+                        "the fault attaches to — NOT a ChaosBlade command/target "
+                        f"token ({decl_scope!r} is a fault_TARGET value, e.g. the "
+                        "`file` in `blade create file append`).\n\n"
+                        f"{_scope_candidates_hint(state)}\n\n"
+                        "Re-run `finish_planning` with fault_scope set to one of "
+                        "those domains (for a bare-host file/CPU/mem/disk fault "
+                        "the domain is `host`; the `file`/`cpu`/... token goes in "
+                        "fault_target)."
+                    ))]
+                    logger.warning(
+                        "extract_planning_metadata: declared fault_scope %r is "
+                        "not a registered domain; nudging pre-freeze correction "
+                        "(write-once would make it fatal downstream)",
+                        decl_scope,
+                    )
+                    return result
+                scope_changed = bool(decl_scope and decl_scope != spec.scope)
+                if scope_changed:
                     updates["scope"] = decl_scope
-                    if spec.names:
-                        updates["names"] = ()
-                    if spec.labels:
-                        updates["labels"] = {}
                 if decl_target and decl_target != spec.fault_target:
                     updates["fault_target"] = decl_target
                 if decl_action and decl_action != spec.fault_action:
                     updates["fault_action"] = decl_action
+                # D2 full-identity declaration: namespace/names/labels come
+                # from the planner's declaration, NOT probe order. A declared
+                # selector wins outright; an ABSENT one (None) falls back to
+                # clearing stale old-scope selectors on a scope change (B76
+                # kind-consistency: a name/label locked under the old scope is
+                # kind-inconsistent with the new one). A declared-empty
+                # selector (()/ {}) is honoured as an explicit namespace-wide
+                # intent, not treated as absent.
+                if decl_ns and decl_ns != spec.namespace:
+                    updates["namespace"] = decl_ns
+                if decl_names is not None:
+                    # Vehicle-name defense (ported from the retired
+                    # agent_loop._drop_vehicle_names, task-29848471): a
+                    # transient debug/tool pod the LLM quotes as the victim
+                    # must never be persisted. Mirrors plan_builder's
+                    # _build_spec_from_submit — refuse the declared names if
+                    # any NEW name is a known injection vehicle, keeping the
+                    # prior selector so the confirmation gate / verifier anchor
+                    # stay on the real target.
+                    from chaos_agent.agent.execution_artifacts import is_vehicle_name
+
+                    _vehicle_hits = [
+                        n for n in decl_names
+                        if n not in spec.names and is_vehicle_name(n, state)
+                    ]
+                    if _vehicle_hits:
+                        logger.warning(
+                            "spec-write blocked: writer=extract_planning_metadata "
+                            "declaration vehicle name(s) %s rejected, keeping "
+                            "names %s", _vehicle_hits, list(spec.names),
+                        )
+                    else:
+                        updates["names"] = decl_names
+                elif scope_changed and spec.names:
+                    updates["names"] = ()
+                if decl_labels is not None:
+                    updates["labels"] = decl_labels
+                elif scope_changed and spec.labels:
+                    updates["labels"] = {}
         elif not identity_complete:
             # No declaration → derive from the plan's Execution Steps first
             # (the LLM's actual plan — never the case menu): fill-vacuum
@@ -992,8 +1164,9 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         result["fault_spec"] = new_spec.to_dict()
         logger.debug(
             "spec-write: writer=extract_planning_metadata "
-            "names %s -> %s basis=skill-case fault_type derivation + "
-            "duration contract backfill (names never modified here)",
+            "names %s -> %s basis=finish_planning declaration (victim "
+            "selector) + plan-step identity derivation + duration contract "
+            "backfill",
             list(spec.names), list(new_spec.names),
         )
         logger.info(

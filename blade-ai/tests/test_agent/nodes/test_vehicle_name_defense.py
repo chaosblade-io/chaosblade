@@ -15,7 +15,6 @@ import pytest
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from chaos_agent.agent.execution_artifacts import is_vehicle_name
-from chaos_agent.agent.nodes.execute.agent_loop import _drop_vehicle_names
 from chaos_agent.agent.nodes.planning.plan_builder import _build_spec_from_submit
 from chaos_agent.agent.spec.fault_spec import FaultSpec
 
@@ -132,33 +131,16 @@ class TestBuildSpecFromSubmitVehicleBlock:
 
 
 # ---------------------------------------------------------------------------
-# Write-side defense 2: agent_loop lazy derivation helper
+# Write-side defense 2 (RETIRED with D1/D4): the agent_loop lazy-derivation
+# helper ``_drop_vehicle_names`` was deleted when probe-order identity
+# derivation was removed (cli-nl-identity-from-declaration). The vehicle-name
+# defense it carried was MIGRATED — not dropped — to the declaration
+# consumption point in extract_planning_metadata (now the authoritative
+# identity source). It is pinned there by
+# ``test_declaration_rejects_vehicle_name_keeps_prior`` in
+# tests/test_agent/nodes/test_extract_planning_metadata.py. Defense 1
+# (plan_builder._build_spec_from_submit) above is unchanged.
 # ---------------------------------------------------------------------------
-
-
-class TestDropVehicleNames:
-    def test_vehicle_names_dropped_other_fields_kept(self):
-        updates = {"namespace": "default", "scope": "pod", "names": (VEHICLE,)}
-        _drop_vehicle_names(updates, state={}, v_args=f"get pod {VEHICLE}")
-        assert "names" not in updates
-        assert updates["namespace"] == "default"
-        assert updates["scope"] == "pod"
-
-    def test_legit_names_untouched(self):
-        updates = {"names": ("mysql-79794985d4-7zl5p",)}
-        _drop_vehicle_names(updates, state={}, v_args="get pod mysql")
-        assert updates["names"] == ("mysql-79794985d4-7zl5p",)
-
-    def test_no_names_key_is_noop(self):
-        updates = {"namespace": "default"}
-        _drop_vehicle_names(updates, state={}, v_args="get pods -n default")
-        assert updates == {"namespace": "default"}
-
-    def test_mixed_names_with_one_vehicle_drops_all(self):
-        """A names tuple is atomic — partial writes would split the target."""
-        updates = {"names": ("mysql-abc", VEHICLE)}
-        _drop_vehicle_names(updates, state={}, v_args="get pod")
-        assert "names" not in updates
 
 
 # ---------------------------------------------------------------------------

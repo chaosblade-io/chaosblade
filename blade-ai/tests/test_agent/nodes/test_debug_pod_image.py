@@ -15,7 +15,7 @@ see the W-67-1 section at the bottom for the classification pins.
 """
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
@@ -583,5 +583,5 @@ async def test_tool_pod_fallback_runs_unless_the_node_itself_is_missing(
                          new=discover):
         await _executors._execute_observations(commands, "/kc", "t-fb")
 
-    create.assert_awaited_once_with("ghost-node", "/kc", "t-fb")
+    create.assert_awaited_once_with("ghost-node", "/kc", "t-fb", target=ANY)
     assert discover.await_count == (1 if fallback_expected else 0)

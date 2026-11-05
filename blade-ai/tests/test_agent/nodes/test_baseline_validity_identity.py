@@ -762,7 +762,7 @@ class TestR10ReplayEndToEnd:
 
         exec_calls = {"n": 0}
 
-        async def fake_exec(resolved, kubeconfig, task_id):
+        async def fake_exec(resolved, kubeconfig, task_id, *, target=None):
             exec_calls["n"] += 1
             if exec_calls["n"] == 1:
                 return _r10_observations()

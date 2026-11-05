@@ -36,7 +36,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
-from chaos_agent.transports import PROFILE_HOST, PROFILE_K8S
+from chaos_agent.transports import (
+    PROFILE_HOST,
+    PROFILE_K8S,
+    TransportTarget,
+    resolve_transport_target,
+)
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
@@ -290,6 +295,8 @@ def run_all_detectors(
     after: PostInjectState,
     ctx: DetectionContext,
     profile: str | None = None,
+    *,
+    skipped_out: dict[str, str] | None = None,
 ) -> dict[str, list[dict]]:
     """Run the detectors for ``profile`` (default ``ctx.profile``).
 
@@ -303,6 +310,13 @@ def run_all_detectors(
     cluster: case #40 reported EndpointRemovals 2→0 off a failed endpoints
     query, and ProcessDeath would report every baseline process dead off a
     failed ``ps``. Use :func:`unreadable_channels` to surface what was skipped.
+
+    W-83-5 root-fix (``skipped_out``): a key-absent findings entry is
+    indistinguishable, at the summary layer, from "ran and found nothing" — so
+    a skipped detector rendered as ``DependencyErrors: 0`` (a clean zero) across
+    ≥6 cases. When ``skipped_out`` is supplied, every gated-off detector is
+    recorded there as ``{detector_key: reason}`` so the caller can surface the
+    lost capability as a first-class SKIPPED state instead of a silent zero.
     """
     prof = profile or ctx.profile or PROFILE_K8S
     unreadable = unreadable_channels(after)
@@ -344,6 +358,13 @@ def run_all_detectors(
                 "channel(s) %s (%s) — data missing, not empty",
                 d.key, ", ".join(blocked), " | ".join(sources),
             )
+            if skipped_out is not None:
+                # Surface the lost capability, not just the failed channel:
+                # {detector_key: which channels blocked it and why}.
+                skipped_out[d.key] = (
+                    f"not adjudicated — unreadable capture channel(s): "
+                    f"{', '.join(blocked)}"
+                )
             continue
         try:
             items = d.detect(before, after, ctx)
@@ -408,11 +429,13 @@ class SideEffectObserver(Protocol):
         ...
 
     async def capture_base_snapshot(
-        self, spec, kubeconfig: str, task_id: str = ""
+        self, spec, kubeconfig: str, task_id: str = "",
+        *, xport_target: "TransportTarget | None" = None,
     ) -> SideEffectSnapshot | None: ...
 
     async def fetch_post_inject_state(
-        self, spec, kubeconfig: str, injection_start_time: str, task_id: str = ""
+        self, spec, kubeconfig: str, injection_start_time: str, task_id: str = "",
+        *, xport_target: "TransportTarget | None" = None,
     ) -> PostInjectState: ...
 
     def summarize(self, snapshot: SideEffectSnapshot) -> tuple[str, dict]:
@@ -438,10 +461,19 @@ def resolve_observer(profile: str) -> SideEffectObserver | None:
     return _OBSERVERS.get(profile)
 
 
-async def capture_primary_metrics(spec, kubeconfig: str) -> dict:
+async def capture_primary_metrics(
+    spec, kubeconfig: str, *, xport_target: TransportTarget | None = None,
+) -> dict:
     """Capture the fault dimension's primary metric by reusing the feasibility
     ``(profile, target)`` probe. Returns ``{}`` when no probe applies or the
     read fails (fail-open — primary metrics are advisory context).
+
+    ``xport_target`` is the single-authority transport target resolved from the
+    owning node's state; it rides down to ``probe.measure`` so the reused
+    feasibility probe reads per-session kubewiz values from state, not settings.
+    Named ``xport_target`` to avoid the ``target`` fault-dimension string bound
+    below. ``None`` falls back to settings-only (byte-identical to the pre-seam
+    behaviour) for genuinely stateless callers.
     """
     from chaos_agent.agent.spec.feasibility import (
         profile_for_spec,
@@ -455,7 +487,7 @@ async def capture_primary_metrics(spec, kubeconfig: str) -> dict:
     if probe is None:
         return {}
     try:
-        m = await probe.measure(spec, kubeconfig)
+        m = await probe.measure(spec, kubeconfig, xport_target=xport_target)
     except Exception as exc:
         logger.debug("primary-metric probe failed for target=%s: %s", target, exc)
         return {}
@@ -495,7 +527,8 @@ def _pod_key(namespace: str, name: str) -> str:
 
 
 async def capture_snapshot(
-    namespace: str, kubeconfig: str, *, node_name: str = "", task_id: str = ""
+    namespace: str, kubeconfig: str, *, node_name: str = "", task_id: str = "",
+    target: TransportTarget | None = None,
 ) -> SideEffectSnapshot | None:
     """Capture pre-injection state. Returns None on failure.
 
@@ -506,15 +539,15 @@ async def capture_snapshot(
     namespace. Endpoints are namespace/service concepts and are left empty for
     node scope.
     """
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.config.settings import settings
 
-    _target = TransportTarget.from_state({})
-    pods_cmd = build_kubectl_cmd("get", _pods_get_args(namespace, node_name), kubeconfig=kubeconfig)
+    _target = target if target is not None else resolve_transport_target(None)
+    pods_cmd = build_kubectl_cmd("get", _pods_get_args(namespace, node_name), kubeconfig=kubeconfig, target=_target)
     tasks = [execute_via_transport(pods_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id, source="se-snapshot-pods", expect_profile=PROFILE_K8S)]
     if not node_name:
-        ep_cmd = build_kubectl_cmd("get", ["endpoints", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
+        ep_cmd = build_kubectl_cmd("get", ["endpoints", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig, target=_target)
         tasks.append(execute_via_transport(ep_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id, source="se-snapshot-endpoints", expect_profile=PROFILE_K8S))
 
     try:
@@ -590,26 +623,44 @@ async def fetch_post_inject_state(
     target_names: list[str],
     *,
     node_name: str = "",
+    scope: str = "",
+    labels: dict | None = None,
     task_id: str = "",
+    target: TransportTarget | None = None,
 ) -> PostInjectState:
     """Query current state for side-effect diffing.
 
     Symmetric with ``capture_snapshot``: node-scoped faults fetch the pods on
     the node (all namespaces) and that node's events; namespace-scoped faults
-    fetch the namespace's pods / events / endpoints plus the target pod's logs.
+    fetch the namespace's pods / events / endpoints plus — only when ``scope``
+    names a workload (:func:`is_workload_scope`) — the target pod's logs. A
+    non-workload apiserver-write target (Secret/ConfigMap/Ingress/Service/…)
+    has no pod to read logs from, so the logs channel is skipped for it.
+
+    W-83-5 root-fix: under a workload scope the logs channel must address a
+    literal POD, not the workload name. ``kubectl logs <deployment-name>``
+    resolves the bare name as a Pod → NotFound → the ``target_logs`` channel
+    goes Unreadable → ``DependencyErrorDetector`` is silently skipped for the
+    whole deployment/statefulset/daemonset class. The pod name is now resolved
+    through the shared ``target_identity`` seam; an unresolvable target marks
+    the channel Unreadable with an explicit "unresolved" diagnosis (a VISIBLE
+    absence) instead of issuing a doomed bare-workload-name query.
     """
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.config.settings import settings
+    from chaos_agent.agent.spec.fault_registry import is_workload_scope
+    from chaos_agent.agent.target_identity import resolve_target_pod_name
 
-    _target = TransportTarget.from_state({})
-    pods_cmd = build_kubectl_cmd("get", _pods_get_args(namespace, node_name), kubeconfig=kubeconfig)
+    _target = target if target is not None else resolve_transport_target(None)
+    _capture_errors: dict[str, str] = {}
+    pods_cmd = build_kubectl_cmd("get", _pods_get_args(namespace, node_name), kubeconfig=kubeconfig, target=_target)
     if node_name:
         events_cmd = build_kubectl_cmd("get", [
             "events", "-A", "--field-selector", f"involvedObject.name={node_name}", "-o", "json",
-        ], kubeconfig=kubeconfig)
+        ], kubeconfig=kubeconfig, target=_target)
     else:
-        events_cmd = build_kubectl_cmd("get", ["events", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
+        events_cmd = build_kubectl_cmd("get", ["events", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig, target=_target)
 
     tasks = [
         execute_via_transport(pods_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id, source="se-detect-pods", expect_profile=PROFILE_K8S),
@@ -620,23 +671,58 @@ async def fetch_post_inject_state(
     ep_index = -1
     logs_index = -1
     if not node_name:
-        ep_cmd = build_kubectl_cmd("get", ["endpoints", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
+        ep_cmd = build_kubectl_cmd("get", ["endpoints", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig, target=_target)
         tasks.append(execute_via_transport(ep_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id, source="se-detect-endpoints", expect_profile=PROFILE_K8S))
         ep_index = len(tasks) - 1
-        if target_names:
-            logs_cmd = build_kubectl_cmd("logs", [
-                target_names[0], "-n", namespace,
-                f"--since-time={injection_start_time}", "--tail=200",
-            ], kubeconfig=kubeconfig)
-            tasks.append(execute_via_transport(logs_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id, source="se-detect-logs", expect_profile=PROFILE_K8S))
-            logs_index = len(tasks) - 1
+        # Target-pod logs exist only for a workload target. A non-workload
+        # apiserver-write target (Secret/ConfigMap/Ingress/Service/PVC…) has no
+        # pod, so ``kubectl logs <name>`` is structurally meaningless and always
+        # fails NotFound (r9 inject-6450ed4d: scope=secret issued
+        # ``kubectl logs drill-tls-secret`` → exit 1, a spurious capture_error).
+        # Gate on the canonical workload-scope predicate so the channel is
+        # skipped rather than error-logged.
+        if target_names and is_workload_scope(scope):
+            # W-83-5 root-fix: ``kubectl logs`` addresses a POD, and a bare
+            # workload name (deployment/statefulset/daemonset) resolves as a Pod
+            # → NotFound → target_logs Unreadable → DependencyErrorDetector
+            # silently skipped for the whole workload class. Resolve the target
+            # to a literal pod through the shared seam (self-contained: the
+            # side-effect node has no pre-discovered selector, so discovery is
+            # opt-in here). This is the SAME resolution baseline's
+            # ``_resolve_target_pod`` uses — one authority, no re-derivation.
+            resolved_pod = await resolve_target_pod_name(
+                scope=scope, names=target_names, namespace=namespace,
+                kubeconfig=kubeconfig, labels=labels, discover_selector=True,
+                task_id=task_id, target=_target,
+            )
+            if resolved_pod:
+                logs_cmd = build_kubectl_cmd("logs", [
+                    resolved_pod, "-n", namespace,
+                    f"--since-time={injection_start_time}", "--tail=200",
+                ], kubeconfig=kubeconfig, target=_target)
+                tasks.append(execute_via_transport(logs_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id, source="se-detect-logs", expect_profile=PROFILE_K8S))
+                logs_index = len(tasks) - 1
+            else:
+                # Visible absence (the #61 invariant): the pod could not be
+                # resolved, so mark the channel Unreadable with an explicit
+                # diagnosis. The B77 gate then skips — and, via
+                # ``_skipped_detectors``, REPORTS — every detector that reads
+                # target_logs. A doomed bare-workload-name query is never
+                # issued, so its NotFound can no longer masquerade as "no logs".
+                _capture_errors["target_logs"] = (
+                    f"unresolved: no pod resolved for {scope}/{target_names[0]} "
+                    "(a workload name is never substituted for a pod name)"
+                )
+                logger.warning(
+                    "post-inject target_logs channel Unreadable: unresolved pod "
+                    "for %s/%s (workload name not substituted)",
+                    scope, target_names[0],
+                )
 
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     except Exception:
-        return PostInjectState(captured_at=now_iso())
-
-    _capture_errors: dict[str, str] = {}
+        return PostInjectState(captured_at=now_iso(), capture_errors=_capture_errors)
 
     def _safe_json(result, *, tag: str = "") -> dict:
         if isinstance(result, Exception):
@@ -1238,23 +1324,37 @@ class K8sObserver:
             return True
         return bool(self._node_name(spec))
 
-    async def capture_base_snapshot(self, spec, kubeconfig: str, task_id: str = "") -> SideEffectSnapshot | None:
+    async def capture_base_snapshot(
+        self, spec, kubeconfig: str, task_id: str = "",
+        *, xport_target: TransportTarget | None = None,
+    ) -> SideEffectSnapshot | None:
         namespace = getattr(spec, "namespace", "") or ""
-        snap = await capture_snapshot(namespace, kubeconfig, node_name=self._node_name(spec), task_id=task_id)
+        snap = await capture_snapshot(
+            namespace, kubeconfig, node_name=self._node_name(spec),
+            task_id=task_id, target=xport_target,
+        )
         if snap is not None:
-            snap.primary_metrics = await capture_primary_metrics(spec, kubeconfig)
+            snap.primary_metrics = await capture_primary_metrics(
+                spec, kubeconfig, xport_target=xport_target,
+            )
         return snap
 
     async def fetch_post_inject_state(
-        self, spec, kubeconfig: str, injection_start_time: str, task_id: str = ""
+        self, spec, kubeconfig: str, injection_start_time: str, task_id: str = "",
+        *, xport_target: TransportTarget | None = None,
     ) -> PostInjectState:
         namespace = getattr(spec, "namespace", "") or ""
         target_names = list(getattr(spec, "names", []) or [])
         state = await fetch_post_inject_state(
             namespace, kubeconfig, injection_start_time, target_names,
-            node_name=self._node_name(spec), task_id=task_id,
+            node_name=self._node_name(spec),
+            scope=getattr(spec, "scope", "") or "",
+            labels=dict(getattr(spec, "labels", {}) or {}), task_id=task_id,
+            target=xport_target,
         )
-        state.primary_metrics = await capture_primary_metrics(spec, kubeconfig)
+        state.primary_metrics = await capture_primary_metrics(
+            spec, kubeconfig, xport_target=xport_target,
+        )
         return state
 
     def summarize(self, snapshot: SideEffectSnapshot) -> tuple[str, dict]:
@@ -1269,16 +1369,19 @@ class K8sObserver:
 # --- host diagnostic IO (read-only shell via transport, skip_guard) ---------
 
 
-async def _run_host_diag(command: list[str], timeout: int = 10) -> str | None:
+async def _run_host_diag(
+    command: list[str], timeout: int = 10,
+    *, target: TransportTarget | None = None,
+) -> str | None:
     """Run one read-only host diagnostic. Returns stdout or None on failure."""
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
 
     if not command:
         return None
     try:
-        target = TransportTarget.from_state({})
+        _target = target if target is not None else resolve_transport_target(None)
         result = await execute_via_transport(
-            command, target, timeout=timeout,
+            command, _target, timeout=timeout,
             source="se-host-observe", skip_guard=True,
             # A bare host diagnostic: on a cluster-addressing channel the
             # platform executor answers, so the "side effect" observed would
@@ -1332,19 +1435,131 @@ def _is_kernel_thread(comm: str) -> bool:
     return any(comm.startswith(p) for p in _KERNEL_THREAD_PREFIXES)
 
 
+# ChaosBlade injection/recovery MECHANISM processes churn for the same reason
+# kernel threads do — independently of whether the fault killed anything — and
+# are likewise never a meaningful process-death side effect. They are spawned
+# and torn down by the injection apparatus itself, whether THIS run's or a
+# CONCURRENT blade experiment's on the same shared host. Three sub-classes:
+#   1. ``chaos_*`` — the ChaosBlade OS action executors: the ``chaos_os``
+#      dispatcher plus every per-action binary enumerated in the os-spec
+#      (chaos_dns, chaos_straceerror, chaos_occupynetwork, chaos_filldisk, …).
+#      Blade spawns them at inject and they exit at recovery. ``comm`` is
+#      truncated to 15 chars (``chaos_stracedelay`` → ``chaos_stracedel``) but
+#      the ``chaos_`` prefix always survives, so one prefix match covers every
+#      variant across blade versions.
+#   2. ``setsid`` / ``sh`` / ``sleep`` — the self-recovery timer arm wrapper.
+#      The no-systemd carrier is ``setsid --fork sh -c 'sleep <N>; blade
+#      destroy …'`` (see host_shell provider ``injection_binaries``) and blade's
+#      own ``--timeout`` wraps the inverse the same way, so an ``sh``/``sleep``
+#      pair lives for the whole fault window then vanishes at the deadline.
+#   3. ``strace`` — the real injector binary blade's syscall actions
+#      (chaos_stracedelay / chaos_straceerror) attach with (``strace -p <pid>
+#      -e inject=…``); it detaches at recovery, so a concurrent syscall drill
+#      self-recovering inside our window reads as a "death" here.
+# ProcessDeathDetector diffs ``comm=`` NAME SETS with no PID identity: it can
+# only fire when a name vanishes host-wide and can never attribute a specific
+# instance to the fault. On a drill host these names are dominated by mechanism
+# churn (frequently a CONCURRENT experiment's, not this run's), so keeping them
+# yields structural false "collateral death" reports that poison the postmortem
+# with invented causal stories (e.g. "DNS hijack reaped strace/chaos_os"). This
+# recurs on EVERY host self-recovery run and EVERY overlapping concurrent drill
+# (observed live: CPU case [sh, sleep], process-kill case [sh, sleep], DNS
+# hijack case [chaos_os, sh, sleep, strace]). We drop them before the snapshot,
+# exactly like kernel threads — completing the same invariant rather than
+# leaving the mechanism-scaffolding members of the class unfiltered.
+#
+# Caveat (mirrors the ``watchdogd`` caveat above): ``sh``/``sleep``/``strace``
+# are dual-use — a legitimate workload could run them. We accept that loss
+# because the name-set diff could not attribute such a death to the fault
+# anyway (it cannot tell one ``sh`` from another), whereas the mechanism-churn
+# false positive is structural. ``sshd``/``nginx``/``bash`` and other real
+# daemons/workload shells are deliberately NOT filtered — their disappearance
+# host-wide is still a genuine side effect worth surfacing.
+_INJECTION_MECHANISM_PREFIXES: tuple[str, ...] = ("chaos_",)
+_INJECTION_MECHANISM_EXACT: frozenset[str] = frozenset({
+    "setsid", "sh", "sleep", "strace",
+})
+
+
+def _is_injection_mechanism_process(comm: str) -> bool:
+    """Heuristic: is ``comm`` a ChaosBlade injection/recovery mechanism process?
+
+    These are spawned and torn down by the injection apparatus itself — the
+    blade ``chaos_*`` executors, the ``setsid``/``sh``/``sleep`` self-recovery
+    timer arm, and the ``strace`` syscall-inject helper — so they are never a
+    fault victim. Matched by a curated prefix/exact set sourced from the
+    ChaosBlade os-spec action registry and the host_shell carrier grammar; see
+    the block comment above for the full rationale and the dual-use caveat.
+    """
+    if comm in _INJECTION_MECHANISM_EXACT:
+        return True
+    return any(comm.startswith(p) for p in _INJECTION_MECHANISM_PREFIXES)
+
+
+# The observer's OWN diagnostic binaries are the third and most fundamental
+# source of phantom "process deaths" — this is self-observation contamination,
+# present on EVERY host-profile run regardless of any concurrent drill or blade
+# mechanism. ``HostObserver._capture_host`` / ``fetch_post_inject_state`` run
+# these four diagnostics CONCURRENTLY (``asyncio.gather``) with the
+# ``ps -e -o comm=`` snapshot, so the ``ps`` sample can catch a sibling
+# diagnostic still alive — ``dmesg`` most of all (it drains the whole kernel
+# ring buffer, ``timeout=8``). That self-spawned name lands in the before-set;
+# if the after-side instance already exited by the time its own ``ps`` sampled,
+# the name vanishes and ProcessDeathDetector reports it as a "collateral death"
+# of the fault. The measurement apparatus must never be counted as part of the
+# measured system, so we drop these names before the snapshot — completing the
+# same invariant as kernel threads and injection-mechanism processes: the
+# process snapshot excludes EVERY comm name that churns independently of the
+# injected fault.
+#
+# Authoritative source: the ``_run_host_diag`` argv list in ``_capture_host`` /
+# ``fetch_post_inject_state`` (kept adjacent below). If a diagnostic is added
+# there, its binary MUST be added here too — ``test_observer_diagnostic_set_
+# matches_capture_commands`` guards against that drift.
+#
+# Caveat (mirrors the dual-use caveats above): ``systemctl`` is also a real
+# service manager, but the CLI process is transient (it exits after listing /
+# toggling units) and a service going DOWN is surfaced independently by
+# ServiceDownDetector via the ``services`` channel — never by the ``systemctl``
+# comm name in the process channel. ``ps``/``df``/``dmesg`` are pure diagnostic
+# CLIs, never daemons, never fault victims. ``sshd``/``nginx``/``bash`` and
+# other real daemons/workload processes are deliberately NOT filtered.
+_OBSERVER_DIAGNOSTIC_EXACT: frozenset[str] = frozenset({
+    "ps", "df", "systemctl", "dmesg",
+})
+
+
+def _is_observer_diagnostic(comm: str) -> bool:
+    """Heuristic: is ``comm`` one of the observer's own diagnostic binaries?
+
+    The ``ps``/``df``/``systemctl``/``dmesg`` commands HostObserver runs
+    concurrently with its own process snapshot can be caught alive by that
+    snapshot, contaminating the baseline with the measurement apparatus itself.
+    They churn independently of the fault and are never a meaningful
+    process-death side effect; see the block comment above.
+    """
+    return comm in _OBSERVER_DIAGNOSTIC_EXACT
+
+
 def _parse_process_comms(out: str | None) -> set[str]:
     """Parse ``ps -e -o comm=`` into a set of USER-SPACE process names.
 
-    Kernel threads are filtered out (see :func:`_is_kernel_thread`): they churn
-    on their own and would otherwise flood ProcessDeathDetector with false
-    positives.
+    Three classes are filtered out because they churn independently of any
+    injected fault and would otherwise flood ProcessDeathDetector with false
+    positives: kernel threads (see :func:`_is_kernel_thread`), ChaosBlade
+    injection/recovery mechanism processes (see
+    :func:`_is_injection_mechanism_process`), and the observer's own diagnostic
+    binaries (see :func:`_is_observer_diagnostic`).
     """
     if not out:
         return set()
     return {
         comm
         for ln in out.splitlines()
-        if (comm := ln.strip()) and not _is_kernel_thread(comm)
+        if (comm := ln.strip())
+        and not _is_kernel_thread(comm)
+        and not _is_injection_mechanism_process(comm)
+        and not _is_observer_diagnostic(comm)
     }
 
 
@@ -1394,12 +1609,14 @@ class HostObserver:
         # is always "this host", so capture is always possible.
         return True
 
-    async def _capture_host(self) -> tuple[HostSnapshot, dict[str, str]]:
+    async def _capture_host(
+        self, *, xport_target: TransportTarget | None = None,
+    ) -> tuple[HostSnapshot, dict[str, str]]:
         ps_out, df_out, svc_out, dmesg_out = await asyncio.gather(
-            _run_host_diag(["ps", "-e", "-o", "comm="]),
-            _run_host_diag(["df", "-P"]),
-            _run_host_diag(["systemctl", "list-units", "--type=service", "--no-legend", "--plain"]),
-            _run_host_diag(["dmesg"], timeout=8),
+            _run_host_diag(["ps", "-e", "-o", "comm="], target=xport_target),
+            _run_host_diag(["df", "-P"], target=xport_target),
+            _run_host_diag(["systemctl", "list-units", "--type=service", "--no-legend", "--plain"], target=xport_target),
+            _run_host_diag(["dmesg"], timeout=8, target=xport_target),
         )
         # F2 symmetry: a None diag output is a FAILED baseline capture, not
         # an empty host — record it exactly like the after side does, so a
@@ -1426,26 +1643,32 @@ class HostObserver:
         )
         return host, _capture_errors
 
-    async def capture_base_snapshot(self, spec, kubeconfig: str, task_id: str = "") -> SideEffectSnapshot | None:
-        host, capture_errors = await self._capture_host()
+    async def capture_base_snapshot(
+        self, spec, kubeconfig: str, task_id: str = "",
+        *, xport_target: TransportTarget | None = None,
+    ) -> SideEffectSnapshot | None:
+        host, capture_errors = await self._capture_host(xport_target=xport_target)
         snap = SideEffectSnapshot(
             captured_at=now_iso(), namespace="", host=host,
             capture_errors=capture_errors,
         )
-        snap.primary_metrics = await capture_primary_metrics(spec, kubeconfig)
+        snap.primary_metrics = await capture_primary_metrics(
+            spec, kubeconfig, xport_target=xport_target,
+        )
         return snap
 
     async def fetch_post_inject_state(
-        self, spec, kubeconfig: str, injection_start_time: str, task_id: str = ""
+        self, spec, kubeconfig: str, injection_start_time: str, task_id: str = "",
+        *, xport_target: TransportTarget | None = None,
     ) -> PostInjectState:
         # Return the full current host picture; DmesgOOMDetector slices the
         # dmesg tail against the baseline cursor (before.host.dmesg_line_count)
         # so only kernel lines produced after injection are considered.
         ps_out, df_out, svc_out, dmesg_out = await asyncio.gather(
-            _run_host_diag(["ps", "-e", "-o", "comm="]),
-            _run_host_diag(["df", "-P"]),
-            _run_host_diag(["systemctl", "list-units", "--type=service", "--no-legend", "--plain"]),
-            _run_host_diag(["dmesg"], timeout=8),
+            _run_host_diag(["ps", "-e", "-o", "comm="], target=xport_target),
+            _run_host_diag(["df", "-P"], target=xport_target),
+            _run_host_diag(["systemctl", "list-units", "--type=service", "--no-legend", "--plain"], target=xport_target),
+            _run_host_diag(["dmesg"], timeout=8, target=xport_target),
         )
         # B77 tri-state: a None diag output is a FAILED capture, not an empty
         # host — record it so the detectors reading that channel are gated
@@ -1469,7 +1692,9 @@ class HostObserver:
         state = PostInjectState(
             captured_at=now_iso(), host=host, capture_errors=_capture_errors,
         )
-        state.primary_metrics = await capture_primary_metrics(spec, kubeconfig)
+        state.primary_metrics = await capture_primary_metrics(
+            spec, kubeconfig, xport_target=xport_target,
+        )
         return state
 
     def summarize(self, snapshot: SideEffectSnapshot) -> tuple[str, dict]:

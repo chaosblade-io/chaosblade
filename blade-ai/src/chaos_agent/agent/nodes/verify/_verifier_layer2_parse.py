@@ -9,6 +9,7 @@ import json
 import logging
 import re
 
+from chaos_agent.agent.nodes.verify._metric_extractor import canonicalize_number
 from chaos_agent.agent.nodes.verify._verifier_shared import (
     _parse_status_keyword,
     has_checklist,
@@ -16,7 +17,6 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
 )
 from chaos_agent.agent.result.verdict import (
     CHECKLIST_BENIGN_STATUSES,
-    CHECKLIST_NON_PASSED_STATUSES,
     CHECKLIST_STATUS_VALUES,
     Checklist,
     ChecklistItem,
@@ -38,43 +38,38 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# E2 Phase 3 — Evidence cross-check
+# Evidence cross-check — structured metric claims (W-77R-5 root fix)
 # ---------------------------------------------------------------------------
 #
-# After the LLM emits its VERIFICATION_RESULT, this helper compares the
-# baseline→post numbers it CITES in evidence against the structured
-# metric timeline accumulated on state.metric_observations
-# (populated by PreReasoningHook from each ToolMessage's extracted_metrics).
+# After the LLM submits its verdict, this helper compares the numeric
+# baseline→post claims it STRUCTURED via submit_verification's
+# ``metric_claims`` against the metric timeline accumulated on
+# state.metric_observations (populated by PreReasoningHook from each
+# ToolMessage's extracted_metrics).
 #
-# Failure mode this catches: the LLM claims "RestartCount 7 → 8 (Δ+1)"
-# in evidence — but the timeline shows RestartCount stayed at 7 across
-# every iteration. Without this cross-check the LLM could declare
-# ``verified`` based on a hallucinated change. We don't try to be clever
-# about partial agreement; the rule is simple — if the LLM claims a
-# change AND the timeline says no change for the same metric, downgrade
-# the verdict and warn.
-
-# Number with optional unit suffix (%, m for millicores, Mi/Gi/Ki for memory).
-# The whitespace tolerance covers both "7 → 8" and "7→8". Unit suffix
-# groups are non-capturing — we only care about the numeric values for
-# delta computation; unit parsing happens later via _parse_numeric.
+# Failure mode this catches: the LLM claims "RestartCount 7 → 8" but the
+# timeline shows RestartCount stayed at 7 across every iteration — without
+# this cross-check the LLM could declare ``verified`` on a hallucinated
+# change.
 #
-# Comma-grouped numbers ("78,505,306 → 78,697,402") are matched as whole
-# values. Without the grouped alternative the engine backtracks past the
-# commas and parses "306 → 78" — a fabricated delta with wrong numbers
-# landing in the contradiction warning, or a false-positive downgrade
-# when the LLM faithfully cited a comma-formatted change. The grouped
-# branch is listed first so "123456" still falls through to plain digits.
-_DELTA_PATTERN = re.compile(
-    r"(?P<base>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?\s*(?:→|->|to|—>)\s*"
-    r"(?P<post>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?",
-    re.IGNORECASE,
-)
-
-# How many chars of left context to scan for a metric-name mention.
-# Smaller window → fewer false positives; larger → catches metric name
-# preceding multiple sentences. 80 chars ≈ one sentence.
-_METRIC_CONTEXT_LOOKBACK = 80
+# Binding discipline (the W-77R-5 fix): WHICH metric a claim refers to is
+# declared by the LLM as a structured key (``metric_claims[].metric``), NOT
+# reverse-inferred by the program from free text. The old path parsed
+# ``layer2.details`` with a delta regex + substring metric-name guess
+# (``_pick_metric_by_context``); because K8s metric families nest as
+# substrings (``"replicas"`` ⊂ ``"updatedreplicas"``), a CORRECT
+# ``updatedReplicas 3→1`` claim was mis-bound to the unmoving ``Replicas``
+# and falsely downgraded verified→partial (task inject-0fc9a9a1). Semantic
+# binding is the LLM's job (it reads the difference); numeric comparison is
+# the program's job (exact key lookup). The program never parses natural
+# language to recover a binding.
+#
+# Fail-open (danger asymmetry): a false downgrade of a real-injection
+# verdict is worse than a missed hallucination — it is an authoritative
+# override that silently rewrites ``level``. So the cross-check downgrades
+# ONLY on a deterministic contradiction (declared key exactly hits truth,
+# truth shows zero change, claim declares non-zero). No structured claims,
+# or a declared key absent from the timeline, ABSTAIN (warn at most).
 
 
 def _parse_numeric(value: str) -> float | None:
@@ -92,61 +87,6 @@ def _parse_numeric(value: str) -> float | None:
         return float(m.group(1))
     except ValueError:
         return None
-
-
-def _metric_alias(name: str) -> str:
-    """Normalise a metric name for substring matching against LLM evidence.
-
-    Drops parenthetical qualifiers and lowercases — so
-    ``"Disk usage (overlay)"`` matches LLM text mentioning
-    ``"disk usage"`` regardless of whether it spelled out the partition.
-    """
-    return re.sub(r"\s*\([^)]*\)", "", name).strip().lower()
-
-
-def _pick_metric_by_context(
-    context_lc: str,
-    truth: dict[str, tuple[float, float]],
-) -> str | None:
-    """Resolve which truth metric a given evidence context refers to.
-
-    Two priorities:
-
-    1. **Full-name hit** — if the context literally contains the
-       full metric name (e.g. ``"disk usage (overlay)"``), that's the
-       answer. Most specific signal wins.
-    2. **Alias hit** — fall back to the parenthetical-stripped form
-       (e.g. ``"disk usage"`` matching either overlay or nodefs). When
-       multiple metrics share the same alias, prefer the one with the
-       LONGEST full name, on the theory that more-qualified metric
-       names are usually more recently added and thus more specific.
-       If still ambiguous, return ``None`` rather than guess wrong —
-       false silence here is better than a false contradiction
-       downgrading a real-injection verdict.
-
-    Returns ``None`` when no metric name appears in the context window.
-    """
-    # Priority 1: full-name match (deterministic — exactly one full
-    # name per truth key, no ambiguity).
-    for metric_name in truth:
-        if metric_name.lower() in context_lc:
-            return metric_name
-
-    # Priority 2: alias match. Collect all candidates, dedupe by alias
-    # to detect collisions.
-    alias_hits = [m for m in truth if _metric_alias(m) in context_lc]
-    if not alias_hits:
-        return None
-    if len(alias_hits) == 1:
-        return alias_hits[0]
-
-    # Multiple aliases collide (e.g. "Disk usage (overlay)" and
-    # "Disk usage (nodefs)" both alias to "disk usage"). The evidence
-    # didn't qualify which one — refuse to guess. Returning None here
-    # is the conservative-side path: we skip the cross-check for this
-    # delta rather than risk a false contradiction warning that
-    # would wrongly downgrade a valid verdict.
-    return None
 
 
 def _collect_evidence_text(result: dict) -> str:
@@ -167,15 +107,22 @@ def _collect_evidence_text(result: dict) -> str:
     return "\n".join(parts)
 
 
-def _build_truth_deltas(
+def _build_truth_series(
     observations: list[dict],
-) -> dict[str, tuple[float, float]]:
-    """For each metric seen across observations, compute (baseline, post).
+) -> dict[str, list[float]]:
+    """For each metric seen across observations, its full numeric series in
+    iteration order (same-iteration ties keep arrival order).
 
-    Baseline = earliest iteration's value; post = latest iteration's
-    value. Skips metrics where either value isn't numeric (e.g.
-    ``"OOMKilled"``, ``"True"``) — those have their own categorical
-    detection elsewhere and don't fit the delta-comparison model.
+    Replaces the old first-vs-last ``(base, post)`` tuple: a zero
+    first-vs-last delta is NOT proof the metric never changed — it's an
+    artifact of self-recovery (last obs reverted to baseline, so a real
+    mid-window peak gets erased by comparing only the endpoints; D15 Mode A)
+    or a single-phase snapshot (baseline read dropped by the extractor, so
+    the series is constant at the post value; Mode B). The contradiction
+    check needs the WHOLE series to tell "pinned at one value" from "moved
+    and came back". Non-numeric values (revision hashes, ``"OOMKilled"``,
+    ``"True"``) are skipped — those have their own categorical detection
+    elsewhere; a metric needs >=2 numeric observations to be comparable.
     """
     by_metric: dict[str, list[tuple[int, str]]] = {}
     for obs in observations or []:
@@ -183,64 +130,343 @@ def _build_truth_deltas(
         for name, value in (obs.get("metrics") or {}).items():
             by_metric.setdefault(name, []).append((iteration, value))
 
-    deltas: dict[str, tuple[float, float]] = {}
+    series: dict[str, list[float]] = {}
     for name, values in by_metric.items():
         if len(values) < 2:
             continue
         values.sort(key=lambda t: t[0])
-        base = _parse_numeric(values[0][1])
-        post = _parse_numeric(values[-1][1])
-        if base is None or post is None:
+        nums = [
+            n for n in (_parse_numeric(raw) for _, raw in values)
+            if n is not None
+        ]
+        if len(nums) < 2:
             continue
-        deltas[name] = (base, post)
-    return deltas
+        series[name] = nums
+    return series
 
 
-def _find_contradictions(
-    evidence: str,
-    truth: dict[str, tuple[float, float]],
-    n_obs: int,
-) -> list[str]:
-    """Scan evidence for ``X→Y`` deltas that contradict ``truth``.
+def _unknown_key_abstain_note(metric: str, base, post) -> str:
+    """Honest coverage-gap warning for a claim whose metric key is absent from
+    the timeline AND whose value could not be corroborated by fingerprint.
 
-    Conservative MVP: only flags the "LLM claims change, truth shows
-    no change" case. Inverse cases are handled elsewhere
-    (``_detect_checklist_conclusion_inconsistency``).
+    This is the B-minimal text, kept byte-stable: absence is symmetric between
+    an extractor coverage gap and a genuine hallucination, so it NEVER
+    downgrades (D12 fail-open danger asymmetry) and directs the auditor to
+    out-of-band confirmation. ``test_unknown_key_is_warning_not_contradiction``
+    pins the ``out-of-band`` invariant.
+    """
+    return (
+        f"LLM cited metric '{metric}' (baseline={base}, post={post}) "
+        f"whose key is absent from the observation timeline, so it "
+        f"cannot be cross-checked. The timeline only carries what "
+        f"extract_metrics parses from a FIXED vocabulary of "
+        f"structured reads (df / describe pod / get -o json / "
+        f"labeled jsonpath / top / /proc/stat / diskstats / du / "
+        f"logs / get-table); free-form exec output (ping, "
+        f"/proc/net/*, tc -s qdisc, ss, iptables -L, ...) is "
+        f"structurally not parsed. Absence is therefore ambiguous "
+        f"between an extractor coverage gap and a genuine "
+        f"hallucination, which the framework cannot distinguish "
+        f"without a declared evidence anchor. NOT downgrading "
+        f"(absence is not a contradiction); this evidence class "
+        f"requires out-of-band confirmation."
+    )
+
+
+def _norm_source(s: str) -> str:
+    """Normalize a source/command fragment for substring anchoring (D17 T3):
+    case-fold + collapse internal whitespace, so an LLM-echoed ``"tc  -s
+    qdisc"`` matches the stored command ``"kubectl exec … -- tc -s qdisc show
+    dev eth0"``. Deliberately a soft substring relation, NOT an exact match —
+    the LLM cannot reliably reproduce a full kubectl invocation, and an
+    unmappable/ambiguous source abstains (fail-open) rather than guessing."""
+    return " ".join((s or "").lower().split())
+
+
+# A declared metric-claim value is a number the LLM may annotate with a unit
+# ("1014.755 ms", "0%", "6.433 ms") or leave bare (1012.525). Both are the SAME
+# numeric claim, so the cross-check must key on the value's semantics, not on
+# whether the LLM happened to append a unit — without this tolerance the whole
+# D17 layer is inert for unit-suffixed claims (float("1014.755 ms") raises), so
+# the same drill is cross-checked in one run and silently skipped in the next on
+# pure output-formatting variance. Anchored at the START so a measurement must be
+# presented as a leading quantity; a genuinely non-numeric base/post ("OOMKilled",
+# "sub-ms healthy expectation") has no leading digit → None → skipped, exactly the
+# pre-existing behaviour for a non-numeric claim.
+_CLAIM_NUM_RE = re.compile(r"^\s*([-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)")
+
+
+def _parse_claim_number(value) -> float | None:
+    """Numeric value of a metric-claim base/post, tolerating a trailing unit.
+
+    Returns the float for a bare number (int / float / numeric string) or a
+    unit-suffixed string (``"1014.755 ms"`` → 1014.755); ``None`` for a genuinely
+    non-numeric claim (no leading digit, NaN / ±inf, wrong type) so the caller
+    skips it. ``bool`` is rejected explicitly (``isinstance(True, int)`` is True).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+    elif isinstance(value, str):
+        m = _CLAIM_NUM_RE.match(value)
+        if not m:
+            return None
+        try:
+            f = float(m.group(1))
+        except ValueError:
+            return None
+    else:
+        return None
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / ±inf
+        return None
+    return f
+
+
+def _classify_unknown_claim(
+    claim: dict,
+    metric: str,
+    base,
+    post,
+    fingerprints: dict | None,
+) -> tuple[str, str]:
+    """D17 — resolve a claim whose metric key is ABSENT from the structured
+    timeline using the format-agnostic value fingerprint, breaking the
+    hallucination-vs-coverage-gap symmetry the key space cannot (D12).
+
+    Returns ``(classification, note)``:
+      - "corroborated" (T2): the claimed post value appears in some harvested
+        observation output AS A STANDALONE NUMBER (the ``numeric_fields`` view)
+        → the number is REAL, its key was simply never parsed into the timeline
+        (extractor coverage gap, NOT a hallucination). Non-downgrading positive
+        note. This is the netem-class fix: ``tc -s qdisc`` / ping values the
+        fixed-vocabulary extractor returns ``{}`` for are nonetheless provable
+        from the raw output.
+      - "abstain" (T2-weak): the value's digits occur in an observation ONLY
+        inside a longer non-numeric token — a hex experiment UID (``932`` of
+        ``932eaa6bd493bf54``) or an ISO-date component whose sign is really a
+        separator (``-10`` of ``2026-10-27``) — or the fingerprint predates
+        field-grading. Such a collision proves too little to certify reality,
+        and it simultaneously defeats T3's absence proof, so the only sound
+        ruling is an honest coverage-gap warning. Never downgrades.
+      - "fabricated" (T3): the claim explicitly declares ``kind=raw`` and a
+        ``source`` that anchors to EXACTLY ONE complete harvested observation,
+        and the value is in NO observation output → a verbatim-copied number
+        that exists nowhere is a deterministic fabrication. MAY downgrade
+        (routed to the contradictions channel by ``_check_metric_claims``).
+      - "abstain": no fingerprint, a derived/unmarked claim, an unmapped or
+        ambiguous source, an incomplete harvest, or a value not found without a
+        raw+source anchor → honest coverage-gap warning, never downgrades (D12).
+
+    MONOTONICITY — the invariant that makes T2's narrowing safe. T2-weak
+    intercepts exactly the values present in the over-inclusive ``tokens`` union
+    but absent from every ``numeric_fields``, and T3 still keys its absence proof
+    on ``tokens``. T3 therefore fires on precisely the inputs it fired on before
+    field-grading existed: this design can turn a "corroborated" into an
+    "abstain", never into a "fabricated". Narrowing the presence certificate
+    cannot manufacture a false accusation.
+
+    Fail-open by construction: T2 only ever SUPPRESSES a scary warning when the
+    value is positively present as a number; T3 only fires on a strict per-source
+    anchor to a COMPLETE harvest (every ambiguous case abstains), so it cannot
+    reproduce D12's false-downgrade — the value axis is positively exhaustive
+    where the key axis was merely absent.
+    """
+    # Unit-tolerant parse (fix b): a claim post of "1014.755 ms" carries the
+    # SAME numeric value as a bare 1014.755, so it must canonicalize identically
+    # rather than be silently dropped (float("1014.755 ms") raises). Without this
+    # the whole D17 fingerprint comparison is inert for unit-suffixed claims and
+    # the identical drill is cross-checked in one run, skipped in the next.
+    post_canon = canonicalize_number(_parse_claim_number(post))
+    if post_canon is None or not fingerprints:
+        return "abstain", _unknown_key_abstain_note(metric, base, post)
+    fps = [fp for fp in fingerprints.values() if isinstance(fp, dict)]
+    field_hits = sorted({
+        (fp.get("tool_name") or "?") for fp in fps
+        if post_canon in (fp.get("numeric_fields") or [])
+    })
+    if field_hits:
+        return "corroborated", (
+            f"LLM cited metric '{metric}' (baseline={base}, post={post}) whose "
+            f"key is not in the structured timeline (free-form exec output the "
+            f"fixed-vocabulary extractor does not parse), but its post value "
+            f"{post} WAS found as a standalone numeric field in harvested "
+            f"observation output ({', '.join(field_hits)}). Value-presence "
+            f"corroborates the claim (D17 T2) — an extractor coverage gap, NOT "
+            f"a hallucination. NOT downgrading."
+        )
+    token_hits = sorted({
+        (fp.get("tool_name") or "?") for fp in fps
+        if post_canon in (fp.get("tokens") or [])
+    })
+    if token_hits:
+        # Present only as an embedded digit run. Certifying this as REAL is what
+        # let an incidental UID/date collision vouch for a hallucinated value;
+        # and because the digits ARE in the over-inclusive corpus, T3 cannot
+        # prove absence either. Both certificates fail → abstain (fail-open).
+        return "abstain", (
+            f"LLM cited metric '{metric}' (baseline={base}, post={post}) whose "
+            f"key is not in the structured timeline. The value's digits DO occur "
+            f"in harvested observation output ({', '.join(token_hits)}), but only "
+            f"inside a longer non-numeric token — an experiment UID or timestamp "
+            f"fragment — never as a standalone number. That collision is too weak "
+            f"to certify the value as REAL, and it also defeats the absence proof, "
+            f"so neither certificate applies (D17 T2-weak). Coverage-gap warning, "
+            f"NOT downgrading."
+        )
+    # T3 — fabrication. The value is in NO harvested observation: it is absent
+    # from every ``numeric_fields`` AND from every ``tokens`` (both unions were
+    # checked above), i.e. absent from the over-inclusive corpus the absence
+    # proof requires. Downgrade ONLY under strict per-source anchoring;
+    # every ambiguous case abstains (fail-open, D12's lesson). The claim must
+    # explicitly declare kind=raw AND a source mapping to EXACTLY ONE complete
+    # harvest — a derived value, a missing/unmapped/ambiguous source, or an
+    # incomplete (token-capped) harvest all abstain. D17 earns this downgrade
+    # where D12 could not: the value axis is positively exhaustive (the full
+    # raw output was harvested), so absence here is proof, not a coverage gap.
+    kind = str(claim.get("kind") or "").strip().lower()
+    source = str(claim.get("source") or "").strip()
+    if kind != "raw" or not source:
+        return "abstain", _unknown_key_abstain_note(metric, base, post)
+    src_norm = _norm_source(source)
+    anchored = [
+        fp for fp in fingerprints.values()
+        if isinstance(fp, dict) and fp.get("complete") and src_norm
+        and src_norm in _norm_source(fp.get("command") or "")
+    ]
+    if len(anchored) != 1:
+        # Unmapped (0) or ambiguous (2+) source → cannot prove WHICH observation
+        # the LLM read → abstain rather than risk a false downgrade.
+        return "abstain", _unknown_key_abstain_note(metric, base, post)
+    if post_canon in (anchored[0].get("tokens") or []):
+        # Load-bearing monotonicity guard, not merely defensive: ``anchored[0]``
+        # is a subset of the ``tokens`` union already ruled out above, so this
+        # cannot fire today. Re-checking here is what keeps a narrowing of the T2
+        # PRESENCE certificate (as field-grading just did) from ever widening the
+        # T3 DOWNGRADE set — should the token-union gate above ever be made
+        # stricter, this falls back to abstain rather than manufacturing a false
+        # accusation.
+        return "abstain", _unknown_key_abstain_note(metric, base, post)
+    return "fabricated", (
+        f"LLM claims {metric} {base}→{post} as a RAW value read from "
+        f"'{source}', but that observation was harvested IN FULL and its output "
+        f"contains no such value {post} — nor does ANY other cluster observation "
+        f"(D17 T3). A verbatim-copied number that exists in no observation is a "
+        f"deterministic fabrication, not an extractor coverage gap."
+    )
+
+
+def _check_metric_claims(
+    claims: list,
+    truth: dict[str, list[float]],
+    fingerprints: dict | None = None,
+) -> tuple[list[str], list[str]]:
+    """Compare LLM-declared structured metric claims against ``truth``.
+
+    Each claim is ``{"metric": key, "baseline": n, "post": n}`` — the
+    binding (which metric a number belongs to) is DECLARED by the LLM, so
+    the program does an exact key lookup, never a substring guess.
+
+    Returns ``(contradictions, notes)``:
+      - contradictions: deterministic fabrication signals that MAY downgrade
+        the verdict. Two kinds: (a) the observed series is CONSTANT (metric
+        provably never moved) at a value that is NOT the claimed post — the
+        claimed transition to ``post`` never materialized for an exactly-matched
+        key (a zero first-vs-last delta alone is NOT enough; see
+        ``_build_truth_series`` / D15: self-recovery and single-phase snapshots
+        both fake it). (b) D17 T3: an ABSENT-key claim explicitly declared
+        ``kind=raw`` whose value is provably in NO harvested observation
+        (strict per-source anchor; see ``_classify_unknown_claim``).
+      - notes: NON-downgrading auditor notes appended to ``warnings``. All for
+        a key absent from the timeline (D17): a value-presence CORROBORATION
+        (T2 — the post value was found AS A STANDALONE NUMBER in a harvested
+        observation output, so it is a coverage gap not a hallucination) and an
+        honest ABSTAIN coverage-gap warning. The abstain arm covers both the
+        uncorroborated value and T2-weak, where the value's digits occur only
+        inside a longer non-numeric token (a UID / timestamp fragment) — too
+        weak to certify reality, and it defeats the absence proof besides.
+        Neither ever downgrades — absence cannot be distinguished from an
+        extractor coverage gap, so per the fail-open danger asymmetry it must
+        not override the LLM's verdict.
+
+    ``fingerprints`` (D17) is the ``state.evidence_fingerprints`` map
+    ``{tool_call_id: {tokens, numeric_fields, complete, tool_name, command}}``
+    harvested from raw observation output — ``tokens`` is the over-inclusive
+    corpus the absence proof (T3) keys on, ``numeric_fields`` the delimited
+    subset that alone may certify presence (T2); see
+    ``harvest_evidence_fingerprint``. ``None`` (legacy callers / no
+    observations) makes every absent-key claim abstain, i.e. byte-identical to
+    pre-D17 behaviour, and a fingerprint persisted before field-grading (no
+    ``numeric_fields`` key) likewise abstains rather than certifying.
     """
     contradictions: list[str] = []
-    for match in _DELTA_PATTERN.finditer(evidence):
-        base_str, post_str = match.group("base"), match.group("post")
-        try:
-            # Strip comma grouping before float() — the pattern captures
-            # the literal LLM text (kept verbatim in the warning below),
-            # e.g. "78,505,306" → 78505306.0.
-            llm_base = float(base_str.replace(",", ""))
-            llm_post = float(post_str.replace(",", ""))
-        except ValueError:
+    notes: list[str] = []
+    for claim in claims or []:
+        if not isinstance(claim, dict):
             continue
-        llm_delta = llm_post - llm_base
-        if llm_delta == 0:
+        metric = claim.get("metric")
+        if not isinstance(metric, str) or not metric:
+            continue
+        base, post = claim.get("baseline"), claim.get("post")
+        # Unit-tolerant parse (fix b): tolerate a trailing unit on either value
+        # ("1014.755 ms", "0%") so the cross-check keys on the number, not on
+        # whether the LLM happened to annotate it. A genuinely non-numeric
+        # base/post ("OOMKilled", bool, NaN) yields None → skipped, exactly the
+        # pre-existing behaviour for a claim with nothing numeric to disprove.
+        base_num = _parse_claim_number(base)
+        declared_post = _parse_claim_number(post)
+        if base_num is None or declared_post is None:
+            continue  # non-numeric claim — nothing to cross-check
+        declared_delta = declared_post - base_num
+        if declared_delta == 0:
             continue  # LLM claims no change — nothing to disprove
 
-        ctx_start = max(0, match.start() - _METRIC_CONTEXT_LOOKBACK)
-        context_lc = evidence[ctx_start:match.start()].lower()
-        metric = _pick_metric_by_context(context_lc, truth)
-        if metric is None:
+        if metric not in truth:
+            # D17 — the key is absent from the structured timeline. Resolve via
+            # the format-agnostic value fingerprint (see _classify_unknown_claim):
+            # T2 corroborates (value present AS A STANDALONE NUMBER → positive
+            # note), T3 flags a provable fabrication (kind=raw anchored to
+            # exactly one complete harvest, value present nowhere in the
+            # over-inclusive token corpus → contradiction), and every other case
+            # abstains with an honest coverage-gap warning — including T2-weak,
+            # where the value's digits occur only inside a longer non-numeric
+            # token. Only the T3 "fabricated" classification routes to
+            # contradictions; T2 and both abstain arms append to ``notes`` and
+            # never downgrade. With no kind/source declared (or
+            # fingerprints=None) the branch can only ever append to ``notes``.
+            classification, note = _classify_unknown_claim(
+                claim, metric, base, post, fingerprints,
+            )
+            if classification == "fabricated":
+                contradictions.append(note)
+            else:  # "corroborated" (T2) or "abstain" (incl. T2-weak) — no downgrade
+                notes.append(note)
             continue
 
-        truth_base, truth_post = truth[metric]
-        # Only flag the strong-signal case: truth shows ZERO change but
-        # LLM cites a non-zero delta. Partial mismatches (e.g. truth
-        # delta = +1, LLM delta = +5) might still be a real change the
-        # LLM rounded — too noisy to flag.
-        if truth_post - truth_base == 0:
+        series = truth[metric]
+        # Deterministic contradiction (D15): the observed series is CONSTANT
+        # across every observation AND that constant is NOT the claimed post
+        # — the metric provably never moved, so the claimed transition to
+        # ``post`` never happened. Anchoring on the constant value (not the
+        # first-vs-last delta) is what makes this sound for self-recovering
+        # timelines (Mode A: series [0,0,2,2,0] is not constant) and
+        # single-phase snapshots pinned at the post value (Mode B: [2,2,2]
+        # claim 0→2 — constant == post → the endpoint is corroborated, so
+        # abstain). Partial mismatches (non-constant series) stay silent —
+        # too noisy to flag.
+        if (
+            len(series) >= 2
+            and all(v == series[0] for v in series)
+            and series[0] != declared_post
+        ):
             contradictions.append(
-                f"LLM evidence cites {metric} "
-                f"{base_str}→{post_str} (Δ={llm_delta:+g}), "
+                f"LLM claims {metric} {base}→{post} (Δ={declared_delta:+g}), "
                 f"but observation timeline shows no change "
-                f"(stayed at {truth_base:g} across {n_obs} iteration(s))"
+                f"(pinned at {series[0]:g} across {len(series)} "
+                f"observation(s); claimed post {declared_post:g} never "
+                f"appeared)"
             )
-    return contradictions
+    return contradictions, notes
 
 
 def _apply_contradiction_downgrade(
@@ -271,27 +497,43 @@ def _apply_contradiction_downgrade(
 def cross_check_evidence(
     result: dict,
     observations: list[dict] | None,
+    fingerprints: dict | None = None,
 ) -> dict:
-    """Detect LLM evidence numbers that contradict the observation timeline.
+    """Detect LLM structured metric claims that contradict the timeline.
 
-    Pipeline:
-      1. Build per-metric truth deltas from observations.
-      2. Gather all free-text evidence the LLM emitted.
-      3. Find contradictions (LLM claims delta, truth says zero).
-      4. If any: append warnings + downgrade verdict.
+    Pipeline (structured binding — see module header):
+      1. Read the LLM's declared ``metric_claims`` (from submit_verification
+         args / JSON mode). No claims → abstain (fail-open, no mutation).
+      2. Build per-metric truth series (full iteration-ordered numeric
+         observations) from the timeline.
+      3. Exact-key compare each claim; collect deterministic contradictions
+         (may downgrade) and non-downgrading notes (D17 value-presence
+         corroboration + honest coverage-gap abstain).
+      4. Append notes; if contradictions, downgrade verdict.
 
-    Returns ``result`` (mutated). Safe to call with empty / missing
-    observations — early-exits with no mutation.
+    ``fingerprints`` (D17) is ``state.evidence_fingerprints`` — the
+    format-agnostic value harvest that lets an absent-key claim be corroborated
+    by value-presence (T2) instead of only warned about. When BOTH the key-space
+    truth and the value-space fingerprints are empty there is nothing to
+    cross-check against, so it early-exits with no mutation (byte-identical to
+    pre-D17 behaviour for legacy callers passing only observations).
+
+    Returns ``result`` (mutated). Safe with empty / missing observations,
+    fingerprints, or claims.
     """
-    if not observations:
+    claims = result.get("metric_claims") or []
+    if not claims:
+        return result  # fail-open: no structured binding → abstain
+    truth = _build_truth_series(observations)
+    if not truth and not fingerprints:
+        # Nothing in either the key space (timeline) or the value space
+        # (fingerprints) to cross-check against → abstain, no mutation. A
+        # pure free-form-exec drill (no structured read ever parsed) lands
+        # here on the key space but is still corroborable via fingerprints.
         return result
-    truth = _build_truth_deltas(observations)
-    if not truth:
-        return result
-    evidence = _collect_evidence_text(result)
-    if not evidence:
-        return result
-    contradictions = _find_contradictions(evidence, truth, len(observations))
+    contradictions, notes = _check_metric_claims(claims, truth, fingerprints)
+    if notes:
+        result.setdefault("warnings", []).extend(notes)
     if contradictions:
         _apply_contradiction_downgrade(result, contradictions)
     return result
@@ -326,13 +568,10 @@ def _determine_level(l1_status: str, l2_status: str) -> str:
     return "unverified"
 
 
-_CONTRADICTION_INDICATORS = {
-    "cpu": ["cpu usage high", "cpu utilization", "cpu at"],
-    "network": ["packet loss", "network delay", "latency increased",
-                "connection refused", "network loss"],
-    "disk": ["disk usage", "disk full", "no space left"],
-    "process": ["restart count", "crashloop", "oomkilled"],
-}
+# _CONTRADICTION_INDICATORS removed (Phase 2c / D14): the program no longer
+# reverse-infers "contradiction" semantics from free-text layer2.details via a
+# static keyword table. verdict overrides consume structured status enums only
+# (structured-evidence-binding spec, third consumption face).
 
 
 # _has_negative_prefix and _parse_status_keyword moved to _verifier_shared.py
@@ -396,26 +635,25 @@ def _has_checklist(text: str) -> bool:
 def _detect_checklist_conclusion_inconsistency(
     checklist_items: list[dict],
     l2_status: str,
-    failed_evidence: str = "",
 ) -> tuple[str | None, bool]:
-    """Detect when checklist items contradict the Layer2 conclusion.
+    """Detect a STRUCTURAL contradiction between checklist statuses and Layer2.
 
-    Checks if any checklist item is 'failed' while Layer2 overall says 'passed'.
-    This is a structural inconsistency in the LLM's own output.
+    Purely a closed-set ``ChecklistItemStatus`` enum comparison — the program
+    never reads ``evidence`` free text and never reverse-infers absence /
+    benign / expected-negative semantics from it (D14, structured-evidence-
+    binding spec: the third verdict-override consumption face).
 
-    Note: 'expected' status items are intentionally excluded from this check.
-    'expected' represents anticipated negative results (e.g., DiskPressure=False
-    when below threshold) — they are informational confirmations, not failures,
-    and should not trigger inconsistency detection.
+    The single downgrade trigger: Layer2 concluded ``passed`` while at least one
+    checklist item is marked ``failed``. That is the LLM contradicting itself at
+    the structured-status level (a hard enum inconsistency), so the program
+    downgrades to ``partial``.
 
-    For transient faults (e.g. disk-burn), steps marked 'recovered_before_observation'
-    with no 'failed' or 'partial' steps do NOT trigger inconsistency when Layer2
-    is 'passed' — the LLM correctly judged the fault was active despite the
-    observation tool limitation.
-
-    When the failed items' evidence contains ABSENCE phrases (metrics far below
-    threshold, not just slightly off), the conclusion is auto-downgraded to
-    'partial' because objective measurement overrides subjective judgment.
+    Benign non-passed statuses (``partial``, ``recovered_before_observation``,
+    ``expected``, ``skipped``, ``not_applicable``) do NOT contradict a ``passed``
+    conclusion and MUST NOT trigger a downgrade — whether such a step represents
+    fault-effect absence / a benign / an expected-negative outcome is the LLM's
+    judgement, expressed via its status choice, not the program's to re-derive
+    from text.
 
     Returns:
         (warning_message | None, should_auto_downgrade: bool)
@@ -423,64 +661,64 @@ def _detect_checklist_conclusion_inconsistency(
     if l2_status != "passed" or not checklist_items:
         return None, False
 
-    _non_passed_statuses = CHECKLIST_NON_PASSED_STATUSES
-    non_passed_items = [
+    failed_items = [
         item for item in checklist_items
-        if item.get("status") in _non_passed_statuses
+        if isinstance(item, dict) and item.get("status") == "failed"
     ]
-    if not non_passed_items:
+    if not failed_items:
         return None, False
 
-    failed_items = [item for item in non_passed_items if item.get("status") == "failed"]
-    partial_items = [item for item in non_passed_items if item.get("status") == "partial"]
-    recovered_items = [item for item in non_passed_items if item.get("status") == "recovered_before_observation"]
-
-    if not failed_items and not partial_items and recovered_items:
-        return None, False
-
-    all_evidence = " ".join(item.get("evidence", "") for item in non_passed_items)
-    if failed_evidence:
-        all_evidence += " " + failed_evidence
-    evidence_lower = all_evidence.lower()
-
-    _INJECT_ABSENCE_PHRASES = (
-        "no change", "no increase", "no increase observed", "not observed",
-        "not elevated", "not increased", "no effect", "not affected",
-        "remains at", "remains normal", "unchanged", "no fill",
-        "still normal", "no observable", "not yet observable",
-        "far below", "well below", "at 1%", "at 2%", "at 3%",
-        "at 4%", "at 5%", "at 6%", "at 7%", "at 8%", "at 9%",
-        "at 10%", "at 11%", "at 12%", "at 13%", "at 14%", "at 15%",
-        "at 16%", "at 17%", "at 18%", "at 19%", "at 20%",
-        "below threshold", "under threshold",
-    )
-    has_absence = any(phrase in evidence_lower for phrase in _INJECT_ABSENCE_PHRASES)
-
-    status_parts = []
-    if failed_items:
-        status_parts.append(f"Step(s) {[i.get('step', '?') for i in failed_items]} marked 'failed'")
-    if partial_items:
-        status_parts.append(f"Step(s) {[i.get('step', '?') for i in partial_items]} marked 'partial'")
-    if recovered_items:
-        status_parts.append(f"Step(s) {[i.get('step', '?') for i in recovered_items]} marked 'recovered_before_observation'")
-    status_desc = "; ".join(status_parts)
-
+    steps = [i.get("step", "?") for i in failed_items]
     warning = (
-        f"Checklist-conclusion inconsistency: {status_desc} "
-        f"but Layer2 concluded 'passed'. "
+        f"Checklist-conclusion inconsistency: Step(s) {steps} marked 'failed' "
+        f"but Layer2 concluded 'passed' — a structural contradiction in the "
+        f"LLM's own status declarations. Auto-downgrading to 'partial'."
     )
-    if has_absence:
-        warning += (
-            "Failed steps contain absence evidence (metric far below threshold). "
-            "Auto-downgrading to 'partial' — objective measurement overrides subjective judgment."
-        )
-        return warning, True
-    else:
-        warning += (
-            "The LLM may have determined these failures are benign (e.g., timing delays). "
-            "Overall field is the final authority."
-        )
-        return warning, False
+    return warning, True
+
+
+def _apply_all_dissipated_override(
+    checklist_items: list, level: str
+) -> tuple[str, str | None]:
+    """Structured all-dissipated safety net (D14, enum-only — no free text).
+
+    When EVERY checklist item is marked ``recovered_before_observation`` the
+    fault effect left no observable trace by verification time, so any
+    verified-family level is dishonest — force ``unverified`` (honest
+    ignorance: nothing was observed). A MIXED checklist (some items genuinely
+    observed) only records a warning; partial dissipation is the LLM's overall
+    judgement, not a program override.
+
+    SINGLE-SOURCED across both verdict paths (``_verification_from_submit_args``
+    and ``_parse_verification_result``) so the override cannot drift between
+    them. MUST be applied AFTER the overall level is derived and AFTER the
+    primary-evidence / layer2-sync downgrades, so "nothing observable" is the
+    final word (an earlier placement is dead: the level is still the initial
+    'unverified' before overall-derivation, and overall-derivation overwrites
+    it afterward — the pre-refactor inline copy in the text path was doubly
+    dead for exactly this reason). Pure ``ChecklistItemStatus`` enum counting;
+    no ``evidence`` free text is read.
+
+    Returns:
+        (level, warning_message | None)
+    """
+    if not checklist_items:
+        return level, None
+    recovered_count = sum(
+        1 for item in checklist_items
+        if isinstance(item, dict)
+        and item.get("status") == ChecklistItemStatus.RECOVERED_BEFORE_OBSERVATION.value
+    )
+    if recovered_count == 0:
+        return level, None
+    warning = (
+        f"Verification Checklist has {recovered_count} step(s) marked "
+        f"'recovered_before_observation'. The fault effect had already "
+        f"dissipated before verification could observe it."
+    )
+    if recovered_count == len(checklist_items) and level != "unverified":
+        level = "unverified"
+    return level, warning
 
 
 def _count_verification_steps_in_skill_case(content: str) -> int:
@@ -638,6 +876,11 @@ def _try_parse_json(content: str) -> dict | None:
         "layer2": {"status": l2, "details": data.get("layer2_details", "")},
         "warnings": data.get("warnings", []),
     }
+    # Structured metric claims (W-77R-5) — same passthrough as the
+    # submit-args path, so JSON-mode verdicts carry the binding too.
+    _claims = data.get("metric_claims")
+    if isinstance(_claims, list):
+        result["metric_claims"] = [c for c in _claims if isinstance(c, dict)]
 
     checklist = data.get("verification_checklist")
     if isinstance(checklist, list) and checklist:
@@ -661,14 +904,11 @@ def _try_parse_json(content: str) -> dict | None:
             result["warnings"].append(
                 f"Checklist item statuses outside the closed vocabulary: {_outside}."
             )
-        # Checklist-conclusion inconsistency check (same logic as text parser)
+        # Checklist-conclusion inconsistency check (same logic as text parser):
+        # pure structured status-enum comparison, no free-text evidence (D14).
         if l2 == "passed":
-            _non_passed_ev = " ".join(
-                c.get("evidence", "") for c in checklist
-                if c.get("status") in CHECKLIST_NON_PASSED_STATUSES
-            )
             inconsistency_warning, should_downgrade = _detect_checklist_conclusion_inconsistency(
-                checklist, l2, _non_passed_ev,
+                checklist, l2,
             )
             if inconsistency_warning:
                 result["warnings"].append(inconsistency_warning)
@@ -744,17 +984,11 @@ def _parse_verification_result(text: str) -> dict:
         # No longer downgrade — skipped means genuinely unexecutable
         # (checks that were executed but not met should be marked 'failed', not 'skipped')
 
-    # recovered_before_observation: fault effect dissipated before verification
-    recovered_count = sum(1 for item in checklist_items if item.get("status") == "recovered_before_observation")
-    if recovered_count > 0:
-        result["warnings"].append(
-            f"Verification Checklist has {recovered_count} step(s) marked "
-            f"'recovered_before_observation'. The fault effect had already "
-            f"dissipated before verification could observe it."
-        )
-        # When ALL steps are recovered_before_observation, overall should be unverified
-        if recovered_count == len(checklist_items) and result["level"] != "unverified":
-            result["level"] = "unverified"
+    # recovered_before_observation structured override moved to a single-sourced
+    # helper applied AFTER overall-level derivation (see the call below the
+    # PrimaryEvidenceObserved constraint). The former inline copy here was dead:
+    # result["level"] is still the initial 'unverified' at this point, and the
+    # overall-level determination further down overwrites it regardless.
 
     if result["layer2"]["status"] in ("passed", "partial") and not _has_checklist(text):
         result["warnings"].append(
@@ -762,41 +996,19 @@ def _parse_verification_result(text: str) -> dict:
             "Verification completeness cannot be confirmed."
         )
 
-    # Contradiction detection: Layer2 "failed" but details describe observable fault effects
-    # A true contradiction is when the LLM says "failed" but the details contain
-    # AFFIRMATIVE descriptions of fault effects (e.g., "disk usage at 95%").
-    # Negative/absence context (e.g., "disk usage at 16%, no increase") is NOT
-    # a contradiction — the LLM correctly describes why it concluded "failed".
-    if result["layer2"]["status"] == "failed" and result["layer2"]["details"]:
-        l2d = result["layer2"]["details"]
-        l2d_lower = l2d.lower()
-        _ABSENCE_PHRASES = (
-            "no change", "no increase", "no increase observed", "not observed",
-            "not elevated", "not increased", "no effect", "not affected",
-            "remains at", "remains normal", "unchanged", "no fill",
-            "still normal", "at 16%", "at 17%", "at 18%", "at 19%",
-            "no observable", "not yet observable",
-        )
-        is_absence_context = any(phrase in l2d_lower for phrase in _ABSENCE_PHRASES)
-        if not is_absence_context:
-            for _, indicators in _CONTRADICTION_INDICATORS.items():
-                if any(ind in l2d for ind in indicators):
-                    result["warnings"].append(
-                        "Contradiction: Layer2 concluded 'failed' but details describe "
-                        "observable fault effects. Overriding to 'partial'."
-                    )
-                    result["layer2"]["status"] = "partial"
-                    break
+    # Contradiction detection removed (Phase 2c / D14): the program no longer
+    # reverse-infers "the LLM said failed but details look affirmative" from
+    # free-text layer2.details via _CONTRADICTION_INDICATORS / _ABSENCE_PHRASES.
+    # The LLM's structured layer2 status is authoritative; absence / benign /
+    # expected-negative semantics are declared via ChecklistItemStatus, not
+    # re-derived from text. See structured-evidence-binding spec.
 
-    # Checklist-conclusion inconsistency: checklist says failed but Layer2 says passed
+    # Checklist-conclusion inconsistency (structured status-enum comparison only,
+    # no free-text evidence — D14): a 'failed' item contradicting a 'passed'
+    # Layer2 conclusion is a hard structural inconsistency → downgrade partial.
     if checklist_items:
-        # Collect evidence text from non-passed items for absence-phrase detection
-        _non_passed_evidence = " ".join(
-            item.get("evidence", "") for item in checklist_items
-            if item.get("status") in CHECKLIST_NON_PASSED_STATUSES
-        )
         inconsistency_warning, should_downgrade = _detect_checklist_conclusion_inconsistency(
-            checklist_items, result["layer2"]["status"], _non_passed_evidence,
+            checklist_items, result["layer2"]["status"],
         )
         if inconsistency_warning:
             result["warnings"].append(inconsistency_warning)
@@ -817,9 +1029,9 @@ def _parse_verification_result(text: str) -> dict:
             result["layer1"]["status"], result["layer2"]["status"]
         )
 
-    # If L2 was programmatically downgraded to "partial" (e.g., absence evidence
-    # detected by _detect_checklist_conclusion_inconsistency), override the level
-    # to "partial" as well. Objective measurement overrides subjective judgment.
+    # If L2 was programmatically downgraded to "partial" (e.g., a structural
+    # checklist inconsistency detected by _detect_checklist_conclusion_inconsistency),
+    # override the level to "partial" as well.
     # This mirrors recover_verifier.py's level-sync logic.
     if result["layer2"]["status"] == "partial" and result["level"] in ("verified", "unverified"):
         result["level"] = "partial"
@@ -839,6 +1051,15 @@ def _parse_verification_result(text: str) -> dict:
             "Cannot confirm fault effectiveness without direct primary evidence. "
             "Downgraded to 'partial'."
         )
+
+    # All-dissipated structured override (single-sourced with the submit-args
+    # path): applied last so "every criterion recovered before observation ⇒
+    # nothing observable ⇒ unverified" is the final word.
+    result["level"], _rbo_warning = _apply_all_dissipated_override(
+        checklist_items, result["level"]
+    )
+    if _rbo_warning:
+        result["warnings"].append(_rbo_warning)
 
     # Warnings: only match explicit "Warnings:" line, not any mention of the word
     for line in text_lower.split("\n"):

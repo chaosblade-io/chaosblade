@@ -160,17 +160,23 @@ def test_batch_rejection_reports_which_fault_failed():
 
 
 # ---------------------------------------------------------------------------
-# agent_loop's own message (last line of defence)
+# agent_loop's gate delegates to the shared renderer (last line of defence)
 # ---------------------------------------------------------------------------
 
 
-def test_agent_loop_message_distinguishes_the_two_causes():
-    """The fallback message must not claim no transport was chosen.
+def test_agent_loop_gate_delegates_to_shared_renderer():
+    """The gate must name the cause via the SHARED renderer, not its own fork.
 
-    Its previous single sentence said intent recognition finished "without
-    choosing a transport" — wrong for the common case, where a transport WAS
-    resolved and merely cannot run the requested domain. That wording sent
-    readers hunting for a missing selection instead of an incompatible pair.
+    History: agent_loop used to build a 2-way message inline ("cannot run
+    through the" / "no usable transport"), re-deriving ``family_for_scope`` /
+    ``resolve_channel_name`` / ``profile_of`` itself — a SECOND vocabulary for
+    the same "unsupported environment" fact the execute_loop / recover entry
+    gates also report. It now delegates to the single-source
+    ``explain_unsupported_environment`` (3-way: scope-unregistered / conflict /
+    channel), so all three entry gates speak one vocabulary and the misleading
+    "without choosing a transport" sentence can never come back. This asserts
+    the DELEGATION; the cause distinction itself is tested at the renderer
+    (tests/test_agent/test_capabilities/test_context.py).
     """
     from chaos_agent.agent.nodes.execute import agent_loop as al
 
@@ -178,21 +184,16 @@ def test_agent_loop_message_distinguishes_the_two_causes():
     assert "Intent recognition completed without" not in src
 
     idx = src.index("capability_context.supported")
-    block = src[idx:idx + 3000]
-    # conflict branch names both sides (source strings are wrapped, so assert
-    # on fragments that do not straddle a line break)
-    assert "cannot run through the" in block
-    assert "configured transport" in block
-    assert "profile:" in block
-    # unconfigured branch says what to configure
-    assert "no usable transport" in block
-    assert "kubeconfig, KubeWiz cluster, KubeWiz host" in block
-    # and it is the same evidence set used by the submit-time helper
-    for field in (
-        "kube_connection_mode", "host_name", "ssh_host",
-        "kubeconfig", "kubewiz_cluster_uuid",
-    ):
-        assert field in block
+    block = src[idx:idx + 1200]
+    # the gate consumes the shared verdict + single-source renderer ...
+    assert "resolve_profile_verdict" in block
+    assert "explain_unsupported_environment" in block
+    # ... and no longer re-derives the cause inline (the old 2-way fork is
+    # gone). Asserted on CALL syntax so the gate's own explanatory comment —
+    # which names the retired symbols in prose — does not trip the check.
+    assert "cannot run through the" not in block
+    assert "no usable transport" not in block
+    assert "family_for_scope(" not in block
 
 
 # ---------------------------------------------------------------------------

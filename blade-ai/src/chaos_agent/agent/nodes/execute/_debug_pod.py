@@ -28,6 +28,7 @@ from chaos_agent.transports import (
     PROFILE_K8S,
     TransportTarget,
     execute_via_transport,
+    resolve_transport_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,8 @@ async def discover_created_debug_pod(
     namespace: str,
     created_after_ts: float,
     kubeconfig: str = "",
+    *,
+    target: TransportTarget | None = None,
 ) -> str:
     """Live fallback discovery for a debug pod whose name failed to parse.
 
@@ -237,13 +240,14 @@ async def discover_created_debug_pod(
     the parse-failure path — the normal path pays zero extra cost.
     """
     ns = namespace or _DEFAULT_DEBUG_NS
+    _target = target if target is not None else resolve_transport_target(None)
     cmd = build_kubectl_cmd(
         "get", ["pods", "-n", ns, "-o", "json"],
-        kubeconfig,
+        kubeconfig, target=_target,
     )
     try:
         result = await execute_via_transport(
-            cmd, TransportTarget.from_state({}),
+            cmd, _target,
             timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
         )
     except Exception:
@@ -354,6 +358,7 @@ def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str, bool]:
 async def wait_for_debug_pod_ready(
     pod_name: str, kubeconfig: str, task_id: str,
     timeout: int = 60, namespace: str = "",
+    *, target: TransportTarget | None = None,
 ) -> bool:
     """Wait for debug pod container to be ready before exec.
 
@@ -369,7 +374,7 @@ async def wait_for_debug_pod_ready(
     abandon a doomed image candidate cheaply and try the next one.
     """
     ns = namespace or _DEFAULT_DEBUG_NS
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
 
     # Combined probe: ready flag | restart count | waiting reason.
     # The `pod/` prefix is REQUIRED: debug pod names are
@@ -384,7 +389,7 @@ async def wait_for_debug_pod_ready(
         "-o", "jsonpath={.status.containerStatuses[0].ready}"
               "|{.status.containerStatuses[0].restartCount}"
               "|{.status.containerStatuses[0].state.waiting.reason}",
-    ], kubeconfig=kubeconfig)
+    ], kubeconfig=kubeconfig, target=_target)
 
     async def _probe() -> list[str]:
         try:
@@ -428,7 +433,7 @@ async def wait_for_debug_pod_ready(
     wait_cmd = build_kubectl_cmd("wait", [
         "--for=condition=Ready", f"pod/{pod_name}",
         "-n", ns, f"--timeout={remaining}s",
-    ], kubeconfig=kubeconfig)
+    ], kubeconfig=kubeconfig, target=_target)
     try:
         result = await execute_via_transport(
             wait_cmd, _target, timeout=remaining + 10, task_id=task_id,
@@ -456,17 +461,20 @@ async def wait_for_debug_pod_ready(
     return False
 
 
-async def _find_available_namespace(kubeconfig: str, task_id: str) -> str:
+async def _find_available_namespace(
+    kubeconfig: str, task_id: str,
+    *, target: TransportTarget | None = None,
+) -> str:
     """Find an accessible namespace in the cluster for debug pod creation.
 
     Tries ``default`` first (always exists in standard K8s clusters).
     If not accessible, lists all namespaces and picks the first Active one.
     Returns the namespace name, or empty string if none found.
     """
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
     # Try default first
     cmd = build_kubectl_cmd("get", ["namespace", "default", "--no-headers"],
-                            kubeconfig=kubeconfig)
+                            kubeconfig=kubeconfig, target=_target)
     try:
         result = await execute_via_transport(
             cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id,
@@ -481,7 +489,7 @@ async def _find_available_namespace(kubeconfig: str, task_id: str) -> str:
     list_cmd = build_kubectl_cmd("get", [
         "namespaces", "--no-headers",
         "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase",
-    ], kubeconfig=kubeconfig)
+    ], kubeconfig=kubeconfig, target=_target)
     try:
         result = await execute_via_transport(
             list_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id,
@@ -503,6 +511,7 @@ async def _find_available_namespace(kubeconfig: str, task_id: str) -> str:
 async def create_and_wait_debug_pod(
     node_name: str, kubeconfig: str, task_id: str,
     namespace: str = "",
+    *, target: TransportTarget | None = None,
 ) -> tuple[str, str] | None:
     """Create a debug pod on the specified node and wait for it to be ready.
 
@@ -519,7 +528,7 @@ async def create_and_wait_debug_pod(
     will re-ask a question the API server just answered.
     """
     carrier, _reason = await create_and_wait_debug_pod_with_reason(
-        node_name, kubeconfig, task_id, namespace=namespace,
+        node_name, kubeconfig, task_id, namespace=namespace, target=target,
     )
     return carrier
 
@@ -527,6 +536,7 @@ async def create_and_wait_debug_pod(
 async def create_and_wait_debug_pod_with_reason(
     node_name: str, kubeconfig: str, task_id: str,
     namespace: str = "",
+    *, target: TransportTarget | None = None,
 ) -> tuple[tuple[str, str] | None, str]:
     """Same as ``create_and_wait_debug_pod``, plus WHY it failed.
 
@@ -545,7 +555,9 @@ async def create_and_wait_debug_pod_with_reason(
         logger.warning("Cannot create a debug pod without a node name")
         return (None, CARRIER_TARGET_MISSING)
 
-    ns = namespace or await _find_available_namespace(kubeconfig, task_id)
+    ns = namespace or await _find_available_namespace(
+        kubeconfig, task_id, target=target,
+    )
     if not ns:
         logger.warning("No accessible namespace found for debug pod creation")
         return (None, CARRIER_NO_NAMESPACE)
@@ -565,11 +577,11 @@ async def create_and_wait_debug_pod_with_reason(
     # capability level: probes are still content-gated by the readonly
     # classifier; privilege only widens which read-only shapes CAN run.
     for image in _resolve_debug_pod_images():
+        _target = target if target is not None else resolve_transport_target(None)
         debug_cmd = build_kubectl_cmd("debug", [
             f"node/{node_name}", "-n", ns,
             f"--image={image}", "--profile=sysadmin", "--", "sleep", "3600",
-        ], kubeconfig=kubeconfig)
-        _target = TransportTarget.from_state({})
+        ], kubeconfig=kubeconfig, target=_target)
         try:
             debug_result = await execute_via_transport(
                 debug_cmd, _target, timeout=settings.timeout_kubectl_exec,
@@ -625,11 +637,13 @@ async def create_and_wait_debug_pod_with_reason(
         # so callers cannot accidentally exec into a dead artifact, then try
         # the next image candidate.
         ready = await wait_for_debug_pod_ready(
-            pod_name, kubeconfig, task_id, namespace=ns,
+            pod_name, kubeconfig, task_id, namespace=ns, target=target,
         )
         if ready:
             return ((pod_name, ns), CARRIER_OK)
-        await delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
+        await delete_debug_pod(
+            pod_name, kubeconfig, task_id, namespace=ns, target=target,
+        )
         logger.warning(
             "Debug pod image %s not ready on node %s, trying next candidate",
             image, node_name,
@@ -645,6 +659,7 @@ async def delete_debug_pod(
     pod_name: str, kubeconfig: str, task_id: str,
     namespace: str = "",
     kind: str = "pod",
+    *, target: TransportTarget | None = None,
 ) -> str:
     """Force-delete a debug pod (or another task vehicle, e.g. an occupant
     Deployment). Best-effort, logs warning on failure.
@@ -665,11 +680,11 @@ async def delete_debug_pod(
         namespace: Target namespace. Defaults to ``default`` if empty.
     """
     ns = namespace or _DEFAULT_DEBUG_NS
+    _target = target if target is not None else resolve_transport_target(None)
     del_cmd = build_kubectl_cmd("delete", [
         kind, pod_name, "-n", ns,
         "--force", "--grace-period=0",
-    ], kubeconfig=kubeconfig)
-    _target = TransportTarget.from_state({})
+    ], kubeconfig=kubeconfig, target=_target)
     try:
         result = await execute_via_transport(
             del_cmd, _target, timeout=30, task_id=task_id,

@@ -245,11 +245,6 @@ Your single objective: restore the target to its pre-fault state.
    before running it.
 3. Confirm the destroy output reports success.
 
-## Kubeconfig Requirement
-If a kubeconfig path is provided in the recovery context, you MUST pass it to
-EVERY cluster tool call. The default kubeconfig cannot access the target
-cluster; omitting it connects tool calls to the WRONG cluster.
-
 # REMEMBER
 - Your job ends when the undo action is confirmed landed at the API layer —
   Layer 2 verifies the recovery outcome.

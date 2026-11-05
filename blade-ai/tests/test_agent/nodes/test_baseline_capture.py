@@ -442,7 +442,7 @@ class TestTemplateResolutionNodeScope:
 
 
 class TestLLMJsonParsing:
-    """Test _parse_llm_json_output robustness."""
+    """Test _parse_llm_json_output robustness (essence-B three-state)."""
 
     def test_pure_json(self):
         raw = '[{"description":"test","command":"kubectl get nodes","mode":"simple"}]'
@@ -456,11 +456,47 @@ class TestLLMJsonParsing:
         assert len(result) == 1
 
     def test_empty_input(self):
+        # Empty raw = nothing was sent → legitimate empty, NOT receive failure.
         assert _parse_llm_json_output("") == []
         assert _parse_llm_json_output(None) == []
 
-    def test_invalid_json(self):
-        assert _parse_llm_json_output("not json at all") == []
+    def test_legitimate_empty_list(self):
+        # An explicit [] from the LLM is a legitimate empty verdict — distinct
+        # from the receive-failure None asserted below.
+        assert _parse_llm_json_output("[]") == []
+
+    def test_invalid_json_is_receive_failure_not_empty(self):
+        """Essence-B: non-empty raw from which NO structure is recoverable is a
+        RECEIVE FAILURE (the program did not catch the output), which must be
+        distinguishable from a legitimate empty verdict. It used to return [] —
+        collapsing "we did not parse it" into "the LLM decided nothing" — the
+        exact laundering that dropped a bare-dict expected_absence verdict and
+        降级ed the observation into the empty bucket."""
+        assert _parse_llm_json_output("not json at all") is None
+
+    def test_bare_dict_salvaged_to_single_element_list(self):
+        """Essence-B closed-set salvage: when the prompt asks for exactly ONE
+        entry (N==1) the model frequently emits a bare object instead of a
+        list. json.loads ACCEPTS it, so re-wrapping to [dict] is deterministic
+        syntax recovery, not semantic guessing — the verdict inside must NOT be
+        dropped. This is the形态 every pre-existing test missed (all fed
+        json.dumps([{...}]) arrays)."""
+        raw = '{"verdict":"expected_absence","reason":"no such file pre-injection"}'
+        result = _parse_llm_json_output(raw)
+        assert result == [{"verdict": "expected_absence",
+                           "reason": "no such file pre-injection"}]
+
+    def test_bare_dict_in_markdown_salvaged(self):
+        raw = '```json\n{"verdict":"replace","command":"kubectl get pods"}\n```'
+        result = _parse_llm_json_output(raw)
+        assert len(result) == 1
+        assert result[0]["verdict"] == "replace"
+
+    def test_bare_dict_with_trailing_prose_salvaged(self):
+        raw = 'Here is the decision: {"verdict":"expected_absence"} hope that helps'
+        result = _parse_llm_json_output(raw)
+        assert len(result) == 1
+        assert result[0]["verdict"] == "expected_absence"
 
     def test_trailing_text(self):
         raw = '[{"description":"test","command":"kubectl get nodes","mode":"simple"}] and some trailing text'
@@ -1289,6 +1325,81 @@ class TestLLMDeriveBaselinePrompt:
         # Should contain skill-case tag.
         assert "<skill-case>" in human_content
 
+    @pytest.mark.asyncio
+    async def test_absent_binaries_inject_prompt_guidance(self):
+        """poisoned_binaries (the preplan-probed absent host binaries mirrored to
+        state) inject a guidance block into the PRIMARY derive prompt, steering
+        round 1 to the /proc form instead of an absent ``ss`` that would exit 127
+        and cost a reactive retry round."""
+        mock_llm = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.content = "[]"
+        mock_llm.ainvoke.return_value = mock_response
+
+        from chaos_agent.agent.nodes.baseline.baseline_capture import _llm_derive_baseline_commands
+        await _llm_derive_baseline_commands(
+            mock_llm, "test skill content", "host", "network", "delay",
+            profile="host", poisoned_binaries=("ss", "netstat"),
+        )
+        human = mock_llm.ainvoke.call_args[0][0][1].content
+        # Pre-task framing — NOT the retry path's "exited 127" framing (nothing
+        # has run yet at primary-derive time).
+        assert "pre-task environment probe" in human
+        assert "NOT INSTALLED" in human
+        # The /proc fallback and each absent binary are named for the model.
+        assert "/proc/net/tcp" in human
+        assert "- `ss`" in human
+        assert "- `netstat`" in human
+
+    @pytest.mark.asyncio
+    async def test_no_absent_binaries_no_guidance_block(self):
+        """Zero-drift anchor: with no poisoned_binaries (every k8s channel and a
+        fully-tooled host) the primary derive prompt carries NO absence block —
+        byte-identical to the pre-change prompt, so nothing regresses on the
+        common path."""
+        mock_llm = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.content = "[]"
+        mock_llm.ainvoke.return_value = mock_response
+
+        from chaos_agent.agent.nodes.baseline.baseline_capture import _llm_derive_baseline_commands
+        await _llm_derive_baseline_commands(
+            mock_llm, "test skill content", "host", "network", "delay",
+            profile="host",
+        )
+        human = mock_llm.ainvoke.call_args[0][0][1].content
+        assert "pre-task environment probe" not in human
+
+    @pytest.mark.asyncio
+    async def test_primary_derive_does_not_gate_poisoned_binaries(self):
+        """DESIGN INVARIANT: the primary derive applies absence as GUIDANCE, not
+        a gate. A whitelisted command invoking an absent binary is STILL accepted
+        — gating it here would silently drop the observation dimension (a
+        gate-rejected command never executes, so it never becomes an observation
+        and the reactive retry has no failed obs to recover). The retry path keeps
+        the hard gate (see test_baseline_retry_double_gate), which is safe
+        because it preserves the original observation."""
+        mock_llm = AsyncMock()
+        mock_response = MagicMock()
+        # ``ss -tlnp`` is host-whitelisted; it fails only at RUNTIME (exit 127)
+        # because the binary is absent — the exact field form from the ledger.
+        mock_response.content = json.dumps([
+            {"description": "listening sockets",
+             "command": "ss -tlnp", "mode": "simple"},
+        ])
+        mock_llm.ainvoke.return_value = mock_response
+
+        from chaos_agent.agent.nodes.baseline.baseline_capture import _llm_derive_baseline_commands
+        accepted = await _llm_derive_baseline_commands(
+            mock_llm, "test skill content", "host", "network", "delay",
+            profile="host", poisoned_binaries=("ss",),
+        )
+        # Guidance steered the prompt, but the gate did NOT filter the command:
+        # the dimension survives to execute (and the reactive retry recovers it
+        # if the model ignored the guidance and it exits 127).
+        assert len(accepted) == 1
+        assert accepted[0].command == "ss -tlnp"
+
 
 class TestExtractorFramework:
     """Extractor integration: BaselineCommand.extractors must run after
@@ -1353,7 +1464,7 @@ class TestExtractorFramework:
             "target-pod-xyz                    50m          120Mi\n"
         )
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             # Return one observation per command. The first matches
             # the ``top`` baseline command and carries the table we
             # want the extractor to parse.
@@ -1417,7 +1528,7 @@ class TestExtractorFramework:
         # Inject a custom command list via a stub strategy. Easier
         # than patching BASELINE_COMMANDS in place because we need
         # the runtime to use OUR command (with the booming extractor).
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             return [
                 {
                     "description": commands[0]["description"],
@@ -1478,7 +1589,7 @@ class TestExtractorFramework:
             extractor_called["n"] += 1
             return {"spy_called": True}
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             return [
                 {
                     "description": commands[0]["description"],
@@ -1524,7 +1635,7 @@ class TestExtractorFramework:
         def _bad_contract(stdout, state):
             return ["not", "a", "dict"]
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             return [
                 {
                     "description": commands[0]["description"],
@@ -1780,14 +1891,27 @@ class TestLLMRetryFailedCommands:
         assert "never a literal debug pod name" in human_content
 
     @pytest.mark.asyncio
-    async def test_retry_returns_empty_on_llm_failure(self):
+    async def test_retry_marks_undetermined_on_llm_failure(self):
+        """Essence-B: an exception during the retry call means NO verdict was
+        received — the same epistemic state as unparseable output. It used to
+        return a bare ``{"expected": [], "replace": []}``, indistinguishable
+        from "the LLM judged nothing to fix", letting the failed observation
+        launder into the empty bucket. It must now signal ``receive_failure``
+        and hand the observations back UNDETERMINED. (Contrast
+        test_retry_returns_empty_when_no_llm: no LLM configured is genuine
+        not-applicable, not a receive failure.)"""
         mock_llm = AsyncMock()
         mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("API error"))
         result = await _llm_retry_failed_commands(
             mock_llm, "skill", "pod", "process", "kill",
             [{"command": "bad", "exit_code": 1, "stderr": "err"}],
         )
-        assert result == {"expected": [], "replace": []}
+        assert result["receive_failure"] is True
+        assert result["expected"] == []
+        assert result["replace"] == []
+        assert result["undetermined"] == [
+            {"command": "bad", "exit_code": 1, "stderr": "err"}
+        ]
 
     @pytest.mark.asyncio
     async def test_retry_returns_empty_when_no_llm(self):
@@ -1837,7 +1961,7 @@ class TestBaselineCaptureRetryIntegration:
 
         exec_call_count = {"n": 0}
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             exec_call_count["n"] += 1
             results = []
             for cmd in commands:
@@ -1904,7 +2028,7 @@ class TestBaselineCaptureRetryIntegration:
              "mode": "simple"},
         ])))
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             return [{
                 "description": commands[0]["description"],
                 "command": "kubectl get pods ...",
@@ -1977,7 +2101,7 @@ class TestBaselineCaptureRetryIntegration:
 
         mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             results = []
             for cmd in commands:
                 if "hosts-bak-marker" in (cmd.get("command") or ""):
@@ -2074,7 +2198,7 @@ class TestBaselineCaptureRetryIntegration:
 
         mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             return [{
                 "description": cmd["description"],
                 "command": f"kubectl get configmap {cmd['description']} -n cms-demo",
@@ -2167,7 +2291,7 @@ class TestBaselineCaptureRetryIntegration:
 
         mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             return [{
                 "description": cmd["description"],
                 "command": f"kubectl get configmap hosts-bak -n cms-demo ({cmd['description']})",
@@ -2249,7 +2373,7 @@ class TestBaselineCaptureRetryIntegration:
 
         exec_call_count = {"n": 0}
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             exec_call_count["n"] += 1
             results = []
             for cmd in commands:
@@ -2318,7 +2442,7 @@ class TestBaselineCaptureRetryIntegration:
         """
         exec_call_count = {"n": 0}
 
-        async def fake_exec(commands, kubeconfig, task_id):
+        async def fake_exec(commands, kubeconfig, task_id, *, target=None):
             exec_call_count["n"] += 1
             return [{
                 "description": commands[0]["description"],

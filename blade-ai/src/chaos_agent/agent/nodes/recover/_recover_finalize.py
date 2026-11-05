@@ -27,7 +27,7 @@ from langchain_core.messages import HumanMessage
 
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.result.operation_outcome import write_recover_verification
-from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
+from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
 from chaos_agent.agent.nodes.recover._recover_layer1 import (
     RecoverLayer1Result,
 )
@@ -37,12 +37,16 @@ from chaos_agent.agent.result.verdict import layer1_to_dict
 from chaos_agent.agent.nodes.recover._recover_layer2_parse import _parse_recovery_verification_result
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store
 from chaos_agent.agent.nodes.verify._verifier_finalize import _cleanup_debug_pods
+from chaos_agent.agent.execution_artifacts import settle_recovered_carriers
 from chaos_agent.agent.nodes.verify._verifier_shared import (
     _compute_baseline_confidence,
     extract_submit_args,
     last_ai_text,
 )
-from chaos_agent.agent.nodes.verify._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+from chaos_agent.agent.nodes.verify._verifier_submit import (
+    SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+    _coerce_list_arg,
+)
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState, recovery_task_state_from_level
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
@@ -75,7 +79,11 @@ def _recover_verification_from_submit_args(args: dict, skill_name: str = "") -> 
     Produces the SAME shape ``_parse_recovery_verification_result`` yields so
     downstream finalize logic is source-agnostic.
     """
-    checklist = args.get("checklist") or []
+    # A model may JSON-stringify the list args (qwen-class quirk — see
+    # _coerce_list_arg). This reads the RAW AIMessage tool_call args, which the
+    # @tool BeforeValidator does not rewrite, so coerce before the isinstance
+    # guard or a stringified checklist is silently dropped to [].
+    checklist = _coerce_list_arg(args.get("checklist")) or []
     if not isinstance(checklist, list):
         checklist = []
     raw_l2_status = args.get("layer2_status", "unknown")
@@ -91,11 +99,13 @@ def _recover_verification_from_submit_args(args: dict, skill_name: str = "") -> 
         l2_status = "unknown"
     else:
         l2_status = raw_l2_status
+    # Coerce warnings too: ``list("...")`` on a JSON-string explodes into chars.
+    _rwarnings = _coerce_list_arg(args.get("warnings"))
     result = {
         "level": overall,
         "layer1": {"status": "unknown", "details": ""},  # overwritten by code later
         "layer2": {"status": l2_status, "details": args.get("layer2_details", "")},
-        "warnings": list(args.get("warnings") or []),
+        "warnings": list(_rwarnings) if isinstance(_rwarnings, list) else [],
         "baseline_used": bool(args.get("baseline_used", False)),
     }
     if l2_status != raw_l2_status:
@@ -223,7 +233,6 @@ def make_finalize_recover_verification(registry=None):
             materialize_fault_handle(state)
         )
         kubeconfig = _resolve_kubeconfig(state)
-        sync_kubewiz_runtime(state)
         count = state.get("verifier_loop_count", 0)
         messages = state.get("messages", [])
 
@@ -395,7 +404,7 @@ def make_finalize_recover_verification(registry=None):
                     # execution domain (no status verification — the prompt
                     # only needs the destroy output).
                     retry_raw = await _provider_for_recover(state).layer1_raw_destroy(
-                        experiment_uid, kubeconfig,
+                        experiment_uid, kubeconfig, state=state,
                     )
                     result_update["messages"] = [HumanMessage(content=wrap_system_reminder(
                         f"**{_RETRY_MARKER} executed**\n"
@@ -487,6 +496,21 @@ def make_finalize_recover_verification(registry=None):
         if warnings:
             status_msg += f" (warnings: {len(warnings)})"
         tracker.complete(status_msg)
+
+        # W-70-2: recovery is a VERIFIED fact at this point. When Layer2
+        # confirmed a FULL recovery, the carrier's keep-while-armed deadline
+        # hold — a clock proxy for "the recovery is still outstanding" — is
+        # stale: this recover graph itself discharged the promise the carrier
+        # was holding for, possibly long before the deadline. Settle armed
+        # carriers (recovery_armed → active + drop deadline) so the sweep below
+        # runs the four-delete instead of leaving SA/Role/RoleBinding to linger
+        # past task end with no system-side collector. Gated on FULL
+        # ``recovered`` only — a ``partial`` leaves the outstanding remainder to
+        # the carrier's timer, so it MUST stay armed (fail-safe backstop).
+        if verification["level"] == RecoverVerdict.RECOVERED.value:
+            settle_recovered_carriers(
+                state.get("execution_artifacts"), task_id=task_id,
+            )
 
         # Programmatic debug-pod cleanup (moved here; dedup preserved).
         await _cleanup_debug_pods(state, kubeconfig, task_id, result_update)

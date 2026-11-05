@@ -54,6 +54,15 @@ from chaos_agent.agent.nodes.verify._verifier_submit import (
     submit_recover_verification,
     submit_verification,
 )
+from chaos_agent.agent.prompts.sections.verification import (
+    _CHECKLIST_STATUS_DEFINITIONS,
+    STATUS_NOT_APPLICABLE_DEFINITION,
+    get_verifier_output_format_section,
+)
+from chaos_agent.agent.prompts.sections.recovery import (
+    _RECOVER_CHECKLIST_STATUS_DEFINITIONS,
+    get_recover_output_format_section,
+)
 from chaos_agent.agent.nodes.verify import verifier as verifier_module
 from chaos_agent.agent.result.verdict import (
     CHECKLIST_BENIGN_STATUSES,
@@ -329,11 +338,72 @@ class TestPromptTeachingDerivation:
         )
         assert set(_ITEM_STATUS_PROSE.split(", ")) == CHECKLIST_STATUS_VALUES
 
+    def test_status_definitions_cover_every_enum_member(self):
+        # B76 completion (2026-10-29 python Case #5 inject-e0b3109a): round-14
+        # pinned the VALUE LISTS (the tests above) but never the DEFINITIONS —
+        # the inject-face prose hand-defined only 5 of 7 members and the
+        # recover-face only 4 of 7, leaving `partial` / `not_applicable` /
+        # `expected` / `recovered_before_observation` exposed as enum values
+        # with no taught meaning. The model then invented a definition for
+        # not_applicable and flip-flopped skipped/not_applicable/expected across
+        # structurally identical conditional steps. This pins the guarantee
+        # round-14 only claimed for words, on BOTH consumption faces: every
+        # legislated member has a DEFINITION, derived from an enum-keyed map (a
+        # member without one raises KeyError at import, before this can run).
+        for defs, render, face in (
+            (_CHECKLIST_STATUS_DEFINITIONS,
+             get_verifier_output_format_section, "inject"),
+            (_RECOVER_CHECKLIST_STATUS_DEFINITIONS,
+             get_recover_output_format_section, "recover"),
+        ):
+            assert set(defs) == set(ChecklistItemStatus), face
+            assert {m.value for m in defs} == CHECKLIST_STATUS_VALUES, face
+            prose = render()
+            for member in ChecklistItemStatus:
+                assert f"- **{member.value}**:" in prose, (
+                    f"[{face}] checklist status {member.value!r} is legislated "
+                    "but its definition is missing from the output-format prose"
+                )
+
+    def test_not_applicable_is_single_sourced_across_both_faces(self):
+        # `not_applicable` is CONTEXT-INVARIANT (a step that does not apply to
+        # the actual situation means the same thing whether judging injection or
+        # recovery), so it is defined ONCE and imported by the recover face — a
+        # second hand-copy is exactly the drift this fix removes. Pin identity,
+        # not just equality, so a future re-copy (equal today, drifts tomorrow)
+        # is caught.
+        assert (
+            _CHECKLIST_STATUS_DEFINITIONS[ChecklistItemStatus.NOT_APPLICABLE]
+            is STATUS_NOT_APPLICABLE_DEFINITION
+        )
+        assert (
+            _RECOVER_CHECKLIST_STATUS_DEFINITIONS[ChecklistItemStatus.NOT_APPLICABLE]
+            is STATUS_NOT_APPLICABLE_DEFINITION
+        )
+
+    def test_conditional_step_semantics_have_a_single_owner(self):
+        # The flip-flop root cause: "a conditional/diagnostic step whose
+        # trigger precondition did not fire, so it was correctly NOT run" had
+        # no exclusive owner, so the model spread it across skipped and
+        # not_applicable. Pin the disambiguation so it cannot silently regress:
+        # not_applicable OWNS the precondition-not-fired case; skipped is a
+        # genuine coverage gap that explicitly redirects there — on both faces.
+        assert "precondition" in STATUS_NOT_APPLICABLE_DEFINITION
+        assert "NOT a coverage gap" in STATUS_NOT_APPLICABLE_DEFINITION
+        for defs, face in (
+            (_CHECKLIST_STATUS_DEFINITIONS, "inject"),
+            (_RECOVER_CHECKLIST_STATUS_DEFINITIONS, "recover"),
+        ):
+            sk = defs[ChecklistItemStatus.SKIPPED]
+            assert "not_applicable" in sk and "coverage gap" in sk, face
+
     def test_submit_doc_teaches_the_consistency_contract(self):
-        # B2: the downgrade rules the enforcer actually applies are
-        # TAUGHT at submit time — the model sees the contract while
-        # filling the args, not only in the post-hoc warning after a
-        # mismatch cost a re-verify round.
+        # B2 / Phase 2c (D14): the downgrade rules the enforcer actually applies
+        # are TAUGHT at submit time — the model sees the contract while filling
+        # the args, not only in the post-hoc warning after a mismatch cost a
+        # re-verify round. The checklist rule is now purely structural: a
+        # 'failed' item under a 'passed' conclusion downgrades; the program
+        # never re-derives absence semantics from evidence text.
         doc = submit_verification.description
         assert "Consistency contract" in doc
         assert "DOWNGRADED" in doc
@@ -344,8 +414,12 @@ class TestPromptTeachingDerivation:
         assert '"verified" + primary_evidence_observed=false' in doc
         assert '"verified" + layer2_status="failed"' in doc
         assert 'layer2_status="partial" → overall "partial"' in doc
-        assert "inconsistency warning" in doc
-        assert "absence" in doc
+        # Structural checklist rule + the benign-status guidance that replaces
+        # the retired free-text "absence" escape hatch.
+        assert 'layer2_status="passed" + a "failed" item → DOWNGRADED to "partial"' in doc
+        assert '"recovered_before_observation"' in doc
+        # The retired free-text path must NOT be taught any more.
+        assert "absence" not in doc.lower()
 
     def test_taught_contract_matches_the_enforcer(self):
         # Behavioural anchor: for every taught rule, the enforcer really
@@ -369,9 +443,9 @@ class TestPromptTeachingDerivation:
             "primary_evidence_observed": True,
         })
         assert r["level"] == "partial"
-        # Rule 4: layer2 passed + failed checklist item with ABSENCE
-        # evidence -> layer2 partial (objective measurement overrides);
-        # without absence evidence the mismatch stays a warning only.
+        # Rule 4 (structural, Phase 2c / D14): layer2 passed + ANY 'failed'
+        # checklist item -> layer2 partial. The downgrade is enum-driven; the
+        # evidence text is irrelevant (absence semantics are no longer parsed).
         r = _verification_from_submit_args({
             "overall": "verified", "layer2_status": "passed",
             "primary_evidence_observed": True,
@@ -380,14 +454,26 @@ class TestPromptTeachingDerivation:
         })
         assert r["layer2"]["status"] == "partial"
         assert any("inconsistency" in w for w in r["warnings"])
-        r_warn_only = _verification_from_submit_args({
+        # A 'failed' item WITHOUT any absence phrase downgrades identically —
+        # pinning that the decision is structural, not free-text driven.
+        r_no_absence = _verification_from_submit_args({
             "overall": "verified", "layer2_status": "passed",
             "primary_evidence_observed": True,
             "checklist": [{"step": 1, "status": "failed",
                            "evidence": "timing delay"}],
         })
-        assert r_warn_only["layer2"]["status"] == "passed"
-        assert any("inconsistency" in w for w in r_warn_only["warnings"])
+        assert r_no_absence["layer2"]["status"] == "partial"
+        assert any("inconsistency" in w for w in r_no_absence["warnings"])
+        # A benign non-'failed' status expresses "non-passed but not a real
+        # failure" -> no structural contradiction -> stays passed.
+        r_benign = _verification_from_submit_args({
+            "overall": "verified", "layer2_status": "passed",
+            "primary_evidence_observed": True,
+            "checklist": [{"step": 1, "status": "recovered_before_observation",
+                           "evidence": "effect dissipated before check"}],
+        })
+        assert r_benign["layer2"]["status"] == "passed"
+        assert not any("inconsistency" in w for w in r_benign["warnings"])
 
 
 # ---------------------------------------------------------------------------

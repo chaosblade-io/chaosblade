@@ -25,7 +25,10 @@ from chaos_agent.agent.spec.fault_spec import (
     read_fault_spec,
     strip_timeout_alias,
 )
-from chaos_agent.agent.spec.intent_anchor import extract_explicit_node_anchor
+from chaos_agent.agent.spec.intent_anchor import (
+    extract_explicit_node_anchor,
+    user_text_corroborates,
+)
 from chaos_agent.agent.state import AgentState, has_live_fault
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
 from chaos_agent.agent.target_guard import canonicalise_kind
@@ -164,27 +167,54 @@ def _alignment_violation(candidate: FaultSpec, current: FaultSpec) -> str | None
     dead plan, terminal rejection 44 minutes later).
 
     The one auto-approvable class: the proposal's target IS the resource the
-    user themselves named — same KIND (node: the anchor vocabulary is
-    node-only, so a pod/deployment namesake is a different resource, not the
-    named one) and names INSIDE the anchor set (a proposal adding targets the
-    user never named is an expansion, not an alignment). The anchor is read
-    from the CURRENT contract's ``user_description`` — the entry point's
-    verbatim intent text — NEVER from the candidate's (see identity above).
-    Anything else (different node, different kind, extra targets, anchorless
-    text, different domain) keeps the existing rejection — an unaligned
-    change without the user in the loop stays a dead end by design.
+    user themselves named. HOW that is verified depends on the kind, because
+    the two families carry different authoritative signals:
+
+    - node / host — a narrow, stable prepositional anchor ("在节点 X 上 /
+      on node X") is extracted from the CURRENT contract's
+      ``user_description``. Names must sit INSIDE the anchor set (adding a
+      target the user never named is an expansion, not an alignment); the
+      anchor vocabulary is node-only, so a pod/deployment namesake of the
+      anchored node is a DIFFERENT resource, not the named one.
+    - every non-node kind (ingress / configmap / secret / service / pod /
+      deployment / …) — no such prepositional frame exists, so authority comes
+      from CORROBORATION instead: :func:`user_text_corroborates` checks the
+      proposal's name AND kind occur as whole tokens in the SAME fixed
+      ``user_description`` (verify-not-parse, fail-closed). This re-opens the
+      correction channel the intent_anchor module always delegated to planning
+      but which was previously welded shut for every non-node kind.
+
+    Both branches read ONLY the CURRENT contract's ``user_description`` — the
+    entry point's verbatim intent text — NEVER the candidate's (see identity
+    above), and both pin the fault DOMAIN (``fault_target``). Anything else
+    (different name, uncorroborated kind, extra targets, anchorless text,
+    different domain) keeps the existing rejection — an unaligned change
+    without the user in the loop stays a dead end by design.
 
     The returned token names the violated dimension so the CLI rejection
     receipt can point the LLM at the right correction (identity vs mechanism
     need different fixes).
     """
-    anchors = extract_explicit_node_anchor(current.user_description)
-    if not anchors:
-        return "anchorless"
-    if canonicalise_kind(candidate.scope) != "node":
-        return "kind"
-    proposed_names = set(candidate.names or ())
-    if not proposed_names or not proposed_names <= set(anchors):
+    candidate_kind = canonicalise_kind(candidate.scope)
+    if candidate_kind in ("node", "host"):
+        # Anchored-identity path, preserved verbatim (B76): node/host have a
+        # narrow prepositional anchor frame, so authority = the explicit anchor.
+        anchors = extract_explicit_node_anchor(current.user_description)
+        if not anchors:
+            return "anchorless"
+        proposed_names = set(candidate.names or ())
+        if not proposed_names or not proposed_names <= set(anchors):
+            return "identity"
+        if candidate.fault_target != current.fault_target:
+            return "mechanism"
+        return None
+    # Non-node path (Fix1 路 A): authority = the user's OWN fixed entry text
+    # corroborates the proposed name + kind (verify-not-parse). Any doubt
+    # fails closed to "identity" — never guess, never widen to the proposal's
+    # own echoed description.
+    if not user_text_corroborates(
+        current.user_description, candidate.scope, candidate.names or (),
+    ):
         return "identity"
     if candidate.fault_target != current.fault_target:
         return "mechanism"
@@ -274,7 +304,11 @@ async def plan_change_confirm(state: AgentState) -> dict:
                     "[PLAN CHANGE REJECTED] CLI mode cannot confirm a plan change "
                     "that does not target the resource the user explicitly named "
                     "in the request. Continue with the reviewed FaultSpec or "
-                    "finish_planning(rejected=True)."
+                    "finish_planning(rejected=True). Do NOT substitute a different "
+                    "fault mechanism — or a different target — to force a similar "
+                    "effect: that injects the WRONG fault class on a resource the "
+                    "user never named. If the reviewed identity is unexecutable, "
+                    "finish_planning(rejected=True) and report it honestly."
                 ))],
             }
             await sync_to_store(state, result)
