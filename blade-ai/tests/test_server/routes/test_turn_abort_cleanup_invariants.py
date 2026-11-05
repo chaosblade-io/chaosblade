@@ -800,19 +800,43 @@ def test_stream_polls_raise_on_disconnect():
 
 
 def test_abort_paths_write_terminal_rows_through_shared_helper():
-    """I10: the abort paths of all three stream modules write the
-    TaskStore row's terminal word through write_aborted_task_row."""
-    for rel, fn_name in (
-        ("routes/turn_event_stream.py", "event_generator"),
-        ("routes/inject_stream.py", "event_generator"),
-        ("routes/recover_stream.py", "event_generator"),
-    ):
-        path = SERVER_DIR / rel
-        source = path.read_text(encoding="utf-8")
-        assert "write_aborted_task_row" in source, (
-            f"{rel} must route its abort-path row writes through the shared "
-            "guarded helper (I10 — zombie rows on abort/error exits)"
-        )
+    """I10 (structural chokepoint edition): the INJECT run's terminal
+    TaskStore row word is owned by the single un-bypassable chokepoint —
+    finalize_inject_session — not by a per-path hand-write at each stream
+    exit. The per-path write was the defect shape: the CLI's generic-exception
+    crash arm and the non-stream inject route both forgot it, leaving a zombie
+    "injecting" row. Now every inject exit routes its row stamp through the
+    chokepoint (which delegates to the shared guarded helper). recover_stream
+    keeps its own abort write — it is a separate graph outside the inject
+    chokepoint's jurisdiction."""
+    finalizer_src = (
+        SERVER_DIR.parent / "memory" / "session_finalizer.py"
+    ).read_text(encoding="utf-8")
+    # The chokepoint routes its row stamp through the shared guarded helper.
+    assert "write_aborted_task_row" in finalizer_src, (
+        "finalize_inject_session must stamp the TaskStore row through the "
+        "shared guarded helper — the single chokepoint every inject exit "
+        "routes through (I10 — no zombie rows on any crash/abort exit)"
+    )
+    # The inject stream delegates to the chokepoint: it must NOT hand-write
+    # the row (that per-site write is the forgotten-on-some-paths defect).
+    inject_stream_src = (SERVER_DIR / "routes" / "inject_stream.py").read_text(
+        encoding="utf-8"
+    )
+    assert "write_aborted_task_row" not in inject_stream_src, (
+        "inject_stream must delegate its terminal row word to the finalize "
+        "chokepoint, not hand-write it per-path (I10 — the forgotten-write "
+        "defect the chokepoint exists to eliminate)"
+    )
+    # recover_stream is a separate graph — it keeps its own guarded write.
+    recover_src = (SERVER_DIR / "routes" / "recover_stream.py").read_text(
+        encoding="utf-8"
+    )
+    assert "write_aborted_task_row" in recover_src, (
+        "routes/recover_stream.py must still route its abort-path row write "
+        "through the shared guarded helper (I10 — recover is outside the "
+        "inject chokepoint's jurisdiction)"
+    )
     # The shared helper itself must call update_task_state with the guard.
     helper_src = (SERVER_DIR / "routes/stream_abort.py").read_text(encoding="utf-8")
     assert "skip_if_terminal=True" in helper_src, (

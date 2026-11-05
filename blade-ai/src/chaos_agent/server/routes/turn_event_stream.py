@@ -121,6 +121,14 @@ class TurnContext:
     # caught carrying private mappings of their own). Empty on the
     # normal path, where recover_finalized suppresses the fallback.
     abort_cause: str = field(default="", init=False)
+    # Reason channel (error_override): the crash cause text the abort
+    # dispatch captured (``error_detail``), stashed on ctx so the finally's
+    # defensive inject finalize — which runs OUTSIDE _abort_turn_cleanup and
+    # receives no arguments — can deposit it into a reason-less projection.
+    # Same lifecycle as abort_cause: empty on the normal path, filled only by
+    # the internal_error exit (the one ending the graph cannot record itself,
+    # because the node died before writing failure_reason).
+    abort_error_detail: str = field(default="", init=False)
     # Monotonic reading at the moment a pipeline (inject / batch) is dispatched
     # in this turn. The ResultCard duration measures ONLY the operation itself:
     # intent clarification preceding dispatch is conversation time, not
@@ -612,7 +620,7 @@ async def _drain_interrupts(graph, config, ctx, batcher, sidewrite, converters):
 
 async def _finalize_task_session(
     graph, config, turn_id, store_cancel_fn, *, cancelled: bool = False,
-    abort_cause: str = "",
+    abort_cause: str = "", error_detail: str = "",
 ):
     """Flush messages and finalize the task session on the clean-exit path.
 
@@ -621,6 +629,12 @@ async def _finalize_task_session(
     terminal word classifies through the shared taxonomy for EVERY abort
     cause, not just the two that set the binary ``cancelled`` flag
     (confirm_timeout sets no flag; internal_error needs none).
+
+    ``error_detail`` is the reason channel: the crash cause text the abort
+    dispatch captured (``ctx.abort_error_detail``), deposited into the
+    inject finalize as ``error_override`` so a reason-less projection (an
+    uncaught exception killed the node before it wrote failure_reason)
+    still carries the cause. Empty on every non-crash cause.
     """
     try:
         from chaos_agent.memory.session_store import get_global_session_store
@@ -697,26 +711,16 @@ async def _finalize_task_session(
                         (cancelled or abort_cause) and not _run_finished
                     )
 
-                    if _abort_terminal:
-                        # Terminal write for the TaskStore row, BEFORE the
-                        # session finalize: the row is the user-facing fact
-                        # (boot card / /tasks), the session record is
-                        # derived — a failure in the latter must not swallow
-                        # the former. No later writer comes on the abort
-                        # path, and inference cannot derive "cancelled" on
-                        # its own. Shared guarded helper since round-54: the
-                        # terminal-regression guard (G6) keeps a row that
-                        # already reached its OWN terminal word (the
-                        # pipeline completed before the abort raced in).
-                        # Round-60 F1''': the word classifies from the
-                        # cause memo (the G5 fallback's own read), so the
-                        # no-flag causes (confirm_timeout, internal_error)
-                        # carry their own word too — same event, one word
-                        # on all surfaces, the r55-r57 taxonomy contract.
-                        await write_aborted_task_row(
-                            _op_tid,
-                            abort_row_word(abort_cause or "user_cancel"),
-                        )
+                    # The TaskStore row's terminal word is stamped by the
+                    # single un-bypassable chokepoint INSIDE
+                    # finalize_inject_session below — it reproduces THIS
+                    # path's gate exactly (the finalizer's round-62 P8
+                    # verdict-yield rule keys on the same infer != "injecting"
+                    # predicate as _abort_terminal, and skip_if_terminal is the
+                    # row surface's G6), so the row write is no longer
+                    # hand-wired per-path. The abort word still rides
+                    # status_override below (which reads _abort_terminal) and
+                    # lands on the row and the session alike.
                     await finalize_inject_session(
                         _store,
                         graph,
@@ -737,6 +741,11 @@ async def _finalize_task_session(
                             if _abort_terminal
                             else None
                         ),
+                        # Reason channel: on the internal_error exit the graph
+                        # node died before writing failure_reason, so the
+                        # projection is reason-less — deposit the crash cause
+                        # the abort dispatch captured (graph state wins).
+                        error_override=error_detail or None,
                     )
                     logger.info(
                         "Defensive inject finalize for task=%s from graph state",
@@ -1590,6 +1599,11 @@ async def _abort_turn_cleanup(
     # Before anything else: the finally block's fallback arms key on this
     # (see the cause-memo row of the decision table above).
     ctx.abort_cause = cause
+    # Reason channel: stash the crash cause beside the cause word so the
+    # finally's defensive inject finalize can carry it into the audit record
+    # (graph state wins; this only fills a reason-less projection). Empty on
+    # every non-crash cause, where the graph recorded its own reason.
+    ctx.abort_error_detail = error_detail
     with anyio.CancelScope(shield=True):
         try:
             # Ceiling since round-54 (G7/F5): BOTH arms are bounded now.
@@ -1678,11 +1692,13 @@ async def _cleanup_cancelled_execution_artifacts(ctx: TurnContext) -> None:
         if not artifacts:
             return
         from chaos_agent.agent.nodes.store._store_sync import sync_to_store
+        from chaos_agent.transports import resolve_transport_target
 
         cleaned, names = await cleanup_debug_pod_artifacts(
             artifacts,
             kubeconfig=str(values.get("kubeconfig") or ""),
             task_id=str(values.get("task_id") or ctx.turn_id),
+            target=resolve_transport_target(values),
         )
         if cleaned != artifacts:
             await sync_to_store(values, {"execution_artifacts": cleaned})
@@ -2230,6 +2246,10 @@ async def event_generator(ctx: TurnContext):
                         # from — so the session word matches the row word
                         # for EVERY abort cause, not just the flag-causes.
                         abort_cause=ctx.abort_cause,
+                        # Reason channel: the crash cause text the abort
+                        # dispatch captured, so the defensive inject finalize
+                        # can fill a reason-less projection (graph state wins).
+                        error_detail=ctx.abort_error_detail,
                     )
                     # Round-54 G5: a turn-dispatched recovery killed mid-run
                     # (auto-recover from dialogue) left BOTH its session row

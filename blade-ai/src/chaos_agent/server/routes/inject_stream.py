@@ -23,7 +23,6 @@ from chaos_agent.server.routes.stream_abort import (
     ABORT_SQLITE_CEILING_S,
     ClientDisconnected,
     abort_row_word,
-    write_aborted_task_row,
 )
 from chaos_agent.server.schemas import InjectRequest
 from chaos_agent.utils.time import now_iso
@@ -76,11 +75,15 @@ async def inject_stream(request: InjectRequest, req: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
-    # Runtime override
-    if request.kubeconfig:
-        settings.kubeconfig_path = request.kubeconfig
-    if request.context:
-        settings.kube_context = request.context
+    # Per-request connection identity is carried by the graph STATE built below
+    # (build_inject_initial_state), NOT by mutating the process-global
+    # ``settings`` singleton and NOT by an ambient scope. Every kubectl/blade
+    # command builder on the per-task path resolves its --kubeconfig/--context
+    # and channel from ``resolve_transport_target(state)`` (state > settings),
+    # so two concurrent inject-streams each read their OWN state — no shared
+    # mutable carrier to stomp. A global write here would leak one request's
+    # identity into every other in-flight task; the state is checkpointed per
+    # thread_id and re-hydrated across inject → confirm → recover.
 
     # Build initial state — FaultSpec is the single source of truth.
     try:
@@ -147,6 +150,12 @@ async def inject_stream(request: InjectRequest, req: Request):
         # last mid-graph upsert ("injecting" forever in /tasks; no
         # later writer comes on the abort path).
         _stream_failed = False
+        # Reason channel (error_override): the crash arm below stashes the
+        # cause it already builds for the SSE error, so the finally's
+        # finalize can deposit it into a reason-less projection — an uncaught
+        # exception kills the node before it writes failure_reason to the
+        # graph state. Empty on every non-crash exit.
+        _crash_reason = ""
 
         async def _abort_inject_stream_cleanup() -> str:
             """Single-source abort cleanup for this inject stream (round-52).
@@ -386,6 +395,13 @@ async def inject_stream(request: InjectRequest, req: Request):
             # mid-rollback (error plus disconnect) used to kill the rollback
             # at its first suspension — orphaning committed faults.
             rollback_info = await _abort_inject_stream_cleanup()
+            # Reason channel: stash the crash cause (classification-prefixed,
+            # same shape the CLI persists) for the finally's finalize.
+            # DATA_ENVELOPE mode writes data["error"] verbatim into the audit
+            # record, so this is what keeps the cause from being lost.
+            _crash_reason = (
+                f"internal_error: Inject failed: {type(e).__name__}: {e}{rollback_info}"
+            )
 
             yield StreamEvent(
                 type="error",
@@ -410,33 +426,22 @@ async def inject_stream(request: InjectRequest, req: Request):
             with anyio.CancelScope(shield=True):
                 try:
                     with anyio.fail_after(ABORT_SQLITE_CEILING_S):
-                        if _stream_cancelled or _stream_failed:
-                            # Terminal write for the TaskStore row, BEFORE the
-                            # session finalize (the turn stream's own ordering
-                            # rationale: the row is the user-facing fact —
-                            # /tasks, the audit record — the session record is
-                            # derived, and a failure in the latter must not
-                            # swallow the former). No later writer comes on
-                            # the abort path, and inference cannot derive the
-                            # abort word on its own. Guarded (G6): a row that
-                            # already reached its OWN terminal word (the
-                            # pipeline completed before the abort raced in)
-                            # keeps its verdict — "completed" must not be
-                            # rewritten to "cancelled"/"failed".
-                            # Round-56: the exit flags encode the cause CLASS
-                            # (both interrupt exits set _stream_cancelled;
-                            # only the crash handler sets _stream_failed), so
-                            # the representative cause routes the word
-                            # through the SHARED taxonomy — the inline
-                            # flag→word conditional this site used to carry
-                            # was the r54 G4 defect shape, flag edition.
-                            await write_aborted_task_row(
-                                task_id,
-                                abort_row_word(
-                                    "user_cancel" if _stream_cancelled
-                                    else "internal_error",
-                                ),
-                            )
+                        # The TaskStore row's terminal word is stamped by the
+                        # single un-bypassable chokepoint INSIDE
+                        # finalize_inject_session (it derives the SAME
+                        # floor-aware word the session record and the crash
+                        # envelope already carry, gated by skip_if_terminal +
+                        # the round-62 P8 verdict-yield rule), so this path no
+                        # longer hand-writes the row — the per-site write was
+                        # the defect shape the CLI's generic-exception crash
+                        # arm and the non-stream inject route both forgot,
+                        # leaving a zombie "injecting". The abort cause still
+                        # rides status_override below: on a user cancel it
+                        # classifies the row/session word "cancelled"; on the
+                        # internal-error crash it stays None and the floor word
+                        # wins — a crash AFTER injection landed reads
+                        # "injected"/"unverified", not a hardcoded "failed"
+                        # (a82984a3/B88, now on the row surface too).
                         await finalize_inject_session(
                             session_store,
                             graph,
@@ -472,6 +477,10 @@ async def inject_stream(request: InjectRequest, req: Request):
                                 if _stream_cancelled
                                 else None
                             ),
+                            # Reason channel: fill a reason-less projection
+                            # with the crash cause the except arm witnessed
+                            # (graph state wins when it recorded one).
+                            error_override=_crash_reason or None,
                         )
                 except TimeoutError:
                     logger.warning(

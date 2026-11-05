@@ -605,6 +605,10 @@ class TestSkillsReload:
         data = body["data"]
         assert "skills_dir" in data
         assert "total" in data
+        # Dual-root merge: the payload also lists every root re-scanned
+        # so ``total`` (merged count) is traceable to its sources.
+        assert isinstance(data["roots"], list)
+        assert all(isinstance(r, str) for r in data["roots"])
         # Same set before/after a no-op reload — added and removed
         # arrays are empty.
         assert data["added"] == []
@@ -895,6 +899,14 @@ class TestSkillsDirEndpoint:
         assert len(data["candidates"]) == 3
         labels = [c["label"] for c in data["candidates"]]
         assert labels == ["config.json", "env BLADE_AI_SKILLS_DIR", "dev path"]
+        # ``roots`` is the distinct merge-loaded set (user root first,
+        # built-in pack second). ``resolved`` is always the primary root,
+        # so it must be roots[0]. Additive field — the pinned candidate
+        # contract above is untouched.
+        assert isinstance(data["roots"], list)
+        assert all(isinstance(r, str) for r in data["roots"])
+        assert len(data["roots"]) >= 1
+        assert data["roots"][0] == data["resolved"]
 
 
 class TestConfigSetGetIntegration:

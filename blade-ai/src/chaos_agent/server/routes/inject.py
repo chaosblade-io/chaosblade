@@ -44,11 +44,15 @@ async def inject_fault(request: InjectRequest, req: Request):
             request_id=getattr(req.state, "request_id", ""),
         )
 
-    # Runtime override: kubeconfig/context from request
-    if request.kubeconfig:
-        settings.kubeconfig_path = request.kubeconfig
-    if request.context:
-        settings.kube_context = request.context
+    # Per-request connection identity is carried by the graph STATE built below
+    # (build_inject_initial_state), NOT by mutating the process-global
+    # ``settings`` singleton and NOT by an ambient scope. Every kubectl/blade
+    # command builder on the per-task path resolves its --kubeconfig/--context
+    # and channel from ``resolve_transport_target(state)`` (state > settings),
+    # so two concurrent injects each read their OWN state — no shared mutable
+    # carrier to stomp. A global write here would leak one request's identity
+    # into every other in-flight task; the state is checkpointed per thread_id
+    # and re-hydrated across inject → confirm → recover.
 
     # Build initial state. FaultSpec is the single source of truth for
     # fault identity + tuning; consumers read via ``read_fault_spec``.
@@ -91,6 +95,12 @@ async def inject_fault(request: InjectRequest, req: Request):
         from chaos_agent.observability import status_tracker as _st_mod
         _tsm = get_task_span_manager()
         _otel_cb = getattr(_st_mod, "_otel_callback", None)
+        # Reason channel (error_override): the except arm below stashes the
+        # crash cause so the finally's finalize can deposit it into a
+        # reason-less projection — an uncaught exception kills the node
+        # before it writes failure_reason to the graph state. Empty on the
+        # normal path.
+        _crash_reason = ""
         try:
             _tsm.start_task_span(task_id)
             if _otel_cb is not None:
@@ -152,6 +162,10 @@ async def inject_fault(request: InjectRequest, req: Request):
             # abort-safe: see invariants allowlist
             await auto_rollback(agents["pipeline"], config)
 
+            # Reason channel: stash the crash cause (classification-prefixed,
+            # same shape the CLI persists) for the finally's finalize; the
+            # API return keeps its own bare shape.
+            _crash_reason = f"internal_error: Inject failed: {type(e).__name__}: {e}"
             return {"error": f"{type(e).__name__}: {e}"}
         finally:
             # Finalize session: flush remaining messages from final graph state
@@ -162,6 +176,9 @@ async def inject_fault(request: InjectRequest, req: Request):
                 config,
                 task_id,
                 result_summary_mode=RESULT_SUMMARY_STATUS_ENVELOPE,
+                # Reason channel: fill a reason-less projection with the
+                # crash cause the except arm witnessed (graph state wins).
+                error_override=_crash_reason or None,
             )
             _tsm.end_task_span(task_id)
 

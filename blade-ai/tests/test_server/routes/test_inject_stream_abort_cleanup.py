@@ -173,16 +173,17 @@ async def test_error_plus_disconnect_rolls_back_through_shield():
     # The rollback is the point of the error path: it must precede the
     # terminal finalize (the last durable write on the abort path).
     assert calls.index(("auto_rollback",)) < calls.index(("finalize", None)), calls
-    # Round-54 G4: the error exit is NOT a cancel — no override, the crash
-    # path's session status comes from finalize's own inference — but its
-    # TaskStore row STILL gets a terminal word: "failed", through the
-    # shared guarded helper. Before G4 a crashed run's row stayed a zombie
-    # at its last mid-graph upsert ("injecting" forever in /tasks; no
-    # later writer comes on the abort path).
-    _rows = [c for c in calls if c[0] == "taskstore_row"]
-    assert len(_rows) == 1, calls
-    assert _rows[0][2] == "failed" and _rows[0][3] is True, _rows[0]
-    assert calls.index(_rows[0]) < calls.index(("finalize", None)), calls
+    # Round-54 G4 → structural chokepoint cure: the error exit is NOT a
+    # cancel, so it carries no status_override (None) — the crash path's
+    # terminal word is derived INSIDE finalize_inject_session from the
+    # durable checkpoint (terminal_task_state → the Layer-1 floor), the SAME
+    # single source the session record and the crash envelope use, and
+    # stamped onto the TaskStore row there. The route no longer hand-writes
+    # the row (that per-path write was the defect the CLI crash arm and the
+    # non-stream route forgot → zombie "injecting"). Row-stamp coverage lives
+    # in test_session_finalizer.py's chokepoint matrix; here we assert the
+    # delegation reaches finalize through the shield.
+    assert not [c for c in calls if c[0] == "taskstore_row"], calls
 
 
 @pytest.mark.asyncio
@@ -224,17 +225,18 @@ async def test_scope_cancel_mid_stream_finalizes_through_shield():
             await asyncio.sleep(0.05)  # let it reach the mid-stream hang
             tg.cancel_scope.cancel()
 
-    # No error → no rollback; the terminal triad must all survive the
-    # level-based cancellation, with the cancel exit's OWN semantics:
-    # the TaskStore row write BEFORE the finalize (row = user-facing fact,
-    # finalize = derived record), and the finalize carrying the explicit
-    # cancelled override — not the inference's guess.
+    # No error → no rollback; the terminal writes must all survive the
+    # level-based cancellation, with the cancel exit's OWN semantics: the
+    # finalize carries the explicit "cancelled" override (not the
+    # inference's guess). The TaskStore row's terminal word now rides THAT
+    # override into the finalize chokepoint (which stamps it via
+    # skip_if_terminal), so the route no longer hand-writes the row — the
+    # per-path write was the defect shape. Row-stamp coverage: the
+    # test_session_finalizer.py chokepoint matrix.
     assert ("auto_rollback",) not in calls, calls
     assert ("finalize", "cancelled") in calls, calls
     assert ("unregister",) in calls, calls
-    _ts_writes = [c for c in calls if c[0] == "taskstore_row"]
-    assert len(_ts_writes) == 1 and _ts_writes[0][2] == "cancelled", calls
-    assert calls.index(_ts_writes[0]) < calls.index(("finalize", "cancelled")), calls
+    assert not [c for c in calls if c[0] == "taskstore_row"], calls
 
 
 @pytest.mark.asyncio
@@ -291,14 +293,13 @@ async def test_poll_detected_disconnect_gets_cancel_terminal_triad():
     # Interrupt, not crash: no rollback (the fault's own --timeout plus
     # the recover graph are the interrupt-side safety net — probe r53 D).
     assert ("auto_rollback",) not in calls, calls
-    # The cancel exit's OWN triad words: row "cancelled" through the
-    # guarded helper, then finalize carrying the explicit override (not
-    # the inference's guess the pre-G1 break produced on this path).
-    _rows = [c for c in calls if c[0] == "taskstore_row"]
-    assert len(_rows) == 1, calls
-    assert _rows[0][2] == "cancelled" and _rows[0][3] is True, _rows[0]
+    # The cancel exit's OWN word: finalize carries the explicit "cancelled"
+    # override (not the inference's guess the pre-G1 break produced on this
+    # path), and that override is what the finalize chokepoint stamps onto
+    # the TaskStore row (skip_if_terminal). The route no longer hand-writes
+    # the row — coverage: test_session_finalizer.py chokepoint matrix.
     assert ("finalize", "cancelled") in calls, calls
-    assert calls.index(_rows[0]) < calls.index(("finalize", "cancelled")), calls
+    assert not [c for c in calls if c[0] == "taskstore_row"], calls
     assert ("unregister",) in calls, calls
 
 

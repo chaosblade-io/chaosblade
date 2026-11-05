@@ -43,7 +43,7 @@ from chaos_agent.server.routes.recordings import recordings_router
 from chaos_agent.server.routes.recover_stream import recover_stream  # noqa: F401 - registers route
 from chaos_agent.server.routes.sessions import sessions_router
 from chaos_agent.server.routes.status_stream import status_stream  # noqa: F401 - registers route
-from chaos_agent.skills.loader import get_skills_dir
+from chaos_agent.skills.loader import get_skill_roots, get_skills_dir
 from chaos_agent.skills.prerequisites import PrerequisitesChecker
 from chaos_agent.skills.registry import SkillRegistry
 from chaos_agent.skills.watcher import SkillWatcher
@@ -102,9 +102,11 @@ async def lifespan(app: FastAPI):
     # --- Startup ---
     logger.info("Starting Blade AI Server...")
 
-    # Initialize skill registry
+    # Initialize skill registry — merge-load user root first, then the
+    # read-only built-in pack (built-in cases always available; a user
+    # skill of the same name shadows them).
     registry = SkillRegistry()
-    registry.load_from_directory(get_skills_dir())
+    registry.load_from_roots(get_skill_roots())
     app.state.skill_registry = registry
 
     # Hot-reload watchers. Both are no-ops if watchdog isn't installed
@@ -113,6 +115,11 @@ async def lifespan(app: FastAPI):
     # changes; KnowledgeWatcher rebuilds the knowledge_registry cache
     # on .md changes under src/chaos_agent/knowledge/. Both stop in
     # the shutdown block below.
+    #
+    # The watcher observes only the USER root (the writable dir the user
+    # edits / installs into); the built-in pack is read-only and never
+    # changes at runtime. registry.reload() (no-arg) re-scans BOTH roots
+    # it was loaded from, so the merged view + precedence survive a reload.
     skill_watcher = SkillWatcher(get_skills_dir(), registry)
     skill_watcher.start()
     app.state.skill_watcher = skill_watcher
@@ -408,11 +415,11 @@ def create_app() -> FastAPI:
         # of loaded skills. Best-effort — a missing/corrupt skills dir
         # must not break the version endpoint.
         try:
-            from chaos_agent.skills.loader import get_skills_dir
+            from chaos_agent.skills.loader import get_skill_roots
             from chaos_agent.skills.registry import SkillRegistry
 
             registry = SkillRegistry()
-            registry.load_from_directory(get_skills_dir())
+            registry.load_from_roots(get_skill_roots())
             skill_count = len(registry)
         except Exception:
             skill_count = 0

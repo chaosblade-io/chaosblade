@@ -17,7 +17,7 @@ fault submitted against a k8s channel produced no warning at all
 (observed in a real TUI session: the tool ran, no intent card appeared,
 the turn ended silently).
 
-Command dispatch never surfaced the gap because ``TransportTarget.from_state``
+Command dispatch never surfaced the gap because ``resolve_transport_target``
 applies the settings fallback itself; the prompt does not.
 ``TurnRequest`` carries no transport fields, so the route must resolve
 them from settings — first turn only; later turns inherit via checkpoint

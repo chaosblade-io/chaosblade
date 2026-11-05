@@ -412,7 +412,7 @@ async def test_poll_detected_disconnect_sets_cancel_triad_flag():
         calls.append(("record",))
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)
         calls.append(("finalize", cancelled))
@@ -503,7 +503,7 @@ async def test_turn_dispatched_recover_abort_gets_finalized_in_finally():
     ctx.recover_config = {"configurable": {"thread_id": "recover-1"}}
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)
         calls.append(("finalize", cancelled))
@@ -614,7 +614,7 @@ async def test_turn_recover_abort_user_cancel_gets_cancelled_word():
     ctx.recover_config = {"configurable": {"thread_id": "recover-1"}}
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)
         calls.append(("finalize", cancelled))
@@ -726,7 +726,7 @@ async def test_recover_finalized_on_normal_path_suppresses_fallback():
     ctx.recover_finalized = True
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)
         calls.append(("finalize", cancelled))
@@ -823,7 +823,7 @@ async def _run_abort_with_intent_values(
     # recorded — the window the self-rescue exists to close.
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)
         calls.append(("finalize", cancelled))
@@ -1079,7 +1079,7 @@ async def test_cancel_exit_cleanup_chain_survives_scope_cancellation():
         calls.append(("record",))
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)  # real suspension: dies unless shielded
         calls.append(("finalize", cancelled))
@@ -1208,7 +1208,7 @@ async def test_cancel_cleanup_hitting_ceiling_abandons_rest_bounded(caplog):
         calls.append(("record",))  # pragma: no cover — must be skipped
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)  # real suspension: dies unless shielded
         calls.append(("finalize", cancelled))
@@ -1341,7 +1341,7 @@ async def test_capture_failure_skips_rollback_keeps_record(caplog):
         calls.append(("record",))
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)  # real suspension: dies unless shielded
         calls.append(("finalize", cancelled))
@@ -1485,7 +1485,7 @@ async def test_cancel_with_dispatched_pipeline_clears_state_via_single_source():
         calls.append(("record",))
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)  # real suspension: dies unless shielded
         calls.append(("finalize", cancelled))
@@ -1613,7 +1613,7 @@ async def test_internal_error_cleanup_survives_disconnect_mid_handler():
         calls.append(("record",))
 
     async def fake_finalize(
-    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="",
+    graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail="",
 ):
         await asyncio.sleep(0)  # real suspension: dies unless shielded
         calls.append(("finalize", cancelled))
@@ -1719,7 +1719,7 @@ async def test_abort_after_pipeline_dispatch_finalizes_from_pipeline_thread():
     ctx.pipeline_task_id = "inject-dispatched"
     ctx.pipeline_config = {"configurable": {"thread_id": "inject-dispatched"}}
 
-    async def fake_finalize(graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause=""):
+    async def fake_finalize(graph, config, turn_id, store_cancel_fn, *, cancelled=False, abort_cause="", error_detail=""):
         calls.append((
             "finalize",
             graph is pipeline_graph,

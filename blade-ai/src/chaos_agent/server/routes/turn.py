@@ -116,7 +116,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
         )
         # Channel/transport fields: TurnRequest never carries them, so they
         # resolve from settings — the same fallback the pipeline handoff in
-        # turn_event_stream.py and ``TransportTarget.from_state`` apply.
+        # turn_event_stream.py and ``resolve_transport_target`` apply.
         # The intent prompt renders its `Capability Profile` section from
         # ``kube_connection_mode``; with the field unset the profile resolves
         # to "unknown", the section is skipped, and the Inject Flow rule that

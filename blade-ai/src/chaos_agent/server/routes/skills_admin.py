@@ -108,6 +108,13 @@ async def skills_dir(req: Request):
     no LLM call, no filesystem scan beyond what ``get_skills_dir()``
     already does at startup.
 
+    ``candidates`` is the priority chain ``get_skills_dir()`` walks to
+    resolve the PRIMARY (user-writable) root. ``roots`` is the distinct
+    set actually merge-loaded — the user root first, then the read-only
+    built-in pack — so a user who redirected ``skills_dir`` still sees
+    where the built-in cases come from (``SkillRegistry.load_from_roots``
+    merges both; ``resolved``/``candidates`` alone would hide the pack).
+
     Why a flat ``/skills_dir`` path instead of nesting under
     ``/skills/path``: the latter would shadow any future skill named
     ``path`` (FastAPI matches the literal segment first, then the
@@ -115,7 +122,10 @@ async def skills_dir(req: Request):
     collision class.
     """
     from chaos_agent.config.settings import settings as s
-    from chaos_agent.skills.loader import get_skills_dir as _get_dir
+    from chaos_agent.skills.loader import (
+        get_skill_roots,
+        get_skills_dir as _get_dir,
+    )
     import os
 
     req_id = getattr(req.state, "request_id", "")
@@ -139,7 +149,11 @@ async def skills_dir(req: Request):
         },
     ]
     return JSONEnvelope.ok(
-        data={"resolved": str(resolved), "candidates": candidates},
+        data={
+            "resolved": str(resolved),
+            "candidates": candidates,
+            "roots": [str(r) for r in get_skill_roots()],
+        },
         request_id=req_id,
     )
 
@@ -189,8 +203,12 @@ async def reload_skills(req: Request):
     """Re-scan ``skills_dir`` and surface the diff vs. the previous
     set. Mirrors Python TUI's ``_cmd_skills_reload`` so the user
     sees ``added`` / ``removed`` / ``total`` after the rescan.
+
+    ``total`` counts the MERGED set (user root + read-only built-in
+    pack), so ``skills_dir`` alone would under-report where those
+    skills live; ``roots`` lists every root actually re-scanned.
     """
-    from chaos_agent.skills.loader import get_skills_dir
+    from chaos_agent.skills.loader import get_skill_roots, get_skills_dir
 
     req_id = getattr(req.state, "request_id", "")
     registry = _registry(req)
@@ -202,7 +220,9 @@ async def reload_skills(req: Request):
         )
     before = set(registry.list_skills())
     try:
-        registry.reload(get_skills_dir())
+        # No-arg reload re-scans the roots this registry was loaded from
+        # (user root + built-in pack), preserving the merged view.
+        registry.reload()
     except Exception as e:
         logger.exception("skills reload failed")
         return JSONEnvelope.fail(
@@ -214,6 +234,7 @@ async def reload_skills(req: Request):
     return JSONEnvelope.ok(
         data={
             "skills_dir": str(get_skills_dir()),
+            "roots": [str(r) for r in get_skill_roots()],
             "total": len(after),
             "added": sorted(after - before),
             "removed": sorted(before - after),

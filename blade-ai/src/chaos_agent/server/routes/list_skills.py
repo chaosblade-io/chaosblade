@@ -4,7 +4,6 @@ import logging
 
 from fastapi import Request
 
-from chaos_agent.config.settings import settings
 from chaos_agent.models.schemas import JSONEnvelope
 from chaos_agent.server.routes import skills_router
 
@@ -15,17 +14,24 @@ logger = logging.getLogger(__name__)
 async def list_skills(req: Request):
     """List all supported fault capabilities (from last capabilities-sync).
 
-    Reads the pre-generated skill_capabilities.json. Fast, no LLM/blade calls.
+    Reads the registry the last sync produced. Fast, no LLM/blade calls.
     Run `blade-ai capabilities-sync` to regenerate.
     """
     import json as _json
-    from chaos_agent.skills.loader import get_skills_dir
+    from chaos_agent.skills.capabilities import existing_local_registries
+    from chaos_agent.skills.loader import resolve_skill_dir
 
-    primary = settings.resolved_memory_dir / "skill_capabilities.json"
-    default = get_skills_dir() / "k8s-chaos-skills" / "references" / "skill_capabilities.default.json"
-    src = primary if primary.exists() else default
+    # Language-agnostic endpoint: whichever local registry exists (zh first),
+    # then the checked-in default so it still answers before any sync has run.
+    local_files = existing_local_registries()
+    k8s_dir = resolve_skill_dir("k8s-chaos-skills")
+    default = (
+        k8s_dir / "references" / "skill_capabilities.default.json"
+        if k8s_dir else None
+    )
+    src = local_files[0] if local_files else default
 
-    if not src.exists():
+    if src is None or not src.exists():
         return JSONEnvelope.ok(
             data={"total": 0, "categories": [],
                   "hint": "No capabilities data. Run `blade-ai capabilities-sync` to generate."},
@@ -53,6 +59,13 @@ async def list_skills(req: Request):
         data={
             "total": len(cases),
             "blade_version": catalog.get("blade_version", ""),
+            # Registries are per language now, so "the last sync" is ambiguous
+            # the moment two files exist. This endpoint takes zh first; naming
+            # the language and the file lets a caller detect that instead of
+            # silently rendering one language's prose as if it were the only
+            # registry. Same fields as `blade-ai list`.
+            "lang": catalog.get("lang", ""),
+            "source": str(src),
             "categories": list(cats.values()),
         },
         request_id=getattr(req.state, "request_id", ""),

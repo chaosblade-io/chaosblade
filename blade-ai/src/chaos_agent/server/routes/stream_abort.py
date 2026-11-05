@@ -133,20 +133,26 @@ def abort_row_word(cause: str) -> str:
 
 
 async def write_aborted_task_row(task_id: str, task_state: str) -> None:
-    """Write the terminal TaskStore word for an aborted run, guarded.
+    """Write the terminal TaskStore word for a run, guarded.
 
-    Shared by the abort paths of all three stream modules (the r53
-    triad's row write, generalised off the cancel exits): a run that
-    ended in a disconnect or an internal error must not leave its row
-    at the last mid-graph upsert — a zombie "injecting" in /tasks that
-    inference can never fix (no later writer comes on these paths).
+    The single hardened row-stamp primitive (guarded + retried + loud). Its
+    dominant caller is now the ``finalize_inject_session`` chokepoint — the
+    one finally every inject exit routes through — so a crashed or aborted
+    inject can never leave its row a zombie at the last mid-graph upsert
+    (the forgotten-per-path-write defect this generalises off: the CLI's
+    generic-exception crash arm and the non-stream inject route used to skip
+    the row entirely). recover_stream's abort path and the CLI's
+    signal-handler backstop (which must land the word before a cancellation
+    tears the finally down) are the remaining direct callers.
 
     The guard (r54 G6): ``update_task_state(skip_if_terminal=True)``
     refuses to move a row that already reached its OWN terminal word —
     a cancel landing during result extraction, after the pipeline
     completed, must not rewrite "completed" into "cancelled". The
     abort word is for runs whose graph NEVER got to finish; the run
-    that finished keeps its own verdict.
+    that finished keeps its own verdict. This also makes the chokepoint's
+    clean-path stamp an idempotent no-op (the final node's upsert already
+    landed the terminal word).
 
     Fail-soft by design (an abort path must not raise past the exit
     that is already unwinding), but LOUD: the row word is the

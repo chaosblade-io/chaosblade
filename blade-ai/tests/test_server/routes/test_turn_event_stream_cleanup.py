@@ -108,12 +108,13 @@ async def test_cancel_cleanup_uses_current_pipeline_checkpoint():
         "target": {"scope": "node", "name": "node-a"},
     }
     cleaned_artifact = {**artifact, "status": "cleaned"}
+    values = {
+        "task_id": "task-1",
+        "kubeconfig": "/tmp/kubeconfig",
+        "execution_artifacts": [artifact],
+    }
     graph = SimpleNamespace(
-        aget_state=AsyncMock(return_value=SimpleNamespace(values={
-            "task_id": "task-1",
-            "kubeconfig": "/tmp/kubeconfig",
-            "execution_artifacts": [artifact],
-        }))
+        aget_state=AsyncMock(return_value=SimpleNamespace(values=values))
     )
     ctx = TurnContext(
         sid="sid",
@@ -136,6 +137,8 @@ async def test_cancel_cleanup_uses_current_pipeline_checkpoint():
     ctx.result_graph = graph
     ctx.result_config = ctx.graph_config
 
+    from chaos_agent.transports import resolve_transport_target
+
     with patch(
         "chaos_agent.agent.execution_artifacts.cleanup_debug_pod_artifacts",
         new=AsyncMock(return_value=([cleaned_artifact], ["debug-pod"])),
@@ -149,6 +152,11 @@ async def test_cancel_cleanup_uses_current_pipeline_checkpoint():
         [artifact],
         kubeconfig="/tmp/kubeconfig",
         task_id="task-1",
+        # The cancel-cleanup path resolves the transport target from the SAME
+        # live checkpoint values it read the artifacts from (single authority),
+        # so a per-session kubewiz/ssh value survives instead of falling back
+        # to settings-only.
+        target=resolve_transport_target(values),
     )
     sync.assert_awaited_once()
     assert sync.await_args.args[1] == {"execution_artifacts": [cleaned_artifact]}
@@ -209,8 +217,12 @@ async def test_defensive_finalize_preserves_explicit_user_cancellation():
 
 @pytest.mark.asyncio
 async def test_cancelled_finalize_writes_task_row_cancelled():
-    """Turn abort must stamp the TaskStore row cancelled: no later writer
-    comes, and inference cannot derive "cancelled" on its own."""
+    """Turn abort must get the "cancelled" word onto the TaskStore row — but
+    through the single finalize chokepoint, not a per-path hand-write. The
+    route's job is to hand finalize the classified status_override; the
+    chokepoint inside finalize_inject_session stamps the row from it
+    (skip_if_terminal=True). This test asserts the delegation; the stamp
+    itself is covered by the test_session_finalizer.py chokepoint matrix."""
     values = {"task_id": "task-cancelled", "operation": "inject", "messages": []}
     graph = SimpleNamespace(
         aget_state=AsyncMock(return_value=SimpleNamespace(values=values, next=())),
@@ -224,7 +236,7 @@ async def test_cancelled_finalize_writes_task_row_cancelled():
     ), patch(
         "chaos_agent.memory.session_finalizer.finalize_inject_session",
         new=AsyncMock(),
-    ), patch(
+    ) as finalize, patch(
         "chaos_agent.persistence.task_store.get_task_store",
         new=AsyncMock(return_value=task_store),
     ):
@@ -232,12 +244,10 @@ async def test_cancelled_finalize_writes_task_row_cancelled():
             graph, {}, "turn-1", lambda _task_id: None, cancelled=True,
         )
 
-    # Round-54: the row write rides the shared guarded helper
-    # (stream_abort.write_aborted_task_row) — skip_if_terminal=True is
-    # the terminal-regression guard (G6), part of the write's contract.
-    task_store.update_task_state.assert_awaited_once_with(
-        "task-cancelled", "cancelled", skip_if_terminal=True,
-    )
+    # The classified word rides status_override into the chokepoint, which
+    # owns the row write — the route no longer writes it directly.
+    assert finalize.await_args.kwargs["status_override"] == "cancelled"
+    task_store.update_task_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -472,9 +482,11 @@ async def test_no_flag_causes_classify_session_word_from_cause_memo(
         )
 
     assert finalize.await_args.kwargs["status_override"] == expected_word
-    task_store.update_task_state.assert_awaited_once_with(
-        "task-ct", expected_word, skip_if_terminal=True,
-    )
+    # The row's terminal word rides that override into the finalize
+    # chokepoint (which stamps it via skip_if_terminal) — the route no
+    # longer hand-writes the row. Row-stamp coverage: the
+    # test_session_finalizer.py chokepoint matrix.
+    task_store.update_task_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
