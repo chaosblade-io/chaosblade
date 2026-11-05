@@ -234,8 +234,15 @@ Expected: the avg in rtt min/avg/max/mdev is close to the injected delay (e.g. 3
 - Do NOT ping an external address (e.g. 8.8.8.8), since external network conditions distort the latency
 - If the target Pod uses a distroless image it may have no ping command, so another method is needed
 
-**Method 2: verify HTTP latency with kubectl exec curl**
-Expected: time_total close to the injected delay
+**Method 2: verify HTTP latency with kubectl exec curl (or the framework `http_probe` tool)**
+Expected: the DATA-PATH connect time — `time_connect`, or `time_total - time_namelookup` — rises by ~the injected delay vs the baseline. Do NOT read bare `time_total`.
+
+**Caveats (DNS search-domain amplification — the delay-fault trap)**:
+- A delay fault slows EVERY DNS query, and the K8s default `ndots:5` expands a relative name (fewer than 5 dots, e.g. the 4-dot `<svc>.<ns>.svc.cluster.local`) into ~8 serial search-domain lookups. At a 2s delay the DNS alone can reach ~16s, blowing past the probe `--max-time` → curl `exit 28`, `http_code=000`, `time_total=0`, mis-measuring a data-path delay as "totally unreachable" (the direct source of the task-821d4bb4 false `failed`).
+- The probe address MUST be amplification-resistant. PREFER a pre-resolved ClusterIP (`kubectl get svc <svc> -n <ns> -o jsonpath='{.spec.clusterIP}'`) via `--resolve <host>:<port>:<clusterIP>` or by hitting the IP directly (ZERO DNS — `time_connect` is then the pure data-path handshake delay); a trailing-dot FQDN `<svc>.<ns>.svc.cluster.local.` is second-best (collapses ~8 lookups to 1, but that one is still slowed and mixes into `time_connect`).
+- Emit the segmented times (`namelookup` / `connect` / `total`), e.g. `curl -s -o /dev/null -w 'namelookup=%{time_namelookup} connect=%{time_connect} total=%{time_total}' --connect-timeout 3 --max-time 15 <amplification-resistant-url>`. `namelookup` is the amplification self-check: a pre-resolved IP ≈ 0; a trailing-dot FQDN ≤ ~one delay; ≈ delay × many means the probe is still using an `ndots:5`-amplified relative name — fix the address before taking evidence, never mistake DNS amplification for injected delay.
+- The framework-preferred `http_probe` tool follows the same discipline: put a trailing-dot FQDN or an IP in `url`, or pass `resolve=<host>:<port>:<clusterIP>` (the tool has `--resolve` built in and its validator admits all three forms); its `time_connect` metric is the data-path segment.
+- Baseline, injection-verify and recovery-verify MUST use the SAME amplification-resistant address and the SAME metric.
 
 **Method 3: verify timeouts from application logs**
 Expected: the logs contain keywords such as "timeout", "i/o timeout", "deadline exceeded", "connection timed out"
@@ -252,7 +259,7 @@ Expected: connections are visible in ESTABLISHED state, but there may be many re
 - **(see the general network-fault notes above)** localhost is unaffected by tc rules + Readiness Probe compatibility
 
 > **🤖 The Agent's decision logic**:
-> - Parse the ping or curl output and extract the latency (in ms)
+> - Parse the ping or curl output and extract the latency (in ms). For curl this is the DATA-PATH segment (`time_connect`, or `time_total - time_namelookup`), never bare `time_total` — see Method 2's DNS-amplification caveat.
 > - If the latency is < 50% of the injected value, declare verification failed (some error margin is allowed)
 > - Retry 1-2 times to rule out network jitter
 > - If it still fails, submit the failed verdict; the framework rolls back automatically
@@ -829,6 +836,8 @@ kubectl exec <test-pod> -n <ns> -- curl -s -o /dev/null -w "HTTP %{http_code} Ti
 # if curl is unavailable, try wget
 kubectl exec <test-pod> -n <ns> -- wget -q -O /dev/null --timeout=5 http://<service>:<port>/health
 ```
+
+> **⚠️ Under a network-DELAY fault**: the `<service>` relative name + bare `%{time_total}` above is DNS-amplified — a delay fault slows every DNS query and K8s `ndots:5` expands a relative name into ~8 serial lookups, so `time_total` reflects DNS exhaustion rather than the data-path delay (it can even hit curl's timeout and read `0`). For a delay fault, use the amplification-resistant probe from Q5 Method 2 (pre-resolved ClusterIP / `--resolve`, or a trailing-dot FQDN; read `time_connect`, not bare `time_total`). This is a non-verdict observation, so never wait, retry or sample to chase it.
 
 **Method 3: check application-level events with kubectl get events**
 ```bash

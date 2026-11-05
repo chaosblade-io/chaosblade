@@ -222,6 +222,55 @@ def embed_stdin_in_command(cmd: list[str], stdin_data: str) -> list[str]:
     return ["sh", "-c", f"echo {blob} | base64 -d | {quoted_cmd}"]
 
 
+# Local-filesystem connection-identity flags that ``_build_kubectl_global_args``
+# emits at the HEAD of a kubectl command. They are meaningful ONLY for the local
+# ``kubeconfig`` channel (kubectl runs as a local subprocess against a local
+# kubeconfig file). A remote channel runs kubectl on a remote node (wiz gateway /
+# ssh) where that local path does not exist, so the flags must not survive into
+# the remote payload — leaking ``--kubeconfig`` makes the remote kubectl fail
+# with ``stat <local-path>: no such file or directory`` (the SPE discovery bug).
+_KUBECTL_LOCAL_FLAGS = ("--kubeconfig", "--context")
+
+
+def strip_local_connection_flags(cmd: list[str]) -> list[str]:
+    """Drop the LEADING kubectl connection-identity flags for remote execution.
+
+    ``build_kubectl_cmd`` emits ``[kubectl, (--kubeconfig v)?, (--context v)?,
+    subcommand, ...]``: the connection flags are always contiguous at the head,
+    before the subcommand. This scans from index 1 and removes only that leading
+    run, stopping at the first non-flag token (the subcommand) — so a
+    ``--context`` appearing later (e.g. inside an ``exec`` payload past ``--``)
+    is never touched. Scoped to kubectl (``cmd[0]`` basename) so a non-kubectl
+    command's own ``--context`` is left alone.
+
+    This is the by-construction cure for the settings-vs-target channel
+    divergence. The build side is channel-agnostic — it always emits local
+    connection identity from the tool param / settings — and the AUTHORITATIVE
+    execution channel (``TransportRegistry.resolve(target)``, the same
+    resolution that selects this ``wrap_command``) decides whether the flags
+    survive. Remote channels strip; the local ``kubeconfig`` channel never calls
+    this, so a local subprocess keeps its ``--kubeconfig``. Because the decision
+    rides the target-resolved channel rather than a settings-only lookup, a
+    per-call ``kube_connection_mode`` that diverges from settings can no longer
+    make the built command and the executing channel disagree.
+    """
+    if not cmd or not os.path.basename(cmd[0]).startswith("kubectl"):
+        return cmd
+    i = 1
+    while i < len(cmd):
+        tok = cmd[i]
+        if tok in _KUBECTL_LOCAL_FLAGS:
+            i += 2 if i + 1 < len(cmd) else 1
+            continue
+        if tok.startswith(tuple(f + "=" for f in _KUBECTL_LOCAL_FLAGS)):
+            i += 1
+            continue
+        break  # first non-connection token is the subcommand; payload is safe
+    if i == 1:
+        return cmd  # nothing to strip — avoid a pointless copy
+    return [cmd[0]] + cmd[i:]
+
+
 class KubeconfigChannel:
     """Direct kubectl/blade execution via --kubeconfig flag."""
 
@@ -298,6 +347,9 @@ class KubewizK8sChannel:
         return bool(target.scope == PROFILE_K8S and target.kubewiz_cluster_uuid)
 
     def wrap_command(self, cmd: list[str], target: TransportTarget, timeout: float | None = None, stdin_data: str = "") -> list[str]:
+        # Remote node owns connection identity — drop local --kubeconfig/--context
+        # BEFORE folding stdin / building the payload (see strip_local_connection_flags).
+        cmd = strip_local_connection_flags(cmd)
         if stdin_data:
             cmd = embed_stdin_in_command(cmd, stdin_data)
         wait_timeout = str(_wiz_timeout_seconds(timeout))
@@ -323,6 +375,11 @@ class KubewizK8sChannel:
         return errors
 
     def display_command(self, cmd: list[str], target: TransportTarget | None = None) -> str:
+        # Show what ACTUALLY runs remotely: the local connection flags are
+        # stripped at wrap time, so the display must strip them too (a raw
+        # semantic cmd arrives here unwrapped; an already-wrapped wiz cmd has
+        # cmd[0]=wiz_path and is a no-op for the kubectl-scoped strip).
+        cmd = strip_local_connection_flags(cmd)
         # Strip the wiz wrapper for readability, but never drop WHERE it ran:
         # ``--cluster-uuid`` addresses a CLUSTER, so the command lands on the
         # platform's executor, not on any machine the operator chose.
@@ -366,6 +423,9 @@ class KubewizHostChannel:
         return bool(target.scope == PROFILE_HOST and target.host_name)
 
     def wrap_command(self, cmd: list[str], target: TransportTarget, timeout: float | None = None, stdin_data: str = "") -> list[str]:
+        # Remote node owns connection identity — drop local --kubeconfig/--context
+        # BEFORE folding stdin / building the payload (see strip_local_connection_flags).
+        cmd = strip_local_connection_flags(cmd)
         if stdin_data:
             cmd = embed_stdin_in_command(cmd, stdin_data)
         wait_timeout = str(_wiz_timeout_seconds(timeout))
@@ -392,6 +452,9 @@ class KubewizHostChannel:
         return errors
 
     def display_command(self, cmd: list[str], target: TransportTarget | None = None) -> str:
+        # Show what ACTUALLY runs remotely — strip local connection flags (no-op
+        # for an already-wrapped wiz cmd whose cmd[0] is the wiz path).
+        cmd = strip_local_connection_flags(cmd)
         detail = ""
         if target is not None:
             detail = target.host_name or ""
@@ -431,6 +494,9 @@ class SSHChannel:
         return bool(target.scope == PROFILE_HOST and target.ssh_host)
 
     def wrap_command(self, cmd: list[str], target: TransportTarget, timeout: float | None = None) -> list[str]:
+        # Remote node owns connection identity — drop local --kubeconfig/--context
+        # before quoting the payload (see strip_local_connection_flags).
+        cmd = strip_local_connection_flags(cmd)
         cmd_str = " ".join(shlex.quote(p) for p in cmd)
         ssh_args = [
             "ssh",
@@ -463,6 +529,9 @@ class SSHChannel:
         return errors
 
     def display_command(self, cmd: list[str], target: TransportTarget | None = None) -> str:
+        # Show what ACTUALLY runs remotely — strip local connection flags (no-op
+        # for an already-wrapped ssh cmd whose cmd[0] is "ssh").
+        cmd = strip_local_connection_flags(cmd)
         detail = ""
         if target is not None and target.ssh_host:
             detail = f"{target.ssh_user}@{target.ssh_host}" if target.ssh_user else target.ssh_host

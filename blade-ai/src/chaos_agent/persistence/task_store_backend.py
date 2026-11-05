@@ -153,6 +153,23 @@ def _set_timestamps(fields: dict, existing: Optional[dict]) -> dict:
     return fields
 
 
+def escape_like_pattern(prefix: str) -> str:
+    """Escape a raw prefix into a literal ``LIKE`` pattern (``prefix%``).
+
+    Single source for the escape rule shared by every backend's
+    ``select_task_ids_by_prefix``: ``\\``, ``%`` and ``_`` are LIKE
+    metacharacters, so a user-supplied task-id prefix containing them
+    must be treated literally rather than as a wildcard. Backends pair
+    the returned pattern with ``ESCAPE '\\'`` so the escaping is
+    unambiguous. Task ids only ever contain ``[a-z0-9-]`` today, but the
+    prefix arrives from a human CLI argument, so the defensive escape
+    keeps a stray ``_``/``%`` from silently widening the match set (and
+    thus from turning a unique match into a false "ambiguous").
+    """
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
+
+
 # ---------------------------------------------------------------------------
 # StorageBackend protocol
 # ---------------------------------------------------------------------------
@@ -176,6 +193,23 @@ class StorageBackend(Protocol):
 
     async def select_task(self, task_id: str) -> Optional[dict]:
         """SELECT * FROM tasks WHERE task_id = ?"""
+        ...
+
+    async def select_task_ids_by_prefix(self, prefix: str, limit: int) -> list[str]:
+        """SELECT task_id FROM tasks WHERE task_id LIKE <prefix>% ESCAPE '\\'
+        ORDER BY gmt_create DESC LIMIT ?
+
+        Returns the bare ``task_id`` strings (no row hydration) whose id
+        starts with the literal *prefix*, newest first. Powers the CLI's
+        short-id expansion (``blade-ai recover --task-id inject-c28f25f5``):
+        a human supplies a unique prefix instead of the full UUID. The
+        caller — not the backend — decides uniqueness: 0 rows means no
+        such task, 1 row means the prefix resolved, >1 means ambiguous
+        (the caller must surface the candidates rather than pick one, so a
+        multi-tenant store can never silently recover the wrong task).
+        Backends escape the prefix via :func:`escape_like_pattern` so a
+        stray ``%``/``_`` cannot widen the match.
+        """
         ...
 
     async def upsert_task(self, task_id: str, columns: list[str], values: list) -> None:

@@ -2280,3 +2280,62 @@ class TestExecutionGateRejection:
         # Terminal: field-less flushes must not resurrect it.
         await store.upsert("inject-gate1")
         assert (await store.get("inject-gate1"))["task_state"] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# find_ids_by_prefix — enumeration primitive behind CLI short-id expansion
+# ---------------------------------------------------------------------------
+
+class TestFindIdsByPrefix:
+    """``find_ids_by_prefix`` enumerates literal-prefix matches for the CLI's
+    short-id expansion (``blade-ai recover --task-id inject-c28f25f5``).
+    Uniqueness classification lives in ``resolve_full_task_id``; these pin the
+    raw enumeration contract: literal-prefix match, newest-first order, and the
+    empty / LIKE-wildcard guards."""
+
+    @pytest.mark.asyncio
+    async def test_unique_prefix_returns_the_single_full_id(self, store):
+        full = "inject-c28f25f5-3101-420d-a4e6-7bc473efd72b"
+        await store.upsert(full, skill_name="pod-kill")
+        assert await store.find_ids_by_prefix("inject-c28f25f5") == [full]
+
+    @pytest.mark.asyncio
+    async def test_full_id_is_a_prefix_of_itself(self, store):
+        full = "inject-aaaaaaaa-1111-2222-3333-444444444444"
+        await store.upsert(full, skill_name="pod-kill")
+        assert await store.find_ids_by_prefix(full) == [full]
+
+    @pytest.mark.asyncio
+    async def test_multiple_matches_ordered_newest_first(self, store):
+        # Explicit gmt_create so ORDER BY is deterministic (auto-now would
+        # collide at one instant). ISO-8601 sorts lexicographically.
+        older = "inject-beef0000-0000-0000-0000-000000000001"
+        newer = "inject-beef0000-0000-0000-0000-000000000002"
+        await store.upsert(older, skill_name="s", gmt_create="2026-10-22T10:00:00")
+        await store.upsert(newer, skill_name="s", gmt_create="2026-10-22T11:00:00")
+        assert await store.find_ids_by_prefix("inject-beef0000") == [newer, older]
+
+    @pytest.mark.asyncio
+    async def test_no_match_returns_empty(self, store):
+        await store.upsert("inject-cafe0000-0000-0000-0000-000000000009", skill_name="s")
+        assert await store.find_ids_by_prefix("inject-deadbeef") == []
+
+    @pytest.mark.asyncio
+    async def test_empty_prefix_never_enumerates_the_table(self, store):
+        # "" is a prefix of EVERY id; the guard must short-circuit to [] rather
+        # than dump the whole tasks table into an "ambiguous" verdict.
+        await store.upsert("inject-11111111-1111-1111-1111-111111111111", skill_name="s")
+        await store.upsert("inject-22222222-2222-2222-2222-222222222222", skill_name="s")
+        assert await store.find_ids_by_prefix("") == []
+
+    @pytest.mark.asyncio
+    async def test_like_wildcards_in_prefix_are_escaped_literal(self, store):
+        # '_' is a LIKE single-char wildcard: UNESCAPED, "inject_a" would match
+        # "inject-abc…" ('_' matches '-'), silently widening a unique lookup into
+        # a false ambiguity. The escape makes it literal → no real id starts with
+        # "inject_a" → []. Reverse leg: the same id IS reachable by its literal
+        # prefix, proving the [] above is the escape, not a broken query.
+        full = "inject-abc00000-0000-0000-0000-000000000000"
+        await store.upsert(full, skill_name="s")
+        assert await store.find_ids_by_prefix("inject_a") == []
+        assert await store.find_ids_by_prefix("inject-abc") == [full]

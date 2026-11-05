@@ -226,10 +226,16 @@ def state_to_task_result(
     from chaos_agent.agent.state import (
         TaskState,
         build_status_data,
-        infer_task_state,
+        terminal_task_state,
     )
 
-    task_state = infer_task_state(values)
+    # terminal_task_state (not infer_task_state): this is a TERMINAL surface —
+    # the graph has ENDED (the caller returns before here on the interrupted /
+    # paused branch). A verdict-less run that ended is failed / floored, never
+    # the live-position "injecting", so a crash after injection landed reports
+    # "injected"/"unverified" (matching the crash envelope + audit row) instead
+    # of a frozen mid-flight word.
+    task_state = terminal_task_state(values)
     status_data = build_status_data(task_id, values)
 
     # 透出 LLM token 消耗：从 observability tracer 取 trace 汇总，让平台

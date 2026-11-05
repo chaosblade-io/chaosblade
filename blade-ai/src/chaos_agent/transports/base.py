@@ -57,22 +57,27 @@ class TransportTarget:
     ssh_port: int = 22
 
     @classmethod
-    def from_state(cls, state: dict) -> TransportTarget:
-        """Construct from AgentState or settings (migration bridge).
+    def _from_state(cls, state: dict) -> TransportTarget:
+        """Private hydration primitive — build a target from state + settings.
 
-        Priority: state fields > settings defaults.
+        Priority: state fields > settings defaults.  A field the caller did not
+        explicitly set arrives as ``None``/falsy and falls through to the
+        config-authoritative ``settings`` value (the ground-truth-single-
+        authority D1 hydration contract).  With an empty ``state`` every field
+        falls back to ``settings`` — effectively ``from_settings()``.
 
         .. note::
-            When called with ``from_state({})`` (empty dict), ALL fields
-            fall back to ``settings`` — this is effectively
-            ``from_settings()``.  Tools that call ``from_state({})``
-            implicitly depend on ``sync_kubewiz_runtime(state)`` being
-            called earlier in the pipeline to sync per-session values
-            from state into settings.
-
-            Once all tools accept a ``TransportTarget`` parameter (passed
-            from the graph node via ``resolve_transport_target(state)``),
-            the ``from_state({})`` bridge will be removed.
+            This is NOT a public bridge.  It is the shared internal
+            implementation detail of exactly two callers in
+            ``chaos_agent.transports.registry``: the authoritative seam
+            ``resolve_transport_target(state)`` and the anti-recursion
+            primitive ``resolve_channel_name(state)`` (which the seam's
+            kubewiz-hijack guard depends on, so it must hydrate directly
+            rather than route back through the seam).  Every other consumer
+            obtains a target through ``resolve_transport_target`` — the single
+            authority that layers the ported ``sync_kubewiz_runtime`` guard on
+            top of this primitive.  The former ``from_state({})`` public bridge
+            was retired in ground-truth-single-authority Phase 2d.
         """
         t = cls()
 

@@ -18,6 +18,8 @@ package does not require it when using the SQLite backend.
 import logging
 from typing import Optional
 
+from chaos_agent.persistence.task_store_backend import escape_like_pattern
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -512,6 +514,15 @@ class PostgreSQLBackend:
                 "SELECT * FROM tasks WHERE task_id = $1", task_id
             )
             return _record_to_dict(row) if row else None
+
+    async def select_task_ids_by_prefix(self, prefix: str, limit: int) -> list[str]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT task_id FROM tasks WHERE task_id LIKE $1 ESCAPE '\\' "
+                "ORDER BY gmt_create DESC LIMIT $2",
+                escape_like_pattern(prefix), limit,
+            )
+            return [r["task_id"] for r in rows]
 
     async def upsert_task(self, task_id: str, columns: list[str], values: list) -> None:
         sql, _ = _build_upsert_sql("tasks", columns)

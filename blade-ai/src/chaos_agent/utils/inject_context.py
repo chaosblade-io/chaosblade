@@ -3,20 +3,29 @@
 When a recovery task starts, it needs to know what fault was injected during
 the parent inject task.  The inject_context string carries this information.
 
+This is a GENERIC-layer utility: it is invoked for every target domain
+(k8s / host-SSH / python-app / future providers), so its LLM-facing output
+must stay carrier/tool-agnostic — it must NOT hardcode a single domain's tool
+name (e.g. "kubectl").  Per-tool abstracts below are keyed on the ACTUAL
+ToolMessage name, so a k8s run yields "[kubectl] ...", a host run yields
+"[host_read] ...", a python-app run yields "[blade_python_*] ...", each
+domain-correct by construction.
+
 **Design rationale (first-principles — causal chain illusion prevention)**:
 
-Inject-phase kubectl tool results (df -h overlay 12%, kubectl describe pod,
-etc.) must NOT be provided in reusable raw-output format.  Recovery verifier
-LLMs suffer from "causal chain illusion": when same-format, same-command,
-same-target data from the inject phase is available in context, the LLM
-perceives the causal chain as complete ("I already have kubectl results →
-no need to call kubectl again") and skips tool calls entirely — using stale
-inject-phase data as "current" post-recovery evidence.
+Inject-phase tool results (k8s: df -h overlay 12% / describe pod; host: SSH
+`df`/`free`/`cat` reads; python-app: probe outputs) must NOT be provided in
+reusable raw-output format.  Recovery verifier LLMs suffer from "causal chain
+illusion": when same-format, same-command, same-target data from the inject
+phase is available in context, the LLM perceives the causal chain as complete
+("I already have observation results → no need to re-observe") and skips tool
+calls entirely — using stale inject-phase data as "current" post-recovery
+evidence.
 
 Root cause (5 axioms):
   1. LLM is a causal reasoning engine — tool-call behavior follows causal
      chain completeness perception, not external rule compliance.
-  2. "MUST call kubectl" rules are rationally ignored when causal chain
+  2. "MUST re-observe" rules are rationally ignored when causal chain
      is perceived as complete.
   3. LLMs judge data by SOURCE credibility (tool-obtained = credible), not
      by TIME semantics (injection-phase vs recovery-phase).
@@ -26,15 +35,15 @@ Root cause (5 axioms):
   5. Rejection messages cannot break causal chain illusion because LLM's
      internal causal chain remains self-consistent.
 
-Solution: physically break the causal chain by removing reusable raw kubectl
+Solution: physically break the causal chain by removing reusable raw tool
 output from inject_context.  Only provide:
   - AI reasoning summaries (LLM conclusions, not raw data)
   - Tool result ABSTRACTS (tool type + 1-line summary, no raw output)
-  - EXPIRED marker + MUST-re-execute instruction
+  - EXPIRED marker + MUST-re-execute instruction (domain-neutral wording)
 
 This forces the LLM to perceive "I lack current data → causal chain broken
-→ must call kubectl" instead of "I have data → causal chain complete → no
-need to call kubectl".
+→ must re-observe" instead of "I have data → causal chain complete → no
+need to re-observe".
 
 Reference: task-b6cce4c1 recovery verifier failure analysis.
 """
@@ -116,12 +125,17 @@ def build_inject_context(inject_messages: list) -> str:
 
     # ── Phase 3: EXPIRED marker + MUST-re-execute instruction ──
     # This creates a causal chain break: "inject-phase data is stale →
-    # I must re-execute kubectl to get current data".
+    # I must re-observe via my read tools to get current data".
+    # Domain-neutral wording: this prefix is emitted for EVERY target domain
+    # (k8s / host-SSH / python-app / future providers), so it must NOT name a
+    # specific tool like "kubectl" — the LLM already knows which read-only
+    # observation tools its own target environment provides.
     expired_prefix = (
         "⚠️ EXPIRED DATA — captured during fault injection (NOT current state)\n"
         "The observations below were made WHILE THE FAULT WAS ACTIVE. "
         "They represent the FAULT STATE, not the CURRENT (post-recovery) state.\n"
-        "You MUST re-execute the same kubectl commands NOW to obtain CURRENT data. "
+        "You MUST re-execute the same observation commands NOW — via whichever "
+        "read-only tools this task's target environment provides — to obtain CURRENT data. "
         "Using these injection-phase observations as 'current evidence' is INVALID.\n"
     )
 

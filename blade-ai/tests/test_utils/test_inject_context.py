@@ -379,3 +379,111 @@ class TestBladeJsonDetection:
         abstract = _abstract_kubectl_result(blade_create)
         assert "blade operation result" in abstract
         assert "code=200" in abstract
+
+
+# ---------------------------------------------------------------------------
+# Domain-neutrality regression tests (host / python-app domains)
+#
+# build_inject_context is a GENERIC-layer utility invoked for every domain
+# (k8s / host-SSH / python-app).  Its LLM-facing output must NOT leak a
+# single domain's tool vocabulary ("kubectl") into non-k8s domains.  These
+# tests lock that invariant with NEGATIVE assertions (the high-value kind):
+# the whole class of fixtures below was previously absent — every existing
+# fixture used name="kubectl", which is exactly why the leak went uncaught
+# across 7 host-domain drill cases.
+# ---------------------------------------------------------------------------
+
+def _make_host_read_df_result():
+    """Host-domain SSH `df -h` read (tool name = host_read, NOT kubectl)."""
+    return ToolMessage(
+        content=(
+            "Filesystem      Size  Used Avail Use% Mounted on\n"
+            "/dev/vda1       116G   13G   97G  12% /\n"
+        ),
+        tool_call_id="call_host_df_1",
+        name="host_read",
+    )
+
+
+def _make_host_inject_result():
+    """Host-domain injection tool result (tool name = host_inject)."""
+    return ToolMessage(
+        content="free -m buff/cache rose after mem load; target host drill reached",
+        tool_call_id="call_host_inject_1",
+        name="host_inject",
+    )
+
+
+def _make_python_create_result():
+    """Python-app domain injection result (tool name = blade_python_create)."""
+    return ToolMessage(
+        content=(
+            '{"code":200,"success":true,"result":'
+            '"command: python-agent load --class com.demo.Service"}'
+        ),
+        tool_call_id="call_py_create_1",
+        name="blade_python_create",
+    )
+
+
+class TestDomainNeutrality:
+    """The generic-layer inject_context must not leak k8s tool vocabulary
+    into host / python-app domains, while the causal-chain-breaking mechanism
+    (EXPIRED marker + MUST re-observe + metric stripping) stays intact."""
+
+    def test_expired_prefix_is_domain_neutral(self):
+        """The shared EXPIRED prefix must use neutral wording, never 'kubectl'."""
+        for msgs in (
+            [_make_host_read_df_result()],
+            [_make_python_create_result()],
+            [_make_df_h_tool_result()],  # even a k8s run uses the neutral prefix
+        ):
+            result = build_inject_context(msgs)
+            # Old k8s-bound wording must be gone (reverse assertion pins the bug)
+            assert "re-execute the same kubectl commands" not in result
+            # Neutral mechanism wording present
+            assert "observation commands" in result
+            assert "EXPIRED" in result
+
+    def test_host_domain_no_kubectl_leak(self):
+        """Host-only messages must produce zero 'kubectl' anywhere in context."""
+        msgs = [_make_host_read_df_result(), _make_host_inject_result()]
+        result = build_inject_context(msgs)
+        assert "kubectl" not in result
+        # Domain-correct abstracts keyed on the actual tool name
+        assert "[host_read]" in result
+        assert "[host_inject]" in result
+        assert "EXPIRED" in result
+        assert "re-execute" in result
+
+    def test_python_domain_no_kubectl_leak(self):
+        """Python-app-only messages must produce zero 'kubectl' in context."""
+        msgs = [_make_python_create_result()]
+        result = build_inject_context(msgs)
+        assert "kubectl" not in result
+        assert "[blade_python_create]" in result
+        assert "EXPIRED" in result
+
+    def test_host_metric_values_still_stripped(self):
+        """Causal-chain protection extends to host domain: raw metric values
+        in a host_read result must be stripped so they can't be reused as
+        'current' post-recovery evidence."""
+        msgs = [_make_host_read_df_result()]
+        result = build_inject_context(msgs)
+        # Specific size/percentage values from the host df output must not survive
+        assert "116G" not in result
+        assert "13G" not in result
+
+    def test_mixed_non_k8s_domains_no_kubectl_leak(self):
+        """A host + python mixed context still leaks no k8s vocabulary."""
+        msgs = [
+            _make_ai_message(),
+            _make_host_read_df_result(),
+            _make_python_create_result(),
+        ]
+        result = build_inject_context(msgs)
+        assert "kubectl" not in result
+        # AI reasoning preserved across domains
+        assert "Layer2: passed" in result
+        assert "[host_read]" in result
+        assert "[blade_python_create]" in result

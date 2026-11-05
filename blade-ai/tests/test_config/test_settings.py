@@ -1,6 +1,92 @@
 """Tests for pydantic-settings configuration."""
 
+import json
+import os
+import shutil
+import tempfile
+
 import pytest
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _simulate_ambient_config_dir():
+    """Reproduce the leak condition deterministically: a shell that exports
+    ``BLADE_AI_CONFIG_DIR``.
+
+    The drill-isolation workflow exports ``BLADE_AI_CONFIG_DIR`` routinely, and
+    ``settings._active_config_file()`` honours it BEFORE the module-level
+    ``_CONFIG_FILE`` that every isolation patch in this file monkeypatches. A
+    full regression launched from such a shell therefore bypassed all of those
+    patches and read the ambient ``config.json`` — turning 6 cases in
+    ``TestSettingsPriority`` / ``TestEmptyStringFallback`` red, while a clean
+    shell stayed green (the failure masqueraded as a suite-size flake).
+
+    Module scope is deliberate: this fixture is set up BEFORE the function-
+    scoped ``_isolate_task_store`` conftest fixture, so every test in this
+    module runs as though the ambient var were present. The conftest fixture
+    must neutralise it per test; if that neutralisation is ever removed, the
+    priority/empty-string tests below read this decoy (``model_name ==
+    "AMBIENT-LEAK"``) and fail loudly — a structural regression guard that
+    fires in ANY shell, not just a polluted one.
+    """
+    decoy_dir = tempfile.mkdtemp(prefix="blade-ambient-cfgdir-")
+    with open(os.path.join(decoy_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model_name": "AMBIENT-LEAK",
+                "api_base_url": "https://ambient-leak.invalid/v1",
+            },
+            f,
+        )
+    prev = os.environ.get("BLADE_AI_CONFIG_DIR")
+    os.environ["BLADE_AI_CONFIG_DIR"] = decoy_dir
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("BLADE_AI_CONFIG_DIR", None)
+        else:
+            os.environ["BLADE_AI_CONFIG_DIR"] = prev
+        shutil.rmtree(decoy_dir, ignore_errors=True)
+
+
+class TestConfigDirIsolation:
+    """The ``BLADE_AI_CONFIG_DIR`` seam and its neutralisation.
+
+    ``_active_config_file()`` checks ``BLADE_AI_CONFIG_DIR`` before
+    ``_CONFIG_FILE``; these tests pin that contract and verify the autouse
+    conftest isolation clears an ambient value so ``_CONFIG_FILE`` patches
+    stay authoritative.
+    """
+
+    def test_active_config_file_prefers_env_override(self, monkeypatch, tmp_path):
+        """Document WHY isolation is needed: CONFIG_DIR beats _CONFIG_FILE."""
+        from chaos_agent.config import settings as S
+
+        monkeypatch.setattr(S, "_CONFIG_FILE", tmp_path / "ignored.json")
+        monkeypatch.setenv("BLADE_AI_CONFIG_DIR", str(tmp_path / "override"))
+        assert S._active_config_file() == tmp_path / "override" / "config.json"
+
+    def test_ambient_config_dir_is_neutralized(self):
+        """The module fixture above set BLADE_AI_CONFIG_DIR at module setup;
+        the conftest autouse fixture must have cleared it for this test.
+
+        Deterministic in every shell: fails if the conftest neutralisation is
+        removed, because the module-scoped decoy would still be in os.environ.
+        """
+        assert "BLADE_AI_CONFIG_DIR" not in os.environ
+
+    def test_config_file_monkeypatch_is_authoritative(self, monkeypatch, tmp_path):
+        """End-to-end: with the ambient var neutralised, a _CONFIG_FILE patch
+        decides what a fresh Settings() reads — never the ambient decoy."""
+        from chaos_agent.config.settings import Settings
+
+        config_file = tmp_path / "authoritative.json"
+        config_file.write_text('{"model_name": "from-config"}', encoding="utf-8")
+        monkeypatch.setattr(
+            "chaos_agent.config.settings._CONFIG_FILE", config_file,
+        )
+        assert Settings(llm_api_key="test").model_name == "from-config"
 
 
 class TestSettingsSshPortValidation:

@@ -32,13 +32,11 @@ class _ChaosAgentPool:
         Extracted so both sync and async init paths share the heavy
         registry-loading logic without duplication.
         """
-        from chaos_agent.skills.loader import get_skills_dir
+        from chaos_agent.skills.loader import get_skill_roots
         from chaos_agent.skills.registry import SkillRegistry
 
         registry = SkillRegistry()
-        skills_dir = get_skills_dir()
-        if skills_dir.exists():
-            registry.load_from_directory(skills_dir)
+        registry.load_from_roots(get_skill_roots())
         return {"registry": registry}
 
     def _commit(self, agents: dict, registry) -> None:

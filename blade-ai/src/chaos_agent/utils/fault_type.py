@@ -189,6 +189,8 @@ def ensure_min_duration(
     scope: str | None,
     target: str | None,
     action: str | None,
+    *,
+    warn_explicit_below_floor: bool = True,
 ) -> int:
     """Resolve the effective timeout for a fault type (single source of truth).
 
@@ -204,6 +206,23 @@ def ensure_min_duration(
     Args:
         timeout_value: Current --timeout value (0, None, or a positive int/string).
         scope/target/action: Fault type identifiers.
+        warn_explicit_below_floor: When ``False``, an explicit positive value
+            below the floor is still honoured verbatim but WITHOUT the
+            requested-vs-recommended warning. The BOTTOM injection layer
+            (blade_create / blade_python_create / kubectl-exec blade create)
+            passes ``False``: by dispatch time its ``--timeout`` has been
+            engine-pinned to the fault's RECOVERY TIMER (D+G, layer 3 of the
+            three-layer duration guarantee) — a derived safety net that by
+            design "may carry operational headroom over the contract value"
+            (target_guard/types.py). The floor is empirically the
+            OBSERVATION-window (D) verification latency, and the layer that
+            owns D (TOP inject.py / MIDDLE extract_planning_metadata /
+            l4 adapter) has already surfaced the gap on the correct number.
+            Re-warning at the bottom layer fires a second time on the larger
+            D+G value for the same fact — redundant and misleading (it names
+            the safety net, not the tight observation window). The absent
+            (``timeout_value`` falsy) branch keeps its own configured-default
+            warning regardless of this flag.
 
     Returns:
         The effective timeout value in seconds.
@@ -240,11 +259,17 @@ def ensure_min_duration(
         # make the requested-vs-recommended gap visible. Raising it would
         # be the same defect as downgrading one (DNS-hijack discipline);
         # too-tight windows exit honestly as unverified/partial instead.
-        logger.warning(
-            "Explicit timeout %ss is below the recommended %ss floor for "
-            "fault type (%s, %s, %s); applying the requested %ss verbatim.",
-            current, floor, scope, target, action, current,
-        )
+        #
+        # The warning is suppressed when ``warn_explicit_below_floor=False``
+        # (the BOTTOM injection layer): there the value is the engine-pinned
+        # recovery timer D+G, not the observation window D the floor measures,
+        # and the D-owning layer has already warned. See the Args docstring.
+        if warn_explicit_below_floor:
+            logger.warning(
+                "Explicit timeout %ss is below the recommended %ss floor for "
+                "fault type (%s, %s, %s); applying the requested %ss verbatim.",
+                current, floor, scope, target, action, current,
+            )
         return current
     return current
 

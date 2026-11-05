@@ -151,7 +151,7 @@ def resolve_channel_name(state: dict | None = None) -> str:
     default kubeconfig cluster.
     """
     try:
-        target = TransportTarget.from_state(state or {})
+        target = TransportTarget._from_state(state or {})
         return TransportRegistry.resolve(target).name
     except ValueError as exc:
         logger.warning("Transport resolve failed, marking channel unknown: %s", exc)
@@ -161,6 +161,48 @@ def resolve_channel_name(state: dict | None = None) -> str:
 def is_kubewiz_channel(state: dict | None = None) -> bool:
     """True when the resolved channel routes through the KubeWiz gateway."""
     return resolve_channel_name(state) in KUBEWIZ_CHANNELS
+
+
+def resolve_transport_target(state: dict | None) -> TransportTarget:
+    """Single authoritative entry point for obtaining a ``TransportTarget``.
+
+    Config (``settings``) is the authority for *channel selection*; ``state``
+    supplies explicit per-session *connection* overrides (resolved by
+    ``TransportTarget._from_state`` — an unset field is ``None`` and falls back
+    to settings; see the ground-truth-single-authority D1 hydration contract).
+
+    This function encodes the guard formerly living in ``sync_kubewiz_runtime``
+    (ground-truth-single-authority D5): a **stale** ``kubewiz_cluster_uuid`` /
+    ``kubewiz_profile`` lingering in ``state`` MUST NOT flip a session that
+    *config* resolves to a non-kubewiz channel.  ``sync_kubewiz_runtime``
+    achieved this by only syncing state→settings when ``is_kubewiz_channel()``
+    (a settings-only check); the seam reproduces the identical intent by
+    dropping state-sourced kubewiz params before field-based inference when the
+    config-resolved channel is not kubewiz.  Without this, routing the orphan
+    ``from_state(state)`` callers through the seam would re-introduce the exact
+    channel-hijack the guard was written to prevent.
+
+    It lives in the transports layer (next to ``is_kubewiz_channel`` and
+    ``TransportTarget``) so every consumer — tools, graph nodes, the registry —
+    resolves through one import with no layering inversion.  Callers with no
+    session state pass ``None``/``{}`` and get the settings-authoritative
+    target (identical to the old ``from_state({})`` bridge).
+
+    .. note::
+        ``resolve_channel_name`` / ``is_kubewiz_channel`` are the *primitives*
+        this guard depends on and deliberately keep calling ``_from_state``
+        directly — routing them back through the seam would recurse.
+    """
+    resolved: dict = dict(state or {})
+    if not is_kubewiz_channel():
+        # Config does not resolve to a kubewiz channel — a state kubewiz param
+        # is stale and must not hijack field-based inference (ported guard).
+        resolved = {
+            k: v
+            for k, v in resolved.items()
+            if k not in ("kubewiz_cluster_uuid", "kubewiz_profile")
+        }
+    return TransportTarget._from_state(resolved)
 
 
 # Capability profiles: what the executor *can run* against a target

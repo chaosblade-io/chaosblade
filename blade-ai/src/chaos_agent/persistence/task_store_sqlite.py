@@ -17,6 +17,8 @@ from typing import Optional
 
 import aiosqlite
 
+from chaos_agent.persistence.task_store_backend import escape_like_pattern
+
 # ---------------------------------------------------------------------------
 # DDL
 # ---------------------------------------------------------------------------
@@ -442,6 +444,16 @@ class SQLiteBackend:
         )
         row = await cursor.fetchone()
         return _row_to_dict(row) if row else None
+
+    async def select_task_ids_by_prefix(self, prefix: str, limit: int) -> list[str]:
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            "SELECT task_id FROM tasks WHERE task_id LIKE ? ESCAPE '\\' "
+            "ORDER BY gmt_create DESC LIMIT ?",
+            (escape_like_pattern(prefix), limit),
+        )
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
 
     async def upsert_task(self, task_id: str, columns: list[str], values: list) -> None:
         sql = _build_upsert_sql("tasks", columns)

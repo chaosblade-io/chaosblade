@@ -594,9 +594,14 @@ class Settings(BaseSettings):
     # short (10s) so a misconfigured base URL / DNS / firewall surfaces a
     # clear error fast. ``llm_read_timeout`` bounds how long we wait for
     # the model's response (time-to-first-token + between-chunk gaps when
-    # streaming, or whole-body wait when non-streaming) — generous (180s)
+    # streaming, or whole-body wait when non-streaming) — generous (600s)
     # because thinking models (Qwen enable_thinking) can take well over
-    # 30s to produce their reasoning on complex ReAct prompts. A single
+    # 30s to produce their reasoning on complex ReAct prompts. NOTE: under
+    # streaming this is a BETWEEN-CHUNK silence bound, not a whole-response
+    # budget — a provider that starts streaming then goes silent for the
+    # full 600s raises ``httpx.ReadTimeout`` (which ``resilient_llm``
+    # deliberately does NOT retry, since re-issuing a 600s-slow verdict can
+    # never heal it). A single
     # scalar would have to choose one number for both, forcing either slow
     # connect-failure or premature read-timeout; splitting them avoids that.
     llm_connect_timeout: int = 10            # BLADE_AI_LLM_CONNECT_TIMEOUT
@@ -855,7 +860,13 @@ class Settings(BaseSettings):
     # 任务侧注册，不是命名）；镜像集限定可执行骨架的镜像白名单；sleep 上限
     # 与 occupant 契约同量级（载体的存活骨架，非故障窗口契约）。
     recovery_carrier_name_prefix: str = "drill-rc-"  # BLADE_AI_RECOVERY_CARRIER_NAME_PREFIX
-    recovery_carrier_allowed_images: str = "busybox:1.36,busybox:latest,curlimages/curl:8.8.0,curlimages/curl:latest"  # BLADE_AI_RECOVERY_CARRIER_ALLOWED_IMAGES，逗号分隔（人工兜底入口）
+    # 默认集只列自带 curl 的镜像：载体 §4 恢复载荷是 ``curl ... DELETE``，而
+    # busybox 只有 wget 没有 curl（W-87-2：定时器 fire 时 ``curl: not found``
+    # 被吞进 restore.log，DELETE 不发，故障静默超窗）。classifier 的载体形态
+    # 判据（条件 4）已强制 ``--image ∈ allowed ∪ discovered``，故把 busybox 从
+    # 权威默认集移除即让 dispatch 门禁自动拒绝 curl-less 载体；节点缓存镜像由
+    # discovered 集（preplan_probe 自动发现）补充，与本集合并判定。
+    recovery_carrier_allowed_images: str = "curlimages/curl:8.8.0,curlimages/curl:latest"  # BLADE_AI_RECOVERY_CARRIER_ALLOWED_IMAGES，逗号分隔（人工兜底入口）
     # 程序自动发现的载体镜像（健康 DaemonSet 镜像 = 节点已缓存），由 preplan_probe
     # 在任务启动时填充（进程内一次性，不持久化、不从 env/config.json 读取——
     # 每次任务重新探测，与「环境事实以当次探测为准」纪律一致）。classifier 将

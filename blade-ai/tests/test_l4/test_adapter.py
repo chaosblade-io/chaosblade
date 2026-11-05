@@ -179,12 +179,16 @@ class TestTestTaskToInitialState:
         assert state["ssh_port"] == 2222
 
     def test_transport_fields_default_empty(self):
-        """Absent transport fields default to empty / port 22."""
+        """Absent transport fields default to empty; ssh_port hydrates to None
+        (ground-truth-single-authority D1) — NOT a truthy placeholder 22, which
+        would short-circuit from_state's ``state or settings`` fallback and mask
+        the config-authoritative port (B3).  The protocol default 22 is applied
+        downstream only when both state and settings are unset."""
         task = L4TestTask(task_id="t-td", intent="x", payload=_valid_payload())
         state = _to_initial_state(task)
         assert state["kube_connection_mode"] == ""
         assert state["ssh_host"] == ""
-        assert state["ssh_port"] == 22
+        assert state["ssh_port"] is None
 
     def test_invalid_kube_connection_mode_fails_closed(self):
         """A bad kube_connection_mode must raise a clear ValueError at the
@@ -298,6 +302,26 @@ class TestStateToTaskResult:
         assert result.status == "degraded"
         assert result.error is None
         assert "unverified" in result.summary
+
+    @patch("chaos_agent.agent.state.build_status_data")
+    @patch("chaos_agent.agent.state.infer_task_state")
+    def test_verdictless_ended_run_floors_to_failed_not_degraded(
+        self, mock_infer, mock_build,
+    ):
+        """Cure B (terminal-surface single-source): state_to_task_result is a
+        TERMINAL surface ("Extract TaskResult from graph final state"). A run
+        whose live-position word froze at "injecting" (verifier cut by a crash,
+        no durable Layer-1 floor) must report the terminal "failed" via
+        terminal_task_state — NOT the mid-flight "degraded" the raw
+        infer_task_state produced. Discriminates the cure: with the pre-cure
+        raw infer_task_state, task_state stays "injecting" → status "degraded".
+        """
+        mock_infer.return_value = "injecting"
+        mock_build.return_value = {"fault_type": "pod-cpu"}
+
+        result = _to_task_result({"operation": "inject"}, "t-frozen")
+
+        assert result.status == "failed"
 
     @patch("chaos_agent.agent.state.build_status_data")
     @patch("chaos_agent.agent.state.infer_task_state")

@@ -55,6 +55,14 @@ class ResponseCode(IntEnum):
     # plan, then stop and ask); the code carries the "your turn" fact.
     AWAITING_CONFIRMATION = 1003
 
+    # A human-supplied short task-id prefix matched MORE THAN ONE task, so it
+    # cannot be expanded to a single full id. Distinct from TASK_NOT_FOUND
+    # (2xxx): the input is not missing, it is under-specified — the caller must
+    # surface the candidates and let the human disambiguate. Lives in 1xxx
+    # (client/validation) because the fix is a more precise argument, not a
+    # lookup miss.
+    AMBIGUOUS_TASK_ID = 1004
+
     # Not-found (2xxx)
     TASK_NOT_FOUND = 2001
 

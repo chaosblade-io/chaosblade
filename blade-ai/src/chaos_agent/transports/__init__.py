@@ -23,6 +23,7 @@ from .registry import (
     is_kubewiz_channel,
     profile_of,
     resolve_channel_name,
+    resolve_transport_target,
 )
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "execute_via_transport",
     "display_via_transport",
     "resolve_channel_name",
+    "resolve_transport_target",
     "is_kubewiz_channel",
     "is_host_scope_channel",
     "profile_of",

@@ -658,6 +658,21 @@ class TaskStore:
         merged = {**(detail_row or {}), **task_row}
         return self._row_to_dict(merged)
 
+    async def find_ids_by_prefix(self, prefix: str, limit: int = 20) -> list[str]:
+        """Return task_ids whose id starts with the literal ``prefix``.
+
+        Newest first, capped at ``limit`` (one beyond the cap is enough for
+        the caller to declare ambiguity, so the default never needs raising
+        for the uniqueness decision). Empty ``prefix`` returns ``[]`` — an
+        empty string is a prefix of every id and must never enumerate the
+        whole table. This is the enumeration primitive behind the CLI's
+        short-id expansion; uniqueness classification lives in the caller
+        (``resolve_full_task_id``), not here.
+        """
+        if not prefix:
+            return []
+        return await self._backend.select_task_ids_by_prefix(prefix, limit)
+
     async def list_tasks(self, task_state: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
         """Return tasks from the narrow table, ordered by ``gmt_create`` DESC.
 
