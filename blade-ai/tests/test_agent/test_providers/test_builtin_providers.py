@@ -879,3 +879,87 @@ def test_recovery_facts_render_fill_record_keeps_its_vocabulary():
     )
     assert "truncate -s 0 /var/tmp/fill.bin" in rendered
     assert "dmsetup" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# host_shell recovery_facts_render — the raw-shell host carrier has no artifact
+# and no UID, so its arm/fire facts come from the SAME read-side receipt scan
+# the verifier's evidence timeline uses (single source, no second parser).
+# ---------------------------------------------------------------------------
+
+_HOST_UNIT = "drill-timeoffset-recover"
+
+
+def _host_arm_fire_state(*, with_fire: bool = True) -> dict:
+    msgs = [
+        AIMessage(content="", tool_calls=[{
+            "id": "arm", "name": "host_inject",
+            "args": {"command": f"systemd-run --on-active=30s --unit={_HOST_UNIT} date -s REALTIME"},
+        }]),
+        ToolMessage(
+            content=f"--- STDERR ---\nRunning as unit: {_HOST_UNIT}.service\n",
+            tool_call_id="arm", name="host_inject",
+        ),
+    ]
+    if with_fire:
+        msgs += [
+            AIMessage(content="", tool_calls=[{
+                "id": "fire", "name": "host_read",
+                "args": {"command": f"systemctl show {_HOST_UNIT}.timer -p Result"},
+            }]),
+            ToolMessage(content="Result=success\n", tool_call_id="fire", name="host_read"),
+        ]
+    return {"execution_artifacts": [], "messages": msgs}
+
+
+def test_host_shell_recovery_facts_empty_state_returns_empty():
+    # Conformance parity (test_conformance L432-433): inert on an empty state.
+    assert HostShellProvider().recovery_facts_render({}, spec_params={}) == ""
+
+
+def test_host_shell_recovery_facts_no_carrier_is_honest_empty():
+    # A host fault with no systemd-run carrier (Branch B) renders nothing —
+    # never a fabricated fire.
+    state = {
+        "execution_artifacts": [],
+        "messages": [
+            AIMessage(content="", tool_calls=[{
+                "id": "inj", "name": "host_inject",
+                "args": {"command": "iptables -A INPUT -j DROP"},
+            }]),
+            ToolMessage(content="ok\n", tool_call_id="inj", name="host_inject"),
+        ],
+    }
+    assert HostShellProvider().recovery_facts_render(state, spec_params={}) == ""
+
+
+def test_host_shell_recovery_facts_renders_confirmed_fire():
+    rendered = HostShellProvider().recovery_facts_render(
+        _host_arm_fire_state(), spec_params={},
+    )
+    assert "FIRED on host" in rendered
+    assert f"{_HOST_UNIT}.timer" in rendered
+    assert "Result=success" in rendered
+    # event/moment separation: the wall-clock fire time is declared unavailable
+    assert "wall-clock fire time is unavailable" in rendered
+
+
+def test_host_shell_recovery_facts_renders_armed_when_fire_unobserved():
+    rendered = HostShellProvider().recovery_facts_render(
+        _host_arm_fire_state(with_fire=False), spec_params={},
+    )
+    assert "ARMED on host" in rendered
+    assert _HOST_UNIT in rendered
+    assert "FIRED" not in rendered
+
+
+def test_host_shell_recovery_facts_share_the_verifier_scan():
+    # Single source: the provider render and the timeline scan must agree on the
+    # same stream (no divergent second parser).
+    from chaos_agent.agent.evidence_clock import scan_host_recovery_receipts
+
+    state = _host_arm_fire_state()
+    facts = scan_host_recovery_receipts(state)
+    rendered = HostShellProvider().recovery_facts_render(state, spec_params={})
+    assert facts["fired"]["confirmed"] is True
+    assert facts["fired"]["unit_name"] in rendered

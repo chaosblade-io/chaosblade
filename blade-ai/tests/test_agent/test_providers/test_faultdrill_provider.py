@@ -1037,7 +1037,7 @@ def _patch_fire(monkeypatch):
 
     state: dict = {"calls": []}
 
-    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0):
+    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0, target=None):
         assert sub in ("get", "patch"), (
             f"the replay must not dispatch {sub!r} — the carrier stack "
             "belongs to the artifact sweep"
@@ -1096,7 +1096,7 @@ async def test_replay_after_timer_fire_is_guard2_no_op(monkeypatch):
     restore = [{"op": "remove", "path": "/spec/type"}]
     calls: list = []
 
-    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0):
+    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0, target=None):
         calls.append(sub)
         assert sub == "get", "an already-restored target must not be patched"
         return CommandResult(
@@ -1136,7 +1136,7 @@ async def test_recover_carrier_face_dispatch_narrow_handle(_patch_fire):
 async def test_recover_carrier_face_failure_fails_visible(monkeypatch):
     import chaos_agent.agent.providers.faultdrill.provider as fd_provider
 
-    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0):
+    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0, target=None):
         return CommandResult(
             exit_code=1, stdout="", stderr="Error from server (Forbidden)",
         )
@@ -1341,13 +1341,13 @@ def _recover_stub(monkeypatch):
         "calls": {"restore": 0, "restore_state": None},
     }
 
-    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0):
+    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0, target=None):
         raise AssertionError(
             "a monkeypatched _do_restore must keep the replay off the "
             f"wire — unexpected {sub!r} dispatch"
         )
 
-    async def fake_restore(task_state, kubeconfig):
+    async def fake_restore(task_state, kubeconfig, *, xport_target=None):
         state["calls"]["restore"] += 1
         state["calls"]["restore_state"] = task_state
         return state["restore"]
@@ -1648,7 +1648,7 @@ def _sweep_stub(monkeypatch):
 
     state: dict = {"delete": _R(0, "deleted"), "deletes": []}
 
-    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0):
+    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0, target=None):
         assert sub == "delete", (
             f"the sweep is delete-only; unexpected verb {sub!r} — a read "
             "back would rebuild the retired phase gate"

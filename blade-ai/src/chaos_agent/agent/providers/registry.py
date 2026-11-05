@@ -39,6 +39,7 @@ from chaos_agent.agent.providers.base import DestroyOutcome, FaultProvider
 if TYPE_CHECKING:
     from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.target_guard.types import EffectiveTarget
+    from chaos_agent.transports import TransportTarget
 
 logger = logging.getLogger(__name__)
 
@@ -651,6 +652,7 @@ class FaultProviderRegistry:
     @classmethod
     async def sweep_artifact(
         cls, artifact: Any, *, kubeconfig: str = "", task_id: str = "",
+        target: "TransportTarget | None" = None,
     ) -> "Optional[bool]":
         """Claim-based single-artifact sweep; ``None`` when unowned.
 
@@ -672,6 +674,7 @@ class FaultProviderRegistry:
                 continue
             outcome = await hook(
                 artifact, kubeconfig=kubeconfig, task_id=task_id,
+                target=target,
             )
             if outcome is not None:
                 return outcome
@@ -1330,7 +1333,7 @@ class FaultProviderRegistry:
         failures: list[str] = []
         for uid in residuals:
             try:
-                out = await provider.layer1_raw_destroy(uid, kubeconfig)
+                out = await provider.layer1_raw_destroy(uid, kubeconfig, state=values)
             except Exception as e:  # noqa: BLE001
                 failures.append(f"{uid}: {e}")
                 continue
@@ -1361,7 +1364,7 @@ class FaultProviderRegistry:
                 # warning surface is the honest verdict.
                 _status_check = getattr(provider, "experiment_destroyed", None)
                 if _status_check is not None and await _status_check(
-                    uid, kubeconfig,
+                    uid, kubeconfig, state=values,
                 ):
                     retired_new.append(uid)
                     continue

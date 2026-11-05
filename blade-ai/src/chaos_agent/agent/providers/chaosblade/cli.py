@@ -11,9 +11,10 @@ Scene-specific flags (e.g. --time, --cpu-count) remain in the generic `flags` pa
 
 import logging
 import shlex
-from typing import Literal
+from typing import Annotated, Literal
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolArg, tool
+from langgraph.prebuilt import InjectedState
 
 from chaos_agent.agent.spec.fault_registry import is_host_scope
 from chaos_agent.config.settings import settings
@@ -22,11 +23,12 @@ from chaos_agent.tools.markers import UNCERTAIN_OUTCOME_MARKER  # re-exported
 from chaos_agent.transports import (
     KUBEWIZ_CHANNELS,
     PROFILE_HOST,
+    PROFILE_UNKNOWN,
+    TransportRegistry,
     TransportTarget,
     execute_via_transport,
-    is_kubewiz_channel,
     profile_of,
-    resolve_channel_name,
+    resolve_transport_target,
 )
 from chaos_agent.transports.protocol import explain_transport_anomaly
 
@@ -72,24 +74,83 @@ def _split_args(args: str) -> list[str]:
 
 
 def _get_blade_path() -> str:
-    """Resolve blade binary path: explicit setting > bundled > system PATH."""
+    """Resolve the LOCAL blade binary path: explicit setting > bundled > PATH.
+
+    Low-level primitive. The single ``profile → path`` authority is
+    :func:`blade_bin_for` below, which delegates here for the local/k8s profile.
+    ``blade_create`` also calls this directly for its scope-driven path (see the
+    NOTE at its command-shape branch).
+    """
     if settings.blade_path:
         return settings.blade_path
     return settings._resolve_blade_path()
 
 
 def _get_host_blade_path() -> str:
-    """Resolve the blade binary name for host scope.
+    """Resolve the blade binary name for the HOST profile.
 
     Host-scope injections run blade ON the remote host (wrapped in
     ``wiz task exec``), so the path must be valid THERE, not locally. Never
     reuse ``_get_blade_path()`` / ``settings.blade_path`` here: those resolve a
     *local* absolute path (bundled / vendored), which is meaningless remotely
-    and would leak a local path into the remote command. Default to the bare
-    ``blade`` on the remote PATH; override via ``settings.host_blade_path``
-    only when the remote binary lives outside PATH.
+    and would leak a local path into the remote command (that leak is B1).
+    Default to the bare ``blade`` on the remote PATH; override via
+    ``settings.host_blade_path`` only when the remote binary lives outside PATH.
+
+    Low-level primitive. The "never leak a local path into a host command"
+    invariant is now guaranteed at a single point by :func:`blade_bin_for`,
+    which delegates here for the host profile — so the four channel-driven tools
+    can no longer forget the host branch. ``blade_create`` still calls this
+    directly for its scope-driven path.
     """
     return settings.host_blade_path or "blade"
+
+
+def blade_bin_for(target: TransportTarget) -> str:
+    """Single ``profile → blade binary path`` authority for a resolved target.
+
+    D3/B1: this mapping used to be duplicated as an inline
+    ``profile_of(...) == HOST`` branch in each blade tool, and ``blade_help``
+    simply forgot the host branch — baking a LOCAL vendor absolute path into a
+    command meant to run ON a remote host (``/Users/…/vendor/chaosblade/blade:
+    No such file or directory``). Collapsing the mapping here makes "forgot the
+    host branch" structurally impossible: every channel-driven tool that reads
+    ``blade_bin_for(target)`` gets the profile-correct path for free.
+
+    - host profile → the REMOTE bare blade (:func:`_get_host_blade_path`), a
+      path valid on the target host, never a local absolute path.
+    - local / k8s   → the local vendor absolute path (:func:`_get_blade_path`).
+
+    Layering: this resolver lives in the chaosblade PROVIDER package, not on
+    ``TransportTarget`` in the transports layer, on purpose — the blade binary
+    path is a chaosblade-carrier concern, and the phase-11 carrier-import
+    boundary forbids the generic transports layer from importing a concrete
+    provider subpackage (``test_provider_imports_confined_to_allowlist``). The
+    provider may import transports (the sanctioned direction), so the resolver
+    reads the target's profile from ``TransportRegistry`` and delegates to the
+    two in-module primitives — which keeps the ``conftest`` stub of
+    ``_get_blade_path`` honored and the local domain byte-identical.
+
+    ``blade_create`` deliberately does NOT use this resolver: it keys both its
+    command SHAPE and its path off the fault ``scope`` argument
+    (``is_host_scope(scope)``), which ``fault_registry`` keeps distinct from a
+    transport-channel ``profile == "host"`` test on purpose — a host-scope fault
+    uses the remote blade even before a host channel is configured (pinned by
+    ``test_host_create_uses_host_blade_path``). The four channel-driven tools
+    (destroy/status/query_k8s/help) take no scope argument, so the resolved
+    channel profile is their only — and authoritative — signal.
+    """
+    try:
+        profile = getattr(TransportRegistry.resolve(target), "profile", PROFILE_UNKNOWN)
+    except ValueError:
+        # Under-specified scope / unknown channel_override: fail soft to the
+        # local path, matching resolve_channel_name's PROFILE_UNKNOWN (not host)
+        # branch — never resolve to a bare remote blade unless the channel is
+        # affirmatively host.
+        profile = PROFILE_UNKNOWN
+    if profile == PROFILE_HOST:
+        return _get_host_blade_path()
+    return _get_blade_path()
 
 
 def _build_kubeconfig_arg(kubeconfig: str = "") -> list[str]:
@@ -135,11 +196,13 @@ async def blade_create(
     namespace: str = "",
     names: str = "",
     labels: str = "",
-    kubeconfig: str = "",
+    kubeconfig: Annotated[str, InjectedToolArg] = "",
     evict_count: str = "",
     evict_percent: str = "",
     flags: str = "",
     task_id: str = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
 ) -> str:
     """Phase 2 ONLY — mutating: create a ChaosBlade K8s/host fault
     experiment (real chaos on the target). NOT Phase 1 (inspect via
@@ -149,7 +212,7 @@ async def blade_create(
     Inputs:
       - scope: pod|container|node|host. target: cpu|memory|network|disk|
         process|pod. action: fullload|drop|dns|occupy|fill|burn|kill|delete.
-      - namespace/names/labels/kubeconfig/evict_*: passthrough.
+      - namespace/names/labels/evict_*: passthrough.
       - flags: scenario flags (catalog: `chaosblade-cli.md`); drop →
         "--interface eth0" (drops ALL packets; no --percent).
 
@@ -162,8 +225,8 @@ async def blade_create(
       - scope="pod" = whole Pod (never --container-names);
         scope="container" REQUIRES --container-ids/--container-names.
       - scope="node": --namespace/--labels rejected, auto-omitted; select
-        via --names. scope="host": OS-executor; no namespace/labels/
-        kubeconfig; params in `flags`.
+        via --names. scope="host": OS-executor; no namespace/labels;
+        params in `flags`.
       - Memory: pod: --mem-percent|--mem-size; node: --mem-percent ONLY.
       - "unknown flag: --namespace" (host blade) = version issue — retry
         without it.
@@ -194,12 +257,21 @@ async def blade_create(
     # (SSH): it runs the command ON the target host, so blade records the
     # experiment in that host's local DB and blade_destroy over the same
     # transport recovers it (no blade `--channel ssh` needed here).
+    # NOTE: blade_create is the ONE blade tool that selects its binary path off
+    # the fault ``scope`` argument (``_is_host = is_host_scope(scope)``) rather
+    # than ``blade_bin_for(_target)`` (which resolves the transport-CHANNEL profile).
+    # This is deliberate, not an oversight: the two axes are kept distinct (see
+    # ``fault_registry.is_host_scope``) because a host-scope fault runs blade on
+    # the remote host — needing the bare remote path — even before a host channel
+    # is configured, and the command SHAPE below is scope-driven too. Pinned by
+    # ``test_host_create_uses_host_blade_path``. The four channel-driven tools
+    # (destroy/status/query_k8s/help) have no scope arg and read blade_bin.
     if _is_host:
         cmd = [_get_host_blade_path(), "create", target, action]
     else:
         cmd = [_get_blade_path(), "create", "k8s", f"{scope}-{target}", action]
 
-    _target = TransportTarget.from_state({})
+    _target = resolve_transport_target(state)
     _kubewiz = False
     if not _is_host:
         # K8s scenario common flags
@@ -211,14 +283,23 @@ async def blade_create(
             cmd.extend(["--names", names])
         if labels and scope != "node":
             cmd.extend(["--labels", labels])
-        # Channel selection is fail-soft: is_kubewiz_channel degrades to kubeconfig
-        # if resolution fails. Config validity is guaranteed upstream (settings
-        # kube_connection_mode validator + preflight check_transport_config), so an
-        # unresolvable channel never reaches this injection path in practice.
+        # Channel selection is fail-soft: an unresolvable channel degrades to
+        # kubeconfig. Config validity is guaranteed upstream (settings
+        # kube_connection_mode validator + preflight check_transport_config), so
+        # an unresolvable channel never reaches this injection path in practice.
         # kubewiz mode: blade reaches KubeWiz Core via its own --kubewiz-url flags,
         # so it runs locally and must NOT be re-wrapped in `wiz task exec`
         # (bypass_channel=True below).
-        _kubewiz = is_kubewiz_channel()
+        # D3: derive kubewiz-ness from the SAME state-resolved ``_target`` this
+        # command executes over (execute_via_transport below), not the
+        # settings-only ``is_kubewiz_channel()``. A per-session state channel
+        # override would otherwise build a --kubeconfig-shaped command yet run
+        # it over the kubewiz channel. No-op when state carries no override.
+        # Mirrors blade_status / blade_help.
+        try:
+            _kubewiz = TransportRegistry.resolve(_target).name in KUBEWIZ_CHANNELS
+        except ValueError:
+            _kubewiz = False
         if _kubewiz:
             cmd.extend(_build_blade_kubewiz_args(_target))
         else:
@@ -247,12 +328,23 @@ async def blade_create(
         # Timeout specified (by LLM or CLI): passes through verbatim;
         # zero/malformed values normalize to the default.
         # ``normalize_timeout_flag`` also canonicalizes ``--timeout=<value>``.
+        #
+        # ``warn_explicit_below_floor=False``: a present ``--timeout`` here is
+        # the engine-pinned RECOVERY TIMER (D+G, layer 3), not the observation
+        # window D the floor is empirically derived from. The layer that owns D
+        # (TOP inject.py / MIDDLE extract_planning_metadata / l4 adapter) has
+        # already surfaced the requested-vs-recommended gap on the correct
+        # number; re-warning here fires a second time on the larger D+G value
+        # for the same fact (see fault_type.ensure_min_duration).
         timeout_idx = cmd.index("--timeout")
         try:
             current_int = int(timeout_value)
         except (ValueError, TypeError):
             current_int = 0
-        effective_timeout = ensure_min_duration(timeout_value, scope, target, action)
+        effective_timeout = ensure_min_duration(
+            timeout_value, scope, target, action,
+            warn_explicit_below_floor=False,
+        )
         if effective_timeout != current_int:
             cmd[timeout_idx + 1] = str(effective_timeout)
             logger.info(
@@ -387,7 +479,12 @@ async def blade_create(
 
 
 @tool
-async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
+async def blade_destroy(
+    uid: str,
+    kubeconfig: Annotated[str, InjectedToolArg] = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
+) -> str:
     """Mutating. Destroy a ChaosBlade experiment by UID to recover the fault.
 
     Runs `blade destroy <UID>`. NOT available in Phase 1 planning — the
@@ -402,7 +499,6 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
 
     Inputs:
       - uid: experiment UID returned by blade_create (`result.uid`) or blade_status.
-      - kubeconfig: optional override (defaults to settings + KUBECONFIG env).
 
     Output: JSON from blade CLI; failure starts with "Error:".
 
@@ -415,8 +511,17 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
       - Phase 2 may only destroy UIDs returned by blade_create in the current
         task. The runtime rejects any other UID.
     """
-    _target = TransportTarget.from_state({})
-    _channel_name = resolve_channel_name()
+    _target = resolve_transport_target(state)
+    # D3: derive the channel from the SAME state-resolved ``_target`` that
+    # ``blade_bin_for(_target)`` uses below, not from the settings-only
+    # ``resolve_channel_name()``. A per-session state channel override would
+    # otherwise make the destroy command SHAPE (host/kubewiz branch, --target
+    # k8s) diverge from the channel it actually executes over. No-op when state
+    # carries no override. Mirrors blade_status / blade_help.
+    try:
+        _channel_name = TransportRegistry.resolve(_target).name
+    except ValueError:
+        _channel_name = PROFILE_UNKNOWN
     # Unlike blade_create (which keys host-ness off its ``scope`` argument),
     # destroy/status receive NO scope arg — the resolved channel is the only
     # signal, and it is authoritative: preflight (check_transport_config)
@@ -428,10 +533,13 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
         # in that host's LOCAL DB. Destroy must run there too (wiz-wrapped,
         # bypass_channel=False) using the bare remote blade — NO --target k8s,
         # NO kubewiz/kubeconfig args (there is no cluster CRD to reach).
-        cmd = [_get_host_blade_path(), "destroy", uid]
+        # ``blade_bin_for(_target)`` is the single authority for the profile→path
+        # mapping (host profile → bare remote blade); the branch here only
+        # controls command SHAPE / bypass / args, never the binary path.
+        cmd = [blade_bin_for(_target), "destroy", uid]
         _bypass = False
     else:
-        cmd = [_get_blade_path(), "destroy", uid]
+        cmd = [blade_bin_for(_target), "destroy", uid]
         _kubewiz = _channel_name in KUBEWIZ_CHANNELS
         # kubewiz mode: experiments are K8s CRDs, not local DB records.
         # Without --target k8s, blade looks in local DB and returns "record not found".
@@ -461,11 +569,16 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
 
 
 @tool
-async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
+async def blade_status(
+    uid: str = "",
+    kubeconfig: Annotated[str, InjectedToolArg] = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
+) -> str:
     """Phase 1 / Phase 2 read-only. Query a ChaosBlade experiment's CLI-side status.
 
-    Runs `blade status [--uid <UID>]`. Read-only — listing existing
-    experiments does not mutate cluster state.
+    Runs `blade status --uid <UID>`, or `blade status --type create` when uid
+    is empty. Read-only — listing experiments does not mutate cluster state.
 
     When to use:
       - Verifier Layer 1: confirm the experiment is "Success" after blade_create.
@@ -474,8 +587,9 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
         pods/nodes are actually affected).
 
     Inputs:
-      - uid: experiment UID. Empty → lists all experiments (output may be large).
-      - kubeconfig: optional override.
+      - uid: experiment UID. Empty → lists all `create` experiments (a bare
+        `blade status` errors 45000 "less parameter: type|uid", so `--type
+        create` is supplied). Output may be large.
 
     Output: JSON with Uid / Command / Status / Error / CreateTime / UpdateTime.
             Status ∈ {Created, Success, Error, Destroyed}.
@@ -487,16 +601,33 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
         kubeconfig via the KUBECONFIG env var instead. No action required from
         the caller.
     """
-    _target = TransportTarget.from_state({})
-    _channel_name = resolve_channel_name()
+    _target = resolve_transport_target(state)
+    # D3: derive the channel from the SAME resolved ``_target`` that
+    # ``blade_bin_for(_target)`` uses below. ``resolve_channel_name()``
+    # re-derives from settings only, ignoring any per-session state override —
+    # so when state carries an explicit channel the host/kubewiz branch here
+    # could pick a different channel than the binary path (branch says k8s
+    # while blade_bin_for returns the host blade, or vice versa). When state
+    # carries no override the two are identical, so this is a no-op for the
+    # common path.
+    try:
+        _channel_name = TransportRegistry.resolve(_target).name
+    except ValueError:
+        _channel_name = PROFILE_UNKNOWN
     _is_host_channel = profile_of(_channel_name) == PROFILE_HOST
     if _is_host_channel:
         # Host scope: the experiment lives in the remote host's LOCAL DB.
         # Query it there (wiz-wrapped, bypass_channel=False) with the bare
         # remote blade — NO `blade query k8s` (no cluster CRD), NO KUBECONFIG env.
-        cmd = [_get_host_blade_path(), "status"]
+        cmd = [blade_bin_for(_target), "status"]
         if uid:
             cmd.extend(["--uid", uid])
+        else:
+            # Empty uid → LIST create experiments. A bare `blade status`
+            # (no --uid, no --type) errors with code 45000 "less parameter:
+            # type|uid", so fulfil the docstring's "lists all experiments"
+            # promise by supplying --type create (D1 contract-honesty fix).
+            cmd.extend(["--type", "create"])
         try:
             result = await execute_via_transport(cmd, _target, timeout=settings.timeout_blade, bypass_channel=False, expect_profile=profile_for_tool("blade_status"))
         except Exception as e:
@@ -513,7 +644,7 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
     # (only local DB). Delegate to blade query k8s which queries the
     # remote cluster CRD via kubewiz.
     if _channel_name == "kubewiz_k8s" and uid:
-        cmd = [_get_blade_path(), "query", "k8s", "create", uid]
+        cmd = [blade_bin_for(_target), "query", "k8s", "create", uid]
         cmd.extend(_build_blade_kubewiz_args(_target))
         try:
             # blade reaches KubeWiz Core natively; run local, don't wiz-wrap.
@@ -524,9 +655,14 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
         stderr = result.stderr.strip() if result.stderr else ""
         return stdout or stderr or ""
 
-    cmd = [_get_blade_path(), "status"]
+    cmd = [blade_bin_for(_target), "status"]
     if uid:
         cmd.extend(["--uid", uid])
+    else:
+        # Empty uid → LIST create experiments (D1 contract-honesty fix): a
+        # bare `blade status` errors 45000 "less parameter: type|uid", so
+        # --type create makes the docstring's "lists all" promise real.
+        cmd.extend(["--type", "create"])
     # kubeconfig mode: blade status v1.8.0 does NOT support --kubeconfig flag,
     # so pass via KUBECONFIG env var instead
     env_override = _build_kubeconfig_env(kubeconfig)
@@ -540,7 +676,11 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
 
 
 @tool
-async def blade_help(subcommand: str = "") -> str:
+async def blade_help(
+    subcommand: str = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
+) -> str:
     """Phase 1 / Phase 2 read-only. Query ChaosBlade CLI help for any subcommand.
 
     Runs `blade [subcommand...] -h`. Read-only — only prints help text,
@@ -567,13 +707,25 @@ async def blade_help(subcommand: str = "") -> str:
     tokens = _split_args(subcommand)
     tokens = [t for t in tokens
               if t not in ("-h", "--help") and not t.startswith("--")]
-    cmd = [_get_blade_path()] + tokens + ["-h"]
 
     try:
-        _target = TransportTarget.from_state({})
+        _target = resolve_transport_target(state)
+        # B1 fix: the binary path comes from ``blade_bin_for(_target)`` (the single
+        # profile→path authority), so a host-profile session gets the bare
+        # remote blade instead of leaking a local vendor absolute path — the
+        # host branch this tool used to forget.
+        cmd = [blade_bin_for(_target)] + tokens + ["-h"]
         # blade -h is local help text; in kubewiz mode blade runs natively, so
-        # don't wrap it in `wiz task exec`.
-        result = await execute_via_transport(cmd, _target, timeout=10, bypass_channel=is_kubewiz_channel(), expect_profile=profile_for_tool("blade_help"))
+        # don't wrap it in `wiz task exec`. D3: decide bypass from the SAME
+        # resolved ``_target`` that blade_bin_for used, not from the
+        # settings-only ``is_kubewiz_channel()`` — otherwise a per-session
+        # state override could make the binary path and the wrap decision
+        # diverge. No-op when state carries no override.
+        try:
+            _bypass = TransportRegistry.resolve(_target).name in KUBEWIZ_CHANNELS
+        except ValueError:
+            _bypass = False
+        result = await execute_via_transport(cmd, _target, timeout=10, bypass_channel=_bypass, expect_profile=profile_for_tool("blade_help"))
     except Exception as e:
         return f"Error: blade help failed: {e}"
 
@@ -584,7 +736,12 @@ async def blade_help(subcommand: str = "") -> str:
 
 
 @tool
-async def blade_query_k8s(uid: str = "", kubeconfig: str = "") -> str:
+async def blade_query_k8s(
+    uid: str = "",
+    kubeconfig: Annotated[str, InjectedToolArg] = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
+) -> str:
     """Phase 2 read-only. Query the cluster-side status of a ChaosBlade K8s experiment.
 
     Runs `blade query k8s create <UID>`. Returns which pods / nodes the
@@ -598,7 +755,6 @@ async def blade_query_k8s(uid: str = "", kubeconfig: str = "") -> str:
 
     Inputs:
       - uid: experiment UID (required; empty UID returns an error).
-      - kubeconfig: optional override.
 
     Output: JSON, e.g. `{"code":200,"success":true,"result":{"uid":"...",
             "statuses":[{"state":"Success","kind":"pod","identifier":"ns/node/pod/container/runtime"}]}}`.
@@ -612,7 +768,17 @@ async def blade_query_k8s(uid: str = "", kubeconfig: str = "") -> str:
       - Host-scope experiments have NO cluster CRD/selector to query; this
         tool returns guidance pointing to blade_status instead of running.
     """
-    _channel_name = resolve_channel_name()
+    _target = resolve_transport_target(state)
+    # D3: derive the channel from the SAME state-resolved ``_target`` used for
+    # execution below, not the settings-only ``resolve_channel_name()`` /
+    # ``is_kubewiz_channel()``. A per-session state channel override would
+    # otherwise make the host gate AND the kubewiz/kubeconfig command SHAPE
+    # diverge from the channel the query actually executes over. No-op when
+    # state carries no override. Mirrors blade_status / blade_help.
+    try:
+        _channel_name = TransportRegistry.resolve(_target).name
+    except ValueError:
+        _channel_name = PROFILE_UNKNOWN
     if profile_of(_channel_name) == PROFILE_HOST:
         # Host scope has no cluster CRD / selector to query — the experiment is
         # a local process on the remote host. `blade query k8s` is meaningless
@@ -625,13 +791,17 @@ async def blade_query_k8s(uid: str = "", kubeconfig: str = "") -> str:
             "no cluster CRD/selector to query). Use blade_status to read the "
             "remote host's local experiment state instead."
         )
-    cmd = [_get_blade_path(), "query", "k8s"]
+    # Past the host gate above, the channel is non-host, so ``blade_bin_for(_target)``
+    # resolves to the local blade — routed through the single profile→path
+    # authority rather than a direct ``_get_blade_path()`` call.
+    cmd = [blade_bin_for(_target), "query", "k8s"]
     if uid:
         cmd.extend(["create", uid])
-    _target = TransportTarget.from_state({})
     # kubewiz mode: blade reaches KubeWiz Core natively via --kubewiz-url, so it
     # runs locally (bypass_channel) and is NOT re-wrapped in `wiz task exec`.
-    _kubewiz = is_kubewiz_channel()
+    # D3: reuse the state-resolved ``_channel_name`` from the host gate above so
+    # the command SHAPE matches the channel ``_target`` executes over.
+    _kubewiz = _channel_name in KUBEWIZ_CHANNELS
     if _kubewiz:
         cmd.extend(_build_blade_kubewiz_args(_target))
     else:

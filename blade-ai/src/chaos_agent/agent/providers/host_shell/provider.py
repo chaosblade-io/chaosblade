@@ -44,6 +44,7 @@ from chaos_agent.agent.providers.base import (
     coerce_tool_args_dict,
 )
 from chaos_agent.agent.providers.message_scanning import (
+    _host_native_call_is_readonly,
     build_tool_call_args_lookup,
     reached_target,
 )
@@ -75,22 +76,70 @@ def _classify_host_inject(args: dict, raw_command: str) -> EffectiveTarget:
     pins the fault TYPE (``network`` → ``process`` is drift), while the
     k8s namespace/names/labels checks are skipped for host scope.
 
+    A READ-ONLY diagnostic (``host_inject``'s ``host_read`` superset role)
+    is the one exception: it mutates nothing and carries no fault family, so
+    it is classified ``SCOPE_READONLY`` (the sentinel the guard passes
+    through) rather than a host-family write — see the M2 arm below. Without
+    it an in-process (``python``-scope) fault's application-level probe is
+    misread as a ``python``→``host`` cross-family drift.
+
     Guard-side target classification migrated from
     ``target_guard/classifier.py`` (phase-7 T5) — pure move, behaviour is
     byte-identical.
     """
     # Lazy imports — target_guard symbols must not be imported at module level
     # from a provider module (see the NOTE near the top of this file).
-    from chaos_agent.agent.target_guard.types import ConfidenceLevel, EffectiveTarget
+    from chaos_agent.agent.target_guard.types import (
+        SCOPE_READONLY,
+        ConfidenceLevel,
+        EffectiveTarget,
+    )
 
     from chaos_agent.agent.target_guard.carriers import (
         classify_host_operation,
         find_banned_host_verbs,
     )
 
+    # Lazy (same discipline as the target_guard imports above): the read-only
+    # authority's single-source hint. Imported by reference, never copied, so
+    # the refusal text cannot drift from the judge (a2f0cce7).
+    from chaos_agent.tools.readonly import HOST_READONLY_PROBE_HINT
+
+    # M2 — a READ-ONLY diagnostic routed through host_inject (its host_read
+    # superset role) is an OBSERVATION, not an injection: it mutates nothing
+    # and has no fault identity to drift. Classify it READONLY so the guard
+    # short-circuits on the sentinel (guard.py step 1) instead of reading it as
+    # a host-family write. Single-sourced from the SAME content-aware predicate
+    # the RED-LINE gate (progress.py), the host-native injection scan
+    # (message_scanning) and host_cmd's skip_guard fast path already trust, so
+    # this verdict is granted EXACTLY when host_cmd would run the command with
+    # skip_guard — the two layers cannot diverge. A MUTATING command is not
+    # read-only, so it falls through to scope="host" below and is still caught
+    # by ToolGuard at dispatch (skip_guard=False). host_command_rejection_reason
+    # fail-closes on internal error and already screens shell metacharacters, so
+    # a pipe/redirect never reaches this arm as "read-only".
+    #
+    # Why this matters: the EXECUTE / RECOVER_VERIFY phases of a python-scope
+    # (in-process) fault have no other channel that reaches the target — the
+    # application-level probe can ONLY be a read-only curl through host_inject.
+    # Before this arm that curl (empty fault family) under a python approval was
+    # misread as a python→host CROSS-FAMILY drift → REJECT_DRIFT → (2nd drift)
+    # DRIFT_TERMINATED with verification=null: a false negative on a physically
+    # successful injection (task inject-980aff35). Host-scope approvals are
+    # unchanged in outcome — a read-only host_inject already passed there as
+    # same-family; this only makes the pass explicit (and lifts the phantom
+    # cross-family reject that python scope uniquely hit).
+    if _host_native_call_is_readonly(args):
+        return EffectiveTarget(
+            scope=SCOPE_READONLY,
+            namespace="",
+            raw_command=raw_command,
+        )
+
     command = str(args.get("command") or "")
     family = classify_host_operation(command)
     reject_detail = ""
+    reject_suggestion = ""
     if not command:
         reject_detail = (
             "host_inject was called with an empty 'command', so there is "
@@ -109,6 +158,16 @@ def _classify_host_inject(args: dict, raw_command: str) -> EffectiveTarget:
                 "cannot be pinned; remove the banned verb and re-express "
                 "that step with the fault family's own binaries"
             )
+        # Layer 2 (O-C2-1, b7cd803d cause-fix pairing): the command was neither
+        # a recognized fault (empty family) nor admitted read-only above, so
+        # pair that cause with the compliant read-only shape from the SINGLE
+        # SOURCE — the model learns the observation channel exists instead of
+        # enumerating alternatives (the python3 -c detour). Carrier-scoped: ONLY
+        # this host classifier attaches it, and only on this fall-through — a
+        # genuine host fault (recognized family) is a real drift and gets no
+        # read-only hint. Structural, not an intent guess: "empty family + not
+        # read-only" is a fact, not a reading of what the model meant (D4).
+        reject_suggestion = HOST_READONLY_PROBE_HINT
     return EffectiveTarget(
         scope="host",
         namespace="",
@@ -124,6 +183,7 @@ def _classify_host_inject(args: dict, raw_command: str) -> EffectiveTarget:
             else "host_inject was called with an empty 'command', so there is "
             "no host operation to classify"
         ),
+        reject_suggestion=reject_suggestion,
     )
 
 
@@ -203,6 +263,18 @@ class HostShellProvider:
             # payload IMMEDIATELY and would be an arbitrary-execution bypass of
             # Gate ① (`systemd-run nginx` runs nginx, which no whitelist admits).
             "systemd-run",
+            # Tier-2 self-recovery detached-timer carrier for hosts WITHOUT
+            # systemd (guarded per-binary). The no-systemd twin of the
+            # `systemd-run` timer above: when the target host has no systemd
+            # (minimal container / non-systemd init / wiz executor), the 降级方案
+            # arms `setsid --fork sh -c 'sleep <N>; <inverse-cmd>'` — a detached
+            # child that survives the session's death and fires the inverse at
+            # the deadline. `--fork` is constitutive (setsid does NOT fork by
+            # default, so a bare form blocks the caller for the whole window);
+            # `_check_setsid` admits ONLY that detached `sh -c` form and
+            # re-admits the payload through the SAME grammar — this stays a
+            # carrier head, never an interpreter/shell in the whitelist.
+            "setsid",
             # Tier-2 single-resource fault primitives (guarded per-binary).
             # Admitted because a fallback plan has to WORK: not every cluster runs
             # ChaosBlade, and for those the 降级方案 section is the only path, not a
@@ -519,7 +591,9 @@ class HostShellProvider:
             details="host-native injection (no blade experiment), Layer 1 not applicable",
         )
 
-    async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:
+    async def layer1_raw_destroy(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> str:
         """No bare destroy exists for a host-native fault (nothing to destroy
         programmatically); the finalize retry never routes here."""
         return ""
@@ -551,6 +625,7 @@ class HostShellProvider:
         # Layer-1 here to hydrate an identity FOR (this returns ``skipped``
         # and the LLM flow's undo is Layer 1), so the list stays unread.
         artifacts: list | None = None,
+        state: dict | None = None,
     ) -> "Layer1Result":
         """No deterministic Layer-1 recovery exists for a host-native fault:
         the raw host command has no experiment to destroy — the LLM flow's
@@ -576,8 +651,46 @@ class HostShellProvider:
     def recovery_facts_render(
         self, state: dict, *, spec_params: dict | None = None
     ) -> str:
-        """UID-less carrier: no carrier-owned injection facts to render."""
-        return ""
+        """Host-native self-recovery facts for the Layer-1 recovery context.
+
+        A raw-shell host fault recovers through a systemd transient timer with
+        no ChaosBlade UID and no ``execution_artifacts`` entry, so nothing else
+        hands the recovery executor its arm/fire state. This derives it from the
+        SAME read-side scan the verifier's evidence timeline uses
+        (``evidence_clock.scan_host_recovery_receipts``) — one authoritative
+        source, never a second parser. Facts only: an empty stream or a carrier
+        with no registered unit renders nothing (a fabricated fire is worse than
+        a silent one).
+        """
+        from chaos_agent.agent.evidence_clock import scan_host_recovery_receipts
+
+        receipts = scan_host_recovery_receipts(state)
+        armed, fired = receipts["armed"], receipts["fired"]
+        if not (armed.get("confirmed") or fired.get("confirmed")):
+            return ""
+        unit = (
+            fired.get("unit_name") or armed.get("unit_name")
+            or "the recovery carrier"
+        )
+        if fired.get("confirmed"):
+            line = (
+                f"- Self-recovery timer FIRED on host: `systemctl show "
+                f"{unit}.timer -p Result` returned Result={fired.get('result')}. "
+                f"The host wall-clock fire time is unavailable — a transient "
+                f"timer reports its Result, not the moment it fired."
+            )
+        else:
+            line = (
+                f"- Self-recovery timer ARMED on host (systemd-run unit {unit}); "
+                f"its fire has NOT been observed — no `systemctl show "
+                f"{unit}.timer -p Result` receipt is on record. A host-managed "
+                f"timer under PID 1 survives the session and fires on its own."
+            )
+        return (
+            "## Host Self-Recovery Carrier (derived from receipts)\n"
+            + line
+            + "\n"
+        )
 
     def merge_deterministic_recover_verdict(
         self, layer1, state: dict, part_override: dict | None = None

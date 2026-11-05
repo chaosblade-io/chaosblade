@@ -677,6 +677,7 @@ class FaultProvider(Protocol):
     async def layer1_destroy(
         self, uid: str, kubeconfig: str = "", *, messages: list | None = None,
         injection_method: str | None = None, artifacts: list | None = None,
+        state: dict | None = None,
     ) -> "Layer1Result":
         """Deterministic Layer-1 RECOVERY execution for this backend (the
         experiment destroy + destroyed-state verification), consumed by the
@@ -704,7 +705,9 @@ class FaultProvider(Protocol):
         and recognising any particular artifact type stays provider-side."""
         ...
 
-    async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:
+    async def layer1_raw_destroy(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> str:
         """Bare deterministic destroy for the Layer-2 still-active RETRY path:
         a single destroy invocation returning its raw output, with NO
         destroyed-state verification (the retry prompt only needs the destroy

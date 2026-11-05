@@ -59,7 +59,8 @@ class _Router:
         return [c for c in self.calls if c[0] == sub]
 
     async def __call__(
-        self, sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0
+        self, sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0,
+        target=None,
     ):
         self.calls.append((sub, list(v_args), stdin_data))
         key = (sub, v_args[0] if v_args else "")

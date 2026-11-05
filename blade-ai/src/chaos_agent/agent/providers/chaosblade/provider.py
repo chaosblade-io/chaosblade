@@ -50,7 +50,7 @@ from chaos_agent.agent.providers.message_scanning import (
     build_tool_call_args_lookup,
 )
 from .verify import classify_blade_exec_payload
-from chaos_agent.transports import PROFILE_HOST, PROFILE_K8S
+from chaos_agent.transports import PROFILE_HOST, PROFILE_K8S, resolve_transport_target
 
 # NOTE: this module must keep importing ONLY providers-internal + stdlib
 # modules at module level — "providers-internal" now includes the sibling
@@ -1096,7 +1096,9 @@ class ChaosbladeProvider:
 
         return classify_destroy_output(output)
 
-    async def experiment_destroyed(self, uid: str, kubeconfig: str = "") -> bool:
+    async def experiment_destroyed(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> bool:
         """Status-only death check — the sweep's convergence valve (B76
         review I2/I2b).
 
@@ -1111,7 +1113,7 @@ class ChaosbladeProvider:
         from .recover import parse_blade_status_destroyed
 
         try:
-            out = await blade_status.ainvoke({"uid": uid, "kubeconfig": kubeconfig})
+            out = await blade_status.ainvoke({"uid": uid, "kubeconfig": kubeconfig, "state": state})
         except Exception:  # noqa: BLE001
             return False
         raw = out if isinstance(out, str) else str(out)
@@ -1559,6 +1561,7 @@ class ChaosbladeProvider:
                 kubeconfig,
                 task_id=task_id,
                 injection_pod_name=(self.recovery_vehicle(state) or None),
+                target=resolve_transport_target(state),
             )
         return await _run_host_blade_layer1(
             experiment_uid,
@@ -1569,6 +1572,7 @@ class ChaosbladeProvider:
             is_teardown=make_teardown_matcher(
                 state.get("execution_artifacts") or []
             ),
+            state=state,
         )
 
     async def layer1_destroy(
@@ -1582,6 +1586,7 @@ class ChaosbladeProvider:
         # identity IS the experiment UID, so there is no recipe to hydrate
         # from ``execution_artifacts`` and the list stays unread.
         artifacts: list | None = None,
+        state: dict | None = None,
     ) -> "Layer1Result":
         """Deterministic Layer-1 recovery: ``blade_destroy`` + ``blade_status``
         destroyed-state verification (delegates to ``_chaosblade_recover`` —
@@ -1593,15 +1598,18 @@ class ChaosbladeProvider:
             kubeconfig,
             messages=messages,
             injection_method=injection_method,
+            state=state,
         )
 
-    async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:
+    async def layer1_raw_destroy(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> str:
         """Bare destroy for the finalize retry (delegates to ``_chaosblade_recover``
         — no ``blade_status`` verification; the retry prompt only needs the
         destroy output)."""
         from .recover import raw_destroy
 
-        return await raw_destroy(uid, kubeconfig)
+        return await raw_destroy(uid, kubeconfig, state=state)
 
     def extract_kubectl_exec_pod_name(self, messages: list) -> str | None:
         """Tool pod the kubectl-exec delivery ran its successful ``blade
@@ -1973,6 +1981,7 @@ class ChaosbladeProvider:
             kubeconfig,
             messages=messages,
             injection_method=state.get("injection_method"),
+            state=state,
         )
         # COMBO injection: a kubectl-native component was injected alongside
         # the blade experiment. The no-LLM path can ONLY destroy the blade

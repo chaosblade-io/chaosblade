@@ -96,7 +96,9 @@ def parse_blade_status_destroyed(raw: str) -> tuple[str, str]:
 # Bare destroy — the Layer-2 still-active retry path (no status verification)
 # ---------------------------------------------------------------------------
 
-async def raw_destroy(experiment_uid: str, kubeconfig: str) -> str:
+async def raw_destroy(
+    experiment_uid: str, kubeconfig: str, *, state: dict | None = None,
+) -> str:
     """Single bare ``blade_destroy`` invocation returning its raw output.
 
     Used by the recover finalize retry (Layer 2 saw the fault still active):
@@ -104,7 +106,7 @@ async def raw_destroy(experiment_uid: str, kubeconfig: str) -> str:
     verification — the retry prompt only needs the destroy output."""
     from chaos_agent.agent.providers.chaosblade.cli import blade_destroy
 
-    output = await blade_destroy.ainvoke({"uid": experiment_uid, "kubeconfig": kubeconfig})
+    output = await blade_destroy.ainvoke({"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state})
     return output if isinstance(output, str) else str(output)
 
 
@@ -115,6 +117,7 @@ async def raw_destroy(experiment_uid: str, kubeconfig: str) -> str:
 async def run_layer1_destroy(
     experiment_uid: str, kubeconfig: str, *, messages: list | None = None,
     injection_method: str | None = None,
+    state: dict | None = None,
 ) -> Layer1Result:
     """Execute blade_destroy and verify the experiment is destroyed.
 
@@ -144,7 +147,7 @@ async def run_layer1_destroy(
 
         # Step 1: Execute blade_destroy
         destroy_output = await blade_destroy.ainvoke(
-            {"uid": experiment_uid, "kubeconfig": kubeconfig}
+            {"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state}
         )
         destroy_raw = destroy_output if isinstance(destroy_output, str) else str(destroy_output)
         destroy_status, destroy_details = parse_blade_destroy_output(destroy_raw)
@@ -155,7 +158,7 @@ async def run_layer1_destroy(
             # Check via blade_status — if CRD is not found, treat as recovered.
             try:
                 status_output = await blade_status.ainvoke(
-                    {"uid": experiment_uid, "kubeconfig": kubeconfig}
+                    {"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state}
                 )
                 status_raw = status_output if isinstance(status_output, str) else str(status_output)
                 if "not found" in status_raw.lower() or "notfound" in status_raw.lower():
@@ -182,7 +185,7 @@ async def run_layer1_destroy(
         # Step 2: Verify via blade_status that experiment is Destroyed
         try:
             status_output = await blade_status.ainvoke(
-                {"uid": experiment_uid, "kubeconfig": kubeconfig}
+                {"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state}
             )
             status_raw = status_output if isinstance(status_output, str) else str(status_output)
             check_status, check_details = parse_blade_status_destroyed(status_raw)

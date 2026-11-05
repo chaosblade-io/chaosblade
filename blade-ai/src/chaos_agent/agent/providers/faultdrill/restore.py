@@ -34,9 +34,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from . import provider as _provider_mod
+
+if TYPE_CHECKING:
+    from chaos_agent.transports import TransportTarget
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +54,10 @@ _INVALID_CREDENTIAL = "invalid-credential"
 # ---------------------------------------------------------------------------
 
 
-async def _do_restore(task_state: dict, kubeconfig: str) -> bool:
+async def _do_restore(
+    task_state: dict, kubeconfig: str, *,
+    xport_target: "TransportTarget | None" = None,
+) -> bool:
     """Revert the target to baseline. Guard 2 (pre-restore readback):
     ``remove`` ops whose path is already absent are dropped (json-remove
     on a missing path errors; the experiment's "已回基线 → 跳过").
@@ -65,7 +71,9 @@ async def _do_restore(task_state: dict, kubeconfig: str) -> bool:
     """
     target = task_state.get("target_ref") or {}
     restore = list(task_state.get("restore_patches") or [])
-    ok_read, target_json, _ = await _get_target_json(target, kubeconfig)
+    ok_read, target_json, _ = await _get_target_json(
+        target, kubeconfig, xport_target=xport_target,
+    )
     if ok_read and isinstance(target_json, dict):
         pending = _filter_already_restored(target_json, restore)
     else:
@@ -73,12 +81,16 @@ async def _do_restore(task_state: dict, kubeconfig: str) -> bool:
 
     patch_ok = True
     if pending:
-        patch_ok = await _patch_target(target, pending, kubeconfig)
+        patch_ok = await _patch_target(
+            target, pending, kubeconfig, xport_target=xport_target,
+        )
 
     inv = dict(task_state.get("invalid_secret") or {})
     del_ok = True
     if inv.get("name"):
-        del_ok = await _delete_invalid_secret(inv, target, kubeconfig)
+        del_ok = await _delete_invalid_secret(
+            inv, target, kubeconfig, xport_target=xport_target,
+        )
 
     extra = [
         d for d in (task_state.get("extra_delete") or [])
@@ -86,12 +98,15 @@ async def _do_restore(task_state: dict, kubeconfig: str) -> bool:
     ]
     extra_ok = True
     if extra:
-        extra_ok = await _delete_extra_objects(extra, kubeconfig)
+        extra_ok = await _delete_extra_objects(
+            extra, kubeconfig, xport_target=xport_target,
+        )
     return patch_ok and del_ok and extra_ok
 
 
 async def _apply_derived_invalid_secret(
-    inv: dict, target: dict, kubeconfig: str
+    inv: dict, target: dict, kubeconfig: str, *,
+    xport_target: "TransportTarget | None" = None,
 ) -> bool:
     """Derive the fault-prop secret from its SOURCE (D5: source reference
     + transformation, zero credential material in the recipe).
@@ -108,7 +123,7 @@ async def _apply_derived_invalid_secret(
     source_name = str(inv.get("sourceName") or "")
     r = await _provider_mod._kubectl(
         "get", ["secret", source_name, "-n", namespace, "-o", "json"],
-        kubeconfig,
+        kubeconfig, target=xport_target,
     )
     if r.exit_code != 0:
         logger.warning(
@@ -164,24 +179,29 @@ async def _apply_derived_invalid_secret(
     r = await _provider_mod._kubectl(
         "apply", ["-f", "-"], kubeconfig,
         stdin_data=yaml.safe_dump(manifest, default_flow_style=False),
+        target=xport_target,
     )
     return r.exit_code == 0
 
 
 async def _delete_invalid_secret(
-    inv: dict, target: dict, kubeconfig: str
+    inv: dict, target: dict, kubeconfig: str, *,
+    xport_target: "TransportTarget | None" = None,
 ) -> bool:
     namespace = _target_namespace(target)
     r = await _provider_mod._kubectl(
         "delete",
         ["secret", str(inv.get("name") or ""), "-n", namespace,
          "--ignore-not-found"],
-        kubeconfig,
+        kubeconfig, target=xport_target,
     )
     return r.exit_code == 0
 
 
-async def _delete_extra_objects(extra: list, kubeconfig: str) -> bool:
+async def _delete_extra_objects(
+    extra: list, kubeconfig: str, *,
+    xport_target: "TransportTarget | None" = None,
+) -> bool:
     """Delete the create-domain prop objects the inject plan built outside
     the patch domain (``extra_delete`` — the general delete-only inverse of
     create-type mechanism writes; the assembler timer folds the same
@@ -201,7 +221,7 @@ async def _delete_extra_objects(extra: list, kubeconfig: str) -> bool:
             continue
         r = await _provider_mod._kubectl(
             "delete", [kind, name, "-n", ns, "--ignore-not-found"],
-            kubeconfig,
+            kubeconfig, target=xport_target,
         )
         ok = ok and r.exit_code == 0
     return ok
@@ -222,7 +242,8 @@ def _target_namespace(target: dict) -> str:
 
 
 async def _get_target_json(
-    target: dict, kubeconfig: str
+    target: dict, kubeconfig: str, *,
+    xport_target: "TransportTarget | None" = None,
 ) -> tuple[bool, Optional[dict], str]:
     kind = str((target or {}).get("kind") or "Deployment").lower()
     name = str((target or {}).get("name") or "")
@@ -230,7 +251,7 @@ async def _get_target_json(
         return False, None, "targetRef carries no name"
     r = await _provider_mod._kubectl(
         "get", [kind, name, "-n", _target_namespace(target), "-o", "json"],
-        kubeconfig,
+        kubeconfig, target=xport_target,
     )
     if r.exit_code != 0:
         return False, None, r.stderr or ""
@@ -244,7 +265,8 @@ async def _get_target_json(
 
 
 async def _patch_target(
-    target: dict, patches: list, kubeconfig: str
+    target: dict, patches: list, kubeconfig: str, *,
+    xport_target: "TransportTarget | None" = None,
 ) -> bool:
     kind = str((target or {}).get("kind") or "Deployment").lower()
     name = str((target or {}).get("name") or "")
@@ -252,7 +274,7 @@ async def _patch_target(
         "patch",
         [kind, name, "-n", _target_namespace(target), "--type=json",
          "-p", json.dumps(patches)],
-        kubeconfig,
+        kubeconfig, target=xport_target,
     )
     return r.exit_code == 0
 

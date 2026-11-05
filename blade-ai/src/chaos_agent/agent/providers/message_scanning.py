@@ -153,16 +153,13 @@ def is_budget_expiry_unknown(content: object) -> bool:
 #: parameter name ``is_teardown`` is an exemption marker) and pinned by
 #: the family teeth (``TestIssueTimeTeardownAttribution``).
 #:
-#: NAME DISAMBIGUATION (root cause II, proxy conflation): this is the
-#: OBJECT-WRITE ATTRIBUTION vocabulary (8 members) — "does the verb alone
-#: prove an object write?" — and is DELIBERATELY NARROWER than the
-#: injection-window anchor set ``tools.progress._KUBECTL_INJECTION_SUBCOMMANDS``
-#: (13 members). ``apply``/``create`` are EXCLUDED here on purpose:
-#: apply-native fault attribution is content-judged by
+#: SCOPE (object-write attribution only): this vocabulary answers "does the
+#: verb alone prove an object write?" — ``apply``/``create`` are EXCLUDED on
+#: purpose: apply-native fault attribution is content-judged by
 #: ``k8s_native.classifier.is_apply_native_fault_injection``, never by the
 #: bare verb, so admitting them here would misattribute benign ``apply``s.
-#: The anchor set includes them because an apply-native carrier DOES open
-#: the injection window. Two concepts, two names — do not "unify" them.
+#: (An apply-native carrier DOES open an injection window, but that is judged
+#: on content by the classifier — do not fold it into this verb set.)
 KUBECTL_WRITE_SUBCOMMANDS = frozenset(
     {
         "scale",

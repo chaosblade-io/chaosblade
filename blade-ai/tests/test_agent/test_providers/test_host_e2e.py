@@ -112,5 +112,82 @@ async def test_host_read_rejects_mutating_command():
     out = await host_read.ainvoke({"command": "rm -rf /var/lib/chaos_fill.img"})
     assert out.startswith("Error:")
     assert "read-only diagnostic" in out
-    # Guidance still points to host_inject only for genuine fault-injection.
-    assert "host_inject" in out
+    # The guidance names WHERE a fault belongs, not a tool to re-issue it with.
+    # It used to assert ``"host_inject" in out``, which pinned a dead-end
+    # pointer: host_read is bound only in PLAN/VERIFY and host_inject only in
+    # EXECUTE/RECOVER_VERIFY — host_shell/provider.py's phase map returns one or
+    # the other, never both (test_factory pins that disjointness both ways) — so
+    # host_inject is unbound in EVERY phase this message can appear in. Naming
+    # it sends the model at a call that cannot dispatch, the dead end host_cmd
+    # already refuses to build for its pipe gate ("a hard floor may redirect
+    # only to a REACHABLE path").
+    assert "execution phase" in out
+    assert "host_inject" not in out
+
+
+async def test_host_read_refusal_never_points_at_an_unbound_tool():
+    """No host_read refusal branch may name a tool that is not bound with it.
+
+    Covers both branches — the unregistered-binary terminal, the mutating
+    terminal and the shape refusal — so a future edit cannot reintroduce the
+    dead-end pointer through one of them.
+    """
+    from chaos_agent.tools.host_cmd import host_read
+
+    for command in (
+        "rm -rf /var/lib/chaos_fill.img",          # unregistered-binary terminal
+        "dd if=/dev/zero of=/tmp/x bs=1M count=1",  # mutating terminal
+        "df -h | grep vda",                        # shape refusal (pipe)
+    ):
+        out = await host_read.ainvoke({"command": command})
+        assert out.startswith("Error:"), command
+        assert "host_inject" not in out, command
+        # Every branch still says where a mutating action belongs instead.
+        assert "execution phase" in out or "read-only phase" in out, command
+
+
+async def test_unregistered_binary_refusal_does_not_invite_an_existence_probe():
+    """The unregistered-binary verdict must not suggest checking installation.
+
+    Measured cost (host Case #13, timeoffset, 2227s run): ``chronyc tracking``
+    was refused here, the generic fix text offered "to check whether a binary
+    exists, prefer `command -v <name>`", and the model burned a reconnaissance
+    turn on ``command -v chronyc`` — which answered ``/usr/bin/chronyc``.
+    Installed, and irrelevant: this verdict is about the classifier's
+    registration, not the host's PATH, so no existence probe can change it. The
+    verdict is now rendered by its own branch (dispatched on
+    ``readonly.is_unregistered_binary_reason``, not on substring-matched prose).
+
+    ``losetup`` stands in for the unregistered binary because ``chronyc`` has
+    since been registered on its monitoring verbs — the point is the VERDICT,
+    not the specific name.
+    """
+    from chaos_agent.tools.host_cmd import host_read
+
+    out = await host_read.ainvoke({"command": "losetup -a"})
+    assert "not a known read-only diagnostic command" in out
+    # The probe may be NAMED — naming it to forbid it is clearer than omitting
+    # it, since the model was reaching for it on its own. What must not survive
+    # is the RECOMMENDATION, and the reason it cannot help must be stated (a
+    # bare prohibition invites a retry).
+    assert "prefer `command -v" not in out
+    assert "Do NOT probe whether it is installed" in out
+    assert "cannot change this verdict" in out
+    # It must say what the verdict IS about, so the model stops probing and
+    # reaches the fact another way.
+    assert "registered" in out.lower()
+
+
+async def test_shape_refusal_keeps_the_existence_probe_guidance():
+    """The generic branch must NOT lose the ``command -v`` guidance.
+
+    The sibling of the test above: the existence-probe bullet is wrong for the
+    unregistered-binary verdict (where the answer cannot change anything) but
+    right for a shape refusal, where the model is legitimately mid-diagnosis and
+    a missing binary is a real possibility. Splitting the branches must not
+    throw the good half away with the bad.
+    """
+    from chaos_agent.tools.host_cmd import host_read
+
+    out = await host_read.ainvoke({"command": "df -h | grep vda"})
+    assert "command -v" in out

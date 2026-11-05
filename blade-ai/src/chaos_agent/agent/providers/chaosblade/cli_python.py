@@ -28,7 +28,11 @@ Agent lifecycle (verified against chaosblade 1.9.0-alpha, not inferred):
   3. ``blade create python ...`` resolves the port from a RUNNING prepare record
      and posts to ``http://127.0.0.1:<port>/create``. With several RUNNING records
      it was observed to pick the OLDEST, so a stale record shadows a newer
-     prepare — revoke stale records before relying on a new port.
+     prepare — revoke stale records before relying on a new port. The
+     connection-refused error path below DETECTS this shadowing by enumerating
+     the RUNNING records (read-only ``blade status --type prepare``) and presents
+     the authoritative breakdown to the model, so it can self-correct in one step
+     instead of guessing which record blade bound to.
   4. ``blade revoke <prepare-uid>`` DELETES the ``sitecustomize.py`` hook, so the
      application loses its agent on the next restart. It is not fault recovery.
 
@@ -63,10 +67,13 @@ When the channel IS host-profile but the fault is still not delivered, the cause
 is the agent precondition — the error path below explains it.
 """
 
+import json
 import logging
 import re
+from typing import Annotated
 
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 
 from chaos_agent.config.settings import settings
 from chaos_agent.agent.providers.chaosblade.verify import HEX16_UID_SHAPE
@@ -75,7 +82,7 @@ from chaos_agent.agent.providers.chaosblade.cli import (
     _get_host_blade_path,
     _split_args,
 )
-from chaos_agent.transports import TransportTarget, execute_via_transport
+from chaos_agent.transports import execute_via_transport, resolve_transport_target
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +97,15 @@ logger = logging.getLogger(__name__)
 PY_FAILED_CREATE_UID_RE = re.compile(
     r'"(?:uid|result)"\s*:\s*"(' + HEX16_UID_SHAPE + r')"'
 )
+
+# The agent port blade actually tried to reach, rendered in the raw CLI error as
+# ``http://127.0.0.1:<port>/create`` and/or ``dial tcp 127.0.0.1:<port>: connect:
+# connection refused``. Pinning it lets the connection-refused path name WHICH
+# prepare record blade bound to when several are RUNNING (the OLDEST-pick
+# shadowing documented in the module header) instead of leaving the model to
+# guess. Deterministic fact-finding for the presentation layer; the judgment of
+# what to do about a shadowing record stays with the model.
+_PY_BOUND_PORT_RE = re.compile(r"127\.0\.0\.1:(\d+)")
 
 # Matcher flags accepted per fault target, mirroring the ChaosBlade Python
 # plugin spec. Single source for the tool's matcher mapping: only names present
@@ -120,6 +136,122 @@ def _build_matcher_args(target: str, values: dict[str, str]) -> list[str]:
     return args
 
 
+async def _enumerate_running_prepare_records(
+    target, task_id: str
+) -> list[dict[str, str]]:
+    """Best-effort READ-ONLY enumeration of RUNNING python prepare records.
+
+    Runs ``blade status --type prepare`` on the SAME host channel the injection
+    used and returns ``[{uid, port, script, createtime}, ...]`` for every record
+    whose ``Status`` is ``Running``. ANY failure (transport error, non-zero exit,
+    unparseable output, missing ``result`` list) yields ``[]`` so the caller
+    falls back to the generic single-record precondition message — this
+    diagnostic must never break the error path it is enriching.
+
+    Read-only by construction: it queries state and never mutates it, so it is
+    safe to run on the failure path without the model's involvement. Deciding
+    WHAT to do about a shadowing record (revoke a stale one vs. report a dead
+    agent) stays with the model — the program only surfaces the facts.
+    """
+    argv = [_get_host_blade_path(), "status", "--type", "prepare"]
+    try:
+        res = await execute_via_transport(
+            argv,
+            target,
+            timeout=settings.timeout_blade,
+            task_id=task_id,
+            bypass_channel=False,
+            expect_profile=profile_for_tool("blade_python_create"),
+        )
+    except Exception:  # noqa: BLE001 - best-effort diagnostic, never fatal
+        return []
+    if res.exit_code != 0 or not (res.stdout or "").strip():
+        return []
+    try:
+        payload = json.loads(res.stdout)
+    except (ValueError, TypeError):
+        return []
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, list):
+        return []
+    records: list[dict[str, str]] = []
+    for rec in result:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("Status", "")).strip().lower() != "running":
+            continue
+        records.append({
+            "uid": str(rec.get("Uid", "") or ""),
+            "port": str(rec.get("Port", "") or ""),
+            # blade's prepare status puts the target-script path in ``Pid``.
+            "script": str(rec.get("Pid", "") or ""),
+            "createtime": str(rec.get("CreateTime", "") or ""),
+        })
+    return records
+
+
+def _render_shadow_diagnosis(
+    records: list[dict[str, str]], bound_port: str, combined: str
+) -> str | None:
+    """Explain the stale-record-shadow failure when ≥2 prepare records are RUNNING.
+
+    Returns ``None`` when there is nothing to disambiguate (fewer than two
+    RUNNING records), so the caller keeps the single-record app-restart message
+    — that IS the likely cause when only the target's own record exists.
+
+    When several records are RUNNING, blade resolves the port from the OLDEST one
+    (module header, verified against chaosblade 1.9.0-alpha), so a stale record
+    for an app that no longer runs SHADOWS a newer live prepare. The generic
+    "a prepare record exists but NO agent is listening" wording hides this: it
+    reads as a single-record problem and points the model at an app restart,
+    sending it on a guessing detour (observed: ~300 log lines in the Case #3
+    run1 residue). This presents the authoritative enumeration + the selection
+    rule + BOTH remedies, and lets the model match the script path to its target
+    to decide in one step.
+    """
+    if len(records) < 2:
+        return None
+    lines = []
+    for rec in records:
+        marker = (
+            "   <-- blade bound here (connection refused)"
+            if bound_port and rec["port"] == bound_port
+            else ""
+        )
+        lines.append(
+            f"  - port {rec['port'] or '?'}, uid {rec['uid'] or '?'}, "
+            f"script {rec['script'] or '?'}{marker}"
+        )
+    enumeration = "\n".join(lines)
+    bound_clause = (
+        f"blade bound to port {bound_port} and got connection-refused."
+        if bound_port
+        else "blade bound to one of these ports and got connection-refused."
+    )
+    return (
+        "Error: blade resolved the agent port from a RUNNING prepare record, but "
+        "nothing was listening there, so the injection was not delivered. This "
+        f"host has {len(records)} RUNNING python prepare records; blade resolves "
+        "the port from the OLDEST one, so a stale record for an app that is no "
+        "longer running can SHADOW a newer, live prepare (blade's documented "
+        "selection behavior — not a fault of your target).\n"
+        f"RUNNING prepare records:\n{enumeration}\n"
+        f"{bound_clause}\n"
+        "Decide by matching each record's script path to the app you are "
+        "drilling:\n"
+        "  - If a DIFFERENT (stale) record is shadowing your target's record, "
+        "remove the stale one with blade_python_revoke(uid='<stale_uid>') so "
+        "blade resolves your target's port, then retry this injection. Do NOT "
+        "revoke a record a concurrent drill may still depend on.\n"
+        "  - If your target's OWN record is the one not listening, the agent is "
+        "not running inside the application: the hook written by prepare only "
+        "takes effect when the app is RESTARTED with the hook directory on "
+        "PYTHONPATH — that cannot be done mid-drill, so report it as a "
+        "prerequisite failure instead of retrying.\n"
+        f"Raw output: {combined}"
+    )
+
+
 @tool
 async def blade_python_create(
     target: str,
@@ -138,6 +270,8 @@ async def blade_python_create(
     operation: str = "",
     flags: str = "",
     task_id: str = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
 ) -> str:
     """Phase 2 ONLY. Inject an in-process method fault into a Python app
     (a real library call misbehaves). NOT Phase 1; NOT resource faults
@@ -179,8 +313,14 @@ async def blade_python_create(
     from chaos_agent.utils.fault_type import ensure_min_duration, normalize_timeout_flag
 
     timeout_value = normalize_timeout_flag(argv)
+    # ``warn_explicit_below_floor=False``: a present ``--timeout`` here is the
+    # engine-pinned RECOVERY TIMER (D+G, layer 3 of the three-layer duration
+    # guarantee), not the observation window D the floor is derived from — the
+    # D-owning layer already warned. The absent (None) branch is unaffected: it
+    # still surfaces the configured-default warning (see ensure_min_duration).
     effective_timeout = ensure_min_duration(
         timeout_value, _PYTHON_SCOPE, target, action,
+        warn_explicit_below_floor=False,
     )
     if timeout_value is None:
         argv.extend(["--timeout", str(effective_timeout)])
@@ -203,7 +343,7 @@ async def blade_python_create(
     try:
         result = await execute_via_transport(
             argv,
-            TransportTarget.from_state({}),
+            resolve_transport_target(state),
             timeout=settings.timeout_blade,
             task_id=task_id,
             bypass_channel=False,
@@ -245,6 +385,24 @@ async def blade_python_create(
                 f"Raw output: {combined}"
             )
         if "connection refused" in lowered or "agent is not running" in lowered:
+            # Multi-record disambiguation FIRST: blade resolves the port from the
+            # OLDEST RUNNING prepare record, so a stale record for a dead app can
+            # SHADOW the target's live agent. The generic single-record wording
+            # below hides this and points the model at an app restart, which is
+            # the wrong remedy when the real cause is a shadowing record (Case #3
+            # run1: ~300 log lines of guessing before the model found the two
+            # records on its own). Enumerate the RUNNING records read-only and,
+            # when there are ≥2, present the authoritative breakdown so the model
+            # self-corrects in one step. Falls back to the single-record message
+            # when there is nothing to disambiguate (or enumeration fails).
+            bound_match = _PY_BOUND_PORT_RE.search(combined)
+            bound_port = bound_match.group(1) if bound_match else ""
+            records = await _enumerate_running_prepare_records(
+                resolve_transport_target(state), task_id
+            )
+            shadow = _render_shadow_diagnosis(records, bound_port, combined)
+            if shadow is not None:
+                return shadow
             return (
                 "Error: a prepare record exists but NO agent is listening on its "
                 "port, so the injection was not delivered. The hook file written "
@@ -285,6 +443,8 @@ async def blade_python_prepare(
     port: int = 9526,
     python_path: str = "",
     task_id: str = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
 ) -> str:
     """Write the ChaosBlade Python agent startup hook for a target app.
     Runs `blade prepare python --port <port> --target-script <script>` on
@@ -336,7 +496,7 @@ async def blade_python_prepare(
     try:
         result = await execute_via_transport(
             argv,
-            TransportTarget.from_state({}),
+            resolve_transport_target(state),
             timeout=settings.timeout_blade,
             task_id=task_id,
             bypass_channel=False,
@@ -358,7 +518,12 @@ async def blade_python_prepare(
 
 
 @tool
-async def blade_python_revoke(uid: str, task_id: str = "") -> str:
+async def blade_python_revoke(
+    uid: str,
+    task_id: str = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
+) -> str:
     """Undo a ChaosBlade Python agent preparation (`blade revoke <PREPARE UID>`).
 
     Removes the preparation created by blade_python_prepare. This is teardown of
@@ -393,7 +558,7 @@ async def blade_python_revoke(uid: str, task_id: str = "") -> str:
     try:
         result = await execute_via_transport(
             argv,
-            TransportTarget.from_state({}),
+            resolve_transport_target(state),
             timeout=settings.timeout_blade,
             task_id=task_id,
             bypass_channel=False,

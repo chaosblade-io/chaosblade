@@ -214,13 +214,13 @@ def _replay_stub(monkeypatch):
         "calls": {"restore": 0, "restore_state": None},
     }
 
-    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0):
+    async def fake_kubectl(sub, v_args, kubeconfig, *, stdin_data="", timeout=30.0, target=None):
         raise AssertionError(
             "a monkeypatched _do_restore must keep the replay off the "
             f"wire — unexpected {sub!r} dispatch"
         )
 
-    async def fake_restore(task_state, kubeconfig):
+    async def fake_restore(task_state, kubeconfig, *, xport_target=None):
         journal["calls"]["restore"] += 1
         journal["calls"]["restore_state"] = task_state
         return journal["restore"]

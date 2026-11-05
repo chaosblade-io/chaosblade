@@ -39,15 +39,19 @@ from chaos_agent.agent.providers.faultdrill.assembler import (
     assert_carrier_shape,
     build_body_landing_scripts,
     build_carrier_artifact,
+    build_dryrun_script,
+    build_owner_ref_patch,
     build_probe_get_script,
     build_restore_script,
     build_role_append_patch,
     build_role_create_v_args,
     build_run_v_args,
+    build_self_teardown_rule,
     build_ssar_script,
     canonical_kind,
     carrier_name,
     derive_role_rules,
+    dryrun_verdict,
     faultdrill_assemble_carrier,
     parse_receipt,
     render_role_commands,
@@ -69,6 +73,7 @@ from chaos_agent.agent.providers.faultdrill.provider import (
     _assembler_receipt_artifacts,
 )
 from chaos_agent.config.settings import settings
+import chaos_agent.agent.providers.faultdrill.assembler as fd_assembler
 
 
 # ---------------------------------------------------------------------------
@@ -185,23 +190,39 @@ def _echoed_ssar(script: str, allowed: bool = True, verb_drift: str | None = Non
 
 
 def _ok_exec_router(arm_clock: dict | None = None, *, probe_code: str = "200",
-                    ssar_allowed: bool = True, ssar_verb_drift: str | None = None):
+                    ssar_allowed: bool = True, ssar_verb_drift: str | None = None,
+                    dryrun_code: str = "200"):
     """Route every carrier exec by its script SHAPE (§3 GET probe / §3
-    SSAR / §7 landing writes / §4 arm). ``arm_clock`` records the moment
-    the arming exec is dispatched (the countdown's origin)."""
+    SSAR / §3 dry-run arm gate / §7 landing writes / §4 arm). ``arm_clock``
+    records the moment the arming exec is dispatched (the countdown's
+    origin). ``dryrun_code`` drives the dry-run gate's MAIN= verdict —
+    401/403 make it fail closed before arming."""
 
     def _route(sub, v_args, stdin_data):
         script = _exec_script(v_args)
+        # The dry-run arm gate ALSO carries %{http_code}, so its shape
+        # branch must precede the GET probe's; it returns the labelled
+        # MAIN=<code> receipt dryrun_verdict parses (not a bare code).
+        if "?dryRun=All" in script:
+            return _R(0, f"MAIN={dryrun_code}")
+        # The §4 arm script is matched by its UNIQUE `echo armed` marker
+        # BEFORE the generic %{http_code} probe branch: the self-
+        # termination tail (§4 ownerRef GC) captures the restore PATCH's
+        # http_code to gate the fail-open self-delete, so the arm script
+        # now ALSO contains `http_code` — without this ordering it would
+        # mis-route to the probe's bare-code response and never echo
+        # `armed`. `echo armed` is exclusive to the arm script (the GET
+        # probe and dry-run receipts do not carry it).
+        if "echo armed" in script:
+            if arm_clock is not None:
+                arm_clock["t"] = time.time()
+            return _R(0, "armed")
         if "http_code" in script:
             return _R(0, probe_code)
         if "selfsubjectaccessreviews" in script:
             return _R(0, json.dumps(_echoed_ssar(
                 script, allowed=ssar_allowed, verb_drift=ssar_verb_drift,
             )))
-        if "echo armed" in script:
-            if arm_clock is not None:
-                arm_clock["t"] = time.time()
-            return _R(0, "armed")
         return _R(0, "")  # §7 b64 landing writes
 
     return _route
@@ -634,6 +655,25 @@ def test_image_discovered_pool_is_local(monkeypatch):
     assert select_carrier_image() == "registry.local/terway:v1.12.1"
 
 
+def test_image_discovered_match_is_exact_not_substring(monkeypatch):
+    # Regression (r7 live run): a configured bare name (busybox:latest,
+    # docker.io — unpullable in a VPC cluster) is a SUBSTRING of a
+    # discovered FQ image (registry.local/acs/busybox:latest). Substring
+    # matching classified the bare name as node-cached, the assembler
+    # built a carrier from it, and _wait_pod_running burned the full 120s
+    # on ImagePullBackOff. Exact matching keeps the pool to genuinely
+    # node-cached images, so the unpullable bare name never wins.
+    monkeypatch.setattr(settings, "recovery_carrier_allowed_images",
+                        "busybox:latest,curlimages/curl:8.8.0")
+    monkeypatch.setattr(settings, "recovery_carrier_discovered_images",
+                        "registry.local/acs/busybox:latest,"
+                        "ghcr.io/x/chaosblade-tool:1.8.0")
+    picked = select_carrier_image()
+    assert picked != "busybox:latest"
+    # pool = the discovered FQ images; alphabetical pool[0] (no curl name)
+    assert picked == "ghcr.io/x/chaosblade-tool:1.8.0"
+
+
 def test_image_empty_union_refuses(monkeypatch):
     # fail-closed: no allowed image → no carrier
     monkeypatch.setattr(settings, "recovery_carrier_allowed_images", "")
@@ -1017,6 +1057,119 @@ def test_ssar_nonempty_group_omission_still_fails_closed():
 
 
 # ---------------------------------------------------------------------------
+# §3 step 3 — content-aware dry-run arm gate (the verb-blind spot fix)
+# ---------------------------------------------------------------------------
+
+
+def test_build_dryrun_script_carries_dryrun_all_and_http_code():
+    s = build_dryrun_script(
+        "https://kubernetes.default.svc/apis/apps/v1/namespaces/ns1/"
+        "deployments/web",
+        '[{"op":"replace","path":"/spec/replicas","value":3}]',
+        user_agent="blade-ai-recovery/drill-rc-x",
+    )
+    # The exact restore request, rehearsed: PATCH, dryRun=All, real token,
+    # json-patch content type, and a labelled %{http_code} verdict line.
+    assert "-X PATCH" in s
+    assert "?dryRun=All" in s
+    assert "application/json-patch+json" in s
+    assert "MAIN=$(curl" in s
+    assert "%{http_code}" in s
+    assert "Authorization: Bearer $T" in s
+
+
+def test_build_dryrun_script_body_file_landing_form():
+    # The oversized-payload landing tier must be mirrored: -d @file, not
+    # an inline body, so the dry-run rehearses the SAME bytes the arm sends.
+    s = build_dryrun_script(
+        "https://kubernetes.default.svc/api/v1/namespaces/ns1/pods/p",
+        "[]", body_file="/tmp/restore.json",
+    )
+    assert "-d @/tmp/restore.json" in s
+    assert "?dryRun=All" in s
+
+
+def test_build_dryrun_script_emits_one_del_line_per_delete_url():
+    s = build_dryrun_script(
+        "https://kubernetes.default.svc/api/v1/namespaces/ns1/pods/p",
+        "[]",
+        delete_urls=[
+            "https://kubernetes.default.svc/api/v1/namespaces/ns1/secrets/a",
+            "https://kubernetes.default.svc/api/v1/namespaces/ns1/secrets/b",
+        ],
+    )
+    assert "DEL0=$(curl" in s and "DEL1=$(curl" in s
+    assert "-X DELETE" in s
+    # Every delete dry-run also carries ?dryRun=All (nothing is persisted).
+    assert s.count("?dryRun=All") == 3
+
+
+def test_dryrun_verdict_2xx_is_ok():
+    verdict, detail = dryrun_verdict("MAIN=200")
+    assert verdict == "ok" and detail == ""
+
+
+def test_dryrun_verdict_201_is_ok():
+    assert dryrun_verdict("MAIN=201")[0] == "ok"
+
+
+def test_dryrun_verdict_403_is_denied():
+    # The canonical case: the RBAC privilege-escalation guard rejects a
+    # create the verb-level SSAR passed — the dry-run is the ONLY gate
+    # that sees it, and it MUST fail closed.
+    verdict, detail = dryrun_verdict("MAIN=403")
+    assert verdict == "denied"
+    assert "403" in detail or "denied" in detail.lower()
+
+
+def test_dryrun_verdict_401_is_denied():
+    assert dryrun_verdict("MAIN=401")[0] == "denied"
+
+
+def test_dryrun_verdict_409_is_ok_idempotent():
+    # Already-exists at arm time is idempotent, NOT an authz denial —
+    # failing closed here would break a recovery that works (the live
+    # fire's create-on-existing is a no-op, the target is already right).
+    assert dryrun_verdict("MAIN=409")[0] == "ok"
+
+
+def test_dryrun_verdict_404_is_ok():
+    assert dryrun_verdict("MAIN=404")[0] == "ok"
+
+
+def test_dryrun_verdict_422_is_ok_dryrun_artifact():
+    # A json-patch ``replace`` on a path the INJECT creates is 422
+    # against the pre-injection dry-run baseline yet applies fine at fire
+    # time — failing closed on 4xx-other-than-authz would break it.
+    assert dryrun_verdict("MAIN=422")[0] == "ok"
+
+
+def test_dryrun_verdict_5xx_is_ok_not_authz():
+    assert dryrun_verdict("MAIN=500")[0] == "ok"
+
+
+def test_dryrun_verdict_any_denied_line_fails_closed():
+    # A multi-request receipt (patch + deletes) fails closed if ANY line
+    # is an authz denial — the delete leg is as gated as the patch leg.
+    verdict, _ = dryrun_verdict("MAIN=200\nDEL0=403\nDEL1=200")
+    assert verdict == "denied"
+
+
+def test_dryrun_verdict_all_clean_multi_line_is_ok():
+    assert dryrun_verdict("MAIN=200\nDEL0=200\nDEL1=404")[0] == "ok"
+
+
+def test_dryrun_verdict_no_code_lines_is_form_error():
+    verdict, detail = dryrun_verdict("curl: (6) Could not resolve host")
+    assert verdict == "form_error"
+    assert "no http_code" in detail
+
+
+def test_dryrun_verdict_empty_is_form_error():
+    assert dryrun_verdict("")[0] == "form_error"
+
+
+# ---------------------------------------------------------------------------
 # Recipe verification — baseline precheck (guard against a timer that
 # would MUTATE the baseline) + landing readback
 # ---------------------------------------------------------------------------
@@ -1186,7 +1339,7 @@ def test_artifact_schema_equivalent_to_screener_registration():
         "namespace", "operation_family", "created_tool_call_id",
         "rbac_family", "cleanup", "recovery_timeout_seconds",
         "recovery_deadline_epoch", "host_exec_tool_call_id",
-        "host_exec_seen_ids", "recovery_handle",
+        "host_exec_seen_ids", "disarm_seen_ids", "recovery_handle",
     ):
         assert field in art, field
     assert art["artifact_id"] == "recovery_carrier:ns1/drill-rc-x"
@@ -1201,6 +1354,9 @@ def test_artifact_schema_equivalent_to_screener_registration():
     assert art["created_tool_call_id"] == ""
     assert art["host_exec_tool_call_id"] == ""
     assert art["host_exec_seen_ids"] == []
+    # the symmetric delete-side replay guard ledger is declared empty at
+    # birth (case #13) — no delete has fired yet
+    assert art["disarm_seen_ids"] == []
     # four-way delete, reverse-dependency order (pod → binding → role → sa)
     assert [c["v_args"].split()[0] for c in art["cleanup"]] == [
         "pod", "rolebinding", "role", "serviceaccount",
@@ -1324,14 +1480,22 @@ async def test_armed_before_inject_hard_order(_kube):
             f"a target patch was dispatched before arming (call #{i})"
         )
     # verification order inside the arming half: probe BEFORE SSAR
-    # BEFORE arm (all indices in the SAME exec-scripts domain)
+    # BEFORE dry-run BEFORE arm (all indices in the SAME exec-scripts
+    # domain). The dry-run is the content-aware gate that runs after the
+    # verb-level SSAR and immediately before the arming exec.
     scripts = [_exec_script(v) for s, v, _ in _kube.calls if s == "exec"]
-    probe_idx = next(i for i, s in enumerate(scripts) if "http_code" in s)
+    probe_idx = next(
+        i for i, s in enumerate(scripts)
+        if "http_code" in s and "?dryRun=All" not in s
+    )
     ssar_idx = next(
         i for i, s in enumerate(scripts) if "selfsubjectaccessreviews" in s
     )
+    dryrun_idx = next(
+        i for i, s in enumerate(scripts) if "?dryRun=All" in s
+    )
     arm_in_scripts = next(i for i, s in enumerate(scripts) if "echo armed" in s)
-    assert probe_idx < ssar_idx < arm_in_scripts
+    assert probe_idx < ssar_idx < dryrun_idx < arm_in_scripts
 
 
 async def test_probe_403_fails_closed_and_cleans_the_stack(_kube):
@@ -1393,6 +1557,87 @@ async def test_ssar_echo_drift_fails_closed(_kube):
     assert receipt["status"] == "failed"
     assert "form_error" in receipt["error"]
     assert not any(s == "patch" for s, _, _ in _kube.calls)
+
+
+async def test_dryrun_403_fails_closed_after_ssar_passed(_kube):
+    # THE verb-blind-spot regression: SSAR says ``allowed`` (the carrier
+    # may ``create rolebindings``) yet the content-aware dry-run hits the
+    # RBAC privilege-escalation guard and returns 403. The gate must fail
+    # closed BEFORE arming — this is exactly the ServiceAccount 权限被撤销
+    # self-recovery failure the verb-level gates structurally could not see.
+    _wire_happy(_kube, exec_router=_ok_exec_router(dryrun_code="403"))
+    receipt = await _assemble()
+
+    assert receipt["status"] == "failed"
+    assert "dry-run" in receipt["error"]
+    assert receipt["carrier"]["armed"] is False
+    # the stack is cleaned, reverse-dependency order
+    deletes = [v for s, v, _ in _kube.calls if s == "delete"]
+    assert [v[0] for v in deletes] == [
+        "pod", "rolebinding", "role", "serviceaccount",
+    ]
+    # SSAR PASSED (the point: verb-level green, content-level red) and the
+    # dry-run ran, but nothing was armed and the target was never patched.
+    scripts = [_exec_script(v) for s, v, _ in _kube.calls if s == "exec"]
+    assert any("selfsubjectaccessreviews" in s for s in scripts)
+    assert any("?dryRun=All" in s for s in scripts)
+    # The §4.9 self-termination wiring patches the carrier's OWN RBAC trio
+    # (ownerRef→pod + the delete-pods self-teardown grant) — that is stack
+    # construction, cleaned up by the four-way teardown on this abort exactly
+    # like `create role`, and it precedes the dry-run gate by design. The
+    # gate's contract is that the TARGET is never mutated, so the assertion
+    # excludes the carrier self-RBAC kinds (the inject patch is `patch service`).
+    assert not any(
+        s == "patch" and v
+        and v[0] not in ("role", "serviceaccount", "rolebinding")
+        for s, v, _ in _kube.calls
+    )
+    assert not any("echo armed" in s for s in scripts)
+
+
+async def test_dryrun_401_fails_closed(_kube):
+    _wire_happy(_kube, exec_router=_ok_exec_router(dryrun_code="401"))
+    receipt = await _assemble()
+    assert receipt["status"] == "failed"
+    assert receipt["carrier"]["armed"] is False
+    # The target was never mutated (the §4.9 self-termination patches touch
+    # only the carrier's own RBAC trio — see test_dryrun_403 for the rationale).
+    assert not any(
+        s == "patch" and v
+        and v[0] not in ("role", "serviceaccount", "rolebinding")
+        for s, v, _ in _kube.calls
+    )
+
+
+async def test_dryrun_form_error_does_not_abort(_kube):
+    # Verdict discipline: a form_error (unparseable receipt / transport
+    # artifact) is NOT a confirmed denial, so it must NOT break a recovery
+    # that would otherwise work — the assembler still arms and injects.
+    # An empty MAIN= value carries no digits, so dryrun_verdict returns
+    # form_error (distinct from the 401/403 denied path).
+    _wire_happy(_kube, exec_router=_ok_exec_router(dryrun_code=""))
+    receipt = await _assemble()
+    assert receipt["status"] == "success"
+    assert receipt["carrier"]["armed"] is True
+
+
+async def test_dryrun_non_authz_odd_code_still_arms(_kube):
+    # A 5xx (apiserver-side transient) is NOT an authz denial — only
+    # 401/403 fail closed, so the drill proceeds rather than being
+    # aborted by a code the authz-focused gate does not own.
+    _wire_happy(_kube, exec_router=_ok_exec_router(dryrun_code="503"))
+    receipt = await _assemble()
+    assert receipt["status"] == "success"
+    assert receipt["carrier"]["armed"] is True
+
+
+async def test_dryrun_409_idempotent_still_arms(_kube):
+    # A create-on-existing at arm time is 409 (idempotent), NOT an authz
+    # denial — the gate passes and the drill proceeds.
+    _wire_happy(_kube, exec_router=_ok_exec_router(dryrun_code="409"))
+    receipt = await _assemble()
+    assert receipt["status"] == "success"
+    assert receipt["carrier"]["armed"] is True
 
 
 async def test_baseline_inconsistency_fails_before_building_anything(_kube):
@@ -1550,15 +1795,26 @@ async def test_rbac_derivation_is_same_source_and_always_uniform(_kube):
         (s, v) for s, v, _ in _kube.calls
         if v and v[0] == "role" and s in ("create", "patch")
     ]
-    assert [s for s, _ in role_calls] == ["create"], (
+    # Isolate the DERIVATION construction from the §4.9 self-termination
+    # wiring that also patches the role: the self-teardown grant is a
+    # `--type=json` append whose rule carries a `resourceNames` lock, and
+    # the ownerRef is a `--type=merge` — neither is a derivation family.
+    derivation_calls = [
+        (s, v) for s, v in role_calls
+        if s == "create"
+        or ("--type=json" in v
+            and "resourceNames" not in v[v.index("-p") + 1])
+    ]
+    assert [s for s, _ in derivation_calls] == ["create"], (
         "a single-family derivation must render through ONE create "
-        "command — a json-patch append here would mean the derivation "
-        "grew a second family"
+        "command — a derivation json-patch append here would mean the "
+        "derivation grew a second family"
     )
-    _, create_v = role_calls[0]
+    _, create_v = derivation_calls[0]
     assert create_v[create_v.index("--verb") + 1] == "get,patch"
     assert "services" in create_v
-    # the artifact's rbac_family role mirrors the SAME derived verbs
+    # the artifact's rbac_family role mirrors the SAME derived verbs — the
+    # self-teardown grant is deliberately NOT folded into the family record.
     fam = {m["kind"]: m for m in receipt["artifact"]["rbac_family"]}
     assert fam["role"]["verbs"] == ["get", "patch"]
 
@@ -2034,15 +2290,24 @@ async def test_assemble_extra_delete_role_covers_both_families(_kube):
         (s, v) for s, v, _ in _kube.calls
         if v and v[0] == "role" and s in ("create", "patch")
     ]
-    assert [s for s, _ in role_calls] == ["create", "patch"], (
+    # Strip the §4.9 self-termination patches (the resourceNames-locked
+    # delete-pods grant `--type=json` + the ownerRef `--type=merge`) so the
+    # sequence reflects the DERIVATION construction alone.
+    derivation_calls = [
+        (s, v) for s, v in role_calls
+        if s == "create"
+        or ("--type=json" in v
+            and "resourceNames" not in v[v.index("-p") + 1])
+    ]
+    assert [s for s, _ in derivation_calls] == ["create", "patch"], (
         "a two-family derivation (delete×secrets + patch×services) must "
         "render through the two-step construction"
     )
-    _, create_v = role_calls[0]
+    _, create_v = derivation_calls[0]
     # secrets sorts before services → the create command carries delete
     assert create_v[create_v.index("--verb") + 1] == "delete,get"
     assert "secrets" in create_v
-    _, patch_v = role_calls[1]
+    _, patch_v = derivation_calls[1]
     appended = json.loads(patch_v[patch_v.index("-p") + 1])
     assert appended == [{
         "op": "add", "path": "/rules/-",
@@ -2148,13 +2413,273 @@ async def test_assemble_no_extra_delete_is_unchanged(_kube):
     receipt = await _assemble()
     assert receipt["status"] == "success"
     assert receipt["artifact"]["recovery_handle"]["extra_delete"] == []
-    role_calls = [
+    # Derivation-only role sequence (strip the §4.9 self-termination grant
+    # `--type=json` w/ resourceNames + the ownerRef `--type=merge`): a pure
+    # single-family fault still renders through ONE create.
+    derivation_calls = [
         s for s, v, _ in _kube.calls
-        if v and v[0] == "role" and s in ("create", "patch")
+        if v and v[0] == "role"
+        and (s == "create"
+             or (s == "patch" and "--type=json" in v
+                 and "resourceNames" not in v[v.index("-p") + 1]))
     ]
-    assert role_calls == ["create"]
+    assert derivation_calls == ["create"]
     arm_scripts = [
         _exec_script(v) for s, v, _ in _kube.calls
         if s == "exec" and "echo armed" in _exec_script(v)
     ]
-    assert "-X DELETE" not in arm_scripts[-1]
+    armed = arm_scripts[-1]
+    # No PROP-delete curl is folded into the timer (extra_delete is empty).
+    # The prop-delete form is `curl -s -X DELETE` (WITHOUT -f); the §4.9
+    # self-delete tail (`curl -sf -X DELETE`, inside the 2xx case guard) IS
+    # expected here — it is the W-83-3B root-fix, not a prop delete.
+    assert "curl -s -X DELETE" not in armed
+    assert "curl -sf -X DELETE" in armed
+
+
+# ---------------------------------------------------------------------------
+# §4.9 Owner GC self-termination (the W-83-3B root-fix): the carrier stack
+# self-terminates IN-CLUSTER at TTL regardless of the agent process — an
+# ownerRef→pod on the RBAC trio + a resourceNames-locked delete-pods grant,
+# so the armed timer's fail-open self-delete cascades all four objects via
+# the apiserver's GC. This retires the recovery-carrier standard's L264
+# "用自己授权删自己授权" deadlock (the old tail could remove only ONE
+# Binding, stranding the SA/Role as inert shells). Cascade + real-token
+# self-delete verified live (实测 A/B, 2026-10-20, K8s v1.24.6).
+# ---------------------------------------------------------------------------
+
+
+def test_build_self_teardown_rule_is_independent_and_resourceName_locked():
+    # The grant is ONE independent rule: ``delete pods`` resourceNames-locked
+    # to the carrier itself — the least-privilege self-reference, never a
+    # wildcard or a second verb/resource.
+    rule = build_self_teardown_rule("drill-rc-a1b2c3d4")
+    assert rule == {
+        "apiGroups": [""], "resources": ["pods"],
+        "resourceNames": ["drill-rc-a1b2c3d4"], "verbs": ["delete"],
+    }
+    # And it is NOT part of the derivation: derive_role_rules for a plain
+    # PATCH recipe never emits a pods/delete or resourceNames-locked rule —
+    # the grant is appended by _attach_self_termination, kept out of both the
+    # create broadcast and the SSAR-verified rules.
+    derived = derive_role_rules([{"kind": "Service", "methods": ["PATCH"]}])
+    assert all("pods" not in r["resources"] for r in derived)
+    assert all("resourceNames" not in r for r in derived)
+
+
+def test_build_owner_ref_patch_points_at_the_carrier_pod():
+    patch = json.loads(build_owner_ref_patch("drill-rc-a1b2c3d4", "uid-123"))
+    assert patch["metadata"]["ownerReferences"] == [{
+        "apiVersion": "v1", "kind": "Pod",
+        "name": "drill-rc-a1b2c3d4", "uid": "uid-123",
+    }]
+
+
+def test_restore_script_self_delete_tail_is_gated_holds_and_graces():
+    body = json.dumps([{"op": "replace", "path": "/spec/x", "value": "a"}])
+    url = "https://api/api/v1/namespaces/ns/pods/drill-rc-x?gracePeriodSeconds=0"
+    s = build_restore_script(600, "https://target", body, self_delete_url=url)
+    # the restore PATCH's HTTP code is CAPTURED (not swallowed) so the tail
+    # can gate on it, and the body is preserved for forensics
+    assert "-w '%{http_code}'" in s
+    assert "-o /tmp/rr.body" in s
+    assert 'echo "RESTORE_HTTP=$RC"' in s
+    assert "cat /tmp/rr.body" in s
+    # FAIL-OPEN GATE (L262): the self-delete fires ONLY on a 2xx restore
+    assert 'case "$RC" in 2*)' in s
+    # FORENSICS HOLD: default = buffer − lead, strictly inside the skeleton
+    hold = (fd_assembler._SKELETON_BUFFER_SECONDS
+            - fd_assembler._SELF_DELETE_LEAD_SECONDS)
+    assert f"sleep {hold}" in s
+    # the self-delete removes the POD (GC cascades the RBAC), -sf + grace 0
+    assert "curl -sf -X DELETE" in s
+    assert url in s
+    # ordering: restore PATCH → self-delete tail last
+    assert s.index("-X PATCH") < s.index("curl -sf -X DELETE")
+    # one armed subshell, everything still lands in restore.log
+    assert s.count(" >/tmp/restore.log 2>&1 & echo armed") == 1
+
+
+def test_restore_script_self_delete_hold_is_overridable():
+    body = json.dumps([{"op": "replace", "path": "/spec/x", "value": "a"}])
+    s = build_restore_script(
+        600, "https://t", body,
+        self_delete_url="https://api/pods/x", self_delete_hold_seconds=42,
+    )
+    assert "sleep 42;" in s
+
+
+def test_restore_script_self_delete_empty_is_byte_identical():
+    # regression anchor: an empty self_delete_url reproduces the pure-patch
+    # script EXACTLY — no $RC capture, no case guard, no tail. The fail-safe
+    # path that suppresses the tail relies on this byte-identity to fall back
+    # to the pre-fix armed form.
+    body = json.dumps([{"op": "remove", "path": "/spec/paused"}])
+    baseline = build_restore_script(600, "https://u", body)
+    assert build_restore_script(
+        600, "https://u", body, self_delete_url="",
+    ) == baseline
+    assert 'case "$RC"' not in baseline
+    assert "curl -sf -X DELETE" not in baseline
+
+
+def _owner_ref_patches(router: _Router) -> list[tuple[str, dict]]:
+    """The §4.9 ownerRef merge patches (SA/Role/RoleBinding) — each carries
+    ``metadata.ownerReferences``→the carrier pod."""
+    out = []
+    for sub, v, _ in router.calls:
+        if sub == "patch" and v and "--type=merge" in v:
+            payload = json.loads(v[v.index("-p") + 1])
+            if "ownerReferences" in (payload.get("metadata") or {}):
+                out.append((v[0], payload))
+    return out
+
+
+def _self_teardown_grant(router: _Router):
+    """The independent delete-pods grant appended to the carrier Role."""
+    for sub, v, _ in router.calls:
+        if sub == "patch" and v and v[0] == "role" and "--type=json" in v:
+            for op in json.loads(v[v.index("-p") + 1]):
+                val = op.get("value") or {}
+                if val.get("resources") == ["pods"] and "resourceNames" in val:
+                    return op
+    return None
+
+
+def _armed_script(router: _Router) -> str:
+    scripts = [
+        _exec_script(v) for s, v, _ in router.calls
+        if s == "exec" and "echo armed" in _exec_script(v)
+    ]
+    assert scripts, "no arming exec was dispatched"
+    return scripts[-1]
+
+
+async def test_assemble_wires_owner_gc_self_termination(_kube):
+    _wire_happy(_kube)
+    receipt = await _assemble()
+    assert receipt["status"] == "success"
+    carrier = receipt["carrier"]["name"]
+    steps = {s["step"]: s for s in receipt["steps"]}
+    assert steps["self_termination"]["ok"] is True
+    # ownerRef→pod set on ALL THREE RBAC objects, each naming the carrier pod
+    owners = _owner_ref_patches(_kube)
+    assert sorted(k for k, _ in owners) == [
+        "role", "rolebinding", "serviceaccount",
+    ]
+    for _, payload in owners:
+        ref = payload["metadata"]["ownerReferences"][0]
+        assert ref["kind"] == "Pod" and ref["name"] == carrier
+    # the delete-pods grant is appended as an INDEPENDENT /rules/- entry
+    grant = _self_teardown_grant(_kube)
+    assert grant is not None
+    assert grant["op"] == "add" and grant["path"] == "/rules/-"
+    assert grant["value"] == {
+        "apiGroups": [""], "resources": ["pods"],
+        "resourceNames": [carrier], "verbs": ["delete"],
+    }
+    # the armed timer carries the gated self-delete tail at the pod URL
+    armed = _armed_script(_kube)
+    assert 'case "$RC" in 2*)' in armed
+    assert f"/pods/{carrier}?gracePeriodSeconds=0" in armed
+
+
+async def test_assemble_self_teardown_grant_is_never_ssar_probed(_kube):
+    # The resourceNames-locked delete-pods grant CANNOT be SSAR-probed (the
+    # review carries no resourceName → allowed:false against the lock), so it
+    # is deliberately kept OUT of the SSAR-verified rules — fail-open,
+    # verified by construction (the standard's "delete verb 无法用 GET 事前
+    # 探测" clause). Probing it would fail-close and击穿 the arming.
+    _wire_happy(_kube)
+    receipt = await _assemble()
+    assert receipt["status"] == "success"
+    ssar = []
+    for sub, v, _ in _kube.calls:
+        if sub != "exec":
+            continue
+        script = _exec_script(v)
+        if "selfsubjectaccessreviews" not in script:
+            continue
+        body = re.search(r"-d '(\{.*\})'", script).group(1)
+        attrs = json.loads(body)["spec"]["resourceAttributes"]
+        ssar.append((attrs["verb"], attrs["resource"]))
+    assert ("delete", "pods") not in ssar
+    assert ("patch", "services") in ssar  # the derivation verb IS probed
+
+
+async def test_assemble_self_termination_fails_safe_suppresses_tail(_kube):
+    # Fail-safe, never fail-worse: if ANY self-termination step fails the tail
+    # is SUPPRESSED (no self-delete, no ownerRef) and cleanup falls back to the
+    # agent four-way teardown — the recovery STILL arms and injects. A
+    # half-wired tail (self-delete without ownerRef) would delete the pod and
+    # ORPHAN the three live RBAC objects, strictly worse than the status quo,
+    # so the three steps are all-or-nothing.
+    _wire_happy(_kube)
+    _kube.on("patch", "role", _R(1, "", "grant rejected"))
+    receipt = await _assemble()
+    assert receipt["status"] == "success"
+    assert receipt["carrier"]["armed"] is True
+    steps = {s["step"]: s for s in receipt["steps"]}
+    assert steps["self_termination"]["ok"] is False
+    # the grant failed first → no ownerRef set (all-or-nothing)
+    assert _owner_ref_patches(_kube) == []
+    # the armed timer carries NO self-delete tail (the pure pre-fix form)
+    armed = _armed_script(_kube)
+    assert "curl -sf -X DELETE" not in armed
+    assert 'case "$RC" in 2*)' not in armed
+
+
+async def test_assemble_self_delete_dropped_on_budget_subordination(monkeypatch):
+    # §7 budget subordination (recovery-carrier.md L263): the self-delete tail
+    # is the LOWEST-priority segment — when the landed arm payload WITH the
+    # tail exceeds the channel budget, the tail is DROPPED (cleanup falls back
+    # to the agent four-way teardown) rather than failing the whole recovery.
+    # Recovery completeness outranks self-termination.
+    import chaos_agent.agent.providers.faultdrill.provider as fd_provider
+
+    big = "x" * 1200
+    baseline = {"spec": {"template": {"spec": {"containers": [
+        {"image": big},
+    ]}}}}
+    landed = {"spec": {"template": {"spec": {"containers": [
+        {"image": "registry.example.com/paused:1"},
+    ]}}}}
+    patches = [{"op": "replace",
+                "path": "/spec/template/spec/containers/0/image",
+                "value": "registry.example.com/paused:1"}]
+    restore = [{"op": "replace",
+                "path": "/spec/template/spec/containers/0/image",
+                "value": big}]
+
+    def _fresh() -> _Router:
+        router = _Router()
+        _wire_happy(router)
+        router.on("get", "service", _seq(
+            _R(0, json.dumps(baseline)), _R(0, json.dumps(landed)),
+        ))
+        monkeypatch.setattr(fd_provider, "_kubectl", router)
+        return router
+
+    # Pass 1: default budget — measure the landed arm script WITH the tail
+    # (the carrier name is fixed-width drill-rc-<8hex>, so the length is
+    # stable across the two passes).
+    r1 = _fresh()
+    rec1 = await _assemble(patches=patches, restore=restore)
+    assert rec1["status"] == "success"
+    armed1 = _armed_script(r1)
+    assert "-d @/tmp/restore.json" in armed1   # body landed (oversized tier)
+    assert "curl -sf -X DELETE" in armed1      # tail present at default budget
+    with_tail = len(armed1)
+
+    # Pass 2: clamp the budget just under the with-tail length — the tail
+    # overflows it and the drop brings the payload back under (the tail is
+    # ~200B, so no-tail ≪ budget). The recovery must still arm.
+    monkeypatch.setattr(fd_assembler, "_ARM_PAYLOAD_BUDGET", with_tail - 10)
+    r2 = _fresh()
+    rec2 = await _assemble(patches=patches, restore=restore)
+    assert rec2["status"] == "success"
+    assert rec2["carrier"]["armed"] is True
+    assert "selfdelete_dropped" in {s["step"] for s in rec2["steps"]}
+    armed2 = _armed_script(r2)
+    assert "curl -sf -X DELETE" not in armed2  # tail dropped
+    assert "-d @/tmp/restore.json" in armed2   # still landed + armed

@@ -38,6 +38,7 @@ import json
 import logging
 import re
 from collections import namedtuple
+from typing import TYPE_CHECKING
 
 from langchain_core.messages import ToolMessage
 
@@ -67,6 +68,9 @@ from chaos_agent.observability.status_tracker import get_tracker
 from chaos_agent.tools.pod_discovery import (
     TOOL_POD_NAMESPACE as _TOOL_POD_NAMESPACE,
 )
+
+if TYPE_CHECKING:
+    from chaos_agent.transports import TransportTarget
 
 logger = logging.getLogger(__name__)
 
@@ -1783,9 +1787,16 @@ def _is_early_destroy(res: dict, exp_status: str) -> bool:
     Distinguishes timeout expiry (record lives out its full window) from an
     external destroy — e.g. the executor cleaning up its own injection record
     after a one-shot fault (task inject-e47de3e8: destroyed +20.4s after
-    creation with --timeout=600). The two need different verdicts: expiry
-    means the fault window closed and live observation is impossible, while an
-    early destroy says nothing about the fault's actual effects.
+    creation with --timeout=600).
+
+    NARRATIVE-ONLY since the Bug3 root fix: both sub-cases are abstentions that
+    yield the SAME verdict word (``warning`` + ``expired=True``), because for
+    verdict purposes an expired record only ever proves the RECORD is gone, not
+    that the fault never took effect. This predicate now selects the DETAILS
+    string alone — explaining WHY the record is gone (external cleanup vs the
+    fault window closing) — so the Layer 2 LLM and the audit trail carry the
+    cause. It no longer drives the status word (it used to split warning vs
+    failed, which made two physically-identical abstentions diverge downstream).
     """
     flag = str(res.get("Flag", "") or "")
     match = re.search(r"--timeout[=\s]+(\d+)", flag)
@@ -1814,9 +1825,16 @@ def _parse_blade_status_output(raw: str) -> tuple[str, str, bool]:
     """Parse blade_status JSON output into (status, details, expired).
 
     Returns:
-        status: "passed" if experiment is Running/Success, "failed" otherwise.
+        status: "passed" if experiment is Running/Success; "warning" if the
+            record is expired (Destroyed/Revoked/Completed) or the Operator is
+            still reconciling — an ABSTENTION that defers the verdict to
+            Layer 2; "failed" only for a genuine error / unparseable output.
         details: Human-readable details string.
-        expired: True if experiment status is Destroyed/Revoked/Completed (timeout expired).
+        expired: True if experiment status is Destroyed/Revoked/Completed. The
+            record is gone, so Layer 1 liveness cannot judge the fault's actual
+            effects — an abstention that carries ``warning``, never ``failed``
+            (Bug3 root fix: ``failed`` is reserved for "the fault did NOT take
+            effect", a counter-verdict an expired record cannot make).
     """
     data = _extract_json_object(raw)
     if data is None:
@@ -1852,8 +1870,23 @@ def _parse_blade_status_output(raw: str) -> tuple[str, str, bool]:
                 f"actual effects; Layer 2 will verify cluster-level evidence.",
                 True,
             )
+        # Root fix (Bug3): an expired record is an ABSTENTION, not a
+        # counter-verdict. Both expired sub-cases (early destroy AND timeout
+        # expiry) mean the same thing for the verdict — "the record is gone,
+        # Layer 1 liveness CANNOT judge the fault's actual effects, Layer 2
+        # decides" — so both carry the ``warning`` word (the defer-to-Layer2
+        # status) and ``expired=True``. Labeling timeout expiry ``failed``
+        # overloaded the word that everywhere else means "the fault did NOT
+        # take effect": infer_task_state then routed a physically-identical
+        # abstention through its terminal-failure fall-through, where only the
+        # narrow expired-override (Layer2 passed AND level verified) rescued
+        # it — leaving every other Layer2/level combination to diverge from
+        # the early-destroy ``warning`` case on a sub-second coin-flip of WHEN
+        # the record was destroyed relative to --timeout. The narrative
+        # distinction stays in the details string (it explains WHY the record
+        # is gone); the verdict word no longer encodes it.
         return (
-            "failed",
+            "warning",
             f"Experiment status: {exp_status} — the fault window has expired "
             f"(--timeout elapsed), so live fault effects can no longer be observed. "
             f"Layer 2 may still find residual evidence.",
@@ -2001,8 +2034,15 @@ def _map_query_k8s_to_layer1(
     if q_result.status == "passed":
         layer1_status = "passed"
     elif q_result.expired:
-        # expired=True means experiment Destroyed/Revoked
-        layer1_status = "failed"
+        # Bug3 root fix: an expired record (Destroyed/Revoked) is an ABSTENTION
+        # — Layer 1 liveness cannot judge the fault's actual effects — so it
+        # carries ``warning`` (defer to Layer 2), never ``failed`` (which
+        # everywhere else means "the fault did NOT take effect", a counter-
+        # verdict an expired record cannot make). Same unification the host
+        # blade_status path applies; ``expired=True`` stays the machine flag
+        # downstream reads. This k8s path had NO early-destroy nuance — it
+        # labeled ALL expiry ``failed``, the harsher half of the old split.
+        layer1_status = "warning"
     else:
         layer1_status = q_result.status  # "failed" or "unknown"
     return Layer1Result(
@@ -2018,6 +2058,7 @@ def _map_query_k8s_to_layer1(
 async def _run_layer1_via_kubectl_exec(
     experiment_uid: str, kubeconfig: str, *, task_id: str = "",
     injection_pod_name: str | None = None,
+    target: "TransportTarget | None" = None,
 ) -> Layer1Result:
     """Layer 1 verification via kubectl exec into a tool pod.
 
@@ -2056,11 +2097,11 @@ async def _run_layer1_via_kubectl_exec(
         from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
         from chaos_agent.transports import (
             PROFILE_K8S,
-            TransportTarget,
             execute_via_transport,
+            resolve_transport_target,
         )
 
-        _target = TransportTarget.from_state({})
+        _target = target if target is not None else resolve_transport_target(None)
 
         # Step 0: Try the original injection pod first (if known)
         if injection_pod_name:
@@ -2070,7 +2111,7 @@ async def _run_layer1_via_kubectl_exec(
             query_cmd = build_kubectl_cmd("exec", [
                 injection_pod_name, "-n", _TOOL_POD_NAMESPACE,
                 "--", "blade", "query", "k8s", "create", experiment_uid,
-            ], kubeconfig=kubeconfig)
+            ], kubeconfig=kubeconfig, target=_target)
             try:
                 query_run_result = await execute_via_transport(
                     query_cmd, _target, task_id=task_id, source="verifier-L1", expect_profile=PROFILE_K8S)
@@ -2116,7 +2157,7 @@ async def _run_layer1_via_kubectl_exec(
             status_cmd = build_kubectl_cmd("exec", [
                 injection_pod_name, "-n", _TOOL_POD_NAMESPACE,
                 "--", "blade", "status", experiment_uid,
-            ], kubeconfig=kubeconfig)
+            ], kubeconfig=kubeconfig, target=_target)
             try:
                 status_result = await execute_via_transport(
                     status_cmd, _target, task_id=task_id, source="verifier-L1", expect_profile=PROFILE_K8S)
@@ -2199,7 +2240,7 @@ async def _run_layer1_via_kubectl_exec(
             query_cmd = build_kubectl_cmd("exec", [
                 pod_name, "-n", pod_ns,
                 "--", "blade", "query", "k8s", "create", experiment_uid,
-            ], kubeconfig=kubeconfig)
+            ], kubeconfig=kubeconfig, target=_target)
             try:
                 query_result = await execute_via_transport(
                     query_cmd, _target, task_id=task_id, source="verifier-L1", expect_profile=PROFILE_K8S)
@@ -2234,7 +2275,7 @@ async def _run_layer1_via_kubectl_exec(
             status_cmd = build_kubectl_cmd("exec", [
                 pod_name, "-n", pod_ns,
                 "--", "blade", "status", experiment_uid,
-            ], kubeconfig=kubeconfig)
+            ], kubeconfig=kubeconfig, target=_target)
             try:
                 status_result = await execute_via_transport(
                     status_cmd, _target, task_id=task_id, source="verifier-L1", expect_profile=PROFILE_K8S)
@@ -2312,6 +2353,7 @@ async def _run_host_blade_layer1(
     messages: list | None = None,
     injection_method: str | None = None,
     is_teardown=None,
+    state: dict | None = None,
 ) -> Layer1Result:
     """Execute host-blade Layer 1 verification: blade_status + blade_query_k8s.
 
@@ -2363,7 +2405,7 @@ async def _run_host_blade_layer1(
 
         # Step 1: blade_status — experiment-level check
         status_output = await blade_status.ainvoke(
-            {"uid": experiment_uid, "kubeconfig": kubeconfig}
+            {"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state}
         )
         raw = status_output if isinstance(status_output, str) else str(status_output)
         layer1_status, layer1_details, layer1_expired = _parse_blade_status_output(raw)
@@ -2379,7 +2421,7 @@ async def _run_host_blade_layer1(
             logger.info(f"blade_status local DB miss (raw={raw[:80]!r}), trying blade_query_k8s as fallback")
             try:
                 query_output = await blade_query_k8s.ainvoke(
-                    {"uid": experiment_uid, "kubeconfig": kubeconfig}
+                    {"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state}
                 )
                 query_raw = query_output if isinstance(query_output, str) else str(query_output)
                 q_result = _parse_blade_query_k8s_output(query_raw)
@@ -2423,7 +2465,7 @@ async def _run_host_blade_layer1(
             elif layer1_status == "passed":
                 try:
                     query_output = await blade_query_k8s.ainvoke(
-                        {"uid": experiment_uid, "kubeconfig": kubeconfig}
+                        {"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state}
                     )
                     query_raw = query_output if isinstance(query_output, str) else str(query_output)
                     q_result = _parse_blade_query_k8s_output(query_raw)
@@ -2457,7 +2499,7 @@ async def _run_host_blade_layer1(
                         await asyncio.sleep(5)
                         try:
                             recheck_output = await blade_query_k8s.ainvoke(
-                                {"uid": experiment_uid, "kubeconfig": kubeconfig}
+                                {"uid": experiment_uid, "kubeconfig": kubeconfig, "state": state}
                             )
                             recheck_raw = recheck_output if isinstance(recheck_output, str) else str(recheck_output)
                             recheck = _parse_blade_query_k8s_output(recheck_raw)
@@ -2537,6 +2579,7 @@ async def _run_host_blade_layer1(
                         "subcommand": "get",
                         "v_args": "nodes",
                         "kubeconfig": kubeconfig,
+                        "state": state,
                     })
                     _node_str = _node_out if isinstance(_node_out, str) else str(_node_out)
                     if "NotReady" in _node_str:

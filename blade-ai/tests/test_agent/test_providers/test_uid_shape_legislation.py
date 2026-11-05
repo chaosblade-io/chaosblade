@@ -102,9 +102,38 @@ SRC_ROOT = pathlib.Path(__file__).resolve().parents[3] / "src" / "chaos_agent"
 # Deliberate exemptions from the jurisdiction: hex-class regexes that are
 # NOT experiment-UID shapes. Every entry must carry a reason; an entry
 # whose site no longer matches is pruned loudly (test fails) so the ledger
-# cannot rot. (Currently empty: every hand-copy found so far was fixed,
-# not exempted.)
-EXEMPT: dict[tuple[str, int], str] = {}
+# cannot rot.
+#
+# Keyed by (relative_path, FOLDED PATTERN TEXT), NOT by line number: an
+# exemption asserts something about a pattern's SHAPE ("this is a float
+# literal, not a UID"), and that assertion must travel with the pattern. A
+# line-keyed ledger breaks on any unrelated edit above the anchor — it
+# reported a "new hand-copied hex regex" when a docstring 20 lines up grew —
+# which is a false alarm that trains reviewers to ignore this gate. Liveness
+# is still enforced: change or delete the pattern and the entry goes stale.
+EXEMPT: dict[tuple[str, str], str] = {
+    # ``_FINGERPRINT_NUM_RE`` harvests bare numeric literals (optional sign,
+    # digits, optional fraction, optional scientific-notation exponent) for
+    # the verify cross-check's value-presence fingerprinting. Its ``[eE]``
+    # exponent marker admits only hex LETTERS, so ``_class_is_hex`` flags the
+    # class — but this is a float shape, never an experiment-UID shape: it
+    # mines/canonicalizes metric values (``canonicalize_number``), not UIDs.
+    (
+        "src/chaos_agent/agent/nodes/verify/_metric_extractor.py",
+        r"[-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?",
+    ): "float/scientific-notation literal ([eE] is the exponent marker), not a UID shape",
+    # ``_CLAIM_NUM_RE`` is the compare-side twin of ``_FINGERPRINT_NUM_RE``: it
+    # leading-anchors the SAME float shape to parse a metric-claim base/post that
+    # may carry a unit ("1014.755 ms"). Same ``[eE]`` exponent marker, same
+    # false positive — a float shape, never an experiment-UID shape. Keeping it
+    # shape-identical to the harvest side is load-bearing: canonicalize_number's
+    # contract requires both sides to recognize the same numeric literals or a
+    # value-presence match silently starves.
+    (
+        "src/chaos_agent/agent/nodes/verify/_verifier_layer2_parse.py",
+        r"^\s*([-+]?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)",
+    ): "float/scientific-notation literal ([eE] is the exponent marker), not a UID shape",
+}
 
 
 def _iter_char_classes(pattern_text: str):
@@ -297,7 +326,7 @@ def test_jurisdiction_scan_no_hand_copied_hex_regexes() -> None:
     violations = [
         f"{rel}:{lineno}  {text}"
         for rel, lineno, text in sites
-        if (rel, lineno) not in EXEMPT
+        if (rel, text) not in EXEMPT
     ]
     assert not violations, (
         "hex-class regexes outside the UID-shape legislation (compose the "
@@ -311,9 +340,11 @@ def test_jurisdiction_exempt_ledger_is_live() -> None:
 
     An exemption that no longer matches anything is stale bookkeeping —
     it would silently stop meaning anything. Fail loudly so the ledger
-    gets pruned.
+    gets pruned. Keyed by pattern text (not line number), so this fires when
+    the exempted PATTERN changes or disappears, and stays quiet when merely
+    unrelated code above it moves.
     """
-    sites = {(rel, lineno) for rel, lineno, _ in _scan_hex_regex_sites(SRC_ROOT)}
+    sites = {(rel, text) for rel, _, text in _scan_hex_regex_sites(SRC_ROOT)}
     stale = sorted(set(EXEMPT) - sites)
     assert not stale, f"stale EXEMPT entries (site no longer scanned): {stale}"
 

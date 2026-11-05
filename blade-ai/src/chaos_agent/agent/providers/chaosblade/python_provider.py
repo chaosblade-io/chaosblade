@@ -668,17 +668,22 @@ class ChaosbladePythonProvider:
             is_teardown=make_teardown_matcher(
                 state.get("execution_artifacts") or []
             ),
+            state=state,
         )
 
-    async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:
+    async def layer1_raw_destroy(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> str:
         """Bare destroy for the finalize retry (same host Layer-1 domain as
         :meth:`layer1_destroy` — no status verification; the retry prompt
         only needs the destroy output)."""
         from .recover import raw_destroy
 
-        return await raw_destroy(uid, kubeconfig)
+        return await raw_destroy(uid, kubeconfig, state=state)
 
-    async def experiment_destroyed(self, uid: str, kubeconfig: str = "") -> bool:
+    async def experiment_destroyed(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> bool:
         """Status-only death check — the sweep's convergence valve (B76
         review J2: the same valve was host-carrier-only, so a python
         experiment's repeat-destroy not-found failure never converged).
@@ -693,7 +698,7 @@ class ChaosbladePythonProvider:
         from .recover import parse_blade_status_destroyed
 
         try:
-            out = await blade_status.ainvoke({"uid": uid, "kubeconfig": kubeconfig})
+            out = await blade_status.ainvoke({"uid": uid, "kubeconfig": kubeconfig, "state": state})
         except Exception:  # noqa: BLE001
             return False
         raw = out if isinstance(out, str) else str(out)
@@ -711,6 +716,7 @@ class ChaosbladePythonProvider:
         # identity IS the experiment UID, so there is no recipe to hydrate
         # from ``execution_artifacts`` and the list stays unread.
         artifacts: list | None = None,
+        state: dict | None = None,
     ) -> "Layer1Result":
         """Deterministic Layer-1 recovery: destroy the python-agent experiment
         via the canonical host Layer-1 path (it is recorded in the local DB of
@@ -722,6 +728,7 @@ class ChaosbladePythonProvider:
             kubeconfig,
             messages=messages,
             injection_method=injection_method,
+            state=state,
         )
 
     def recovery_vehicle(self, state: dict) -> str:
@@ -848,6 +855,7 @@ class ChaosbladePythonProvider:
             kubeconfig,
             messages=messages,
             injection_method=state.get("injection_method"),
+            state=state,
         )
         # COMBO injection parity with ChaosbladeProvider.recover: a
         # kubectl-native component alongside the experiment cannot be undone

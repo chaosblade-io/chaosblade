@@ -69,6 +69,10 @@ SECRET = _manifest("Secret", "v1", "drill-secret")
 PVC = _manifest("PersistentVolumeClaim", "v1", "drill-pvc")
 PV = _manifest("PersistentVolume", "v1", "drill-pv")
 NAMESPACE = _manifest("Namespace", "v1", "drill-ns")
+# apply-allowlist-limitrange (#71 LimitRange误配): the injection body is a
+# freshly created LimitRange — a persistent fault object with no self-timer,
+# so it rides the same apply-native attribution as NetworkPolicy.
+LIMITRANGE = _manifest("LimitRange", "v1", "drill-lr-abc")
 # NOT persistent-fault: ordinary workload / service / carrier scaffolding
 DEPLOYMENT = _manifest("Deployment", "apps/v1", "victim")
 STATEFULSET = _manifest("StatefulSet", "apps/v1", "victim")
@@ -104,7 +108,7 @@ class TestApplyNativePredicate:
     fault object, recognised by KIND. Every other face reuses this."""
 
     @pytest.mark.parametrize("manifest", [
-        NETPOL, CONFIGMAP, SECRET, PVC, PV, NAMESPACE,
+        NETPOL, CONFIGMAP, SECRET, PVC, PV, NAMESPACE, LIMITRANGE,
     ])
     def test_persistent_fault_kinds_are_injections(self, manifest):
         assert is_apply_native_fault_injection(
@@ -174,6 +178,18 @@ class TestApplyNativePredicate:
         # the category is defined by KIND, minus the CR channel.
         assert "faultdrill" not in PERSISTENT_FAULT_MANIFEST_KINDS
         assert "networkpolicy" in PERSISTENT_FAULT_MANIFEST_KINDS
+        # apply-allowlist-limitrange: limitrange propagates from
+        # ALLOWED_MANIFEST_KINDS into the derived persistent-fault set (single
+        # source, no re-declaration) — pinned from the set, not a literal.
+        assert "limitrange" in PERSISTENT_FAULT_MANIFEST_KINDS
+
+    def test_limitrange_apply_is_injection(self):
+        # design D5's propagation effect: adding limitrange to the whitelist
+        # makes the apply-native predicate (and therefore the armed gate and
+        # every attribution face) recognise an apply-LimitRange as a fault.
+        assert is_apply_native_fault_injection(
+            "kubectl", _apply_args(LIMITRANGE),
+        )
 
 
 # ---------------------------------------------------------------------------

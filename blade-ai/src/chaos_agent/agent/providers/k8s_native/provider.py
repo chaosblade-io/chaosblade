@@ -587,7 +587,9 @@ class K8sNativeProvider:
             details="kubectl-native injection (no blade experiment), Layer 1 not applicable",
         )
 
-    async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:
+    async def layer1_raw_destroy(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> str:
         """No bare destroy exists for a kubectl-native fault (nothing to
         destroy programmatically); the finalize retry never routes here."""
         return ""
@@ -618,6 +620,7 @@ class K8sNativeProvider:
         # Layer-1 here to hydrate an identity FOR (this returns ``skipped``
         # and the LLM flow's undo is Layer 1), so the list stays unread.
         artifacts: list | None = None,
+        state: dict | None = None,
     ) -> "Layer1Result":
         """No deterministic Layer-1 recovery exists for a kubectl-native fault:
         the mutation has no experiment to destroy — the LLM flow's undo IS

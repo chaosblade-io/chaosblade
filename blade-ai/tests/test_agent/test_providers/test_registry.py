@@ -171,7 +171,7 @@ class _FakeProvider:
     async def layer1_verify(self, state, **kwargs) -> Layer1Result:
         return Layer1Result(status=Layer1Status.SKIPPED, details=f"fake:{self.carrier}")
 
-    async def layer1_raw_destroy(self, uid, kubeconfig="") -> str:
+    async def layer1_raw_destroy(self, uid, kubeconfig="", *, state=None) -> str:
         return ""
 
     def classify_destroy_output(self, output):
@@ -182,7 +182,7 @@ class _FakeProvider:
 
     async def layer1_destroy(
         self, uid, kubeconfig="", *, messages=None, injection_method=None,
-        artifacts=None,
+        artifacts=None, state=None,
     ) -> Layer1Result:
         return Layer1Result(status=Layer1Status.SKIPPED, details=f"fake:{self.carrier}")
 
@@ -1098,7 +1098,7 @@ class _SweepFake(_FakeProvider):
         self._raise = raise_on_destroy
         self._destroyed_verdict = destroyed_verdict
 
-    async def layer1_raw_destroy(self, uid, kubeconfig=""):
+    async def layer1_raw_destroy(self, uid, kubeconfig="", *, state=None):
         self.destroy_calls.append(uid)
         if self._raise is not None:
             raise self._raise
@@ -1114,7 +1114,7 @@ class _SweepFake(_FakeProvider):
 
         return _authority(output)
 
-    async def experiment_destroyed(self, uid, kubeconfig=""):
+    async def experiment_destroyed(self, uid, kubeconfig="", *, state=None):
         self.status_probes.append(uid)
         return self._destroyed_verdict
 
@@ -1419,7 +1419,7 @@ class TestSweepKubeconfigResolution:
         FaultProviderRegistry.register(fake)
         captured: dict[str, str] = {}
 
-        async def _rec(uid, kubeconfig=""):
+        async def _rec(uid, kubeconfig="", *, state=None):
             captured[uid] = kubeconfig
             return '{"code":200,"success":true}'
 
@@ -1441,7 +1441,7 @@ class TestSweepKubeconfigResolution:
         FaultProviderRegistry.register(fake)
         captured: dict[str, str] = {}
 
-        async def _rec(uid, kubeconfig=""):
+        async def _rec(uid, kubeconfig="", *, state=None):
             captured[uid] = kubeconfig
             return '{"code":200,"success":true}'
 

@@ -78,7 +78,11 @@ from chaos_agent.agent.providers.message_scanning import (
     reached_target,
 )
 from chaos_agent.memory.tool_compactor import is_compaction_artifact
-from chaos_agent.transports import PROFILE_K8S
+from chaos_agent.transports import (
+    PROFILE_K8S,
+    TransportTarget,
+    resolve_transport_target,
+)
 
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
@@ -679,6 +683,7 @@ class FaultDrillProvider:
 
     async def sweep_artifact(
         self, artifact: Any, *, kubeconfig: str = "", task_id: str = "",
+        target: TransportTarget | None = None,
     ) -> Optional[bool]:
         """Claim-based single-artifact sweep.
 
@@ -713,7 +718,7 @@ class FaultDrillProvider:
             "delete",
             [f"{CRD_PLURAL}.{settings.faultdrill_crd_group}", name,
              "-n", namespace, "--ignore-not-found"],
-            kubeconfig,
+            kubeconfig, target=target,
         )
         return result.exit_code == 0
 
@@ -863,7 +868,9 @@ class FaultDrillProvider:
             details="faultdrill injection: the recipe landing is bookkeeping, not the fault landing — Layer-2 effect judgment is the authority",
         )
 
-    async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:
+    async def layer1_raw_destroy(
+        self, uid: str, kubeconfig: str = "", *, state: dict | None = None,
+    ) -> str:
         """Final semantics: no bare destroy form — recovery is the
         four-state convergence over the CR reference, not a UID destroy;
         the finalize retry seam only fires for UID-bearing carriers
@@ -884,6 +891,7 @@ class FaultDrillProvider:
         messages: list | None = None,
         injection_method: str | None = None,
         artifacts: list | None = None,
+        state: dict | None = None,
     ) -> "Layer1Result":
         """Deterministic Layer-1 recovery: the ledger-model
         restore-recipe replay (M2 task 2.3, design ND7).
@@ -924,7 +932,10 @@ class FaultDrillProvider:
         hydrated = self._recipe_face_handle(
             None, list(messages or []), list(artifacts or []),
         )
-        verdict = await _replay_restore_recipe(hydrated or {}, kubeconfig)
+        verdict = await _replay_restore_recipe(
+            hydrated or {}, kubeconfig,
+            xport_target=resolve_transport_target(state),
+        )
         return Layer1Result(
             status=verdict["status"],
             details=verdict["details"],
@@ -1026,7 +1037,7 @@ class FaultDrillProvider:
                 ),
             )
         return await self._recover_from_ledger(
-            full, kubeconfig, dispatch_handle=handle,
+            full, kubeconfig, dispatch_handle=handle, state=state,
         )
 
     def _recipe_face_handle(
@@ -1097,6 +1108,7 @@ class FaultDrillProvider:
 
     async def _recover_from_ledger(
         self, handle: dict, kubeconfig: str, *, dispatch_handle: Optional[dict] = None,
+        state: dict | None = None,
     ) -> RecoverResult:
         """The ledger-model deterministic recover for EITHER face
         (design ND7 — ``blade-ai recover`` 从任务台账重放配方，与载体
@@ -1118,7 +1130,9 @@ class FaultDrillProvider:
             layer1_to_dict,
         )
 
-        verdict = await _replay_restore_recipe(handle, kubeconfig)
+        verdict = await _replay_restore_recipe(
+            handle, kubeconfig, xport_target=resolve_transport_target(state),
+        )
         layer1 = Layer1Result(
             status=verdict["status"], details=verdict["details"],
         )
@@ -1359,6 +1373,7 @@ def _namespace_from_v_args(v_args: str) -> str:
 async def _kubectl(
     subcommand: str, v_args: list[str], kubeconfig: str, *,
     stdin_data: str = "", timeout: float = 30.0,
+    target: TransportTarget | None = None,
 ):
     """Single execution seam for the restore replay's target readback
     and patch, and the sweep's delete (patch point for tests; lazy tool
@@ -1368,6 +1383,7 @@ async def _kubectl(
 
     return await exec_kubectl_raw(
         subcommand, v_args, kubeconfig, timeout=timeout, stdin_data=stdin_data,
+        target=target,
     )
 
 
@@ -1376,7 +1392,9 @@ async def _kubectl(
 # ---------------------------------------------------------------------------
 
 
-async def _replay_restore_recipe(handle: dict, kubeconfig: str) -> dict:
+async def _replay_restore_recipe(
+    handle: dict, kubeconfig: str, *, xport_target: TransportTarget | None = None,
+) -> dict:
     """The ledger-model replay core (design ND7): ONE guard-2 idempotent
     restore-recipe replay onto the TARGET, for EITHER face — the recipe
     rides the task's fault_handle (the assembler receipt's
@@ -1436,6 +1454,7 @@ async def _replay_restore_recipe(handle: dict, kubeconfig: str) -> dict:
             "extra_delete": extra_delete,
         },
         kubeconfig,
+        xport_target=xport_target,
     )
     where = f"{_target_namespace(target)}/{target.get('name')}"
     if restored:
