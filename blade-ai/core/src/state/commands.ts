@@ -2009,6 +2009,17 @@ function buildBuiltInCommands(): SlashCommand[] {
                 const value = (c["value"] as string) || "—";
                 lines.push(`  - ${label}: ${value || "—"}`);
               }
+              // Dual-root merge: when the loader actually merged more than
+              // one root (user root + read-only built-in pack), surface the
+              // full set so a redirected skills_dir doesn't hide where the
+              // built-in cases come from. Single-root (dev) stays unchanged.
+              const roots = (data["roots"] as string[]) ?? [];
+              if (roots.length > 1) {
+                lines.push(t("skills.path_roots_head"));
+                for (const r of roots) {
+                  lines.push(`  - ${r}`);
+                }
+              }
               pushLog(ctx, lines.join("\n"), "info");
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -3051,7 +3062,15 @@ function formatSkillsReload(data: Record<string, unknown>): string {
   const dir = (data["skills_dir"] as string) || "";
   const added = (data["added"] as string[]) ?? [];
   const removed = (data["removed"] as string[]) ?? [];
+  const roots = (data["roots"] as string[]) ?? [];
   const lines: string[] = [t("skills.reload_head", { dir, total })];
+  // ``total`` is the MERGED count (user root + read-only built-in pack),
+  // so ``dir`` alone under-reports where those skills live. List every
+  // re-scanned root when there's a genuine multi-root merge; single-root
+  // (dev) output is unchanged.
+  if (roots.length > 1) {
+    lines.push(t("skills.reload_roots", { roots: roots.join(", ") }));
+  }
   if (added.length === 0 && removed.length === 0) {
     lines.push(t("skills.reload_no_change"));
   } else {

@@ -391,6 +391,7 @@ export const en: Dict = {
   "skills.show_scripts_head": "scripts ({n}):",
   "skills.reload_failed": "skills reload failed: {err}",
   "skills.reload_head": "rescanned {dir} ({total} skills)",
+  "skills.reload_roots": "  merged roots: {roots}",
   "skills.reload_no_change": "  (no additions / removals)",
   "skills.reload_added": "  + added: {items}",
   "skills.reload_removed": "  - removed: {items}",
@@ -411,6 +412,7 @@ export const en: Dict = {
   "command.skills.path.desc": "Print the resolved skills_dir + candidate priority list",
   "skills.path_head": "resolved: {dir}",
   "skills.path_candidates_head": "candidates (by priority):",
+  "skills.path_roots_head": "merged roots (by precedence):",
   "skills.path_failed": "failed to read skills_dir: {err}",
 
   "recordings.empty": "no recordings on disk yet",

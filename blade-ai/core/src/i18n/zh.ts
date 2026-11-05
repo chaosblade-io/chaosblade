@@ -375,6 +375,7 @@ export const zh: Dict = {
   "skills.show_scripts_head": "脚本（{n}）：",
   "skills.reload_failed": "重新扫描技能失败：{err}",
   "skills.reload_head": "已重新扫描 {dir}（共 {total} 项）",
+  "skills.reload_roots": "  合并根：{roots}",
   "skills.reload_no_change": "  (无新增 / 移除)",
   "skills.reload_added": "  + 新增：{items}",
   "skills.reload_removed": "  - 移除：{items}",
@@ -395,6 +396,7 @@ export const zh: Dict = {
   "command.skills.path.desc": "打印 skills_dir 的解析路径与候选优先级",
   "skills.path_head": "resolved: {dir}",
   "skills.path_candidates_head": "候选（按优先级）：",
+  "skills.path_roots_head": "实际合并加载的根（按优先级）：",
   "skills.path_failed": "读取 skills_dir 失败：{err}",
 
   "recordings.empty": "本机暂无录像",
