@@ -80,7 +80,22 @@ Required sections, in this exact order:
 
 Section guidance:
 - Summary: 1-2 sentences, the headline of what happened.
-- Background: user request, fault type, target, parameters.
+- Background: the concrete ACTIONS and the resolved target — the facts
+  only the execution trace reveals. A labeled bullet list:
+    - `Injection action:` the concrete operation/command that actually
+      applied the fault (e.g. the `kubectl exec ...` shell that ran, or
+      the `blade create ...` issued) — NOT a carrier enum like
+      "kubectl_native".
+    - `Recovery action:`  the concrete operation/command that reverts
+      this fault (planned at injection time), e.g. killing the injected
+      PIDs or `blade destroy <uid>` — NOT a carrier enum.
+    - `Resolved target:`  the concrete resource name(s) actually hit
+      (e.g. the resolved Pod name), when the trace shows them.
+  Do NOT restate the deterministic facts: the fault type, namespace,
+  status, duration, the user's request, the target selector and the
+  parameters are already rendered by the program in the header ABOVE
+  your `## Summary`. Repeating them here only risks a mismatch against
+  that authoritative block, so write only what the trace adds.
 - Timeline: bullet list of key moments. Each message in the context
   has a `time` field (Beijing time HH:MM:SS). Use these real timestamps
   in the output (e.g. "- **20:17:34** blade create issued the injection").
@@ -100,7 +115,7 @@ Section guidance:
 Tone: factual, terse. No hedging. No marketing language. Treat the
 reader as a senior engineer who wants signal, not narrative.
 
-Write in Chinese unless the input is predominantly English."""
+Write in English."""
 
 
 _USER_PROMPT_TEMPLATE = """Generate the postmortem markdown for the experiment below.
@@ -109,8 +124,9 @@ Context (JSON):
 {context_json}
 
 Output the markdown directly, starting with `## Summary`. Do NOT wrap
-in code fences. Do NOT include a top-level `#` heading — the file
-header is added by the caller."""
+in code fences. Do NOT include a top-level `#` heading — the title and
+the deterministic fact block above your `## Summary` are added by the
+caller, so never restate those facts here."""
 
 
 async def generate_postmortem(
@@ -122,8 +138,9 @@ async def generate_postmortem(
     """Invoke the LLM to produce a postmortem markdown body.
 
     Raises asyncio.TimeoutError when LLM exceeds ``timeout`` seconds.
-    Caller (save_memory) catches this + any LLM error and degrades to
-    postmortem=None so the result envelope still ships.
+    Caller (``terminal_reports_node._generate_postmortem``) catches this
+    + any LLM error and degrades to postmortem=None so the result
+    envelope still ships.
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -146,6 +163,35 @@ async def generate_postmortem(
     return _validate_and_bound(raw)
 
 
+def _is_summary_heading(stripped_line: str) -> bool:
+    """Single source for "is this line a ``## Summary`` heading".
+
+    Normalised: a level-2 heading whose text starts with ``summary``,
+    case-insensitive and tolerant of surrounding whitespace. BOTH the
+    acceptance gate (:func:`_validate_and_bound`) and :func:`make_summary`
+    detect the section through this one predicate so they can never drift.
+
+    K1 root fix: the gate used to demand the exact literal ``## Summary``
+    (``_REQUIRED_HEADING not in markdown``) while ``make_summary`` was
+    already case-insensitive — so a legal ``## summary`` / ``##  Summary``
+    variant was silently rejected as a "refusal", dropping an otherwise
+    valid report (postmortem=None, nothing archived). That contradicted
+    this module's own "compliance is hint-not-enforce" contract. Routing
+    both sides through this predicate removes the inconsistency at the
+    source instead of patching one literal.
+    """
+    if not stripped_line.startswith("## "):
+        return False
+    return stripped_line[3:].strip().lower().startswith("summary")
+
+
+def _find_summary_heading(markdown: str) -> bool:
+    """True when *markdown* contains a (normalised) ``## Summary`` heading."""
+    return any(
+        _is_summary_heading(line.strip()) for line in markdown.splitlines()
+    )
+
+
 def _validate_and_bound(markdown: str) -> str:
     """Reject LLM refusals / malformed output; cap oversized output.
 
@@ -156,10 +202,12 @@ def _validate_and_bound(markdown: str) -> str:
     if not markdown:
         return ""
 
-    # Structural sanity: must contain at least the Summary heading.
+    # Structural sanity: must contain a (normalised) Summary heading.
     # Catches refusals like "I'm sorry, I can't generate..." that pass
-    # the non-empty check but aren't real postmortems.
-    if _REQUIRED_HEADING not in markdown:
+    # the non-empty check but aren't real postmortems. Detection goes
+    # through the SAME single-source predicate make_summary uses (K1) so
+    # the gate can never be stricter than the downstream extractor.
+    if not _find_summary_heading(markdown):
         logger.warning(
             "Postmortem rejected: missing required heading %r (got %d chars)",
             _REQUIRED_HEADING, len(markdown),
@@ -202,8 +250,7 @@ def make_summary(markdown_body: str) -> str:
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("## "):
-            heading = stripped[3:].strip().lower()
-            if not in_summary and heading.startswith("summary"):
+            if not in_summary and _is_summary_heading(stripped):
                 in_summary = True
                 continue
             if in_summary:

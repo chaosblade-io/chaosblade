@@ -373,7 +373,15 @@ _D7_NEW_LITERALS: dict[str, list[str]] = {
         "Only Layer 1 (programmatic) verification was performed.",
         "Only Layer 1 (programmatic) verification was confirmed.",
     ],
-    "verifier.py": [
+    # The a82984a3 root cure consolidated the simple verifier's two neutral
+    # warning literals into the single-source durable-evidence floor
+    # (``verification_floor_from_layer1`` in operation_outcome.py), so the
+    # no-LLM ``verifier()`` node and the crash-path floor derive the SAME
+    # wording from ONE place. verifier.py now delegates to that floor — its own
+    # render faces stay carrier-free and are still scanned by the second guard
+    # below (empty literal list) — so its D7 wording is pinned at its new home.
+    "verifier.py": [],
+    "operation_outcome.py": [
         "Only Layer 1 (programmatic) verification was performed.",
         "Native fault: Layer 1 not applicable, Layer 2 skipped (no LLM). ",
     ],
@@ -397,6 +405,13 @@ class TestPhase9D7CarrierNeutralNarrative:
 
     @staticmethod
     def _d7_path(rel: str) -> Path:
+        # The a82984a3 root cure moved the simple verifier's neutral wording
+        # into the shared durable-evidence floor, which lives in
+        # agent/result/operation_outcome.py (not under nodes/verify|recover).
+        # Resolve that home explicitly; every other entry is a verify/recover
+        # render-face node.
+        if rel == "operation_outcome.py":
+            return _SRC_ROOT / "agent" / "result" / rel
         sub = "recover" if rel.startswith("_recover") else "verify"
         return _SRC_ROOT / "agent" / "nodes" / sub / rel
 

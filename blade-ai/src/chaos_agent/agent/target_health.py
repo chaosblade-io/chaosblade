@@ -50,7 +50,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from chaos_agent.transports import TransportTarget
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +165,8 @@ class TargetHealthChecker(Protocol):
     """Scope this checker covers (e.g. ``"node"`` / ``"pod"``)."""
 
     async def check(
-        self, target: dict, kubeconfig: str
+        self, target: dict, kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> HealthReport:
         """Inspect ``target`` and return a ``HealthReport``."""
         ...
@@ -195,7 +199,8 @@ class NodeHealthChecker:
     scope = "node"
 
     async def check(
-        self, target: dict, kubeconfig: str
+        self, target: dict, kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> HealthReport:
         from chaos_agent.config.settings import settings
         from chaos_agent.tools.pod_discovery import (
@@ -215,7 +220,9 @@ class NodeHealthChecker:
                 checked_detail="node: no target",
             )
 
-        conditions = await _query_node_conditions(names[0], kubeconfig)
+        conditions = await _query_node_conditions(
+            names[0], kubeconfig, xport_target=xport_target,
+        )
         report = _build_node_report(target, conditions)
 
         # chaosblade-tool existence — node scope requires DaemonSet pod on target.
@@ -224,7 +231,9 @@ class NodeHealthChecker:
         # PRESENT so the report can no longer stamp a carrier it never found.
         tool_state = None
         if settings.blade_agent_check_enabled and kubeconfig:
-            tool_state = await _query_blade_agent_on_node(names[0], kubeconfig)
+            tool_state = await _query_blade_agent_on_node(
+                names[0], kubeconfig, xport_target=xport_target,
+            )
             if tool_state == TOOL_POD_ABSENT:
                 report.issues.append(
                     HealthIssue(
@@ -260,10 +269,13 @@ class PodHealthChecker:
     scope = "pod"
 
     async def check(
-        self, target: dict, kubeconfig: str
+        self, target: dict, kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> HealthReport:
         namespace = target.get("namespace", "default")
-        pod_names = await _resolve_pod_names(target, kubeconfig)
+        pod_names = await _resolve_pod_names(
+            target, kubeconfig, xport_target=xport_target,
+        )
         if not pod_names:
             return HealthReport(
                 target=target,
@@ -277,7 +289,9 @@ class PodHealthChecker:
         worst = HealthSeverity.OK
         checked_pods: list[str] = []
         for pod_name in pod_names:
-            status = await _query_pod_status(pod_name, namespace, kubeconfig)
+            status = await _query_pod_status(
+                pod_name, namespace, kubeconfig, xport_target=xport_target,
+            )
             report = _build_pod_report(target, status)
             for issue in report.issues:
                 issue.message = f"[{pod_name}] {issue.message}"
@@ -330,6 +344,8 @@ async def assess_target_health(
     scope: str,
     target: dict,
     kubeconfig: str = "",
+    *,
+    xport_target: TransportTarget | None = None,
 ) -> HealthReport:
     """Single entry point — agent_loop calls this once per turn.
 
@@ -348,7 +364,7 @@ async def assess_target_health(
             target=target, overall=HealthSeverity.OK, issues=[]
         )
     try:
-        return await checker.check(target, kubeconfig)
+        return await checker.check(target, kubeconfig, xport_target=xport_target)
     except Exception as exc:
         # A checker bug must NOT take down the inject pipeline (never
         # raise, never block). R66: but it must not masquerade as a
@@ -616,7 +632,8 @@ _NODE_NOT_FOUND = "node_not_found"
 
 
 async def _query_node_conditions(
-    node_name: str, kubeconfig: str
+    node_name: str, kubeconfig: str,
+    *, xport_target: TransportTarget | None = None,
 ) -> list[dict] | str | None:
     """Real impl: ``kubectl get node {name} -o json``, return
     ``.status.conditions``.
@@ -645,6 +662,7 @@ async def _query_node_conditions(
         ["node", node_name, "-o", "json"],
         kubeconfig or "",
         log_name="_query_node_conditions",
+        target=xport_target,
     )
     if not outcome.ok:
         # "not found" ⇒ the node genuinely does not exist (a real BLOCK —
@@ -673,7 +691,8 @@ async def _query_node_conditions(
 
 
 async def _query_blade_agent_on_node(
-    node_name: str, kubeconfig: str
+    node_name: str, kubeconfig: str,
+    *, xport_target: TransportTarget | None = None,
 ) -> str:
     """Three-state ChaosBlade tool-pod presence on ``node_name``.
 
@@ -693,11 +712,16 @@ async def _query_blade_agent_on_node(
     """
     from chaos_agent.tools.pod_discovery import discover_tool_pod_state_on_node
 
-    state, _found = await discover_tool_pod_state_on_node(node_name, kubeconfig)
+    state, _found = await discover_tool_pod_state_on_node(
+        node_name, kubeconfig, target=xport_target,
+    )
     return state
 
 
-async def _resolve_pod_names(target: dict, kubeconfig: str) -> list[str]:
+async def _resolve_pod_names(
+    target: dict, kubeconfig: str,
+    *, xport_target: TransportTarget | None = None,
+) -> list[str]:
     """Resolve real pod names from a target dict.
 
     When the user selects pods via labels (e.g. app=accounting), ``names``
@@ -716,32 +740,27 @@ async def _resolve_pod_names(target: dict, kubeconfig: str) -> list[str]:
     names = coerce_to_list(target.get("names"), context="_resolve_pod_names")
 
     if labels:
-        label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
-        from chaos_agent.tools.kubectl_cli import query_kubectl
-        outcome = await query_kubectl(
-            [
-                "pod", "-l", label_selector, "-n", namespace,
-                "--field-selector=status.phase=Running",
-                "-o", "jsonpath={.items[*].metadata.name}",
-            ],
-            kubeconfig or "",
-            log_name="_resolve_pod_names",
+        # The ``{.items[*].metadata.name}`` query+parse is single-sourced in the
+        # target_identity seam (SET twin ``resolve_pods_by_selector``) — this was
+        # the R69 site that hand-rolled it and once split an "Error from server
+        # …" failure string into pod names. The seam gates on ``exit_code`` and
+        # splits only the undecorated stdout, so a failed query yields ``()``
+        # (isomorphic to the old ``.ok`` tri-state gate); the labels-empty /
+        # no-match fallback to ``names`` stays here as this face's own concern.
+        from chaos_agent.agent.target_identity import resolve_pods_by_selector
+        pod_names = await resolve_pods_by_selector(
+            selector=labels, namespace=namespace, kubeconfig=kubeconfig or "",
+            field_selector="status.phase=Running", target=xport_target,
         )
-        # R69: gate on ``.ok`` (tri-state) instead of sniffing the decorated
-        # ``_kubectl_impl`` string. The old path split ANY non-empty text —
-        # including an "Error from server ..." failure string — on whitespace
-        # and returned the tokens as pod names (so "Error" became a pod).
-        # ``.text`` is the undecorated payload and is empty unless ok.
-        if outcome.ok:
-            pod_names = [n for n in outcome.text.split() if n]
-            if pod_names:
-                return pod_names
+        if pod_names:
+            return list(pod_names)
 
     return list(names)
 
 
 async def _query_pod_status(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, xport_target: TransportTarget | None = None,
 ) -> dict:
     """Real impl: ``kubectl get pod -n {ns} {name} -o json``, return
     ``.status``.
@@ -764,6 +783,7 @@ async def _query_pod_status(
 
     outcome = await query_kubectl(
         args, kubeconfig or "", log_name="_query_pod_status",
+        target=xport_target,
     )
     if not outcome.ok:
         # R69: classify from ``.error`` (the merged stdout+stderr diagnosis

@@ -399,6 +399,46 @@ register_family(
             "pod", "node", "container",
             "deployment", "statefulset", "daemonset",
             "service",
+            # Config-object / entry-plane victim scopes (openspec
+            # register-config-object-fault-scopes). ``ingress`` /
+            # ``configmap`` / ``secret`` are the DIRECT victim of a
+            # config-plane fault — the injection patches the object's OWN
+            # body (Ingress backend rename, ConfigMap tamper, Secret
+            # invalidation), structurally identical to ``service`` above
+            # (namespaced, non-workload, patch-injectable, served by
+            # ``k8s_native`` / ``faultdrill_cr`` — never by chaosblade,
+            # which cannot patch them). They live in THIS family (not a new
+            # one) so the whole vocabulary derives from a single edit and
+            # the execution/guard/freeze layers stay untouched: the
+            # faultdrill assembler's ``_KIND_REST_MAP`` and the classifier's
+            # ``KIND_ALIASES`` already carry all three, and freeze.py's
+            # namespaced companion-surface grant (W-55-1) already covers
+            # every namespaced non-host scope. Registering them lets the
+            # planner declare the victim's OWN scope so the guard's
+            # ``effective.scope == approved.scope`` name-match path opens —
+            # without it the approved scope is forced to downgrade (e.g. to
+            # ``service``) and drift_policy rejects the victim-own-body
+            # write as ``scope drift: approved=service effective=ingress``.
+            "ingress", "configmap", "secret",
+            # Workload-owner victim scope (openspec expand-k8s-case-coverage
+            # 4.2/4.3, CronJob_任务异常). ``cronjob`` is the DIRECT victim of
+            # a task-suspension / backoff-exhaustion fault — the injection
+            # patches the CronJob's OWN body (``spec.suspend`` /
+            # ``spec.jobTemplate``), the same victim-own-body-write class as
+            # the config objects above, so it needs the identical vocabulary
+            # registration to open the guard's ``effective.scope ==
+            # approved.scope`` name-match path. Two cronjob-specific facts:
+            # (1) it is ALSO an owner scope (jobs→pods traversal lives in
+            # ``drift_policy.OWNER_SCOPES`` / ``freeze``), an ORTHOGONAL axis
+            # to being a victim scope — the two roles never interact because
+            # the victim-self-write path matches on scope equality before any
+            # owner traversal; (2) unlike ingress/configmap/secret it is
+            # ``batch/v1`` and was MISSING from the faultdrill assembler's
+            # ``_KIND_REST_MAP``, so registering the vocabulary WITHOUT the
+            # assembler entry would decouple the two layers (caught by
+            # test_fault_scope_vocabulary's coupling invariant). Namespaced,
+            # non-cluster-scoped, patch-injectable, never served by chaosblade.
+            "cronjob",
         ),
         carrier_types=("chaosblade", "k8s_native", "faultdrill_cr"),
         # NOTE (R21/G-5): this is a DELIBERATE parallel declaration, not a

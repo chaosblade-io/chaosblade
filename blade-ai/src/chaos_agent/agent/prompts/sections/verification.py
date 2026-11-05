@@ -6,9 +6,12 @@ eliminating copy-paste duplication per the P2 design principle.
 """
 
 from chaos_agent.agent.prompts.reminder import (
+    CONCURRENT_BATCH_FACT,
+    LEDGER_BATCH_FACT,
     PARALLELIZE_PRINCIPLE,
     SYSTEM_REMINDER_DECLARATION,
 )
+from chaos_agent.agent.result.verdict import ChecklistItemStatus
 
 
 def get_verifier_role_section() -> str:
@@ -49,6 +52,8 @@ def get_verifier_core_principles_section() -> str:
 - When a tool returns error, the TOOL is right — verify its actual interface before retrying
 - Your product is an evidence chain for ONE claim: did the fault take effect on the approved target — effect present, attributable to the injection, coverage of the target set. When every element has evidence, the burden is discharged and you submit; re-sampling an element that already has evidence adds no proof. Only a MISSING element earns another observation — "another angle exists" is always true and is never a reason to continue, and being unable to observe is itself a conclusion — the conclusion is 'unobserved', never 'absent'
 - {PARALLELIZE_PRINCIPLE}
+- {LEDGER_BATCH_FACT}
+- {CONCURRENT_BATCH_FACT}
 - {SYSTEM_REMINDER_DECLARATION}"""
 
 
@@ -112,6 +117,76 @@ When you use a DIFFERENT method than specified in a skill case step, document: "
 Design your own verification plan: identify the observables the fault mechanism is expected to change, then observe them starting from the most direct evidence of the mechanism. Analyze fault context to determine what effects to check for."""
 
 
+# Checklist status DEFINITIONS, keyed by every ChecklistItemStatus member.
+#
+# B76 round-14 single-sourced the vocabulary VALUE LISTS (tool schema,
+# _ITEM_STATUS_PROSE, JSON reminder all derive from the enum). It never
+# single-sourced the DEFINITIONS — those stayed hand-copied prose in
+# get_verifier_output_format_section and silently drifted to 5-of-7:
+# `partial` and `not_applicable` were exposed to the LLM as enum values but
+# taught NO meaning. The gap is load-bearing: with no authoritative owner for
+# "a conditional/diagnostic step whose trigger precondition did not fire, so
+# it was correctly NOT run", the model invents a definition and flip-flops
+# between skipped / not_applicable / expected for structurally identical steps
+# (2026-10-29 python Case #5 inject-e0b3109a: step3 `blade status` → skipped,
+# step5 matcher-recheck → not_applicable, same "precondition false" shape,
+# ~12 reasoning lines burned on a label that never changes the verdict; Case #2
+# had labelled BOTH steps not_applicable — cross-case inconsistent).
+#
+# Rendering iterates the enum and indexes this map, so adding a member without
+# a definition raises KeyError at import — B76's "teaching cannot silently miss
+# a legislated word" guarantee, extended from the WORD to its MEANING.
+# Context-INVARIANT checklist status semantics, shared by BOTH the inject and
+# the recover verifier faces. `not_applicable` means the same thing regardless
+# of which side is judging — a step that does not apply to the actual
+# situation — so it is defined ONCE here and imported by recovery.py; a second
+# hand-copy would drift (the very failure this fix removes).
+STATUS_NOT_APPLICABLE_DEFINITION = (
+    "The step does not apply to the actual situation and was correctly NOT "
+    "executed — either its target does not exist in this environment, OR "
+    "it is a conditional/diagnostic step whose trigger precondition did "
+    "not fire (e.g. \"run only if the effect is absent\", but the effect "
+    "WAS observed). Correctly not running it is NOT a coverage gap. MUST "
+    "carry a reason."
+)
+
+_CHECKLIST_STATUS_DEFINITIONS: dict[ChecklistItemStatus, str] = {
+    ChecklistItemStatus.PASSED: (
+        "Fault effect IS observable and attributable to the injection."
+    ),
+    ChecklistItemStatus.PARTIAL: (
+        "You ran the check but THIS step's evidence is incomplete or mixed — "
+        "the effect is only partly confirmed. Counts as a non-passed step."
+    ),
+    ChecklistItemStatus.FAILED: (
+        "You checked AND the expected effect is NOT observed. Mark what you "
+        "see NOW."
+    ),
+    ChecklistItemStatus.SKIPPED: (
+        "The step DOES apply and should have been run, but you could NOT "
+        "execute it (tool unavailable / no read-only channel) — a genuine "
+        "coverage gap. If you actually ran an observation command it is NEVER "
+        "'skipped'. A conditional step that correctly did not trigger is "
+        "'not_applicable', NOT 'skipped'."
+    ),
+    ChecklistItemStatus.RECOVERED_BEFORE_OBSERVATION: (
+        "Fault was transient and had dissipated by the time you checked. ALL "
+        "steps recovered → Overall 'unverified'."
+    ),
+    ChecklistItemStatus.EXPECTED: (
+        "A negative result you OBSERVED that is anticipated given injection "
+        "parameters (e.g., threshold not reached). Use only when other steps "
+        "confirm the fault IS in effect."
+    ),
+    ChecklistItemStatus.NOT_APPLICABLE: STATUS_NOT_APPLICABLE_DEFINITION,
+}
+
+_CHECKLIST_STATUS_DEFINITIONS_BLOCK = "\n".join(
+    f"- **{member.value}**: {_CHECKLIST_STATUS_DEFINITIONS[member]}"
+    for member in ChecklistItemStatus
+)
+
+
 def get_verifier_output_format_section() -> str:
     """Machine-parseable output specification for verifier.
 
@@ -130,6 +205,10 @@ Your text responses are brief progress updates (1-3 sentences per observation). 
 
 See the tool schema for argument details (overall, layer2_status, checklist, etc.). Fallback: if tool calling is unavailable, output a JSON-compatible VERIFICATION_RESULT block.
 
+**Numeric claims (metric_claims field)**: when your verdict rests on a numeric baseline→post change, record each in `metric_claims` as `{metric, baseline, post}`, keyed to the EXACT observed metric name (`updatedReplicas`, not `replicas`; `Disk usage (nodefs)`, not `disk usage`). The timeline cross-check reads this structured binding and compares your declared numbers against the observed metric by exact key — it does NOT parse your prose. A claim bound to the wrong key (or left only in free text) cannot be cross-checked, so the program treats it as unverified-by-measurement rather than confirmed.
+
+**Free-form exec numbers (kind/source fields)**: a number read from output the structured extractor cannot parse into the timeline (`tc -s qdisc`, `ping`, `ss`, `/proc/net/*`, `iptables -L`) is unreachable by exact key — so add two OPTIONAL fields. `kind`/`source` describe the provenance of the **`post` value only** — the number you read from the cited observation. Set `"kind":"raw"` when that `post` value is copied VERBATIM from one observation, plus `"source":"<a distinctive fragment of that command>"` (e.g. `"tc -s qdisc"`). The cross-check separately harvests the numbers in each observation's raw output: a declared `post` value appearing there AS A STANDALONE NUMBER is CORROBORATED (an extractor coverage gap, NOT a hallucination — no downgrade); digits occurring only inside a longer token (an experiment UID, a timestamp) corroborate nothing and just warn; a `post` value you marked `raw`+`source` that appears in NO observation output is FABRICATED and downgrades the verdict. The `baseline` field is NOT part of this anchor: a baseline is inherently read in an EARLIER phase (the pre-injection snapshot), which the fabrication check never inspects — so a baseline that no longer appears in any live observation is never FABRICATED and needs no `source`. Mark any computed / aggregated / ratio value (packet-loss %, a delta, a rate) `"kind":"derived"` — those legitimately never appear verbatim and are exempt. Omitting `kind` is treated as derived (never flagged), so declare `raw` ONLY for a `post` number you literally copied.
+
 **Primary Evidence Definition** (for PrimaryEvidenceObserved field):
 Primary evidence = **significant change from baseline OR significant deviation from expected healthy state** in the metric the fault targets. Does NOT require reaching the exact target value.
 - Significant: resource metric delta ≥ 15pp, new fault artifacts, or a state change of the target consistent with the fault mechanism.
@@ -137,17 +216,13 @@ Primary evidence = **significant change from baseline OR significant deviation f
 - PrimaryEvidenceObserved=false → Overall CANNOT be "verified" (use "partial" at best).
 
 **Status Definitions**:
-- **passed**: Fault effect IS observable and attributable to the injection.
-- **failed**: You checked AND the expected effect is NOT observed. Mark what you see NOW.
-- **skipped**: You did NOT execute this check (tool unavailable). If you actually ran an observation command, it is NEVER 'skipped'.
-- **recovered_before_observation**: Fault was transient and had dissipated by the time you checked. ALL steps recovered → Overall 'unverified'.
-- **expected**: A negative result that is anticipated given injection parameters (e.g., threshold not reached). Use only when other steps confirm the fault IS in effect.
+""" + _CHECKLIST_STATUS_DEFINITIONS_BLOCK + """
 
 **Overall Definitions**:
 - **verified**: The fault effect (significant change from baseline / deviation from healthy state) is confirmed across the ENTIRE approved target set — the whole target, not a subset.
 - **partial**: The effect is REAL but INCOMPLETE — confirmed on only some members of the approved target set (state coverage as N/total), or evidence mixed / observation incomplete.
 - **unverified**: No significant change from baseline and no deviation from healthy state anywhere, or all steps recovered.
 
-Checklist = OBSERVED FACTS. Overall = HOLISTIC JUDGMENT. A checklist CAN have 'failed' items while Overall says 'verified' — explain in Warnings.
+Checklist = OBSERVED FACTS. Overall = HOLISTIC JUDGMENT. The program enforces status consistency STRUCTURALLY, by reading your status enum only — it never re-derives absence/benign semantics from your evidence text. layer2_status='passed' while any item is 'failed' is a self-contradiction and is DOWNGRADED to 'partial'. So when a step's negative result is NOT a real failure (effect absent / benign / expected-negative / dissipated before you could observe it), declare it 'expected' | 'partial' | 'recovered_before_observation' — reserve 'failed' for a genuine unmet effect.
 
 The VERIFICATION_CHECKLIST is mandatory and parsed programmatically."""

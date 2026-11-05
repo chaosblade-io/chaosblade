@@ -155,6 +155,53 @@ class TestBuildSkillTools:
         assert "- scripts/verify.py" in result
         assert "- references/verify.py" in result
 
+    def test_read_skill_resource_resolves_extension_drop(self, mock_registry):
+        # Tier 2: the model used a case *title* as a path and dropped BOTH the
+        # directory level and the extension. Live in inject-de715486
+        # (2026-10-26): the agent requested
+        # "references/catalogue/Pod_网络故障_网络包乱序" (no ".md") for the
+        # settled case file, Tier 1 could not bridge it (the request basename
+        # has no extension, so it equals no resource's basename), and the call
+        # fell through to did-you-mean — a wasted turn on a path the registry
+        # owns. The stem match closes it under the same unique-or-none licence.
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        # "verify" for "scripts/verify.py" — no directory, no extension.
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "verify",
+        })
+        assert not result.startswith("Error:")
+        assert "print('verify')" in result
+        assert "[Path resolved]" in result
+        assert "scripts/verify.py" in result
+
+    def test_read_skill_resource_ambiguous_stem_still_errors(
+        self, mock_registry, tmp_skills_dir,
+    ):
+        # Tier 2 inherits Tier 1's guard: two resources sharing a STEM (same
+        # title, different extension) is a real collision. Guessing would
+        # serve the wrong playbook, so the caller must show both instead.
+        (tmp_skills_dir / "test-skill" / "references" / "verify.md").write_text(
+            "# verify doc", encoding="utf-8",
+        )
+        tools = _build_skill_tools(mock_registry)
+        read_tool = next(t for t in tools if t.name == "read_skill_resource")
+        activate_tool = next(t for t in tools if t.name == "activate_skill")
+        activate_tool.invoke({"skill_name": "test-skill"})
+
+        result = read_tool.invoke({
+            "skill_name": "test-skill",
+            "resource_path": "verify",
+        })
+        assert result.startswith("Error:")
+        assert "Did you mean:" in result
+        assert "- scripts/verify.py" in result
+        assert "- references/verify.md" in result
+
     def test_read_skill_resource_no_hint_when_unrelated(self, mock_registry):
         # A path sharing nothing with any resource gets no did-you-mean
         # (a bogus hint is worse than none) — just the full listing.
@@ -229,6 +276,22 @@ class TestBuildSkillTools:
         assert "safety floor" not in finish_tool.description
         assert "Default 0 = not declared" in finish_tool.description
 
+    def test_finish_planning_settled_means_triple_complete(self, mock_registry):
+        """Fix2 (openspec generalize-nonnode-victim-identity-correction): the
+        "settled" wording must match extract_planning_metadata's actual
+        criterion — an identity is settled only when its FULL triple
+        (fault_scope AND fault_target AND fault_action) is set. The legacy
+        "fields already settled are never rewritten" phrasing conflated an
+        INCOMPLETE triple (where the declaration is the FILL path, not a
+        conflict) with a COMPLETE one (where a differing declaration must go
+        through propose_plan_change) — the contract ambiguity Fix2 removes.
+        """
+        tools = _build_skill_tools(mock_registry)
+        finish_tool = next(t for t in tools if t.name == "finish_planning")
+        assert "SETTLED only once its full triple" in finish_tool.description
+        assert "FILL path" in finish_tool.description
+        assert "fields already settled" not in finish_tool.description
+
     def test_finish_planning_declares_fault_identity_triple(self, mock_registry):
         """B83/B84 (#49 post-mortem): finish_planning carries the fault-identity
         declaration surface.
@@ -244,6 +307,107 @@ class TestBuildSkillTools:
         assert {"fault_scope", "fault_target", "fault_action"} <= set(finish_tool.args)
         assert "MAIN injection mechanism" in finish_tool.description
         assert "propose_plan_change" in finish_tool.description
+
+    def test_finish_planning_distinguishes_config_from_blade_fault_identity(
+        self, mock_registry
+    ):
+        """#14-R-live2 deep-dive: the fault-identity triple's contract must tell
+        the planner that a CONFIG-type fault (kubectl-native / CR carrier) has NO
+        canonical target/action vocabulary and its execution carries no blade
+        fault_target, so the target guard's fault-type lock never engages.
+
+        Before this correction the description claimed the triple exists "so the
+        target guard can judge the mechanism against the right fault family" —
+        universally. That is true for blade resource faults but FALSE for config
+        faults: ``guard._fault_type_lock_drift`` compares only when BOTH sides
+        carry a fault_target, and ``EffectiveTarget.fault_target`` is populated
+        only from ChaosBlade tokens. The #14 planning round quoted that claim
+        verbatim and burned ~24 reasoning lines deliberating a target/action name
+        that has no downstream verdict gate. The description now states the code
+        truth so the planner picks a concise descriptive label instead.
+        """
+        tools = _build_skill_tools(mock_registry)
+        finish_tool = next(t for t in tools if t.name == "finish_planning")
+        # The two fault classes are distinguished, and the config class is told
+        # the triple is descriptive with no verdict gate reading it.
+        assert "BLADE resource fault" in finish_tool.description
+        assert "CONFIG-type fault" in finish_tool.description
+        assert "DESCRIPTIVE mechanism label" in finish_tool.description
+        assert "do NOT deliberate" in finish_tool.description
+        # The stale universal claim that drove the churn is gone.
+        assert (
+            "judge the mechanism against the right fault family"
+            not in finish_tool.description
+        )
+        # #49 invariant preserved: still never copy a triple from the case menu.
+        assert "never copy a triple from it" in finish_tool.description
+
+    def test_finish_planning_blast_radius_precedent_drops_taskid_shaped_label(
+        self, mock_registry
+    ):
+        """#14-R-live2 skeleton/weight audit: the blast_radius_scope re-plan
+        precedent keeps its RULE text verbatim but drops the concrete
+        ``run6 inject-3d5de7fa:`` label.
+
+        Behavioural forensics over 444 runs (reasoning_content echoes): the
+        task_id-shaped ``inject-3d5de7fa`` string was cited by 8 runs as a
+        *task_id naming format example* (interference) vs only 3 runs that used
+        the precedent for a blast_radius decision — and those 3 cited the RULE
+        ("warns against pre-emptively narrowing"), never the bare id. The id's
+        provenance stays in developer-facing code comments/tests
+        (tool_screener.py, test_screener.py, test_faultdrill_provider.py) which
+        the model never reads; removing it from the model-facing docstring kills
+        the task_id interference at zero cost to the precedent's rule.
+        """
+        tools = _build_skill_tools(mock_registry)
+        finish_tool = next(t for t in tools if t.name == "finish_planning")
+        # The task_id-shaped label is gone from the model-facing contract.
+        assert "inject-3d5de7fa" not in finish_tool.description
+        # The load-bearing precedent RULE is preserved verbatim.
+        assert (
+            "cluster-wide declared for a CR that was refused"
+            in finish_tool.description
+        )
+        assert (
+            "re-evaluated for the namespace-scoped kubectl-native patch"
+            in finish_tool.description
+        )
+        # The re-plan rule body itself is untouched.
+        assert "Do NOT degrade inline" in finish_tool.description
+        assert "stale pre-degradation scope" in finish_tool.description
+        assert "re-PLAN through finish_planning" in finish_tool.description
+
+    def test_finish_planning_duration_separates_observation_from_recovery_timer(
+        self, mock_registry
+    ):
+        """duration_seconds teaching must split the observation window D from
+        the framework-owned recovery timer (D+G).
+
+        Planning-phase presentation gap (#74-R, inject-310a4bea): the
+        recovery-timer value is derived once at dispatch
+        (registry.enforce_contract_duration -> recovery_timer_seconds(D)=D+G),
+        pinned onto the carrier, and rendered into the execution-phase
+        structured_params_hint. The planning-facing description used to say
+        only "auto-recovery timers ... derive from it", so the planner —
+        reading SKILL.md's "take the execution-prompt-issued
+        recovery_timer_seconds, never self-compute the grace" — had no
+        authoritative value at planning time and burned reasoning deciding
+        whether to compute D+G itself or leave a placeholder. The fix is a
+        descriptive fact on the presentation surface, not a rule: declare D
+        here, the recovery timer is a downstream framework derivation. These
+        assertions pin that split; reverting to the incomplete framing turns
+        them red.
+        """
+        tools = _build_skill_tools(mock_registry)
+        finish_tool = next(t for t in tools if t.name == "finish_planning")
+        desc = finish_tool.description
+        # D is the observation window, distinct from the recovery timer.
+        assert "OBSERVATION window" in desc
+        # The two-number contract: the timer is D + recovery grace.
+        assert "recovery grace" in desc
+        # The timer is program-owned (derived + pinned), not planner-supplied.
+        assert "framework-owned" in desc
+        assert "Default 0 = not declared" in desc
 
 
 class TestCreateAgent:
@@ -697,7 +861,19 @@ class TestPhaseSpecMatrix:
         "phase1": [
             "activate_skill", "read_skill_resource", "read_file",
             "save_fault_plan", "finish_planning", "propose_plan_change",
-            "read_knowledge_resource", "update_progress",
+            "read_knowledge_resource",
+            # Typed L7 HTTP probe (A4): planning establishes the PRE-injection
+            # baseline through the SAME canonical structured probe the verifier
+            # / recover-verifier bind, so an HTTP fault's baseline lands on the
+            # observation timeline as born-structured JSON. Static base, before
+            # update_progress.
+            "http_probe",
+            # Host / python-app sibling of http_probe (static base, right after
+            # it): the born-structured read-only curl delivered on the host, so a
+            # bare-host / application-side L7 baseline lands on the timeline as
+            # structured JSON too. Before update_progress.
+            "host_http_probe",
+            "update_progress",
             "blade_help", "blade_status", "kubectl_read", "host_read",
         ],
         "phase2": [
@@ -716,12 +892,24 @@ class TestPhaseSpecMatrix:
         ],
         "verifier": [
             "read_skill_resource", "execute_skill_script",
-            "read_knowledge_resource", "submit_verification", "time_wait",
+            "read_knowledge_resource",
+            # Typed L7 HTTP probe (L1): the framework-owned read-only curl that
+            # replaces an LLM-hand-written ``kubectl_read exec ... curl`` for
+            # HTTP-fault verification. Static base, before submit_verification.
+            "http_probe",
+            # Host / python-app sibling of http_probe (static base, right after
+            # it) — see the phase1 note. Before submit_verification.
+            "host_http_probe",
+            "submit_verification", "time_wait",
             "update_progress", "kubectl_read", "host_read",
         ],
         "recover_verifier": [
             "read_skill_resource", "execute_skill_script",
-            "read_knowledge_resource", "submit_recover_verification",
+            "read_knowledge_resource",
+            "http_probe",
+            # Host / python-app sibling of http_probe — see the phase1 note.
+            "host_http_probe",
+            "submit_recover_verification",
             "time_wait", "update_progress", "kubectl", "host_inject",
         ],
     }

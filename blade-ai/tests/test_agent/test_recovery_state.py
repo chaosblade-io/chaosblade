@@ -183,7 +183,7 @@ def test_build_recover_initial_from_checkpoint_carries_liability_records():
 def test_connection_override_outranks_frozen_checkpoint_on_every_field():
     """The caller-carried connection (session-bound environment snapshot)
     replaces the injector's frozen credentials on all four axes, and a
-    carried channel mode travels with it so TransportTarget.from_state
+    carried channel mode travels with it so resolve_transport_target
     resolves the matching transport."""
     initial = build_recover_initial_from_checkpoint(
         {
@@ -447,3 +447,89 @@ def test_workspace_id_absent_defaults_to_empty_string():
     )
     assert initial["workspace_id"] == ""
     assert initial["tenant_id"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Frozen-channel inheritance (Case #87) — recover is channel-affine: with no
+# carried connection it pins the injection-time channel instead of re-deriving
+# one from ambient settings that may have drifted since inject.
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_channel_inherited_when_no_connection_override():
+    """Bare CLI / HTTP / auto-recover carries no connection: the injection-time
+    frozen channel becomes the recover channel, so a drifted ambient config
+    cannot silently re-route the transport."""
+    initial = build_recover_initial_from_checkpoint(
+        {
+            "experiment_uid": "uid-123",
+            "fault_spec": {"scope": "deployment"},
+            "kube_connection_mode": "kubeconfig",
+        },
+        "task-inject",
+    )
+    assert initial["kube_connection_mode"] == "kubeconfig"
+
+
+def test_connection_override_channel_outranks_frozen_channel():
+    """The recovering caller's explicitly carried channel still wins over the
+    frozen injection channel — the 2026-09-15 identity rule is preserved: a
+    cross-user recover runs on the recoverer's session-bound environment."""
+    initial = build_recover_initial_from_checkpoint(
+        {
+            "experiment_uid": "uid-123",
+            "kube_connection_mode": "kubeconfig",
+        },
+        "task-inject",
+        connection_override={"kube_connection_mode": "kubewiz_host"},
+    )
+    assert initial["kube_connection_mode"] == "kubewiz_host"
+
+
+def test_absent_channel_everywhere_keeps_key_unset():
+    """Neither conn nor frozen inject value carries a mode (a task injected
+    before the channel was frozen): the key stays absent so resolution falls
+    back to the caller's settings — zero regression to legacy behavior."""
+    initial = build_recover_initial_from_checkpoint(
+        {"experiment_uid": "uid-123", "fault_spec": {"scope": "deployment"}},
+        "task-inject",
+    )
+    assert "kube_connection_mode" not in initial
+
+
+def test_case87_frozen_channel_makes_guard_resolve_k8s_not_unknown(monkeypatch):
+    """End-to-end guard regression for Case #87.
+
+    Ambient settings drifted to a host channel between inject and recover, but
+    the recover state now carries the frozen ``kubeconfig`` channel, so the
+    scope/transport guard resolves k8s (tools dispatch) instead of fail-closing
+    to unknown. The contrast leg drops the frozen channel and reproduces the
+    original fail-closed verdict, proving the freeze is what closes the gap.
+    """
+    from chaos_agent.agent.capabilities.context import resolve_profile_for_state
+    from chaos_agent.config.settings import settings
+
+    # Ambient config drifted to a host channel after injection.
+    monkeypatch.setattr(settings, "kube_connection_mode", "ssh")
+    monkeypatch.setattr(settings, "ssh_host", "127.0.0.1")
+
+    pinned = build_recover_initial_from_checkpoint(
+        {
+            "experiment_uid": "uid-123",
+            "fault_spec": {"scope": "deployment"},
+            "kube_connection_mode": "kubeconfig",  # frozen at inject time
+        },
+        "task-inject",
+    )
+    assert pinned["kube_connection_mode"] == "kubeconfig"
+    # deployment scope (k8s) + frozen kubeconfig transport (k8s) agree.
+    assert resolve_profile_for_state(pinned) == "k8s"
+
+    drifted = build_recover_initial_from_checkpoint(
+        {"experiment_uid": "uid-123", "fault_spec": {"scope": "deployment"}},
+        "task-inject",
+    )
+    assert "kube_connection_mode" not in drifted
+    # No frozen channel → ambient ssh/host mismatches the deployment scope →
+    # the guard fail-closes (the original Case #87 symptom).
+    assert resolve_profile_for_state(drifted) == "unknown"

@@ -20,11 +20,16 @@ Design rationale (from first-principles audit of task-d0f0f506 recovery):
 """
 
 from chaos_agent.agent.prompts.reminder import (
+    CONCURRENT_BATCH_FACT,
     PARALLELIZE_PRINCIPLE,
     SYSTEM_REMINDER_DECLARATION,
 )
 from chaos_agent.agent.prompts.sections.experience_section import get_experience_section
 from chaos_agent.agent.prompts.sections.knowledge_sections import get_knowledge_summary_section
+from chaos_agent.agent.prompts.sections.verification import (
+    STATUS_NOT_APPLICABLE_DEFINITION,
+)
+from chaos_agent.agent.result.verdict import ChecklistItemStatus
 from chaos_agent.transports import PROFILE_K8S
 
 
@@ -72,6 +77,7 @@ def get_recover_core_principles_section() -> str:
 - When a tool returns error, the TOOL is right — verify its actual interface before retrying
 - If an observation repeatedly fails or returns the same unexpected result, suspect your METHOD (wrong filter/command/assumption), not the target — switch to structured status (conditions/events/resource state) instead of retrying the same command. If still unobservable, mark the step skipped with the reason; never silently omit
 - {PARALLELIZE_PRINCIPLE}
+- {CONCURRENT_BATCH_FACT}
 - {SYSTEM_REMINDER_DECLARATION}"""
 
 
@@ -169,6 +175,53 @@ Judgement:
   and a clean-attribution tail must never be recorded as partial."""
 
 
+# Recover-face checklist status DEFINITIONS, keyed by every ChecklistItemStatus
+# member. Same B76-completion root fix as the inject face (verification.py):
+# submit_recover_verification's checklist exposes ALL 7 enum values (derived
+# from ChecklistItemStatus) but this block hand-defined only 4 — leaving
+# `not_applicable`, `expected` and `recovered_before_observation` taught with no
+# meaning, the identical gap that made the inject verifier invent a definition
+# for not_applicable and flip-flop it against skipped. `not_applicable` is
+# CONTEXT-INVARIANT so it is imported from the single source in verification.py
+# (not re-copied); the polarity-flipping members carry their recover-side
+# meaning here (passed = effect ABSENT). Rendering iterates the enum and indexes
+# this map, so a member without a definition raises KeyError at import.
+_RECOVER_CHECKLIST_STATUS_DEFINITIONS: dict[ChecklistItemStatus, str] = {
+    ChecklistItemStatus.PASSED: (
+        "Fault effect is absent for this metric (back to baseline or within "
+        "healthy range)."
+    ),
+    ChecklistItemStatus.PARTIAL: (
+        "Inconclusive — some indicators show recovery, others do not."
+    ),
+    ChecklistItemStatus.FAILED: (
+        "Fault effect is still present for this metric."
+    ),
+    ChecklistItemStatus.SKIPPED: (
+        "The step DOES apply and should have been run, but you could NOT "
+        "execute it (tool unavailable / no read-only channel) — a genuine "
+        "coverage gap. A conditional step that correctly did not trigger is "
+        "'not_applicable', NOT 'skipped'."
+    ),
+    ChecklistItemStatus.RECOVERED_BEFORE_OBSERVATION: (
+        "The fault effect had already dissipated before you could observe the "
+        "post-recovery state (e.g. auto-recovery fired first) — nothing "
+        "persists to verify against. Record what you observe now."
+    ),
+    ChecklistItemStatus.EXPECTED: (
+        "A residual deviation you OBSERVED that is anticipated as recovery "
+        "propagation cost (the system converging after the undo), NOT a fault "
+        "residual. Use when the trajectory is improving toward baseline."
+    ),
+    ChecklistItemStatus.NOT_APPLICABLE: STATUS_NOT_APPLICABLE_DEFINITION,
+}
+
+_RECOVER_CHECKLIST_STATUS_DEFINITIONS_BLOCK = "\n".join(
+    f"- **{member.value}**: {_RECOVER_CHECKLIST_STATUS_DEFINITIONS[member]}"
+    for member in ChecklistItemStatus
+)
+
+
 def get_recover_output_format_section(*, layer1_label: str = "deterministic destroy") -> str:
     """Machine-parseable output specification for recovery verification.
 
@@ -208,10 +261,7 @@ or "unverified" when the observation channel itself was unavailable.
 - **unrecovered**: Fault effect is STILL present despite recovery attempt.
 
 **Per-Step Status Definitions**:
-- **passed**: Fault effect is absent for this metric (back to baseline or within healthy range).
-- **failed**: Fault effect is still present for this metric.
-- **skipped**: Could not execute this check (tool unavailable).
-- **partial**: Inconclusive — some indicators show recovery, others do not.
+{_RECOVER_CHECKLIST_STATUS_DEFINITIONS_BLOCK}
 
 Checklist = OBSERVED FACTS. Overall = HOLISTIC JUDGMENT. A checklist CAN
 hold 'partial' items (e.g. convergence still in progress) while Overall says

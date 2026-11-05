@@ -15,7 +15,7 @@ import re
 import shlex
 import time
 from copy import deepcopy
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -26,6 +26,9 @@ from chaos_agent.agent.target_guard.classifier import (
 )
 from chaos_agent.agent.target_guard.types import SCOPE_ESCAPE
 from chaos_agent.agent.tool_verdicts import message_result_failed
+
+if TYPE_CHECKING:
+    from chaos_agent.transports import TransportTarget
 
 logger = logging.getLogger(__name__)
 
@@ -501,6 +504,10 @@ def issue_call_is_registered_teardown(
       with ToolGuard's admission rule) is the host twin of the carrier
       arm — every host skill 降级方案 prescribes "先武装定时恢复，再
       注入", and the payload runs at the DEADLINE, never at issue time.
+      The no-systemd Tier-2 twin (``setsid --fork`` detached-timer) is
+      exempt on the SAME face by its own guard-shared form primitive
+      (:func:`chaos_agent.tools.guard.is_setsid_detached_timer`), so a
+      no-systemd host's arm-first order is not mis-attributed either.
       Without this face the arm-first order pre-empted the host_native
       slot (a failed injection after a successful arm reported the task
       as injected), mis-marked combo on blade+timer pairs, and read as
@@ -580,11 +587,17 @@ def host_call_is_registered_recovery(
       never re-derived here). An admitted systemd-run call is therefore
       a timer registration by construction, and every other host inject
       command (``kill -STOP``, ``iptables``, ``dd`` — the fault binaries)
-      stays attributed. R25/G-8 adds the DIRECT ``blade destroy/revoke``
-      argv (judged by :func:`_is_host_blade_demolition`) — the host
-      twin of the kubectl BLADE-DEMOLITION face: the host shell's
-      ``issue_time_method`` has no verb filter on inject tools, so the
-      same demolition delivery was mis-attributed ``host_native`` there.
+      stays attributed. The Tier-2 no-systemd twin ``setsid`` is admitted
+      ONLY as a detached self-recovery timer
+      (:func:`chaos_agent.tools.guard.is_setsid_detached_timer` — the SAME
+      primitive the guard's ``_check_setsid`` admits on), so an admitted
+      ``setsid --fork sh -c 'sleep <N> && <inverse>'`` arm is a timer
+      registration exactly like the systemd-run one. R25/G-8 adds the
+      DIRECT ``blade destroy/revoke`` argv (judged by
+      :func:`_is_host_blade_demolition`) — the host twin of the kubectl
+      BLADE-DEMOLITION face: the host shell's ``issue_time_method`` has no
+      verb filter on inject tools, so the same demolition delivery was
+      mis-attributed ``host_native`` there.
     - INJECT CARRIERS ONLY. The tool-name domain is the provider's own
       ``inject_tool_names`` (``host_inject`` / ``exec_host_command`` /
       ``shell``), single-sourced through the declaration seam
@@ -625,11 +638,21 @@ def host_call_is_registered_recovery(
         if not isinstance(binary, str) or not binary:
             return False
         argv = [binary] + [str(a) for a in extra]
-    from chaos_agent.tools.guard import is_systemd_run_timer
+    from chaos_agent.tools.guard import (
+        is_setsid_detached_timer,
+        is_systemd_run_timer,
+    )
 
     if _is_host_blade_demolition(argv):
         return True
-    return is_systemd_run_timer(argv)
+    # HOST face admits BOTH self-recovery timer carriers, single-sourced
+    # through the guard's form primitives: Tier-1 ``systemd-run --on-active``
+    # (systemd present) and Tier-2 ``setsid --fork`` detached-timer (no
+    # systemd). Both arm a payload that fires at the DEADLINE, never at issue
+    # time, so both are timer registrations, not injections (R23/G-7 seam,
+    # Tier-2 twin). The guard rejects every other shape of both binaries
+    # BEFORE the tool runs, so these form verdicts ARE the machinery verdicts.
+    return is_systemd_run_timer(argv) or is_setsid_detached_timer(argv)
 
 
 def is_registered_channel_exec(effective: Any, artifacts: list) -> bool:
@@ -929,6 +952,7 @@ def collect_execution_artifacts(
             if not pod_names:
                 continue
             deleted = set(pod_names)
+            delete_call_id = getattr(message, "tool_call_id", "")
             for artifact in artifacts.values():
                 if artifact.get("type") == "recovery_carrier":
                     # A confirmed manual ``kubectl delete pod <carrier>``
@@ -942,19 +966,40 @@ def collect_execution_artifacts(
                     # active so the next cleanup round runs the idempotent
                     # four-way sweep. Already-cleaned artifacts stay
                     # cleaned (replayed deletes must not revive them).
-                    if (
-                        artifact.get("name") in deleted
-                        and artifact.get("status") == "recovery_armed"
-                        and (
-                            not namespace
-                            or artifact.get("namespace") == namespace
-                        )
+                    if artifact.get("name") not in deleted or (
+                        namespace and artifact.get("namespace") != namespace
                     ):
+                        continue
+                    # REPLAY GUARD, symmetric to ``host_exec_seen_ids`` on
+                    # the arming side. This collector rescans the FULL
+                    # message history every execute-loop iteration; a delete
+                    # that PRECEDED the arming in history (a node-migration
+                    # carrier rebuild — delete + recreate the SAME carrier
+                    # name) is replayed on every rescan against the SEEDED
+                    # ``recovery_armed`` status and disarms it, while the
+                    # arming's own seen-ids guard in
+                    # ``_mark_bounded_host_recovery`` blocks a re-stamp — so
+                    # the armed state becomes structurally unstable and the
+                    # armed-before-inject gate rejects a carrier that WAS
+                    # validly armed (case #13: the compact-variable AND the
+                    # full-inline arming both stamped, both were replay-
+                    # disarmed on the next rescan; the injection only landed
+                    # by racing the scale ahead of the disarming rescan, and
+                    # the agent mis-attributed the churn to the payload
+                    # form). A delete fires its disarm AT MOST ONCE — at its
+                    # own iteration, when it is the latest lifecycle event,
+                    # so it can only kill an arming that genuinely precedes
+                    # it; later replays are no-ops and can never reach
+                    # forward to disarm a LATER arming.
+                    disarm_seen = artifact.setdefault("disarm_seen_ids", [])
+                    if delete_call_id and delete_call_id in disarm_seen:
+                        continue
+                    if delete_call_id:
+                        disarm_seen.append(delete_call_id)
+                    if artifact.get("status") == "recovery_armed":
                         artifact["status"] = "active"
                         artifact.pop("recovery_deadline_epoch", None)
-                        artifact["cleanup_tool_call_id"] = getattr(
-                            message, "tool_call_id", "",
-                        )
+                        artifact["cleanup_tool_call_id"] = delete_call_id
                     continue
                 if artifact.get("type") != "debug_pod":
                     continue
@@ -1157,6 +1202,7 @@ async def _read_pod_phase(
     *,
     kubeconfig: str,
     task_id: str,
+    target: TransportTarget | None = None,
 ) -> str | None:
     """Live-read a vehicle pod's Kubernetes phase; ``None`` on any failure.
 
@@ -1170,21 +1216,24 @@ async def _read_pod_phase(
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import (
         PROFILE_K8S,
-        TransportTarget,
         execute_via_transport,
+        resolve_transport_target,
     )
 
     name = str(artifact.get("name") or "")
     namespace = str(artifact.get("namespace") or "")
     if not name or not namespace:
         return None
+    _target = target if target is not None else resolve_transport_target(None)
     get_cmd = build_kubectl_cmd("get", [
         "pod", name, "-n", namespace,
         "-o", "jsonpath={.status.phase}",
-    ], kubeconfig=kubeconfig)
+    ], kubeconfig=kubeconfig, target=_target)
     try:
         result = await execute_via_transport(
-            get_cmd, TransportTarget.from_state({}), timeout=15,
+            get_cmd,
+            _target,
+            timeout=15,
             task_id=task_id, expect_profile=PROFILE_K8S,
         )
     except Exception:  # noqa: BLE001 — liveness read is best-effort
@@ -1195,11 +1244,73 @@ async def _read_pod_phase(
     return phase or None
 
 
+def settle_recovered_carriers(
+    artifacts: list[dict] | None,
+    *,
+    task_id: str | None = None,
+) -> int:
+    """Disarm recovery carriers once recovery is a VERIFIED fact (W-70-2).
+
+    The keep-while-armed gate in :func:`cleanup_debug_pod_artifacts` holds a
+    ``recovery_armed`` carrier back from the four-piece teardown purely on its
+    ``recovery_deadline_epoch`` — a CLOCK proxy for "the recovery this carrier
+    guarantees is still outstanding". That proxy is exact only while the
+    carrier's own timer is the sole path to recovery. ``blade-ai recover`` is a
+    second, authoritative path: Layer1 restores the fault, Layer2 re-observes
+    the cluster and confirms it. When that confirmation lands BEFORE the
+    deadline (early recover), recovery is an achieved FACT while the clock still
+    reads "armed, deadline in future" — the gate keeps a carrier whose promise
+    is already fulfilled, and its ServiceAccount/Role/RoleBinding linger past
+    task end with no system-side trigger left to collect them (the Pod lapses on
+    its own sleep skeleton; the RBAC three do not).
+
+    This is the lifecycle transition the state machine was missing: a carrier is
+    discharged not only when its deadline passes / it dies / it is manually
+    deleted, but when the recovery it holds for is CONFIRMED achieved. Only the
+    recover graph's verified verdict may assert that fact, so only it calls this
+    — and only on a FULL ``recovered`` verdict. A ``partial`` leaves the
+    outstanding remainder to the carrier's timer, so the carrier MUST stay armed
+    (discharging it there would strand the un-recovered part with no backstop).
+
+    Mirrors the manual-``kubectl delete`` disarm above: ``recovery_armed`` →
+    ``active`` + drop the deadline, so the next sweep runs the idempotent
+    four-delete. Stamps ``recovery_settled_by`` to record WHY the hold was
+    released (audit symmetry with ``recovery_void``, which records the opposite
+    — a reversal killed while still pending). This is NOT a void: the reversal
+    already happened via the recover graph, so deleting the now-redundant
+    carrier pod kills nothing owed; a host-level timer that still fires
+    re-applies an idempotent baseline restore (no-op). Type-agnostic on purpose
+    — the gate keys on ``status``, so its exact complement must too (covers both
+    a ``recovery_carrier`` and a ``debug_pod`` armed with a bounded recovery).
+    Mutates in place; returns the number of carriers settled.
+    """
+    settled = 0
+    for artifact in artifacts or []:
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("status") != "recovery_armed":
+            continue
+        artifact["status"] = "active"
+        artifact.pop("recovery_deadline_epoch", None)
+        artifact["recovery_settled_by"] = "recover_graph"
+        settled += 1
+        if task_id:
+            logger.info(
+                "[%s] recovery carrier %s disarmed — recovery CONFIRMED by the "
+                "recover graph before the deadline (W-70-2); releasing the "
+                "keep-while-armed hold so the finalize sweep runs the "
+                "four-delete.",
+                task_id, artifact.get("name") or "",
+            )
+    return settled
+
+
 async def cleanup_debug_pod_artifacts(
     artifacts: list[dict] | None,
     *,
     kubeconfig: str,
     task_id: str,
+    target: TransportTarget | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Fire-and-forget cleanup of tracked debug pods.
 
@@ -1229,7 +1340,7 @@ async def cleanup_debug_pod_artifacts(
             # never fatal here either — same fire-and-forget contract as
             # every other artifact type.
             swept = await _sweep_provider_artifact(
-                artifact, kubeconfig, task_id,
+                artifact, kubeconfig, task_id, target=target,
             )
             if swept:
                 artifact["status"] = "cleaned"
@@ -1257,7 +1368,7 @@ async def cleanup_debug_pod_artifacts(
             # self-recovery is pending off the persisted record, not off a
             # live render here.
             phase = await _read_pod_phase(
-                artifact, kubeconfig=kubeconfig, task_id=task_id,
+                artifact, kubeconfig=kubeconfig, task_id=task_id, target=target,
             )
             if phase is None:
                 return
@@ -1311,6 +1422,7 @@ async def cleanup_debug_pod_artifacts(
                 }.get(trio[0], 5))
                 outcomes = [("pod", name, await delete_debug_pod(
                     name, kubeconfig, task_id, namespace=namespace,
+                    target=target,
                 ))]
                 for family_kind, family_name, family_ns in family:
                     if family_name == name and family_kind == "pod":
@@ -1318,6 +1430,7 @@ async def cleanup_debug_pod_artifacts(
                     outcomes.append((family_kind, family_name, await delete_debug_pod(
                         family_name, kubeconfig, task_id,
                         namespace=family_ns, kind=family_kind,
+                        target=target,
                     )))
                 unconfirmed = [
                     f"{k}/{n}" for k, n, o in outcomes if o != "confirmed"
@@ -1331,6 +1444,7 @@ async def cleanup_debug_pod_artifacts(
             else:
                 outcome = await delete_debug_pod(
                     name, kubeconfig, task_id, namespace=namespace, kind=kind,
+                    target=target,
                 )
         # Mark cleaned regardless of outcome — the pod's ``-- sleep 3600`` bound
         # lets an unlanded delete lapse on its own; we never retry it.
@@ -1354,14 +1468,15 @@ async def cleanup_debug_pod_artifacts(
 
 
 async def _sweep_provider_artifact(
-    artifact: dict, kubeconfig: str, task_id: str,
+    artifact: dict, kubeconfig: str, task_id: str, *,
+    target: TransportTarget | None = None,
 ) -> bool | None:
     """Registry claim-sweep for one provider-owned artifact (never raises)."""
     from chaos_agent.agent.providers.registry import FaultProviderRegistry
 
     try:
         return await FaultProviderRegistry.sweep_artifact(
-            artifact, kubeconfig=kubeconfig, task_id=task_id,
+            artifact, kubeconfig=kubeconfig, task_id=task_id, target=target,
         )
     except Exception:  # noqa: BLE001 — a sweep failure keeps the artifact
         logger.warning(
@@ -2017,6 +2132,25 @@ def _create_role_verbs(args: list[str]) -> list[str]:
 _PATCH_RBAC_KINDS = frozenset({"role", "clusterrole"})
 
 
+def _rbac_patch_add_verbs(v_args: str) -> set[str]:
+    """Verbs named in a patch payload's ``"verbs": [...]`` arrays.
+
+    Read off the RAW ``v_args`` rather than shlex tokens: a json-patch
+    payload with inner spaces splits into many tokens, and only the raw
+    line keeps the arrays whole. Shared by the grant-folding
+    (:func:`_extend_recovery_carrier_rbac_verbs`) and the armed-gate
+    construction exemption (:func:`is_vehicle_rbac_verb_patch`) so both
+    read the SAME payload shape — single source, no second parser to
+    drift.
+    """
+    return {
+        verb.strip().lower()
+        for match in re.finditer(r'"verbs"\s*:\s*\[([^\]]*)\]', v_args)
+        for verb in re.findall(r'"([^"]+)"', match.group(1))
+        if verb.strip()
+    }
+
+
 def _extend_recovery_carrier_rbac_verbs(
     artifacts: dict[str, dict], v_args: str,
 ) -> None:
@@ -2048,12 +2182,7 @@ def _extend_recovery_carrier_rbac_verbs(
     if kind not in _PATCH_RBAC_KINDS:
         return
     name = positionals[1]
-    add_verbs = {
-        verb.strip().lower()
-        for match in re.finditer(r'"verbs"\s*:\s*\[([^\]]*)\]', v_args)
-        for verb in re.findall(r'"([^"]+)"', match.group(1))
-        if verb.strip()
-    }
+    add_verbs = _rbac_patch_add_verbs(v_args)
     if not add_verbs:
         return
     for artifact in artifacts.values():
@@ -2071,6 +2200,73 @@ def _extend_recovery_carrier_rbac_verbs(
                     set(member.get("verbs") or []) | add_verbs
                 )
         return
+
+
+def is_vehicle_rbac_verb_patch(artifacts: list, *, v_args: str = "") -> bool:
+    """True when a patch is an add-only verb ADDITION to a REGISTERED carrier Role.
+
+    Symmetric to :func:`is_vehicle_teardown_delete` for the two-step
+    carrier-RBAC construction. A recovery carrier whose restore payload
+    spans two resource families with non-uniform verbs
+    (``deployments/scale:[get,patch]`` + ``limitranges:[get,delete]``)
+    cannot be built by one ``kubectl create role`` (one rule = one
+    resource-group x one verb-set), so the standard's second step
+    (``kubectl patch role <carrier> --type=json -p
+    '[{"op":"add","path":"/rules/-",...}]'``) APPENDS the missing verbs.
+    That patch targets machinery this task built — the carrier's OWN
+    registered Role — never a fault target, so the armed-before-inject
+    gate must exempt it exactly as it exempts a teardown delete. Without
+    the exemption the gate deadlocks against B85: B85
+    (:func:`_screen_carrier_restore_verbs`) refuses to arm until the Role
+    grants every payload write verb, ``delete`` can only arrive via this
+    patch, and the gate forbids the patch before arming — even though B85's
+    own remediation text prescribes exactly this patch and
+    :func:`_extend_recovery_carrier_rbac_verbs` exists to fold it.
+
+    Strict scope (fail-closed): the patch must (1) name a role/clusterrole
+    that is a REGISTERED ``rbac_family`` member of a ``recovery_carrier``
+    (the same exact-name attachment :func:`_attach_recovery_carrier_rbac`
+    uses — an unregistered or sibling-named Role does NOT qualify, which is
+    why the #71 workaround's second ``create role drill-rc-*-lr`` never
+    satisfied B85), and (2) be an add-only widening — every json-patch
+    ``op`` is ``add`` and the payload carries a non-empty ``verbs`` array.
+    A ``replace``/``remove`` (shrinks or rewrites an existing grant), a
+    strategic-merge patch with no explicit ``add`` op, or a patch with no
+    verb addition returns False and falls back to the gate's rejection.
+    """
+    try:
+        args = shlex.split(v_args)
+    except ValueError:
+        args = v_args.split()
+    positionals = [token for token in args if not token.startswith("-")]
+    if len(positionals) < 2:
+        return False
+    kind = canonicalise_kind(positionals[0].lower())
+    if kind not in _PATCH_RBAC_KINDS:
+        return False
+    name = positionals[1]
+    # Add-only widening: every json-patch op must be ``add`` (a
+    # replace/remove rewrites or shrinks an existing grant, outside the
+    # two-step construction pattern), and the payload must actually add
+    # verbs. Both read the raw v_args via the shared parser.
+    ops = re.findall(r'"op"\s*:\s*"([^"]+)"', v_args)
+    if not ops or any(op.strip().lower() != "add" for op in ops):
+        return False
+    if not _rbac_patch_add_verbs(v_args):
+        return False
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("type") != "recovery_carrier":
+            continue
+        for member in artifact.get("rbac_family") or []:
+            if (
+                isinstance(member, dict)
+                and canonicalise_kind(str(member.get("kind") or "")) == kind
+                and str(member.get("name") or "") == name
+            ):
+                return True
+    return False
 
 
 def _artifact_key(artifact: dict) -> str:
@@ -2096,6 +2292,7 @@ __all__ = [
     "parse_drill_vehicle_markers",
     "recovery_anchor_offsets",
     "recovery_time_anchors",
+    "settle_recovered_carriers",
     "VEHICLE_ARTIFACT_TYPES",
     "vehicle_artifact_types",
 ]

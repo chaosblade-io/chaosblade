@@ -45,7 +45,13 @@ async def compute_env_info(task_id: str = "") -> dict:
     #
     # Local import: avoid a module-level circular import
     # (transports -> config.settings -> ... -> agent.env_info).
-    from chaos_agent.transports import KUBEWIZ_CHANNELS, resolve_channel_name
+    from chaos_agent.transports import (
+        KUBEWIZ_CHANNELS,
+        PROFILE_HOST,
+        profile_of,
+        resolve_channel_name,
+        resolve_transport_target,
+    )
     _channel_name = resolve_channel_name()
     env["kube_connection_mode"] = _channel_name
     if _channel_name in KUBEWIZ_CHANNELS:
@@ -54,6 +60,26 @@ async def compute_env_info(task_id: str = "") -> dict:
     else:
         env["kubeconfig_path"] = settings.kubeconfig_path or "(default)"
         env["kube_context"] = settings.kube_context or "(current)"
+
+    # D1: ``_get_blade_version`` probes the agent-LOCAL vendor blade, but a
+    # host-scoped drill executes injections with the REMOTE host's blade, whose
+    # version can differ (observed: local vendor 1.9.0-alpha vs target host
+    # 1.8.2). Presenting the local version as ``blade_version`` misleads the
+    # planner into a spurious "agent-side vs host-side blade mismatch" story —
+    # the confusion is manufactured by this field, not by any routing error
+    # (blade_bin_for already sends host-scope commands to the remote blade).
+    # Make the field scope-truthful: for a host channel, probe the blade that
+    # actually runs and label the local one as local so the model can never
+    # conflate them.
+    if profile_of(_channel_name) == PROFILE_HOST:
+        host_ver = await _get_host_blade_version(resolve_transport_target(None))
+        local_ver = env["blade_version"]
+        env["blade_version"] = (
+            f"{host_ver} (target host blade; agent-local blade {local_ver})"
+            if host_ver
+            else f"(target host blade unprobed; agent-local blade {local_ver})"
+        )
+
     env["model_name"] = settings.model_name
 
     if task_id:
@@ -98,6 +124,41 @@ async def _get_blade_version() -> str:
     except (FileNotFoundError, OSError):
         pass
     return "not installed"
+
+
+async def _get_host_blade_version(target) -> str:
+    """Probe the blade version ON the target host (host-scoped drills only).
+
+    ``_get_blade_version`` reports the agent-local vendor blade; in a host
+    drill the injection actually runs the remote host's blade, whose version
+    can differ. Probe it through the transport so the Environment section
+    carries the version that will execute. Best-effort by contract: any
+    transport/probe failure yields ``""`` and the caller labels the field, so
+    prompt assembly never breaks on an unreachable host. ``skip_guard`` mirrors
+    the local probe's status as an internal, high-frequency check.
+    """
+    from chaos_agent.transports.executor import execute_via_transport
+    from chaos_agent.transports.registry import PROFILE_HOST
+
+    host_blade = settings.host_blade_path or "blade"
+    try:
+        result = await execute_via_transport(
+            [host_blade, "version"],
+            target,
+            timeout=10,
+            skip_guard=True,
+            source="env-host-blade-version",
+            # Fail closed: the probe MUST reach the target host. If the channel
+            # cannot serve a host profile the command is refused (exit != 0),
+            # the helper returns "", and the caller labels the field "unprobed"
+            # — never silently reporting the agent-local version as the host's.
+            expect_profile=PROFILE_HOST,
+        )
+        if result.exit_code == 0 and result.stdout:
+            return result.stdout.strip()
+    except Exception:  # noqa: BLE001 - best-effort probe, never fail prompt assembly
+        pass
+    return ""
 
 
 async def _check_k8s_available() -> bool:

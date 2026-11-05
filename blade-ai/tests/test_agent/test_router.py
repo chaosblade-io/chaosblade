@@ -234,6 +234,36 @@ class TestShouldContinueExecuteLoop:
         }
         assert should_continue_execute_loop(state) == "replan"
 
+    @patch("chaos_agent.agent.router.settings")
+    def test_readonly_batch_with_active_fault_never_infers_completion(self, mock_settings):
+        """Negative guard (trust-finish-execution-handoff): the router must NEVER
+        infer "injection complete" from a read-only batch. Even with a fault
+        committed and the next batch pure observation with no un-performed step,
+        execute CONTINUES — a multi-step injection (delete-and-recreate / hybrid)
+        legitimately issues read-only batches between steps, which are
+        indistinguishable from a post-injection observation. Completion is the
+        model's own call: finish_execution (ledger terminal → verifier) or simply
+        stopping tool_calls (has_active_fault → verifier). The former
+        arm-then-handoff gate cut here on a fuzzy proxy (find_readonly_violations
+        fails open; build_injection_step_selfcheck under-reports) and risked
+        slicing multi-step injections mid-flight. This test fails if any
+        completion-inference gate is re-introduced on the read-only-batch path."""
+        mock_settings.max_execute_loop = 15
+        ai_msg = type("AIMsg", (), {
+            "tool_calls": [{"name": "kubectl", "args": {"command": "get pods"}}],
+            "type": "ai", "content": "",
+        })()
+        state = {
+            "execute_loop_count": 1,
+            "experiment_uid": None,
+            "error": None,
+            "injection_method": "kubectl_native",
+            "skill_case_content": "",
+            "messages": [ai_msg],
+        }
+        with patch("chaos_agent.agent.router.has_active_fault", return_value=True):
+            assert should_continue_execute_loop(state) == "continue"
+
 
 class TestRouteAfterSafety:
     """Test route_after_safety routing."""

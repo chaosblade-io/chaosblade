@@ -15,6 +15,8 @@ from chaos_agent.tools import (
     safe_read_file,
     safe_write_file,
     read_knowledge_resource,
+    http_probe,
+    host_http_probe,
 )
 
 # Backend execution tools (blade_* / kubectl / kubectl_read) are no longer
@@ -196,6 +198,31 @@ def _phase_specs(skill_tools) -> tuple[PhaseSpec, ...]:
                 _finish_planning,
                 _propose_plan_change,
                 read_knowledge_resource,
+                # Typed L7 HTTP probe — the SAME framework-owned, born-
+                # structured read-only curl the verifier / recover-verifier
+                # bind. Planning establishes the PRE-injection baseline, and
+                # for an HTTP fault that baseline (http_code / latency / and,
+                # with capture=headers/body, the header/body verdict anchors)
+                # must be measured through the same canonical probe so it lands
+                # on the observation timeline as structured JSON — otherwise
+                # the LLM hand-writes a baseline curl that the extractor cannot
+                # parse and the case note's "planning baseline also prefers
+                # http_probe" is a dead promise. Read-only by construction
+                # (classified SCOPE_READONLY by name), so it never trips the
+                # PLAN-phase screen.
+                http_probe,
+                # Host / application-side sibling of ``http_probe`` — the SAME
+                # framework-owned, born-structured read-only curl, but delivered
+                # on the HOST the transport addresses (no client pod to exec
+                # into). This is the ONLY structured L7 observation channel for a
+                # bare-host fault or a python-app HTTP fault reached from the
+                # host: without it the verifier hand-writes a ``host_read`` curl
+                # whose bare text the extractor cannot parse, so http_code /
+                # latency never reach the cross-check timeline (the host face of
+                # the same Case #84 gap ``http_probe`` closed for k8s). Read-only
+                # by construction (classified SCOPE_READONLY by name), so it
+                # never trips the PLAN-phase screen.
+                host_http_probe,
                 update_progress,
             ),
             provider_phase=PLAN,
@@ -236,6 +263,19 @@ def _phase_specs(skill_tools) -> tuple[PhaseSpec, ...]:
                 _read_skill_resource,
                 _execute_skill_script,
                 read_knowledge_resource,
+                # Typed L7 HTTP probe — the framework-owned, born-structured
+                # read-only curl that replaces an LLM-hand-written
+                # ``kubectl_read exec ... curl`` for HTTP-fault verification
+                # (status code / latency). Read-only by construction (classified
+                # SCOPE_READONLY by name), so it never trips the phase screen.
+                http_probe,
+                # Host / application-side sibling of ``http_probe`` (see the PLAN
+                # note): the born-structured read-only curl delivered on the host,
+                # so a bare-host or python-app HTTP fault is verified through the
+                # same canonical probe instead of an unparseable hand-written
+                # ``host_read`` curl. Read-only by construction (SCOPE_READONLY by
+                # name), so it never trips the phase screen.
+                host_http_probe,
                 submit_verification,
                 time_wait,
                 update_progress,
@@ -249,6 +289,17 @@ def _phase_specs(skill_tools) -> tuple[PhaseSpec, ...]:
                 _read_skill_resource,
                 _execute_skill_script,
                 read_knowledge_resource,
+                # Same typed HTTP probe as the inject verifier — recover Layer 2
+                # must confirm the L7 symptom CLEARED (e.g. http_code 503→200)
+                # from the same independent client pod, without a hand-written
+                # curl being rejected mid-recovery (Case #84 recover side).
+                http_probe,
+                # Same host-side typed probe as the inject verifier — recover
+                # Layer 2 must confirm a host / python-app L7 symptom CLEARED
+                # (e.g. http_code 503→200) from the host vantage, without a
+                # hand-written curl being rejected or going unparseable
+                # mid-recovery.
+                host_http_probe,
                 submit_recover_verification,
                 time_wait,
                 update_progress,
@@ -586,6 +637,19 @@ def with_thinking_disabled(llm):
     return llm.model_copy(update={"extra_body": _payload})
 
 
+def _basename_stem(name: str) -> str:
+    """Strip a single trailing extension from a basename.
+
+    ``"Pod_网络故障_网络包乱序.md"`` → ``"Pod_网络故障_网络包乱序"``; a name with
+    no dot is returned unchanged. Only the LAST dot segment is dropped, so
+    multi-dot names (``examples.v2.yaml`` → ``examples.v2``) keep their inner
+    dots. Case-file basenames use underscores, never dots, so this is safe for
+    the catalogue namespace that motivates Tier 2 below.
+    """
+    base = name.rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] if "." in base else base
+
+
 def _resolve_unique_basename(
     registry: SkillRegistry, skill_name: str, resource_path: str,
 ) -> str | None:
@@ -607,8 +671,24 @@ def _resolve_unique_basename(
     re-transcribe is the soft-constraint side of the same contract; resolving
     in the owner layer is the enforced side.
 
-    Ambiguity is never guessed: two resources sharing a filename is a real
-    collision and the caller must show both.
+    Resolution runs in two tiers under the SAME unique-or-none licence:
+
+    * Tier 1 — exact basename: the model dropped a directory level but kept
+      the filename and extension (``recovery-carrier.md`` above).
+    * Tier 2 — basename stem: the model compressed the path AND dropped the
+      extension, which is what happens when a case *title* is used directly as
+      a path. Live in inject-de715486 (2026-10-26): the agent, holding the
+      settled case name ``Pod_网络故障_网络包乱序``, requested
+      ``references/catalogue/Pod_网络故障_网络包乱序`` — no intermediate
+      directory, no ``.md``. Tier 1 cannot bridge this (``base`` has no
+      extension, so it equals no resource's basename), and the request fell
+      through to did-you-mean, burning a turn on a path the registry could
+      have closed itself. The extension is just another "last step" of the
+      same near-miss path, so the owner layer appends the one it knows.
+
+    Tier 2 fires only when Tier 1 found nothing, and inherits its guard: a
+    stem shared by two resources (``foo.md`` and ``foo.yaml``) is a real
+    collision, so ambiguity is never guessed and the caller shows both.
     """
     try:
         available = registry.list_resources(skill_name)
@@ -616,18 +696,40 @@ def _resolve_unique_basename(
         # Not activated, missing dir, unreadable — the caller's own handlers
         # produce a more precise message than a resolution attempt could.
         return None
+    available = available or []
     base = str(resource_path).rsplit("/", 1)[-1]
     if not base:
         return None
-    matches = [
-        r for r in (available or []) if r.rsplit("/", 1)[-1] == base
-    ]
-    return matches[0] if len(matches) == 1 else None
+    # Tier 1: exact basename (dropped a directory level, kept name+extension).
+    exact = [r for r in available if r.rsplit("/", 1)[-1] == base]
+    if len(exact) == 1:
+        return exact[0]
+    if exact:
+        # Two resources literally named ``base`` — a real collision, never guessed.
+        return None
+    # Tier 2: basename stem (extension also dropped). Same unique-or-none rule.
+    req_stem = _basename_stem(base)
+    if not req_stem:
+        return None
+    stemmed = [r for r in available if _basename_stem(r) == req_stem]
+    return stemmed[0] if len(stemmed) == 1 else None
 
 
 def _build_skill_tools(registry: SkillRegistry):
     """Build skill-related tools with dynamic catalog from registry."""
+    from typing import Annotated, Optional
+
     from langchain_core.tools import tool as lc_tool
+    from pydantic import BeforeValidator
+
+    # Victim-selector coercion for finish_planning's full-identity
+    # declaration (D2): the same BeforeValidator wrappers submit_fault_intent
+    # uses, so an LLM-emitted JSON-stringified list/dict passes schema
+    # validation instead of being rejected at the @lc_tool boundary.
+    from chaos_agent.agent.nodes.planning.intent_clarification import (
+        _validate_labels,
+        _validate_names,
+    )
 
     @lc_tool
     def activate_skill(skill_name: str) -> str:
@@ -768,6 +870,19 @@ def _build_skill_tools(registry: SkillRegistry):
                     r for r in available
                     if r.rsplit("/", 1)[-1] == _base
                 ][:2]
+            if not matches:
+                # Stem fallback, mirroring Tier 2 of _resolve_unique_basename:
+                # when the extension was dropped too, an exact-basename match
+                # finds nothing. If the stem is UNIQUE the resolver already
+                # read it, so reaching here means the stem is AMBIGUOUS (two
+                # resources share a title, differ by extension) — name both so
+                # the model picks instead of re-listing everything.
+                _stem = _basename_stem(str(resource_path))
+                if _stem:
+                    matches = [
+                        r for r in available
+                        if _basename_stem(r) == _stem
+                    ][:2]
             hint = (
                 "Did you mean:\n"
                 + "\n".join(f"  - {m}" for m in matches)
@@ -901,6 +1016,9 @@ def _build_skill_tools(registry: SkillRegistry):
         fault_scope: str = "",
         fault_target: str = "",
         fault_action: str = "",
+        fault_namespace: str = "",
+        fault_names: Annotated[Optional[list[str]], BeforeValidator(_validate_names)] = None,
+        fault_labels: Annotated[Optional[dict[str, str]], BeforeValidator(_validate_labels)] = None,
     ) -> str:
         """Signal that Phase 1 is complete — either proceed to execution or reject the request.
 
@@ -938,10 +1056,10 @@ def _build_skill_tools(registry: SkillRegistry):
             re-PLAN through finish_planning once execution DEGRADES to a
             narrower channel after confirmation, so the declared scope is
             re-confirmed to what actually landed. Do NOT degrade inline
-            and leave a stale pre-degradation scope in the audit (run6
-            inject-3d5de7fa: cluster-wide declared for a CR that was
-            refused, never re-evaluated for the namespace-scoped
-            kubectl-native patch that actually landed).
+            and leave a stale pre-degradation scope in the audit (a past
+            run: cluster-wide declared for a CR that was refused, never
+            re-evaluated for the namespace-scoped kubectl-native patch
+            that actually landed).
           - blast_radius_detail: One-line description of what cluster resources
             the execution will mutate beyond the target (e.g. "Will taint 30 nodes
             cluster-wide to block scheduling").
@@ -949,20 +1067,52 @@ def _build_skill_tools(registry: SkillRegistry):
             (e.g. "references/catalogue/Pod_镜像拉取失败/Pod_镜像拉取失败_镜像不存在或标签错误.md").
             Required when multiple skill cases were read during planning —
             tells the system which one to use for verification.
-          - duration_seconds: The injection window in seconds this plan commits
-            to. The reviewed FaultSpec contract, auto-recovery timers, and the
-            audit snapshot derive from it. Default 0 = not declared.
+          - duration_seconds: The OBSERVATION window D in seconds this plan
+            commits to — how long the fault stays injected while the framework
+            is present to observe it. The reviewed FaultSpec contract and the
+            audit snapshot derive from it. The fault's own auto-recovery timer
+            is a separate, framework-owned number (D + recovery grace, the
+            two-number window contract): the engine derives it at dispatch,
+            pins it onto the carrier, and renders it into the execution-phase
+            structured parameters. This planning declaration carries D.
+            Default 0 = not declared.
           - fault_scope / fault_target / fault_action: The fault-identity triple
             of the plan's MAIN injection mechanism (e.g. pod / process / hold for
             a file-descriptor hold, pod / cpu / fullload for a blade CPU fault).
-            This declares WHAT is attacked so the target guard can judge the
-            mechanism against the right fault family — the skill-case document
-            is a MENU (main path + backup means), so never copy a triple from it.
-            Fill every missing field of the FaultSpec; fields already settled
-            (structured flags, confirmed intent) are never rewritten by this —
-            if the declared triple CONFLICTS with a settled identity, use
+            This declares WHAT is attacked. For a BLADE resource fault
+            (cpu / mem / disk / network / process) use the canonical
+            target/action vocabulary — the guard's fault-type lock checks it.
+            For a CONFIG-type fault (kubectl-native / CR carrier) that lock
+            never engages, so the triple is a DESCRIPTIVE mechanism label:
+            pick a concise name, do NOT deliberate over the wording. Either way
+            the skill-case document is a MENU (main path + backup means), so
+            never copy a triple from it.
+            Fill every missing field of the FaultSpec. An identity counts as
+            SETTLED only once its full triple (fault_scope AND fault_target AND
+            fault_action) is already set: while ANY of the three is still empty,
+            this declaration is the FILL path that completes it — declaring a
+            scope then is normal completion, NOT a conflict, and it also clears
+            any selector locked under a stale old scope. Once the triple is
+            COMPLETE it is never rewritten by a declaration; if your declared
+            triple then CONFLICTS with that settled identity, use
             propose_plan_change instead of silently diverging from it.
             Default "" for each = not declared.
+          - fault_namespace / fault_names / fault_labels: the VICTIM SELECTOR
+            of the declared identity — WHICH instance(s) of fault_scope, in
+            WHICH namespace. This declaration is the AUTHORITATIVE source of
+            the target's name/namespace: the system does NOT infer them from
+            whichever resource a probe happened to read first, so an omitted
+            selector is never silently back-filled by probe order.
+            fault_names = instance names of the fault_scope kind (e.g.
+            ["entry"] for an ingress named entry); a target identified by its
+            workload/owner goes in fault_labels (e.g. {"app": "demo"}).
+            fault_namespace empty for cluster-scoped kinds (node). Omitting
+            BOTH fault_names and fault_labels declares a namespace-wide fault
+            (any instance of the kind in the namespace) — legitimate only when
+            that is the real intent; it triggers elevated safety review, so
+            prefer precise names. Never copy a selector from the skill-case
+            document (a menu of examples); declare the target THIS plan
+            attacks. Default omitted = not declared.
 
         Output: Confirmation message.
 

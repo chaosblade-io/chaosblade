@@ -79,6 +79,38 @@ class TestIncidentShapeIsDetected:
         assert tool == "kubectl:get"
 
 
+class TestLoopHintAdvisoryClarification:
+    """inject-b3d0df6e (host端口占用案 Step-8) root fix, 断链2.
+
+    The model read a bare "LOOP DETECTED: systemctl start ... repeated 3 times
+    with identical results" as "the runtime BLOCKED/suppressed my call", and
+    switched verbs to dodge a guard that never blocked anything — the real
+    cause was a same-turn concurrency race. The detector is HINT-ONLY in every
+    phase (all four callers inject the string and none filter bindings; only
+    the separate detect_action_stagnation soft-blocks), and it fires only once
+    the repeated calls already produced identical ToolMessage outputs, i.e.
+    they all ran. So the hint must SAY that. Mutation teeth: delete the
+    advisory clause from _build_loop_hint and these go red.
+    """
+
+    def test_advisory_states_calls_ran_and_nothing_blocked(self):
+        for phase in ("intent", "planning", "execute", "verify", "recover"):
+            hint = detect_repeated_tool_calls(_incident_history(4), phase=phase)
+            assert hint is not None, phase
+            assert "LOOP DETECTED" in hint, phase          # detection preserved
+            assert "DID run" in hint, phase                # they executed
+            assert "never blocks or suppresses" in hint, phase
+
+    def test_advisory_preempts_suppression_misattribution(self):
+        hint = detect_repeated_tool_calls(_incident_history(4), phase="execute")
+        # The exact false belief from the incident trace must be pre-empted.
+        assert "not caused by a suppressed call" in hint
+
+    def test_reflection_body_still_present(self):
+        hint = detect_repeated_tool_calls(_incident_history(4), phase="execute")
+        assert "REFLECT" in hint
+
+
 class TestFalsePositiveTolerance:
     """Silence unless there is positive evidence of a stall."""
 

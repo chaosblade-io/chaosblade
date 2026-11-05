@@ -11,11 +11,19 @@ trivially testable (mock the context dict, no need for a full state).
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from chaos_agent.agent.spec.fault_spec import fault_type_from_state, read_fault_spec
 from chaos_agent.agent.result.operation_outcome import read_inject_verification, read_operation_outcome
 from chaos_agent.agent.result.verdict import INJECT_VERDICT_VALUES, FailureCategory
+
+# Per-tool-call ceiling on the serialised ``args`` handed to the postmortem
+# LLM (K2). Mirrors the 500-char per-message ``content`` cap so the upload
+# surface is bounded on BOTH axes; without it a single large arg (embedded
+# YAML, long shell command) defeats the BLADE_AI_POSTMORTEM_MAX_MESSAGES
+# privacy ceiling the docs promise. See _bound_tool_call_args.
+_MAX_TOOL_CALL_ARGS_CHARS: int = 500
 
 # Failure categories with NO experiment activity at all: the user or a
 # safety gate refused BEFORE any execution — no verifier data, no
@@ -158,12 +166,42 @@ def build_postmortem_context(state: dict, *, max_messages: int = 30) -> dict[str
     }
 
 
+def _bound_tool_call_args(args: Any) -> Any:
+    """Bound one tool_call's ``args`` so the postmortem upload surface has
+    a TRUE hard ceiling (K2).
+
+    ``content`` was already capped at 500 chars/message, but ``args`` rode
+    through unbounded — a single ``kubectl apply -f`` with an embedded YAML
+    (or a long shell command) could blow past the documented privacy
+    ceiling. The settings/generator docstrings promise that reducing
+    ``BLADE_AI_POSTMORTEM_MAX_MESSAGES`` "shrinks the upload surface"; that
+    only bounds message COUNT, not per-message SIZE, so the promise was
+    half-true and a huge arg could also overflow the LLM context (→ generate
+    raises → caught → postmortem=None, a silent report loss).
+
+    Small args are returned UNCHANGED (structured form preserved — no
+    behaviour change for normal tool calls); only oversized args are
+    serialised and truncated with a marker. Per-tool-call cap ⇒ combined
+    with the content cap and MAX_MESSAGES, the surface is bounded on both
+    axes.
+    """
+    try:
+        rendered = json.dumps(args, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        rendered = str(args)
+    if len(rendered) <= _MAX_TOOL_CALL_ARGS_CHARS:
+        return args
+    return rendered[:_MAX_TOOL_CALL_ARGS_CHARS] + "…(truncated)"
+
+
 def _summarise_message(msg) -> dict[str, Any]:
     """Reduce a langchain message to {type, time, content_preview, tool_calls}.
 
     Full content is truncated at 500 chars per message — the LLM only
     needs the gist for timeline reconstruction. Tool calls are kept
-    structured because the postmortem timeline references them by name.
+    structured because the postmortem timeline references them by name;
+    their ``args`` are size-bounded (see :func:`_bound_tool_call_args`) so
+    a single large arg cannot defeat the MAX_MESSAGES privacy ceiling.
     """
     msg_type = getattr(msg, "type", "") or msg.__class__.__name__.lower().replace("message", "")
     content = getattr(msg, "content", "") or ""
@@ -178,7 +216,7 @@ def _summarise_message(msg) -> dict[str, Any]:
             continue
         tcs.append({
             "name": tc.get("name", ""),
-            "args": tc.get("args", {}),
+            "args": _bound_tool_call_args(tc.get("args", {})),
         })
 
     # Wall-clock timestamp (Beijing ISO string) injected by _ts_add_messages reducer

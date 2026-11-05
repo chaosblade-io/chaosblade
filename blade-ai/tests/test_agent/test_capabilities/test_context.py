@@ -5,10 +5,16 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from chaos_agent.agent.capabilities import (
+    PROFILE_UNKNOWN_CHANNEL,
+    PROFILE_UNKNOWN_CONFLICT,
+    PROFILE_UNKNOWN_SCOPE_UNREGISTERED,
     build_capability_context,
     build_intent_discovery_context,
+    explain_unsupported_environment,
     filter_tools_for_context,
     is_tool_name_allowed_for_context,
+    resolve_profile_for_state,
+    resolve_profile_verdict,
 )
 from chaos_agent.agent.providers import FaultProviderRegistry
 from chaos_agent.agent.prompts.builders import (
@@ -205,7 +211,13 @@ def test_unknown_profile_prompt_fails_closed():
     assert "do not attempt injection" in prompt.lower()
 
 
-def test_scope_transport_conflict_hides_all_tools():
+def test_scope_transport_conflict_hides_provider_tools_keeps_control():
+    """A scope/transport conflict resolves to PROFILE_UNKNOWN.
+
+    Provider (injection) tools are stripped — no mutation is reachable — but
+    domain-agnostic control tools stay visible so the model keeps its
+    finish/replan/report exits instead of spinning on an empty toolset.
+    """
     FaultProviderRegistry.register_builtins()
     tools = [_tool("kubectl"), _tool("host_inject"), _tool("submit_fault_intent")]
 
@@ -220,10 +232,11 @@ def test_scope_transport_conflict_hides_all_tools():
 
     assert context.profile == PROFILE_UNKNOWN
     assert context.supported is False
-    assert filter_tools_for_context(tools, context) == []
+    visible = {t.name for t in filter_tools_for_context(tools, context)}
+    assert visible == {"submit_fault_intent"}
 
 
-def test_invalid_transport_override_hides_all_tools():
+def test_invalid_transport_override_hides_provider_tools_keeps_control():
     FaultProviderRegistry.register_builtins()
     tools = [_tool("kubectl"), _tool("blade_create"), _tool("submit_fault_intent")]
 
@@ -238,7 +251,8 @@ def test_invalid_transport_override_hides_all_tools():
 
     assert context.profile == PROFILE_UNKNOWN
     assert context.supported is False
-    assert filter_tools_for_context(tools, context) == []
+    visible = {t.name for t in filter_tools_for_context(tools, context)}
+    assert visible == {"submit_fault_intent"}
 
 
 def test_unregistered_scope_fails_closed_instead_of_using_transport_default():
@@ -252,8 +266,135 @@ def test_unregistered_scope_fails_closed_instead_of_using_transport_default():
 
     assert context.profile == PROFILE_UNKNOWN
     assert context.supported is False
-    assert filter_tools_for_context(tools, context) == []
+    # Provider tools hidden; the domain-agnostic control tool survives.
+    visible = {t.name for t in filter_tools_for_context(tools, context)}
+    assert visible == {"time_wait"}
     assert is_tool_name_allowed_for_context("kubectl", state, "execute") is False
+    assert is_tool_name_allowed_for_context("time_wait", state, "execute") is True
+
+
+class TestDomainAgnosticToolsSurviveUnsupportedProfile:
+    """The visibility invariant: profile gates ONLY provider-owned tools.
+
+    Domain-agnostic tools (graph control, MCP) are never profile-bound, so an
+    unsupported/unresolved profile strips every injection tool yet leaves the
+    model its finish/replan/report exits. This is what turns an unsupported
+    environment from a budget-burning spin into a graceful honest stop.
+    """
+
+    @staticmethod
+    def _unknown_state():
+        # scope=pod (k8s) vs transport=ssh (host) → conflict → PROFILE_UNKNOWN
+        return {
+            "fault_spec": {"scope": "pod"},
+            "kube_connection_mode": "ssh",
+            "ssh_host": "host.example",
+        }
+
+    _CONTROL = [
+        "finish_execution", "request_replan", "update_progress",
+        "submit_recover_verification", "submit_verification",
+    ]
+    _PROVIDER = ["kubectl", "blade_create", "host_inject"]
+
+    def test_every_control_tool_visible_every_provider_tool_hidden(self):
+        FaultProviderRegistry.register_builtins()
+        tools = [_tool(n) for n in self._CONTROL + self._PROVIDER]
+        ctx = build_capability_context(self._unknown_state(), "execute", tools)
+        assert ctx.profile == PROFILE_UNKNOWN
+        assert ctx.supported is False
+        assert set(ctx.active_tool_names) == set(self._CONTROL)
+
+    def test_runtime_screener_allows_control_refuses_provider(self):
+        FaultProviderRegistry.register_builtins()
+        st = self._unknown_state()
+        for name in self._CONTROL:
+            assert is_tool_name_allowed_for_context(name, st, "execute") is True, name
+        for name in self._PROVIDER:
+            assert is_tool_name_allowed_for_context(name, st, "execute") is False, name
+
+    def test_discovery_control_tool_survives_unresolved_transport(self):
+        from chaos_agent.agent.capabilities.context import (
+            is_tool_name_allowed_for_intent_discovery,
+        )
+
+        FaultProviderRegistry.register_builtins()
+        st = {"kube_connection_mode": "not-a-channel"}
+        assert is_tool_name_allowed_for_intent_discovery("submit_fault_intent", st) is True
+        assert is_tool_name_allowed_for_intent_discovery("kubectl_read", st) is False
+
+    def test_typo_phase_gate_is_orthogonal_and_still_refuses_control(self):
+        """An unregistered PHASE is a caller wiring bug, not an unsupported
+        environment: it fails closed for EVERY tool, control included."""
+        FaultProviderRegistry.register_builtins()
+        assert is_tool_name_allowed_for_context(
+            "submit_verification", {"fault_spec": {"scope": "pod"}}, "typo_phase",
+        ) is False
+
+
+class TestFailOpenSurfaceIsReadOnlyOrBanned:
+    """P3① mechanical guard on ``_allowance_verdict``'s deliberate fail-open.
+
+    ``_allowance_verdict`` returns ``True`` for EVERY non-provider tool under an
+    UNSUPPORTED/UNKNOWN profile (context.py: ``if not tool_owners: return
+    True``). That is by design — an unsupported environment strips the injection
+    tools yet leaves the model its finish/replan/report exits instead of
+    stranding it on an empty toolset. But the fail-open is only *safe* while the
+    set it exposes cannot mutate the environment behind the profile gate's back.
+
+    The class above pins a HAND-PICKED control roster (``_CONTROL``) — a value
+    snapshot that stays green when a new non-provider writer slips in unnoticed.
+    This test closes that gap without a second snapshot: it enumerates the LIVE
+    framework-owned surface (every ``static_base`` tool across ``_phase_specs``),
+    keeps the non-provider members — the exact set ``provider_tool_owners`` (the
+    same authority ``_allowance_verdict`` consults) does not own — and asserts
+    each one's target-guard classification under the strictest default posture is
+    either:
+
+      * ``SCOPE_READONLY`` — a harmless control/read exit the guard passes, or
+      * ``SCOPE_BANNED``   — independently refused by the target guard absent an
+        operator opt-in (today only ``execute_skill_script``), so the profile
+        fail-open is NOT its only gate.
+
+    A concrete resource scope (a real mutation the guard would drift-check and
+    may allow) or an undeclared ``SCOPE_UNKNOWN`` fails red: admitting a
+    non-provider writer to the fail-open surface must be a deliberate, reviewed
+    act, never an accident of forgetting to make it provider-owned.
+    """
+
+    def test_every_non_provider_tool_is_readonly_or_banned(self, mock_registry):
+        from chaos_agent.agent.capabilities.context import provider_tool_owners
+        from chaos_agent.agent.factory import _build_skill_tools, _phase_specs
+        from chaos_agent.agent.target_guard.classifier import infer_effective_target
+        from chaos_agent.agent.target_guard.types import SCOPE_BANNED, SCOPE_READONLY
+
+        FaultProviderRegistry.register_builtins()
+        owners = provider_tool_owners()
+
+        skill_tools = _build_skill_tools(mock_registry)
+        surface = {
+            t.name
+            for spec in _phase_specs(skill_tools)
+            for t in spec.static_base
+        }
+        assert surface, "empty tool surface — _phase_specs wiring changed"
+
+        # non-provider == the exact set _allowance_verdict fail-opens.
+        fail_open = sorted(name for name in surface if name not in owners)
+        assert fail_open, "no non-provider tools — fail-open surface vanished"
+
+        offenders = [
+            (name, infer_effective_target(name, {}).scope)
+            for name in fail_open
+            if infer_effective_target(name, {}).scope not in (SCOPE_READONLY, SCOPE_BANNED)
+        ]
+        assert not offenders, (
+            "non-provider tool(s) on the profile fail-open surface are neither "
+            "READONLY (harmless exit) nor BANNED (target-guard refused): under an "
+            "unsupported profile the gate would expose an environment mutation "
+            f"with no gate behind it — {offenders}. Make it provider-owned "
+            "(profile-gated), classify it READONLY, or default-BAN it."
+        )
 
 
 class TestOwnershipWhitelist:
@@ -488,3 +629,105 @@ class TestSharedCapabilityVerdict:
         assert "failing open (tool_call passes through)" in src, (
             "the classifier's fail-open policy must remain intact"
         )
+
+
+class TestProfileVerdictCarriesReason:
+    """The single source now says WHY a profile fail-closed to UNKNOWN.
+
+    ``profile`` was a lossy sentinel: one "unknown" string flattened three
+    distinct causes, forcing ``explain_tool_refusal`` to re-derive the scope
+    cause and lumping the conflict + channel causes into one misleading "fix
+    your kubeconfig" line — which sent #87 (a scope/transport CONFLICT on a
+    perfectly healthy kubeconfig) debugging in the wrong direction. These pin
+    the reason fork at the source so no downstream surface re-derives it.
+    """
+
+    def test_conflict_reason_names_both_profiles(self):
+        # host scope × k8s(kubeconfig) transport → CONFLICT (the #87 shape).
+        verdict = resolve_profile_verdict(
+            {"fault_spec": {"scope": "host"}, "kube_connection_mode": "kubeconfig"}
+        )
+        assert verdict.profile == PROFILE_UNKNOWN
+        assert verdict.reason == PROFILE_UNKNOWN_CONFLICT
+        assert verdict.scope_profile == "host"
+        assert verdict.transport_profile == "k8s"
+        assert verdict.supported is False
+
+    def test_unregistered_scope_reason(self):
+        verdict = resolve_profile_verdict(
+            {"fault_spec": {"scope": "typo_scope"},
+             "kube_connection_mode": "kubeconfig"}
+        )
+        assert verdict.profile == PROFILE_UNKNOWN
+        assert verdict.reason == PROFILE_UNKNOWN_SCOPE_UNREGISTERED
+        assert verdict.supported is False
+
+    def test_unresolvable_channel_reason(self):
+        # A valid scope but an invalid channel → CHANNEL, NOT conflict: the
+        # transport itself is unprofiled, so the two causes must not collapse.
+        verdict = resolve_profile_verdict(
+            {"fault_spec": {"scope": "pod"},
+             "kube_connection_mode": "not-a-channel"}
+        )
+        assert verdict.profile == PROFILE_UNKNOWN
+        assert verdict.reason == PROFILE_UNKNOWN_CHANNEL
+        assert verdict.supported is False
+
+    def test_resolved_profile_has_no_reason_and_is_supported(self):
+        verdict = resolve_profile_verdict(
+            {"fault_spec": {"scope": "pod"}, "kube_connection_mode": "kubeconfig"}
+        )
+        assert verdict.profile == "k8s"
+        assert verdict.reason is None
+        assert verdict.supported is True
+
+    def test_string_wrapper_is_backward_compatible(self):
+        # resolve_profile_for_state must stay a bare string, byte-identical to
+        # verdict.profile — every pre-existing consumer reads only that.
+        state = {"fault_spec": {"scope": "host"},
+                 "kube_connection_mode": "kubeconfig"}
+        assert resolve_profile_for_state(state) == resolve_profile_verdict(state).profile
+        assert resolve_profile_for_state(state) == PROFILE_UNKNOWN
+
+    def test_context_carries_unknown_reason(self):
+        ctx = build_capability_context(
+            {"fault_spec": {"scope": "host"}, "kube_connection_mode": "kubeconfig"},
+            "execute", [],
+        )
+        assert ctx.supported is False
+        assert ctx.unknown_reason == PROFILE_UNKNOWN_CONFLICT
+
+
+class TestUnsupportedEnvironmentMessageForksByCause:
+    """The operator remediation differs per cause, so the wording must too.
+
+    #87's whole point: a conflict on a HEALTHY kubeconfig must not be reported
+    as "fix your kubeconfig". Each fork is pinned on its distinguishing
+    fragment, plus a reverse assertion that the misleading wording is absent —
+    this is the single renderer the execute / recover / agent_loop entry gates
+    all consume, so one vocabulary is asserted here for all three.
+    """
+
+    def test_conflict_says_mismatch_not_broken_kubeconfig(self):
+        state = {"fault_spec": {"scope": "host"},
+                 "kube_connection_mode": "kubeconfig"}
+        msg = explain_unsupported_environment(resolve_profile_verdict(state), state)
+        assert "channel/scope mismatch" in msg
+        assert "not a broken kubeconfig" in msg
+        assert "host" in msg and "k8s" in msg
+
+    def test_unregistered_scope_points_at_frontmatter_not_cluster(self):
+        state = {"fault_spec": {"scope": "typo_scope"},
+                 "kube_connection_mode": "kubeconfig"}
+        msg = explain_unsupported_environment(resolve_profile_verdict(state), state)
+        assert "registered fault domain" in msg
+        assert "frontmatter" in msg
+        # no kubeconfig fix can work around an unregistered scope
+        assert "no kubeconfig change" in msg
+
+    def test_unresolvable_channel_points_at_environment_config(self):
+        state = {"fault_spec": {"scope": "pod"},
+                 "kube_connection_mode": "not-a-channel"}
+        msg = explain_unsupported_environment(resolve_profile_verdict(state), state)
+        assert "Fix the environment configuration" in msg
+        assert "kubeconfig" in msg

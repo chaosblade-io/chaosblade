@@ -1,5 +1,6 @@
 """Tests for injection feasibility assessment (E18)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -95,6 +96,11 @@ class TestMemoryFeasibilityChecker:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_limit(self):
+        """Essence-B boundary (LEGITIMATE no-ceiling): usage read succeeded but
+        the pod has no resources.limits.memory → unbounded → mem-load is
+        trivially feasible. This is NOT a capability loss, so it stays ``None``
+        (advisory OK) — contrast test_skipped_when_kubectl_top_fails below where
+        the READ itself failed."""
         spec = _make_spec(params={"mem-percent": "98"})
         with patch(
             "chaos_agent.agent.spec._feasibility_checkers._fetch_memory_usage_mb",
@@ -108,7 +114,11 @@ class TestMemoryFeasibilityChecker:
         assert report is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_kubectl_top_fails(self):
+    async def test_skipped_when_kubectl_top_fails(self):
+        """Essence-B (capability loss): a FAILED usage read (metrics-server
+        returned nothing for THIS target, slipping past the global metrics-server
+        precheck) used to launder into ``None`` (≡OK, a silent green on the
+        confirm card). It must now surface as a first-class SKIPPED report."""
         spec = _make_spec(params={"mem-percent": "98"})
         with patch(
             "chaos_agent.agent.spec._feasibility_checkers._fetch_memory_usage_mb",
@@ -119,7 +129,8 @@ class TestMemoryFeasibilityChecker:
         ):
             report = await assess_feasibility(spec, "/fake/kubeconfig")
 
-        assert report is None
+        assert report is not None
+        assert report.severity == FeasibilitySeverity.SKIPPED
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_mem_percent_param(self):
@@ -261,7 +272,13 @@ class TestAssessFeasibility:
         assert report is None
 
     @pytest.mark.asyncio
-    async def test_checker_exception_returns_none(self):
+    async def test_checker_exception_returns_skipped(self):
+        """Essence-B (capability loss): a REGISTERED checker that raised could
+        not determine feasibility. ``assess_feasibility``'s outer handler used to
+        launder the exception into ``None`` (≡OK); it must now surface SKIPPED.
+        (``checker is None`` — no checker at all — still returns None: that is
+        genuine not-applicable, tested by test_unknown_fault_target_returns_none.)
+        """
         spec = _make_spec(params={"mem-percent": "98"})
         with patch(
             "chaos_agent.agent.spec._feasibility_checkers._fetch_memory_usage_mb",
@@ -269,7 +286,8 @@ class TestAssessFeasibility:
         ):
             report = await assess_feasibility(spec, "/fake/kubeconfig")
 
-        assert report is None
+        assert report is not None
+        assert report.severity == FeasibilitySeverity.SKIPPED
 
     @pytest.mark.asyncio
     async def test_report_to_dict_structure(self):
@@ -389,7 +407,13 @@ class TestLabelBasedPodResolution:
         assert report.severity == FeasibilitySeverity.OK
 
     @pytest.mark.asyncio
-    async def test_resolve_fails_returns_none(self):
+    async def test_resolve_fails_returns_skipped(self):
+        """Essence-B (capability loss): the spec is COMPLETE (names+labels+
+        namespace) but no Running pod is resolvable in the cluster, so the mem
+        check could not run. This mirrors NetworkFeasibilityChecker's
+        unresolvable-target SKIPPED — it used to launder into ``None`` (≡OK).
+        Contrast test_returns_none_when_no_names / _no_namespace, where the spec
+        is INCOMPLETE and the check legitimately does not apply (→ None)."""
         spec = _make_spec(
             names=("accounting",),
             labels={"app": "accounting"},
@@ -401,7 +425,8 @@ class TestLabelBasedPodResolution:
         ):
             report = await assess_feasibility(spec, "/fake/kubeconfig")
 
-        assert report is None
+        assert report is not None
+        assert report.severity == FeasibilitySeverity.SKIPPED
 
 
 class TestNetworkFeasibilityChecker:
@@ -520,7 +545,13 @@ class TestNetworkFeasibilityChecker:
         assert "context deadline exceeded" in report.current_value
 
     @pytest.mark.asyncio
-    async def test_network_resolve_fails_returns_none(self):
+    async def test_network_unresolvable_target_returns_skipped(self):
+        """W-83-5 essence-B: an unresolvable target must be a VISIBLE SKIPPED,
+        not a silent ``None``. ``assess_feasibility`` treats ``None`` as
+        "equivalent to OK — fail-open", so the pre-fix ``return None`` made a
+        network check that NEVER RAN render identically to one that PASSED.
+        The network checker now returns a first-class SKIPPED report (the same
+        state the metrics-server-unavailable path uses)."""
         spec = _make_spec(
             fault_target="network",
             fault_action="delay",
@@ -534,7 +565,176 @@ class TestNetworkFeasibilityChecker:
         ):
             report = await assess_feasibility(spec, "/fake/kubeconfig")
 
+        assert report is not None
+        assert report.severity == FeasibilitySeverity.SKIPPED
+        assert "resolve" in report.message.lower()
+        assert report.headroom == 0.0
+
+
+class TestNetworkMechanismGate:
+    """The netfilter-only probes (in-container iptables + interface on pod
+    scope; host iptables on node scope) must be gated on the case-declared
+    ``network_mechanism`` — NOT on ``fault_action`` — so a userspace-bind /
+    resolver fault never receives a factually wrong iptables advisory, while
+    an undeclared ("") or netfilter fault fails safe and runs every probe
+    (byte-identical to the pre-declaration behaviour)."""
+
+    @staticmethod
+    def _pod_scope_patches():
+        """Shared pod-scope plumbing up to the mechanism gate. Returns a dict
+        of patch-target → AsyncMock so tests can assert call/no-call on the
+        gated probes individually."""
+        base = "chaos_agent.agent.spec._feasibility_checkers."
+        return {
+            "_resolve_first_pod": AsyncMock(return_value="accounting-6fbdb464c7-qn2vr"),
+            "_fetch_pod_phase": AsyncMock(return_value="Running"),
+            "_fetch_pod_node": AsyncMock(return_value="node-a"),
+            "_check_blade_tool_pod_ready": AsyncMock(return_value=(True, (), "")),
+            "_check_interface_exists": AsyncMock(return_value=(True, "")),
+            "_check_iptables_available": AsyncMock(return_value=(False, "command not found")),
+            "_check_active_network_experiment": AsyncMock(return_value=False),
+        }, base
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mechanism", ["userspace-bind", "resolver"])
+    async def test_non_netfilter_mechanism_skips_iptables_and_interface(self, mechanism):
+        """A declared non-netfilter mechanism reaches OK WITHOUT the
+        iptables/interface probes running — even though iptables is missing
+        (which would emit a TIGHT advisory under the netfilter path)."""
+        mocks, base = self._pod_scope_patches()
+        spec = _make_spec(
+            fault_target="network", fault_action="occupy",
+            names=("accounting-6fbdb464c7-qn2vr",), params={},
+        )
+        with patch(base + "_resolve_first_pod", mocks["_resolve_first_pod"]), \
+             patch(base + "_fetch_pod_phase", mocks["_fetch_pod_phase"]), \
+             patch(base + "_fetch_pod_node", mocks["_fetch_pod_node"]), \
+             patch(base + "_check_blade_tool_pod_ready", mocks["_check_blade_tool_pod_ready"]), \
+             patch(base + "_check_interface_exists", mocks["_check_interface_exists"]), \
+             patch(base + "_check_iptables_available", mocks["_check_iptables_available"]), \
+             patch(base + "_check_active_network_experiment", mocks["_check_active_network_experiment"]):
+            report = await assess_feasibility(
+                spec, "/fake/kubeconfig", network_mechanism=mechanism,
+            )
+
+        assert report is not None
+        assert report.severity == FeasibilitySeverity.OK
+        # The netfilter-only probes NEVER RAN; the OK report must not claim
+        # iptables/interface facts it did not collect.
+        mocks["_check_interface_exists"].assert_not_called()
+        mocks["_check_iptables_available"].assert_not_called()
+        assert "iptables" not in report.current_value
+        assert "interface" not in report.current_value
+
+    @pytest.mark.asyncio
+    async def test_undeclared_mechanism_fails_safe_to_netfilter(self):
+        """No declaration ("") → the iptables probe RUNS and its missing
+        binary surfaces the TIGHT advisory, exactly as before the gate."""
+        mocks, base = self._pod_scope_patches()
+        spec = _make_spec(
+            fault_target="network", fault_action="occupy",
+            names=("accounting-6fbdb464c7-qn2vr",), params={},
+        )
+        with patch(base + "_resolve_first_pod", mocks["_resolve_first_pod"]), \
+             patch(base + "_fetch_pod_phase", mocks["_fetch_pod_phase"]), \
+             patch(base + "_fetch_pod_node", mocks["_fetch_pod_node"]), \
+             patch(base + "_check_blade_tool_pod_ready", mocks["_check_blade_tool_pod_ready"]), \
+             patch(base + "_check_interface_exists", mocks["_check_interface_exists"]), \
+             patch(base + "_check_iptables_available", mocks["_check_iptables_available"]), \
+             patch(base + "_check_active_network_experiment", mocks["_check_active_network_experiment"]):
+            report = await assess_feasibility(spec, "/fake/kubeconfig")
+
+        assert report is not None
+        assert report.severity == FeasibilitySeverity.TIGHT
+        mocks["_check_iptables_available"].assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_gate_keys_on_mechanism_not_fault_action(self):
+        """Mechanism-invariance: the SAME netfilter-typical action verb
+        (``delay``) is skipped when the case DECLARES userspace-bind, proving
+        the gate reads the declared mechanism, not the action string. Without
+        a hard-coded action branch, an author-declared mechanism is the only
+        input that suppresses the probes."""
+        mocks, base = self._pod_scope_patches()
+        spec = _make_spec(
+            fault_target="network", fault_action="delay",
+            names=("accounting-6fbdb464c7-qn2vr",), params={"time": "3000"},
+        )
+        with patch(base + "_resolve_first_pod", mocks["_resolve_first_pod"]), \
+             patch(base + "_fetch_pod_phase", mocks["_fetch_pod_phase"]), \
+             patch(base + "_fetch_pod_node", mocks["_fetch_pod_node"]), \
+             patch(base + "_check_blade_tool_pod_ready", mocks["_check_blade_tool_pod_ready"]), \
+             patch(base + "_check_interface_exists", mocks["_check_interface_exists"]), \
+             patch(base + "_check_iptables_available", mocks["_check_iptables_available"]), \
+             patch(base + "_check_active_network_experiment", mocks["_check_active_network_experiment"]):
+            report = await assess_feasibility(
+                spec, "/fake/kubeconfig", network_mechanism="userspace-bind",
+            )
+
+        assert report.severity == FeasibilitySeverity.OK
+        mocks["_check_iptables_available"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_node_non_netfilter_mechanism_skips_host_iptables(self):
+        """Node scope: a declared non-netfilter mechanism returns None (check
+        not applicable) instead of probing host iptables — a missing host
+        iptables would otherwise emit an IMPOSSIBLE that could BLOCK a
+        feasible host-port-occupy injection."""
+        spec = _make_spec(
+            fault_target="network", fault_action="occupy",
+            scope="node", names=("node-a",), namespace="", params={},
+        )
+        node_probe = AsyncMock(return_value=(False, "chroot missing"))
+        with patch(
+            "chaos_agent.agent.spec._feasibility_checkers._check_node_iptables_available",
+            node_probe,
+        ):
+            report = await assess_feasibility(
+                spec, "/fake/kubeconfig", network_mechanism="userspace-bind",
+            )
+
         assert report is None
+        node_probe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_node_netfilter_mechanism_still_checks_host_iptables(self):
+        """Control for the node axis: an undeclared ("") node network fault
+        STILL probes host iptables and returns IMPOSSIBLE when missing — the
+        P0 host-iptables guard (task-4d5069fe) is preserved for netfilter."""
+        spec = _make_spec(
+            fault_target="network", fault_action="delay",
+            scope="node", names=("node-a",), namespace="", params={},
+        )
+        node_probe = AsyncMock(return_value=(False, "chroot missing"))
+        with patch(
+            "chaos_agent.agent.spec._feasibility_checkers._check_node_iptables_available",
+            node_probe,
+        ):
+            report = await assess_feasibility(spec, "/fake/kubeconfig")
+
+        assert report is not None
+        assert report.severity == FeasibilitySeverity.IMPOSSIBLE
+        node_probe.assert_called_once()
+
+    def test_gate_has_no_hardcoded_fault_action_branch(self):
+        """Negative source guard: the mechanism gate must be a single
+        membership test against the declared mechanism set, never a growing
+        ``fault_action in {...}`` allowlist. Scanning the checker source keeps
+        the '槽位与内容分离' invariant honest — a future author adding an
+        action-string branch here turns this test red."""
+        import inspect
+        from chaos_agent.agent.spec._feasibility_checkers import (
+            NetworkFeasibilityChecker,
+        )
+
+        src = inspect.getsource(NetworkFeasibilityChecker.assess)
+        assert "needs_netfilter" in src
+        assert "NON_NETFILTER_NETWORK_MECHANISMS" in src
+        # The gate predicate reads the declared mechanism, not the action verb.
+        assert "network_mechanism not in NON_NETFILTER_NETWORK_MECHANISMS" in src
+        # No hard-coded per-action allowlist/denylist driving the netfilter gate.
+        assert 'fault_action ==' not in src
+        assert 'fault_action in' not in src
 
 
 class TestBladeToolPodFeasibility:
@@ -716,7 +916,7 @@ class TestHostFeasibilityProbes:
 
         meminfo = "MemTotal:       2097152 kB\nMemAvailable:   1048576 kB\n"
 
-        async def fake_run(cmd, timeout=8):
+        async def fake_run(cmd, timeout=8, *, target=None):
             if cmd[:2] == ["free", "-m"]:
                 return None  # primary binary missing → degrade
             if cmd[:1] == ["cat"]:
@@ -737,7 +937,7 @@ class TestHostFeasibilityProbes:
     async def test_host_cpu_probe_load_over_cores(self):
         from chaos_agent.agent.spec._host_feasibility_checkers import HostCpuProbe
 
-        async def fake_run(cmd, timeout=8):
+        async def fake_run(cmd, timeout=8, *, target=None):
             if cmd[:1] == ["uptime"]:
                 return " 10:00:00 up 1 day,  load average: 1.50, 1.20, 1.00"
             if cmd[:1] == ["nproc"]:
@@ -768,6 +968,26 @@ class TestHostFeasibilityProbes:
         assert m.limit == 100
 
     @pytest.mark.asyncio
+    async def test_host_disk_probe_resolves_mount_from_names_when_params_empty(self):
+        # D4/B2 real shape: the NL host disk-fill carries the mount in ``names``
+        # with params EMPTY. The probe must read the FaultSpec authority (which
+        # falls through params["path"] → names absolute paths), NOT params.get,
+        # else it measures the root "/" instead of the declared /drill-disk.
+        from chaos_agent.agent.spec._host_feasibility_checkers import HostDiskProbe
+
+        spec = _make_spec(
+            scope="host", fault_target="disk", fault_action="fill",
+            names=("/drill-disk",), params={},
+        )
+        with patch(
+            "chaos_agent.agent.spec._host_feasibility_checkers.fetch_host_disk_usage",
+            new_callable=AsyncMock, return_value=(1, 2),
+        ) as fetch:
+            m = await HostDiskProbe().measure(spec, "")
+        assert m is not None
+        assert fetch.call_args.args[0] == "/drill-disk"
+
+    @pytest.mark.asyncio
     async def test_dispatch_selects_host_probe_for_host_scope(self):
         # scope="host" → profile_for_spec → "host"; mem checker resolves the
         # host mem probe and skips the metrics-server gate.
@@ -784,3 +1004,87 @@ class TestHostFeasibilityProbes:
         assert report is not None
         # target=1960 MiB, usage=500 → headroom huge → OK
         assert report.severity == FeasibilitySeverity.OK
+
+
+class TestSeamDelegation:
+    """``_resolve_first_pod`` / ``_fetch_pod_node`` are thin wrappers over the
+    shared ``target_identity`` seam (#83 audit root-fix). The checker tests above
+    patch these wrappers wholesale, so NOTHING there exercises the delegation
+    GLUE — the exact params the wrapper must hand the seam. These lock it: a
+    workload scope must resolve via selector DISCOVERY (never fall back to the
+    bare workload name — the pre-fix bug), under a Running-phase filter, through
+    an executor that preserves this lane's transport contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolve_first_pod_delegates_with_discovery_and_running_filter(self):
+        from chaos_agent.agent.spec import _feasibility_checkers as fc
+
+        spec = _make_spec(
+            scope="deployment", names=("web",), namespace="ns",
+            fault_target="cpu", fault_action="fullload", params={},
+        )
+        captured: dict = {}
+
+        async def _fake_resolve(**kwargs):
+            captured.update(kwargs)
+            return "web-7d9-abc"
+
+        with patch(
+            "chaos_agent.agent.target_identity.resolve_target_pod_name",
+            side_effect=_fake_resolve,
+        ):
+            out = await fc._resolve_first_pod(spec, "/kc")
+
+        assert out == "web-7d9-abc"
+        assert captured["scope"] == "deployment"
+        assert captured["names"] == ("web",) or list(captured["names"]) == ["web"]
+        assert captured["namespace"] == "ns"
+        assert captured["kubeconfig"] == "/kc"
+        # THE fix: a workload scope asks the workload for its own selector
+        # instead of returning the bare workload name.
+        assert captured["discover_selector"] is True
+        assert captured["field_selector"] == "status.phase=Running"
+
+    @pytest.mark.asyncio
+    async def test_feasibility_executor_preserves_transport_contract(self):
+        """The injected executor must keep ``skip_guard=True`` +
+        ``source='feasibility-check'`` — delegating the query SHAPE to the seam
+        must not drop this lane's transport semantics."""
+        from chaos_agent.agent.spec import _feasibility_checkers as fc
+
+        seen: dict = {}
+
+        async def _fake_transport(cmd, target, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(exit_code=0, stdout="pod-x")
+
+        with patch(
+            "chaos_agent.transports.execute_via_transport",
+            side_effect=_fake_transport,
+        ):
+            await fc._feasibility_executor(["kubectl", "get"], None, timeout=5)
+
+        assert seen["skip_guard"] is True
+        assert seen["source"] == "feasibility-check"
+
+    @pytest.mark.asyncio
+    async def test_fetch_pod_node_delegates_to_seam_primitive(self):
+        from chaos_agent.agent.spec import _feasibility_checkers as fc
+
+        captured: dict = {}
+
+        async def _fake_node(**kwargs):
+            captured.update(kwargs)
+            return "node-a"
+
+        with patch(
+            "chaos_agent.agent.target_identity.resolve_node_of_pod",
+            side_effect=_fake_node,
+        ):
+            out = await fc._fetch_pod_node("pod-1", "ns", "/kc")
+
+        assert out == "node-a"
+        assert captured["pod_name"] == "pod-1"
+        assert captured["namespace"] == "ns"
+        assert captured["kubeconfig"] == "/kc"

@@ -15,21 +15,28 @@ from __future__ import annotations
 
 import logging
 
-from chaos_agent.transports import PROFILE_HOST
+from chaos_agent.transports import (
+    PROFILE_HOST,
+    TransportTarget,
+    resolve_transport_target,
+)
 
 logger = logging.getLogger(__name__)
 
 
-async def _run_host(command: list[str], timeout: int = 8) -> str | None:
+async def _run_host(
+    command: list[str], timeout: int = 8,
+    *, target: TransportTarget | None = None,
+) -> str | None:
     """Run one read-only diagnostic on the target host. stdout or None."""
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
 
     if not command:
         return None
     try:
-        target = TransportTarget.from_state({})
+        _target = target if target is not None else resolve_transport_target(None)
         result = await execute_via_transport(
-            command, target, timeout=timeout,
+            command, _target, timeout=timeout,
             source="feasibility-check", skip_guard=True,
             # This builds a bare shell diagnostic for ONE machine. Without the
             # gate it would run on whatever the configured channel addresses —
@@ -45,7 +52,9 @@ async def _run_host(command: list[str], timeout: int = 8) -> str | None:
         return None
 
 
-async def fetch_host_disk_usage(path: str) -> tuple[int | None, int | None]:
+async def fetch_host_disk_usage(
+    path: str, *, target: TransportTarget | None = None,
+) -> tuple[int | None, int | None]:
     """Return ``(usage_percent, total_gb)`` for ``path`` on the target host.
 
     Runs ``df -P <path>`` directly on the host; parsing is shared with the
@@ -53,7 +62,7 @@ async def fetch_host_disk_usage(path: str) -> tuple[int | None, int | None]:
     """
     from chaos_agent.agent.spec._feasibility_checkers import _parse_df_output
 
-    df_out = await _run_host(["df", "-P", path], timeout=10)
+    df_out = await _run_host(["df", "-P", path], timeout=10, target=target)
     return _parse_df_output(df_out)
 
 
@@ -150,13 +159,15 @@ class HostMemProbe:
     profile = PROFILE_HOST
     target = "mem"
 
-    async def measure(self, spec, kubeconfig):
+    async def measure(self, spec, kubeconfig, *, xport_target=None):
         from chaos_agent.agent.spec.feasibility import Measurement
 
-        used, total = _parse_free_used_total_mb(await _run_host(["free", "-m"]))
+        used, total = _parse_free_used_total_mb(
+            await _run_host(["free", "-m"], target=xport_target)
+        )
         if used is None or total is None:
             used, total = _parse_meminfo_used_total_mb(
-                await _run_host(["cat", "/proc/meminfo"])
+                await _run_host(["cat", "/proc/meminfo"], target=xport_target)
             )
         if used is None or total is None or total == 0:
             return None
@@ -167,15 +178,19 @@ class HostCpuProbe:
     profile = PROFILE_HOST
     target = "cpu"
 
-    async def measure(self, spec, kubeconfig):
+    async def measure(self, spec, kubeconfig, *, xport_target=None):
         from chaos_agent.agent.spec.feasibility import Measurement
 
-        load1 = _parse_loadavg_1m(await _run_host(["uptime"]))
+        load1 = _parse_loadavg_1m(await _run_host(["uptime"], target=xport_target))
         if load1 is None:
-            load1 = _parse_loadavg_1m(await _run_host(["cat", "/proc/loadavg"]))
-        cores = _parse_nproc(await _run_host(["nproc"]))
+            load1 = _parse_loadavg_1m(
+                await _run_host(["cat", "/proc/loadavg"], target=xport_target)
+            )
+        cores = _parse_nproc(await _run_host(["nproc"], target=xport_target))
         if cores is None:
-            cores = _parse_nproc(await _run_host(["cat", "/proc/stat"]))
+            cores = _parse_nproc(
+                await _run_host(["cat", "/proc/stat"], target=xport_target)
+            )
         if load1 is None or not cores:
             return None
         # Millicores, mirroring the k8s cpu probe: capacity = cores * 1000,
@@ -187,11 +202,18 @@ class HostDiskProbe:
     profile = PROFILE_HOST
     target = "disk"
 
-    async def measure(self, spec, kubeconfig):
+    async def measure(self, spec, kubeconfig, *, xport_target=None):
         from chaos_agent.agent.spec.feasibility import Measurement
 
-        path = spec.params.get("path", "/")
-        usage_pct, total_gb = await fetch_host_disk_usage(path)
+        # Read the disk mount from the FaultSpec authority, NOT params["path"]
+        # directly. The real NL host disk-fill stores the mount in ``names``
+        # with params empty (D4/B2); reading params["path"] here would measure
+        # the root fs "/" instead of the declared /drill-disk target — the same
+        # wrong-target bug the verify-side extraction had. Falls back to "/"
+        # only when no path is declared anywhere.
+        targets = spec.disk_mount_targets
+        path = targets[0] if targets else "/"
+        usage_pct, total_gb = await fetch_host_disk_usage(path, target=xport_target)
         if usage_pct is None:
             return None
         return Measurement(current=usage_pct, limit=total_gb)

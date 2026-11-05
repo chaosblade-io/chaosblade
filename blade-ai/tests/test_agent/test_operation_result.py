@@ -9,6 +9,7 @@ from chaos_agent.agent.result.operation_result import (
     build_recover_data_from_state,
     build_recovery_handle,
     build_unknown_inject_data,
+    pending_vehicle_teardown,
     recover_result_label_from_values,
     recover_task_state_from_values,
     target_list_from_state,
@@ -61,6 +62,46 @@ def test_build_inject_data_uses_fault_spec_projection():
     assert data["verification"]["level"] == "verified"
     assert "side_effects" not in data["verification"]
     assert data["side_effects"] == {"container_restarts": []}
+
+
+def test_build_inject_data_freezes_resolved_injection_channel(monkeypatch):
+    """Case #87: the RESOLVED transport channel is frozen into the record so
+    recover pins it instead of re-deriving from drifted ambient settings. A
+    bare CLI inject carries an empty kube_connection_mode override, so the
+    channel in force comes from settings — that resolved name must survive."""
+    from chaos_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
+    monkeypatch.setattr(settings, "kubeconfig_path", "/fake/kubeconfig")
+    data = build_inject_data_from_state(_inject_state(), "task-inject")
+    assert data["injection_channel"] == "kubeconfig"
+
+
+def test_build_inject_data_freezes_host_injection_channel(monkeypatch):
+    """A host-channel inject freezes the host channel name (symmetry: recover
+    of a host fault must not drift onto a k8s channel either)."""
+    from chaos_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "kube_connection_mode", "ssh")
+    monkeypatch.setattr(settings, "ssh_host", "127.0.0.1")
+    data = build_inject_data_from_state(_inject_state(), "task-inject")
+    assert data["injection_channel"] == "ssh"
+
+
+def test_build_inject_data_unresolvable_channel_freezes_empty(monkeypatch):
+    """An unresolvable channel freezes "" — never the ``unknown`` sentinel — so
+    recover keeps its ambient-settings fallback rather than a poison value that
+    would itself resolve to unknown."""
+    from chaos_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "kube_connection_mode", "bogus-channel")
+    data = build_inject_data_from_state(_inject_state(), "task-inject")
+    assert data["injection_channel"] == ""
+
+
+def test_build_unknown_inject_data_has_empty_injection_channel():
+    """Schema parity: the no-state builder carries the field as empty."""
+    assert build_unknown_inject_data("task-x")["injection_channel"] == ""
 
 
 def test_build_recover_data_uses_inject_state_for_fault_and_target():
@@ -193,11 +234,16 @@ def test_inject_status_data_projects_pending_targets_from_fault_spec():
         include_experiment_uid=False,
     )
 
+    # W-78R-1: EVERY terminal builder carries the owed-teardown field
+    # (single-sourced in pending_vehicle_teardown). This pending shape has no
+    # carrier armed, so it rides empty — but the key MUST be present, or a
+    # consumer cannot distinguish "no vehicles owed" from "builder forgot".
     assert data == {
         "task_id": "task-inject",
         "result": "pending",
         "fault_type": "pod-cpu-fullload",
         "targets": [{"name": "pod-a", "namespace": "arms-prom"}],
+        "vehicle_teardown_pending": [],
     }
 
 
@@ -223,7 +269,80 @@ def test_inject_status_data_projects_failed_error_from_fault_spec():
         "targets": [{"name": "pod-a", "namespace": "arms-prom"}],
         "experiment_uid": "",
         "error": "internal_error: boom",
+        # W-78R-1: the crash/failed shape carries the owed-teardown field too
+        # — this is the exact envelope a mid-run uncaught exception ships, so
+        # an armed carrier MUST surface here (empty in this fixture: no
+        # execution_artifacts).
+        "vehicle_teardown_pending": [],
     }
+
+
+def _carrier_state(status: str = "recovery_armed") -> dict:
+    """Inject state carrying one task-built recovery vehicle (W-78R-1).
+
+    Mirrors the mid-run checkpoint shape a native cordon+PDB drill leaves
+    behind: the fault itself plus a ``recovery_carrier`` artifact whose RBAC
+    stack outlives the run (deadline-protected out of the finalize sweep).
+    """
+    state = _inject_state()
+    state["execution_artifacts"] = [
+        {
+            "type": "recovery_carrier",
+            "name": "carrier-abc",
+            "namespace": "cms-demo",
+            "status": status,
+        },
+    ]
+    return state
+
+
+def test_inject_status_data_carries_owed_teardown_from_single_source():
+    # The crash/failed builder must surface an armed carrier, and the list it
+    # rides MUST be the single-sourced predicate's output verbatim — never a
+    # re-derivation at this construction site (R13-1 invariant).
+    state = _carrier_state()
+
+    data = build_inject_status_data_from_state(
+        state,
+        "task-inject",
+        result="failed",
+        error="internal_error: ReadError",
+    )
+
+    assert data["vehicle_teardown_pending"] == ["recovery_carrier:cms-demo/carrier-abc"]
+    assert data["vehicle_teardown_pending"] == pending_vehicle_teardown(state)
+
+
+def test_terminal_builders_agree_on_owed_teardown():
+    # W-78R-1 class invariant: the success-path builder and the crash/failed
+    # builder are BOTH terminal consumers of the owed-teardown fact. For the
+    # same state they must answer identically — the whole bug was the crash
+    # shape silently dropping the field the success shape carried, so "did
+    # this task leave uncollected vehicles" had two answers depending on how
+    # the run ended.
+    state = _carrier_state()
+
+    success = build_inject_data_from_state(state, "task-inject", elapsed_ms=1)
+    crash = build_inject_status_data_from_state(
+        state, "task-inject", result="failed", error="boom",
+    )
+
+    assert success["vehicle_teardown_pending"] == crash["vehicle_teardown_pending"]
+    assert crash["vehicle_teardown_pending"] == ["recovery_carrier:cms-demo/carrier-abc"]
+
+
+def test_inject_status_data_owed_teardown_empty_when_carrier_cleaned():
+    # Reverse proposition: a carrier already swept (status="cleaned") is NOT
+    # owed, so the crash envelope must ride empty — the field is a teardown
+    # LEDGER, not a "was a carrier ever built" flag. Guards against a fix
+    # that over-reports and cries `blade-ai recover` on a clean task.
+    state = _carrier_state(status="cleaned")
+
+    data = build_inject_status_data_from_state(
+        state, "task-inject", result="failed", error="boom",
+    )
+
+    assert data["vehicle_teardown_pending"] == []
 
 
 def test_unknown_inject_data_uses_complete_result_card_shape():
@@ -233,6 +352,7 @@ def test_unknown_inject_data_uses_complete_result_card_shape():
         "fault_type": "",
         "experiment_uid": "uid-1",
         "injection_method": None,
+        "injection_channel": "",
         "fault_handle": None,
         "duration_ms": 0,
         "fault_spec": {},

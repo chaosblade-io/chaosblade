@@ -27,9 +27,18 @@ registration constructor and the predicate reads the field first (suffix
 = legacy fallback only — guarded below), and matcher threading (P3)
 moved the teardown≠mutation exemption into the vocabulary layer itself
 (``make_teardown_matcher`` threading, see
-tests/test_agent/test_teardown_vocab_sentinel.py). This map now guards
-the RECORDED field's expected value per type and the residue of
-independent derivations (the screener's hardcoded strings).
+tests/test_agent/test_teardown_vocab_sentinel.py). This map guards the
+RECORDED field's expected value per type — sync-duty places #1/#2/#4
+below. It does NOT guard place #3 (the screener's hardcoded scope↔type
+special-case): that branch is a targeted ``deployment``↔
+``occupant_deployment`` exemption, fail-closed in direction, and a future
+non-pod-scoped vehicle type's over-rejection surfaces in that type's OWN
+behavioral drill tests (which every new vehicle type must add), not here.
+So #3 stays a MANUAL sync duty — do not read this sentinel as enforcing
+it. Root-collapsing #3 into the recorded-kind single source (a
+data-driven screener check) is deferred until a non-pod-scoped type
+actually lands; doing it for a hypothetical type would touch the
+safety-critical screening path for no live defect.
 """
 
 import ast
@@ -44,7 +53,9 @@ from chaos_agent.agent.execution_artifacts import (
 #: of ``VEHICLE_ARTIFACT_TYPES`` MUST be registered here.
 #:
 #: FOUR-PLACE SYNC DUTY when adding a vehicle type — each place below must
-#: be updated together, and this sentinel goes red if any drifts:
+#: be updated together. This sentinel goes red if #1/#2/#4 drift; #3 is a
+#: MANUAL duty it does NOT enforce (see the #3 note and the module
+#: docstring):
 #:   1. ``VEHICLE_ARTIFACT_TYPES`` (execution_artifacts.py) — the set;
 #:   2. the ``kind`` field written by EVERY registration constructor
 #:      (``_debug_pod_artifact`` / ``_drill_vehicle_artifact`` / the
@@ -53,7 +64,10 @@ from chaos_agent.agent.execution_artifacts import (
 #:      inside ``is_vehicle_teardown_delete`` survives ONLY as the
 #:      hydration fallback for pre-P5 artifacts;
 #:   3. the screener's hardcoded type strings (tool_screener.py — e.g. the
-#:      ``"occupant_deployment" in vehicle_artifact_types(...)`` checks);
+#:      ``"occupant_deployment" in vehicle_artifact_types(...)`` checks) —
+#:      NOT sentinel-enforced: a targeted ``deployment``-scope branch,
+#:      fail-closed, whose drift for a new non-pod-scoped type surfaces in
+#:      that type's own behavioral drill tests, not here;
 #:   4. the constructor ``_drill_vehicle_artifact``'s kind→type whitelist
 #:      (and the recovery-carrier / debug-pod constructors if applicable).
 VEHICLE_KIND_MAP: dict[str, str] = {
@@ -276,6 +290,11 @@ class TestNamespaceTopologySingleSource:
         assert is_cluster_scoped_kind("clusterrole") is True
         assert is_cluster_scoped_kind("clusterrolebinding") is True
         assert is_cluster_scoped_kind("node") is True
+        # expand-k8s-case-coverage 2.1 (回调服务不可达): the admission drill prop is
+        # cluster-scoped — deletion-red pin so the mechanism_writes empty-namespace
+        # entry keeps matching (dropping it from CLUSTER_SCOPED_KINDS → the drift
+        # namespace comparison would materialise a non-empty ns → REJECT_DRIFT).
+        assert is_cluster_scoped_kind("validatingwebhookconfiguration") is True
         assert is_cluster_scoped_kind("role") is False
         assert is_cluster_scoped_kind("serviceaccount") is False
         assert is_cluster_scoped_kind("pod") is False

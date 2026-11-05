@@ -19,7 +19,11 @@ from chaos_agent.agent.spec.feasibility import (
     FeasibilitySeverity,
     register_feasibility_checker,
 )
-from chaos_agent.transports import PROFILE_K8S
+from chaos_agent.transports import (
+    PROFILE_K8S,
+    TransportTarget,
+    resolve_transport_target,
+)
 
 if TYPE_CHECKING:
     from chaos_agent.agent.spec.fault_spec import FaultSpec
@@ -30,6 +34,38 @@ _HEADROOM_IMPOSSIBLE = 0.05
 _HEADROOM_TIGHT = 0.20
 
 
+def _probe_read_skipped_report(dimension: str) -> FeasibilityReport:
+    """Visible SKIPPED report for a feasibility probe that COULD NOT READ the
+    target (essence-B unified guard — single renderer for mem/cpu/disk).
+
+    A probe returning no measurement — target unresolvable in the cluster, or
+    the usage/capacity read returned nothing — is a CAPABILITY LOSS, not
+    evidence of feasibility. Returning ``None`` here would let
+    ``assess_feasibility`` launder it into "None ≡ OK" (a silent green on the
+    confirm card), exactly the failure the metrics-server-unavailable and
+    network-unresolvable paths already surface as first-class SKIPPED. One
+    renderer keeps every dimension's "missing reading" report identical, so the
+    class is closed by construction rather than by each author remembering.
+    """
+    return FeasibilityReport(
+        severity=FeasibilitySeverity.SKIPPED,
+        headroom=0.0,
+        current_value="",
+        limit_value="",
+        target_value="",
+        message=(
+            f"Could not read the target's current {dimension} usage/ceiling "
+            f"(target unresolvable or the metrics read returned nothing) — "
+            f"{dimension} headroom check skipped"
+        ),
+        recommendation=(
+            f"Verify the target workload has a Running pod and that its "
+            f"{dimension} metrics are readable (metrics-server for pod/node "
+            f"usage); the headroom check needs a concrete current+ceiling read"
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Metrics-server availability probe (TTL-cached)
 # ---------------------------------------------------------------------------
@@ -38,7 +74,9 @@ _metrics_probe_cache: tuple[bool, float] | None = None
 _METRICS_PROBE_TTL = 300  # 5 minutes
 
 
-async def is_metrics_server_available(kubeconfig: str) -> bool:
+async def is_metrics_server_available(
+    kubeconfig: str, *, target: TransportTarget | None = None,
+) -> bool:
     """Check if metrics-server is reachable via kubectl top node.
 
     Result is cached with a 5-minute TTL to avoid repeated probes
@@ -48,7 +86,9 @@ async def is_metrics_server_available(kubeconfig: str) -> bool:
     now = _time.monotonic()
     if _metrics_probe_cache and (now - _metrics_probe_cache[1]) < _METRICS_PROBE_TTL:
         return _metrics_probe_cache[0]
-    result = await _run_kubectl(["top", "node", "--no-headers"], kubeconfig, timeout=5)
+    result = await _run_kubectl(
+        ["top", "node", "--no-headers"], kubeconfig, timeout=5, target=target,
+    )
     available = result is not None and len(result.strip()) > 0
     _metrics_probe_cache = (available, now)
     return available
@@ -59,19 +99,22 @@ async def is_metrics_server_available(kubeconfig: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def _run_kubectl(args: list[str], kubeconfig: str, timeout: int = 8) -> str | None:
+async def _run_kubectl(
+    args: list[str], kubeconfig: str, timeout: int = 8,
+    *, target: TransportTarget | None = None,
+) -> str | None:
     """Run a kubectl command. Returns stdout on success, None on any error."""
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
 
     if not args:
         return None
     subcommand = args[0]
     sub_args = args[1:]
-    cmd = build_kubectl_cmd(subcommand, sub_args, kubeconfig=kubeconfig)
+    _target = target if target is not None else resolve_transport_target(None)
+    cmd = build_kubectl_cmd(subcommand, sub_args, kubeconfig=kubeconfig, target=_target)
 
     try:
-        _target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, _target, timeout=timeout, source="feasibility-check",
             skip_guard=True, expect_profile=PROFILE_K8S)
@@ -82,34 +125,63 @@ async def _run_kubectl(args: list[str], kubeconfig: str, timeout: int = 8) -> st
         return None
 
 
+async def _feasibility_executor(
+    cmd, target, *, timeout, task_id: str = "", expect_profile: str = PROFILE_K8S
+):
+    """Transport executor that preserves THIS lane's semantics while the
+    resolution LOGIC lives in the shared ``target_identity`` seam.
+
+    The feasibility probes run pre-confirmation as read-only recon, so they
+    skip the ToolGuard command whitelist (``skip_guard=True``) and tag their
+    transport calls ``source="feasibility-check"``. The seam accepts an
+    injectable ``executor`` precisely so a consumer keeps its own transport
+    contract while single-sourcing the kubectl query shape.
+    """
+    from chaos_agent.transports import execute_via_transport
+
+    return await execute_via_transport(
+        cmd, target, timeout=timeout, source="feasibility-check",
+        skip_guard=True, expect_profile=expect_profile,
+    )
+
+
 async def _resolve_first_pod(
-    spec: "FaultSpec", kubeconfig: str
+    spec: "FaultSpec", kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> str | None:
     """Resolve a real pod name from FaultSpec for feasibility checks.
 
-    When labels are set, queries kubectl to find a Running pod matching
-    the selector.  Falls back to spec.names[0] (assumed exact pod name).
+    Delegates to the shared ``target_identity`` seam — the single authority
+    for target→pod resolution (W-83-5 / #83 audit). ``discover_selector=True``
+    makes a WORKLOAD scope (whose ``spec.labels`` is structurally empty under
+    the B31 guards) ask the workload for its OWN selector, then map it to a
+    Running pod. This closes the pre-fix bug where the fallback returned
+    ``spec.names[0]`` — a bare workload name that kubectl resolves as a *Pod* →
+    ``NotFound`` → every downstream ``_fetch_pod_*`` silently no-ops and the
+    feasibility verdict launders into a false "nothing wrong" for the whole
+    deployment/statefulset/daemonset class.
+
+    Fail-open → ``None`` (never a workload-name guess). The network checker
+    surfaces that ``None`` as a VISIBLE ``SKIPPED`` report rather than silence.
+    ``field_selector="status.phase=Running"`` preserves this lane's pre-existing
+    Running-pod filter. Kept as a module function (delegating body) so the
+    existing test patch target is unchanged.
     """
-    if spec.labels:
-        label_selector = ",".join(f"{k}={v}" for k, v in spec.labels.items())
-        args = [
-            "get", "pod",
-            "-l", label_selector,
-            "-n", spec.namespace or "default",
-            "--field-selector=status.phase=Running",
-            "-o", "jsonpath={.items[0].metadata.name}",
-        ]
-        stdout = await _run_kubectl(args, kubeconfig, timeout=5)
-        pod_name = (stdout or "").strip().strip("'\"")
-        if pod_name:
-            return pod_name
-    if spec.names:
-        return spec.names[0]
-    return None
+    from chaos_agent.agent.target_identity import resolve_target_pod_name
+
+    return await resolve_target_pod_name(
+        scope=spec.scope, names=spec.names,
+        namespace=spec.namespace or "default", kubeconfig=kubeconfig,
+        labels=spec.labels, discover_selector=True,
+        field_selector="status.phase=Running",
+        executor=_feasibility_executor,
+        target=target,
+    )
 
 
 async def _resolve_scope_target(
-    spec: "FaultSpec", kubeconfig: str, *, require_namespace: bool
+    spec: "FaultSpec", kubeconfig: str, *, require_namespace: bool,
+    target: TransportTarget | None = None,
 ) -> str | None:
     """Resolve the probe target name by scope (single dispatch point).
 
@@ -129,16 +201,17 @@ async def _resolve_scope_target(
         return spec.names[0]
     if require_namespace and not spec.namespace:
         return None
-    return await _resolve_first_pod(spec, kubeconfig)
+    return await _resolve_first_pod(spec, kubeconfig, target=target)
 
 
 async def _fetch_memory_usage_mb(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> int | None:
     """kubectl top pod → memory usage in MB."""
     stdout = await _run_kubectl(
         ["top", "pod", pod_name, "-n", namespace, "--no-headers"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     if not stdout:
         return None
@@ -159,7 +232,8 @@ async def _fetch_memory_usage_mb(
 
 
 async def _fetch_memory_limit_mb(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> int | None:
     """kubectl get pod → resources.limits.memory in MB."""
     from chaos_agent.utils.fault_type import parse_k8s_memory_to_mb
@@ -169,7 +243,7 @@ async def _fetch_memory_limit_mb(
             "get", "pod", pod_name, "-n", namespace,
             "-o", "jsonpath={.spec.containers[0].resources.limits.memory}",
         ],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     if not stdout:
         return None
@@ -180,12 +254,13 @@ async def _fetch_memory_limit_mb(
 
 
 async def _fetch_node_memory_usage_mb(
-    node_name: str, kubeconfig: str
+    node_name: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> int | None:
     """kubectl top node → memory usage in MB."""
     stdout = await _run_kubectl(
         ["top", "node", node_name, "--no-headers"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     if not stdout:
         return None
@@ -206,7 +281,8 @@ async def _fetch_node_memory_usage_mb(
 
 
 async def _fetch_node_memory_capacity_mb(
-    node_name: str, kubeconfig: str
+    node_name: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> int | None:
     """kubectl get node → status.allocatable.memory in MB."""
     from chaos_agent.utils.fault_type import parse_k8s_memory_to_mb
@@ -216,7 +292,7 @@ async def _fetch_node_memory_capacity_mb(
             "get", "node", node_name,
             "-o", "jsonpath={.status.allocatable.memory}",
         ],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     if not stdout:
         return None
@@ -227,14 +303,15 @@ async def _fetch_node_memory_capacity_mb(
 
 
 async def _fetch_cpu_usage_millicores(
-    name: str, namespace: str, kubeconfig: str, *, is_node: bool = False
+    name: str, namespace: str, kubeconfig: str, *, is_node: bool = False,
+    target: TransportTarget | None = None,
 ) -> int | None:
     """kubectl top pod/node → CPU usage in millicores."""
     if is_node:
         args = ["top", "node", name, "--no-headers"]
     else:
         args = ["top", "pod", name, "-n", namespace, "--no-headers"]
-    stdout = await _run_kubectl(args, kubeconfig)
+    stdout = await _run_kubectl(args, kubeconfig, target=target)
     if not stdout:
         return None
     parts = stdout.split()
@@ -255,7 +332,8 @@ async def _fetch_cpu_usage_millicores(
 
 
 async def _fetch_cpu_limit_millicores(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> int | None:
     """kubectl get pod → resources.limits.cpu in millicores."""
     stdout = await _run_kubectl(
@@ -263,7 +341,7 @@ async def _fetch_cpu_limit_millicores(
             "get", "pod", pod_name, "-n", namespace,
             "-o", "jsonpath={.spec.containers[0].resources.limits.cpu}",
         ],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     if not stdout:
         return None
@@ -282,7 +360,8 @@ async def _fetch_cpu_limit_millicores(
 
 
 async def _fetch_node_cpu_capacity_millicores(
-    node_name: str, kubeconfig: str
+    node_name: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> int | None:
     """kubectl get node → status.capacity.cpu in millicores."""
     stdout = await _run_kubectl(
@@ -290,7 +369,7 @@ async def _fetch_node_cpu_capacity_millicores(
             "get", "node", node_name,
             "-o", "jsonpath={.status.capacity.cpu}",
         ],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     if not stdout:
         return None
@@ -318,10 +397,20 @@ class MemoryFeasibilityChecker:
     requires_metrics_server = True
 
     async def assess(
-        self, spec: "FaultSpec", kubeconfig: str
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> FeasibilityReport | None:
         target_percent = _parse_int_param(spec.params.get("mem-percent"))
         if target_percent is None or target_percent <= 0:
+            return None
+
+        # Essence-B pre-probe guards (mirror NetworkFeasibilityChecker): an
+        # INCOMPLETE spec means the check does NOT APPLY (→ None / N-A), which
+        # is distinct from a COMPLETE spec whose cluster read FAILED (→ SKIPPED
+        # below). Without these, ``measure() → None`` conflates the two.
+        if not spec.names and not spec.labels:
+            return None
+        if spec.scope != "node" and not spec.namespace:
             return None
 
         # Data source is the only environment-dependent step: delegate to the
@@ -336,8 +425,15 @@ class MemoryFeasibilityChecker:
         probe = resolve_feasibility_probe(profile_for_spec(spec), "mem")
         if probe is None:
             return None
-        m = await probe.measure(spec, kubeconfig)
-        if m is None or m.limit is None or m.limit == 0:
+        m = await probe.measure(spec, kubeconfig, xport_target=xport_target)
+        if m is None:
+            # Probe could not read the target → capability loss → VISIBLE
+            # SKIPPED, never laundered into None≡OK (essence-B).
+            return _probe_read_skipped_report("memory")
+        if m.limit is None or m.limit == 0:
+            # Measurement succeeded but the target has no meaningful ceiling
+            # (e.g. a pod with no resources.limits.memory → unbounded → mem
+            # load is trivially feasible). Legitimate N-A, not a failure.
             return None
         usage_mb = int(m.current)
         limit_mb = int(m.limit)
@@ -399,7 +495,8 @@ class CpuFeasibilityChecker:
     requires_metrics_server = True
 
     async def assess(
-        self, spec: "FaultSpec", kubeconfig: str
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> FeasibilityReport | None:
         target_percent = _parse_int_param(spec.params.get("cpu-percent"))
         if target_percent is None or target_percent <= 0:
@@ -407,6 +504,13 @@ class CpuFeasibilityChecker:
                 target_percent = 100
             else:
                 return None
+
+        # Essence-B pre-probe guard (mirror NetworkFeasibilityChecker): an
+        # INCOMPLETE spec → None (N-A); a COMPLETE spec whose read FAILED →
+        # SKIPPED below. cpu tolerates an empty namespace (require_namespace=
+        # False in _resolve_scope_target), so only the target selector is gated.
+        if not spec.names and not spec.labels:
+            return None
 
         # Data source is the only environment-dependent step: delegate to the
         # (profile, target) probe (k8s: node capacity vs pod limit; host: load
@@ -419,8 +523,14 @@ class CpuFeasibilityChecker:
         probe = resolve_feasibility_probe(profile_for_spec(spec), "cpu")
         if probe is None:
             return None
-        m = await probe.measure(spec, kubeconfig)
-        if m is None or m.limit is None or m.limit == 0:
+        m = await probe.measure(spec, kubeconfig, xport_target=xport_target)
+        if m is None:
+            # Probe could not read the target → capability loss → VISIBLE
+            # SKIPPED, never laundered into None≡OK (essence-B).
+            return _probe_read_skipped_report("cpu")
+        if m.limit is None or m.limit == 0:
+            # No meaningful ceiling (e.g. pod with no resources.limits.cpu →
+            # unbounded → fullload feasible). Legitimate N-A, not a failure.
             return None
         usage_mc = int(m.current)
         capacity_mc = int(m.limit)
@@ -480,9 +590,15 @@ class CpuFeasibilityChecker:
 class NetworkFeasibilityChecker:
     fault_target = "network"
     requires_metrics_server = False
+    #: Opts into the case-declared ``network_mechanism`` (forwarded by
+    #: ``assess_feasibility``) so the netfilter-only iptables/interface probes
+    #: are skipped for non-netfilter mechanisms (userspace-bind / resolver).
+    consumes_network_mechanism = True
 
     async def assess(
-        self, spec: "FaultSpec", kubeconfig: str
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
+        network_mechanism: str = "",
     ) -> FeasibilityReport | None:
         # Network is an availability check (not a headroom dimension), so it
         # has no (profile, target) probe. It is only assessed on the k8s
@@ -494,13 +610,32 @@ class NetworkFeasibilityChecker:
 
         if profile_for_spec(spec) != PROFILE_K8S:
             return None
+        # Mechanism gate: the iptables + interface probes below are
+        # preconditions for the tc/netem (netfilter) injection mechanism ONLY.
+        # A case-declared non-netfilter mechanism (userspace-bind = port occupy
+        # via nc/socat; resolver = dns-class hosts/resolver mutation) never
+        # touches netfilter, so probing it emits a factually wrong advisory
+        # ("iptables unavailable — prefer the blade operator / a netadmin debug
+        # container") that steers away from the working kubectl-native path.
+        # Undeclared ("") FAILS SAFE to netfilter — run every probe, identical
+        # to the pre-declaration behaviour. Single source for the enumeration.
+        from chaos_agent.agent.target_guard.mechanism_writes import (
+            NON_NETFILTER_NETWORK_MECHANISMS,
+        )
+        needs_netfilter = network_mechanism not in NON_NETFILTER_NETWORK_MECHANISMS
         # Node scope: check host iptables via chaosblade-tool pod
         if spec.scope == "node":
             if not spec.names:
                 return None
+            # Host-iptables is a netfilter-mechanism precondition (node tc/netem
+            # faults). A non-netfilter node network mechanism (e.g. host port
+            # occupy = userspace bind) needs no host iptables; skipping the probe
+            # avoids a wrong IMPOSSIBLE that could BLOCK a feasible injection.
+            if not needs_netfilter:
+                return None
             node_name = spec.names[0]
             has_iptables, iptables_detail = await _check_node_iptables_available(
-                node_name, kubeconfig
+                node_name, kubeconfig, target=xport_target,
             )
             if has_iptables is False:
                 return FeasibilityReport(
@@ -544,12 +679,36 @@ class NetworkFeasibilityChecker:
         if not spec.names and not spec.labels:
             return None
 
-        pod_name = await _resolve_first_pod(spec, kubeconfig)
+        pod_name = await _resolve_first_pod(spec, kubeconfig, target=xport_target)
         if not pod_name:
-            return None
+            # W-83-5 essence-B applied to feasibility: an unresolvable target
+            # used to ``return None``, which ``assess_feasibility`` documents
+            # as "equivalent to OK — fail-open". A network check that NEVER
+            # RAN therefore rendered identically to one that PASSED (silent
+            # green on the confirm card). Surface it as a VISIBLE SKIPPED
+            # report — the same first-class state the metrics-server-
+            # unavailable path already uses — so "could not resolve the target
+            # pod" is never laundered into "feasible".
+            return FeasibilityReport(
+                severity=FeasibilitySeverity.SKIPPED,
+                headroom=0.0,
+                current_value="",
+                limit_value="",
+                target_value="",
+                message=(
+                    "Could not resolve a Running target Pod from the fault "
+                    "spec (scope/names/labels) — network feasibility check "
+                    "skipped"
+                ),
+                recommendation=(
+                    "Verify the target workload has a Running pod and that its "
+                    "selector/labels are correct; the network check needs a "
+                    "concrete pod to probe phase/node/interface on"
+                ),
+            )
         namespace = spec.namespace
 
-        phase = await _fetch_pod_phase(pod_name, namespace, kubeconfig)
+        phase = await _fetch_pod_phase(pod_name, namespace, kubeconfig, target=xport_target)
         if phase is None:
             return None
         if phase != "Running":
@@ -571,10 +730,10 @@ class NetworkFeasibilityChecker:
         # pod's NODE. A cluster-level "some tool pod is healthy" probe is
         # not evidence for this node — task-e9bae269 burned two terminal
         # blade_create attempts on exactly this blind spot.
-        node_name = await _fetch_pod_node(pod_name, namespace, kubeconfig)
+        node_name = await _fetch_pod_node(pod_name, namespace, kubeconfig, target=xport_target)
         if node_name:
             ready, missing_bins, tool_detail = await _check_blade_tool_pod_ready(
-                node_name, spec.fault_action, kubeconfig
+                node_name, spec.fault_action, kubeconfig, target=xport_target,
             )
             if ready is False:
                 if missing_bins:
@@ -626,83 +785,90 @@ class NetworkFeasibilityChecker:
                     ),
                 )
 
-        interface = spec.params.get("interface", "eth0")
-        iface_exists, iface_detail = await _check_interface_exists(
-            pod_name, namespace, interface, kubeconfig
-        )
-        if iface_exists is False:
-            return FeasibilityReport(
-                severity=FeasibilitySeverity.IMPOSSIBLE,
-                headroom=0.0,
-                current_value=f"interface={interface} not found",
-                limit_value="",
-                target_value=f"--interface {interface}",
-                message=f"Interface '{interface}' not found in Pod {pod_name}",
-                recommendation=(
-                    f"Check available interfaces: kubectl exec {pod_name} "
-                    f"-n {namespace} -- ip link show"
-                ),
+        # Netfilter-mechanism preconditions (interface + in-container iptables):
+        # skipped for a case-declared non-netfilter mechanism (userspace-bind /
+        # resolver), which injects without touching the interface or netfilter.
+        # Falling through reaches the (mechanism-agnostic) conflict check + OK.
+        netfilter_facts = ""
+        if needs_netfilter:
+            interface = spec.params.get("interface", "eth0")
+            iface_exists, iface_detail = await _check_interface_exists(
+                pod_name, namespace, interface, kubeconfig, target=xport_target,
             )
-        if iface_exists is None:
-            return FeasibilityReport(
-                severity=FeasibilitySeverity.TIGHT,
-                headroom=0.5,
-                current_value=f"interface check failed: {iface_detail}",
-                limit_value="",
-                target_value=f"--interface {interface}",
-                message=(
-                    f"Cannot verify interface '{interface}' in Pod {pod_name}: {iface_detail}"
-                ),
-                recommendation=(
-                    f"Verify: kubectl exec {pod_name} -n {namespace} "
-                    f"-- cat /sys/class/net/{interface}/operstate"
-                ),
-            )
+            if iface_exists is False:
+                return FeasibilityReport(
+                    severity=FeasibilitySeverity.IMPOSSIBLE,
+                    headroom=0.0,
+                    current_value=f"interface={interface} not found",
+                    limit_value="",
+                    target_value=f"--interface {interface}",
+                    message=f"Interface '{interface}' not found in Pod {pod_name}",
+                    recommendation=(
+                        f"Check available interfaces: kubectl exec {pod_name} "
+                        f"-n {namespace} -- ip link show"
+                    ),
+                )
+            if iface_exists is None:
+                return FeasibilityReport(
+                    severity=FeasibilitySeverity.TIGHT,
+                    headroom=0.5,
+                    current_value=f"interface check failed: {iface_detail}",
+                    limit_value="",
+                    target_value=f"--interface {interface}",
+                    message=(
+                        f"Cannot verify interface '{interface}' in Pod {pod_name}: {iface_detail}"
+                    ),
+                    recommendation=(
+                        f"Verify: kubectl exec {pod_name} -n {namespace} "
+                        f"-- cat /sys/class/net/{interface}/operstate"
+                    ),
+                )
 
-        has_iptables, iptables_detail = await _check_iptables_available(
-            pod_name, namespace, kubeconfig
-        )
-        if has_iptables is False:
-            # TIGHT, not IMPOSSIBLE: the blade operator path and the
-            # debug-container degradation path both bring their own
-            # binaries, so a missing in-container iptables only closes
-            # the direct-exec fallback — it does not make the injection
-            # infeasible.
-            return FeasibilityReport(
-                severity=FeasibilitySeverity.TIGHT,
-                headroom=0.5,
-                current_value="iptables not found in target container",
-                limit_value="",
-                target_value="",
-                message=(
-                    f"iptables unavailable in Pod {pod_name} — the "
-                    f"direct-exec fallback path is closed (blade operator "
-                    f"and debug-container paths are unaffected)"
-                ),
-                recommendation=(
-                    "Prefer the blade operator path, or use a kubectl debug "
-                    "ephemeral container (--profile=netadmin) that carries "
-                    "its own iptables"
-                ),
+            has_iptables, iptables_detail = await _check_iptables_available(
+                pod_name, namespace, kubeconfig, target=xport_target,
             )
-        if has_iptables is None:
-            return FeasibilityReport(
-                severity=FeasibilitySeverity.TIGHT,
-                headroom=0.5,
-                current_value=f"iptables check failed: {iptables_detail}",
-                limit_value="",
-                target_value="",
-                message=(
-                    f"Cannot verify iptables in Pod {pod_name}: {iptables_detail}"
-                ),
-                recommendation=(
-                    "Network injection may fail if iptables is missing. "
-                    f"Verify: kubectl exec {pod_name} -n {namespace} -- iptables --version"
-                ),
-            )
+            if has_iptables is False:
+                # TIGHT, not IMPOSSIBLE: the blade operator path and the
+                # debug-container degradation path both bring their own
+                # binaries, so a missing in-container iptables only closes
+                # the direct-exec fallback — it does not make the injection
+                # infeasible.
+                return FeasibilityReport(
+                    severity=FeasibilitySeverity.TIGHT,
+                    headroom=0.5,
+                    current_value="iptables not found in target container",
+                    limit_value="",
+                    target_value="",
+                    message=(
+                        f"iptables unavailable in Pod {pod_name} — the "
+                        f"direct-exec fallback path is closed (blade operator "
+                        f"and debug-container paths are unaffected)"
+                    ),
+                    recommendation=(
+                        "Prefer the blade operator path, or use a kubectl debug "
+                        "ephemeral container (--profile=netadmin) that carries "
+                        "its own iptables"
+                    ),
+                )
+            if has_iptables is None:
+                return FeasibilityReport(
+                    severity=FeasibilitySeverity.TIGHT,
+                    headroom=0.5,
+                    current_value=f"iptables check failed: {iptables_detail}",
+                    limit_value="",
+                    target_value="",
+                    message=(
+                        f"Cannot verify iptables in Pod {pod_name}: {iptables_detail}"
+                    ),
+                    recommendation=(
+                        "Network injection may fail if iptables is missing. "
+                        f"Verify: kubectl exec {pod_name} -n {namespace} -- iptables --version"
+                    ),
+                )
+            netfilter_facts = f", interface={interface} present, iptables available"
 
         has_conflict = await _check_active_network_experiment(
-            pod_name, namespace, kubeconfig
+            pod_name, namespace, kubeconfig, target=xport_target,
         )
         if has_conflict:
             return FeasibilityReport(
@@ -721,7 +887,7 @@ class NetworkFeasibilityChecker:
         return FeasibilityReport(
             severity=FeasibilitySeverity.OK,
             headroom=1.0,
-            current_value=f"phase=Running, interface={interface} present, iptables available",
+            current_value=f"phase=Running{netfilter_facts}",
             limit_value="",
             target_value="",
             message="Network injection feasible",
@@ -744,31 +910,42 @@ def _parse_int_param(value: str | None) -> int | None:
 
 
 async def _fetch_pod_phase(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> str | None:
     """kubectl get pod → .status.phase"""
     stdout = await _run_kubectl(
         ["get", "pod", pod_name, "-n", namespace,
          "-o", "jsonpath={.status.phase}"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     return stdout if stdout else None
 
 
 async def _fetch_pod_node(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> str | None:
-    """kubectl get pod → .spec.nodeName (the node hosting the pod)."""
-    stdout = await _run_kubectl(
-        ["get", "pod", pod_name, "-n", namespace,
-         "-o", "jsonpath={.spec.nodeName}"],
-        kubeconfig,
+    """kubectl get pod → .spec.nodeName (the node hosting the pod).
+
+    Delegates to the shared ``target_identity`` seam primitive
+    :func:`resolve_node_of_pod` (the #83 audit single-sourced the four
+    hand-rolled ``.spec.nodeName`` reads). Fail-open → ``None``; the network
+    checker's ``if node_name:`` guard already treats that as "skip the
+    tool-pod-on-node precondition, keep going" — preserved. Kept as a module
+    function so the existing test patch target is unchanged.
+    """
+    from chaos_agent.agent.target_identity import resolve_node_of_pod
+
+    return await resolve_node_of_pod(
+        pod_name=pod_name, namespace=namespace, kubeconfig=kubeconfig,
+        executor=_feasibility_executor, target=target,
     )
-    return stdout.strip() if stdout else None
 
 
 async def _check_interface_exists(
-    pod_name: str, namespace: str, interface: str, kubeconfig: str
+    pod_name: str, namespace: str, interface: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[bool | None, str]:
     """Check if network interface exists in pod via /sys/class/net/.
 
@@ -778,13 +955,13 @@ async def _check_interface_exists(
         (None, reason) — indeterminate (timeout/unexpected error)
     """
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
 
+    _target = target if target is not None else resolve_transport_target(None)
     cmd = build_kubectl_cmd("exec", [pod_name, "-n", namespace,
-           "--", "cat", f"/sys/class/net/{interface}/operstate"], kubeconfig=kubeconfig)
+           "--", "cat", f"/sys/class/net/{interface}/operstate"], kubeconfig=kubeconfig, target=_target)
 
     try:
-        _target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, _target, timeout=10, source="feasibility-check",
             skip_guard=True, expect_profile=PROFILE_K8S)
@@ -799,7 +976,8 @@ async def _check_interface_exists(
 
 
 async def _check_iptables_available(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[bool | None, str]:
     """Check if iptables is *functionally* available in the pod container.
 
@@ -820,15 +998,15 @@ async def _check_iptables_available(
         (None, reason) — indeterminate (timeout/unexpected error)
     """
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
 
     # Use `iptables -L -n` to verify actual functionality.
     # This requires CAP_NET_ADMIN; without it, exit_code != 0.
+    _target = target if target is not None else resolve_transport_target(None)
     cmd = build_kubectl_cmd("exec", [pod_name, "-n", namespace,
-           "--", "iptables", "-L", "-n"], kubeconfig=kubeconfig)
+           "--", "iptables", "-L", "-n"], kubeconfig=kubeconfig, target=_target)
 
     try:
-        _target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, _target, timeout=10, source="feasibility-check",
             skip_guard=True, expect_profile=PROFILE_K8S)
@@ -849,7 +1027,8 @@ async def _check_iptables_available(
 
 
 async def _find_tool_pod_on_node(
-    node_name: str, kubeconfig: str
+    node_name: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[str, str] | None:
     """Find a Running chaosblade-tool pod on *node_name*.
 
@@ -873,7 +1052,7 @@ async def _find_tool_pod_on_node(
         ["get", "pods", "-A", "-l", "app=chaosblade-tool",
          "--field-selector", f"spec.nodeName={node_name},status.phase=Running",
          "-o", "jsonpath={.items[0].metadata.namespace} {.items[0].metadata.name}"],
-        kubeconfig, timeout=5,
+        kubeconfig, timeout=5, target=target,
     )
     if stdout:
         parts = stdout.split(None, 1)
@@ -897,7 +1076,8 @@ def _required_tool_binaries(action: str) -> tuple[str, ...]:
 
 
 async def _check_blade_tool_pod_ready(
-    node_name: str, action: str, kubeconfig: str
+    node_name: str, action: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[bool | None, tuple[str, ...], str]:
     """Verify the blade operator-path executor on the target node.
 
@@ -907,7 +1087,7 @@ async def _check_blade_tool_pod_ready(
                                or a required binary missing in its image)
         (None, (), d)        — indeterminate (probe error / timeout)
     """
-    tool_pod = await _find_tool_pod_on_node(node_name, kubeconfig)
+    tool_pod = await _find_tool_pod_on_node(node_name, kubeconfig, target=target)
     if not tool_pod:
         return False, (), f"no Running chaosblade-tool pod found on node {node_name}"
     pod_name, namespace = tool_pod
@@ -915,12 +1095,12 @@ async def _check_blade_tool_pod_ready(
     probe_cmd = "command -v " + " && command -v ".join(required)
 
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
 
+    _target = target if target is not None else resolve_transport_target(None)
     cmd = build_kubectl_cmd("exec", [pod_name, "-n", namespace,
-                                     "--", "sh", "-c", probe_cmd], kubeconfig=kubeconfig)
+                                     "--", "sh", "-c", probe_cmd], kubeconfig=kubeconfig, target=_target)
     try:
-        _target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, _target, timeout=10, source="feasibility-check",
             skip_guard=True, expect_profile=PROFILE_K8S)
@@ -939,7 +1119,8 @@ async def _check_blade_tool_pod_ready(
 
 
 async def _check_node_iptables_available(
-    node_name: str, kubeconfig: str
+    node_name: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[bool | None, str]:
     """Check if iptables is functionally available on a node's host.
 
@@ -956,21 +1137,21 @@ async def _check_node_iptables_available(
         (None, reason) — indeterminate (no tool pod, timeout, etc.)
     """
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
-    from chaos_agent.transports import TransportTarget, execute_via_transport
+    from chaos_agent.transports import execute_via_transport
 
-    tool_pod = await _find_tool_pod_on_node(node_name, kubeconfig)
+    tool_pod = await _find_tool_pod_on_node(node_name, kubeconfig, target=target)
     if not tool_pod:
         return None, "no chaosblade-tool pod found on target node"
     pod_name, namespace = tool_pod
 
+    _target = target if target is not None else resolve_transport_target(None)
     cmd = build_kubectl_cmd(
         "exec", [pod_name, "-n", namespace,
                  "--", "chroot", "/host", "iptables", "-L", "-n"],
-        kubeconfig=kubeconfig,
+        kubeconfig=kubeconfig, target=_target,
     )
 
     try:
-        _target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, _target, timeout=10, source="feasibility-check",
             skip_guard=True, expect_profile=PROFILE_K8S)
@@ -988,7 +1169,8 @@ async def _check_node_iptables_available(
 
 
 async def _check_active_network_experiment(
-    pod_name: str, namespace: str, kubeconfig: str
+    pod_name: str, namespace: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> bool:
     """Check if there's already an active chaosblade network experiment on this pod.
 
@@ -1001,6 +1183,7 @@ async def _check_active_network_experiment(
         ["get", "chaosblade", "-o", "json"],
         kubeconfig,
         timeout=8,
+        target=target,
     )
     if not stdout:
         return False
@@ -1034,9 +1217,22 @@ class DiskFeasibilityChecker:
     requires_metrics_server = False
 
     async def assess(
-        self, spec: "FaultSpec", kubeconfig: str
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> FeasibilityReport | None:
-        path = spec.params.get("path", "/")
+        # Report label reads the FaultSpec disk-mount authority (params["path"]
+        # → names absolute paths), NOT params["path"] alone, so a host
+        # disk-fill whose mount lives in ``names`` labels the report with
+        # /drill-disk instead of a misleading "/" (D4/B2). Measurement itself
+        # delegates to the profile probe below.
+        _targets = spec.disk_mount_targets
+        path = _targets[0] if _targets else "/"
+
+        # Essence-B pre-probe guard (mirror NetworkFeasibilityChecker): an
+        # INCOMPLETE spec → None (N-A); a COMPLETE spec whose df read FAILED →
+        # SKIPPED below.
+        if not spec.names and not spec.labels:
+            return None
 
         # Data source is the only environment-dependent step: delegate to the
         # (profile, target) probe (k8s: node tool-pod df vs pod df; host: df /
@@ -1049,9 +1245,11 @@ class DiskFeasibilityChecker:
         probe = resolve_feasibility_probe(profile_for_spec(spec), "disk")
         if probe is None:
             return None
-        m = await probe.measure(spec, kubeconfig)
+        m = await probe.measure(spec, kubeconfig, xport_target=xport_target)
         if m is None:
-            return None
+            # Probe could not read the target's df → capability loss → VISIBLE
+            # SKIPPED, never laundered into None≡OK (essence-B).
+            return _probe_read_skipped_report("disk")
         usage_pct = int(m.current)
         total_gb = m.limit
 
@@ -1115,7 +1313,8 @@ class DiskFeasibilityChecker:
 
 
 async def _fetch_node_disk_usage(
-    node_name: str, path: str, kubeconfig: str
+    node_name: str, path: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[int | None, int | None]:
     """Get disk usage % and total GB for a path on a node via tool pod.
 
@@ -1128,7 +1327,7 @@ async def _fetch_node_disk_usage(
     stdout = await _run_kubectl(
         ["get", "pods", "-n", "chaosblade", "-l", "app=otel-c-tool",
          "-o", "wide", "--no-headers"],
-        kubeconfig, timeout=8,
+        kubeconfig, timeout=8, target=target,
     )
     if not stdout:
         return None, None
@@ -1147,19 +1346,20 @@ async def _fetch_node_disk_usage(
     df_out = await _run_kubectl(
         ["exec", tool_pod, "-n", "chaosblade", "--",
          "df", "-P", path],
-        kubeconfig, timeout=10,
+        kubeconfig, timeout=10, target=target,
     )
     return _parse_df_output(df_out)
 
 
 async def _fetch_pod_disk_usage(
-    pod_name: str, namespace: str, path: str, kubeconfig: str
+    pod_name: str, namespace: str, path: str, kubeconfig: str,
+    *, target: TransportTarget | None = None,
 ) -> tuple[int | None, int | None]:
     """Get disk usage % and total GB for a path inside a pod."""
     df_out = await _run_kubectl(
         ["exec", pod_name, "-n", namespace, "--",
          "df", "-P", path],
-        kubeconfig, timeout=10,
+        kubeconfig, timeout=10, target=target,
     )
     return _parse_df_output(df_out)
 
@@ -1197,21 +1397,43 @@ class K8sMemProbe:
     profile = PROFILE_K8S
     target = "mem"
 
-    async def measure(self, spec: "FaultSpec", kubeconfig: str):
+    async def measure(
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
+    ):
         from chaos_agent.agent.spec.feasibility import Measurement
 
         is_node = spec.scope == "node"
-        name = await _resolve_scope_target(spec, kubeconfig, require_namespace=True)
+        name = await _resolve_scope_target(
+            spec, kubeconfig, require_namespace=True, target=xport_target,
+        )
         if not name:
             return None
         if is_node:
-            usage = await _fetch_node_memory_usage_mb(name, kubeconfig)
-            limit = await _fetch_node_memory_capacity_mb(name, kubeconfig)
-        else:
-            usage = await _fetch_memory_usage_mb(name, spec.namespace, kubeconfig)
-            limit = await _fetch_memory_limit_mb(name, spec.namespace, kubeconfig)
-        if usage is None or limit is None:
+            # Node: BOTH usage (kubectl top) and capacity (allocatable) are
+            # mandatory — either failing is a READ failure → None → SKIPPED.
+            usage = await _fetch_node_memory_usage_mb(
+                name, kubeconfig, target=xport_target,
+            )
+            limit = await _fetch_node_memory_capacity_mb(
+                name, kubeconfig, target=xport_target,
+            )
+            if usage is None or limit is None:
+                return None
+            return Measurement(current=usage, limit=limit)
+        # Pod: usage is mandatory (a metrics-server read); a None LIMIT is
+        # LEGITIMATE — a pod with no resources.limits.memory is unbounded, so
+        # mem-load is trivially feasible. Return Measurement(limit=None) so the
+        # checker reports N-A/OK, NOT a capability-loss SKIPPED (essence-B
+        # distinguishes "the read failed" from "there is no ceiling").
+        usage = await _fetch_memory_usage_mb(
+            name, spec.namespace, kubeconfig, target=xport_target,
+        )
+        if usage is None:
             return None
+        limit = await _fetch_memory_limit_mb(
+            name, spec.namespace, kubeconfig, target=xport_target,
+        )
         return Measurement(current=usage, limit=limit)
 
 
@@ -1219,24 +1441,37 @@ class K8sCpuProbe:
     profile = PROFILE_K8S
     target = "cpu"
 
-    async def measure(self, spec: "FaultSpec", kubeconfig: str):
+    async def measure(
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
+    ):
         from chaos_agent.agent.spec.feasibility import Measurement
 
         is_node = spec.scope == "node"
-        name = await _resolve_scope_target(spec, kubeconfig, require_namespace=False)
+        name = await _resolve_scope_target(
+            spec, kubeconfig, require_namespace=False, target=xport_target,
+        )
         if not name:
             return None
         usage = await _fetch_cpu_usage_millicores(
-            name, spec.namespace, kubeconfig, is_node=is_node
+            name, spec.namespace, kubeconfig, is_node=is_node, target=xport_target,
         )
         if usage is None:
+            # Current-usage read failed (metrics-server) → capability loss.
             return None
         if is_node:
-            capacity = await _fetch_node_cpu_capacity_millicores(name, kubeconfig)
-        else:
-            capacity = await _fetch_cpu_limit_millicores(name, spec.namespace, kubeconfig)
-        if capacity is None:
-            return None
+            # Node capacity is mandatory — a failed read is capability loss.
+            capacity = await _fetch_node_cpu_capacity_millicores(
+                name, kubeconfig, target=xport_target,
+            )
+            if capacity is None:
+                return None
+            return Measurement(current=usage, limit=capacity)
+        # Pod: a None cpu LIMIT is legitimate (no resources.limits.cpu →
+        # unbounded → fullload feasible). Measurement(limit=None) → checker N-A.
+        capacity = await _fetch_cpu_limit_millicores(
+            name, spec.namespace, kubeconfig, target=xport_target,
+        )
         return Measurement(current=usage, limit=capacity)
 
 
@@ -1244,22 +1479,32 @@ class K8sDiskProbe:
     profile = PROFILE_K8S
     target = "disk"
 
-    async def measure(self, spec: "FaultSpec", kubeconfig: str):
+    async def measure(
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
+    ):
         from chaos_agent.agent.spec.feasibility import Measurement
 
-        path = spec.params.get("path", "/")
+        # K8s node/pod disk-fill: names holds the resource (node name / pod
+        # selector), so the mount comes from params["path"] — which is exactly
+        # what the FaultSpec authority resolves first. Reading the authority
+        # keeps a single source for the disk-mount fact (D4/B2); behaviour is
+        # byte-identical here since names never carries an absolute path.
+        _targets = spec.disk_mount_targets
+        path = _targets[0] if _targets else "/"
         if spec.scope == "node":
             if not spec.names:
                 return None
             usage_pct, total_gb = await _fetch_node_disk_usage(
-                spec.names[0], path, kubeconfig
+                spec.names[0], path, kubeconfig, target=xport_target,
             )
         else:
-            pod_name = await _resolve_first_pod(spec, kubeconfig)
+            pod_name = await _resolve_first_pod(spec, kubeconfig, target=xport_target)
             if not pod_name:
                 return None
             usage_pct, total_gb = await _fetch_pod_disk_usage(
-                pod_name, spec.namespace or "default", path, kubeconfig
+                pod_name, spec.namespace or "default", path, kubeconfig,
+                target=xport_target,
             )
         if usage_pct is None:
             return None

@@ -476,7 +476,13 @@ def should_continue_execute_loop(state: AgentState) -> str:
     messages = state.get("messages", [])
     if messages:
         last_msg = messages[-1]
-        # If the last message has tool_calls, continue the ReAct loop
+        # If the last message has tool_calls, continue the ReAct loop. Whether
+        # the injection is complete is the model's own call — it declares it via
+        # finish_execution (ledger terminal → "verifier" below) or simply stops
+        # emitting tool_calls (has_active_fault → "verifier" below). The router
+        # never infers completion from a read-only batch: that proxy cannot tell
+        # a post-injection observation from a multi-step injection's intermediate
+        # check, so it would cut multi-step cases mid-flight.
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             return "continue"
         # An empty AI turn is not a conclusion — keep the loop going rather

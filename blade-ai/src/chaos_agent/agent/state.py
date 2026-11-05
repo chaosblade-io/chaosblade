@@ -12,10 +12,13 @@ from chaos_agent.agent.result.operation_outcome import (
     read_inject_verification,
     read_operation_outcome,
     read_recover_verification,
+    synthesize_inject_verification_floor,
 )
 from chaos_agent.agent.result.verdict import (
     RECOVER_SUCCESS_VALUES,
+    InjectVerdict,
     Layer1Status,
+    Layer2Status,
     RecoverVerdict,
 )
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
@@ -377,6 +380,57 @@ def recovery_task_state_from_level(
     return TaskState.FAILED.value
 
 
+def layer1_expired_override_applies(verification) -> bool:
+    """Single source for "an expired Layer1 record must not veto a verified fault".
+
+    Legislation (task inject-e47de3e8): a Layer1 record that ends ``Destroyed``
+    — whether its ``--timeout`` elapsed OR the agent deliberately cleaned up an
+    abandoned / ``success:true`` false-positive carrier — proves only that the
+    RECORD is gone, NOT that the fault never took effect. When Layer2
+    independently verified the fault effects (``passed`` + level ``verified``),
+    the expired Layer1 ``failed`` must not veto the verdict.
+
+    This predicate is the ONE authority for that rule, consumed by all THREE
+    terminal-failure faces that read the same ``verification`` dict:
+    :func:`infer_task_state` (task_state → envelope code → exit code),
+    :func:`infer_phase` (TaskStore row / snapshot phase) and
+    ``_infer_failure_detail`` (the human-readable failure reason, in
+    ``nodes.store.memory_nodes``). Before it was single-sourced only the
+    failure-detail face carried the exemption, so a verified drill whose carrier
+    was destroyed exited ``failed`` (envelope 4002) while carrying an EMPTY
+    failure reason — the three faces disagreeing on identical input.
+
+    Kept STRICT (``failed`` AND ``expired`` AND Layer2 ``passed`` AND level
+    ``verified``) so it can never mask a genuine failure: a real one lacks
+    ``expired`` (the record was live and truly errored) or lacks a verified
+    Layer2. Deliberately NOT broadened to Layer2 partial/unknown — that would
+    widen the failure-detail face's established behavior without evidence.
+
+    BELT-AND-SUSPENDERS since the Bug3 root fix: the provider no longer labels
+    an expired record ``failed`` — expiry is an abstention, so both the host
+    ``_parse_blade_status_output`` and the k8s ``_map_query_k8s_to_layer1``
+    paths now emit ``warning`` + ``expired=True`` for it (see verify.py). New
+    runs therefore reach the terminal faces through the ``warning`` branches
+    (the lenient defer-to-Layer2 semantics), and this predicate no longer fires
+    for them. It is retained UNCHANGED for legacy checkpoints that recorded the
+    old ``failed``+``expired`` shape, so a resumed old run still gets the same
+    exemption it did before — the root fix eliminates the divergence at the
+    label source; this stays as the downstream safety net for the fossil shape.
+    """
+    if not isinstance(verification, dict):
+        return False
+    layer1 = verification.get("layer1") or {}
+    layer2 = verification.get("layer2") or {}
+    if not isinstance(layer1, dict) or not isinstance(layer2, dict):
+        return False
+    return (
+        layer1.get("status") == Layer1Status.FAILED.value
+        and bool(layer1.get("expired"))
+        and layer2.get("status") == Layer2Status.PASSED.value
+        and verification.get("level", "") == InjectVerdict.VERIFIED.value
+    )
+
+
 def infer_task_state(values: dict) -> str:
     """Infer the overall task_state from AgentState values.
 
@@ -520,11 +574,23 @@ def infer_task_state(values: dict) -> str:
         if level in ("verified", "partial"):
             return "injected"
         return "failed"
-    # Non-CB path L2=unknown: Layer 2 is the only verification layer, so an
-    # "unknown" is NOT passing — but honest ignorance ("unverified" level) is
-    # still distinct from counter-evidence: it maps to "unverified", while any
-    # other level without an L2 verdict stays failed (fail-closed).
-    if l1_skip_no_chaos and l2_status == "unknown":
+    # Non-CB path L2=unknown OR L2=skipped: Layer 2 is the only verification
+    # layer, so neither is passing — but honest ignorance ("unverified" level)
+    # is still distinct from counter-evidence: it maps to "unverified", while
+    # any other level without an L2 verdict stays failed (fail-closed).
+    #
+    # L2="skipped" is the no-LLM / crash floor's marker (Layer 2 never ran):
+    # ``verification_floor_from_layer1`` emits ``layer2.status="skipped"`` with
+    # ``level="unverified"`` for a native fault. B88: without folding it in
+    # here, a native/faultdrill-carrier injection whose verifier was cut by an
+    # ``httpx.ReadTimeout`` AFTER the fault landed fell through to the terminal
+    # "failed" — the a82984a3 dangerous "cluster unaffected" false-negative,
+    # reading as "no live fault" while the carrier still needs recovery — even
+    # though the ChaosBlade path above (L549, ``("passed", "skipped")``) already
+    # covered the same floor shape. The floor never claims a level above
+    # "unverified", so the level-gate below keeps fail-closed for any
+    # contradictory shape (e.g. l2="skipped" yet level="partial").
+    if l1_skip_no_chaos and l2_status in ("unknown", "skipped"):
         level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
         if level in ("unverified", "unknown"):
             return "unverified"
@@ -533,7 +599,13 @@ def infer_task_state(values: dict) -> str:
     # L2 is the deciding factor — mirrors infer_phase() logic.
     if l1_status == "warning" and l2_status == "passed":
         return "injected"
-    if l1_status == "warning" and l2_status == "unknown":
+    # L1 warning + L2 unknown/skipped: same honest-ignorance gate. "skipped"
+    # is the crash/no-LLM floor's marker — ``verification_floor_from_layer1``
+    # emits ``level="unverified"`` + ``l2="skipped"`` when a warning Layer 1
+    # did not pass (B88) — so a warning-L1 fault whose verifier was cut
+    # mid-adjudication lands on "unverified" instead of falling through to the
+    # terminal "failed" (the same native-path false-negative, warning arm).
+    if l1_status == "warning" and l2_status in ("unknown", "skipped"):
         level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
         if level in ("unverified", "unknown"):
             return "unverified"
@@ -550,6 +622,15 @@ def infer_task_state(values: dict) -> str:
         if side_effects and any(v for v in side_effects.values() if v):
             return "injected"
         return "failed"
+    # Expired Layer1 (Destroyed record — timeout elapsed OR a false-positive
+    # carrier the agent cleaned up) + Layer2 independently verified the fault
+    # → NOT a failure. Single-sourced with infer_phase / _infer_failure_detail
+    # so the three terminal faces never disagree (see
+    # layer1_expired_override_applies). Without this branch a verified drill
+    # whose carrier was destroyed fell through to "failed" → envelope 4002 →
+    # exit 1 while carrying an EMPTY failure reason.
+    if layer1_expired_override_applies(verification):
+        return "injected"
     return "failed"
 
 
@@ -573,9 +654,52 @@ def terminal_task_state(values: dict) -> str:
     Shared by every terminal consumer (single-injection result builder, batch
     per-fault record) so the rule cannot be applied in one place and forgotten in
     the other — which is exactly how those two drifted apart.
+
+    Durable-evidence floor (a82984a3 root cure): "no verdict" is NOT the same
+    as "no evidence". A run can END (e.g. an ``httpx.ReadTimeout`` kills the
+    verifier loop mid-adjudication, auto-rolls-back) AFTER injection landed and
+    Layer 1 confirmed the experiment — leaving ``inject_layer1_cache`` +
+    ``experiment_uid`` + probe tool results durable in the checkpoint while the
+    LLM's ``submit_verification`` emission never survived the stream. Fail-closing
+    that to "failed" mislabels a successful injection as a failed one (the exact
+    a82984a3 divergence: CLI result=failed read as "cluster unaffected"). So
+    before fail-closing, consult the SAME deterministic floor the no-LLM
+    ``verifier()`` applies (:func:`synthesize_inject_verification_floor`). It
+    yields a conservative word (injected/unverified) from what was MEASURED, and
+    can NEVER claim "verified" — confirming the fault effect is Layer 2's job.
+    Absent durable Layer 1 (crash before any verifier iteration) the floor is
+    ``None`` and the fail-closed word stands: no evidence, no upgrade.
+
+    Deliberate inject/recover asymmetry (a82984a3 root cure): the RECOVER floor
+    (:func:`recover_task_state_from_values` / ``build_recover_session_summary``)
+    is additionally gated on the ABSENCE of a ``failure_reason`` — a recover
+    verifier cut by its wall-clock / loop budget writes RECOVERY_VERIFICATION_
+    TIMEOUT / WALL_CLOCK_TIMEOUT, a deliberate fail-closed verdict the floor
+    must honour. The INJECT floor here is NOT so gated, on purpose. Inject
+    Layer 1 "passed" means the fault experiment is LIVE on the cluster; a
+    verification budget-cut with a live fault is exactly the a82984a3 shape —
+    reporting "failed" would read as "cluster unaffected" while the fault still
+    runs and still needs recovery (the dangerous false-negative). So on the
+    inject side the safe error direction is UP ("injected": the fault landed,
+    go recover it), whereas on the recover side it is DOWN ("failed": an
+    unverified recovery is not a claimed success). Each arm floors toward its
+    own safe side; the shared invariant is only that the floor never claims the
+    strongest word ("verified" / "recovered") — that stays Layer 2's job.
     """
     state = infer_task_state(values)
-    return "failed" if state == "injecting" else state
+    if state not in ("injecting", "failed"):
+        return state
+    # A real verdict already drove ``state`` — never second-guess it with the
+    # floor (a genuine Layer-2 "failed" verdict must stay "failed").
+    if read_inject_verification(values):
+        return state
+    floor = synthesize_inject_verification_floor(values)
+    if floor is None:
+        # No durable Layer 1 evidence — the fail-closed word stands. "injecting"
+        # is a mid-flight word; at a terminal point it means "ended with no
+        # verdict and no evidence" ⇒ failed (the original fail-close).
+        return "failed" if state == "injecting" else state
+    return infer_task_state({**values, "verification": floor})
 
 
 def graph_is_paused(snapshot) -> bool:
@@ -805,6 +929,11 @@ def infer_phase(values: dict) -> str:
         if level in ("verified", "partial"):
             return "verification_passed"
         return "verification_failed"
+    # Expired Layer1 (Destroyed record) + Layer2 verified → verification_passed.
+    # Aligned with infer_task_state via the single-sourced predicate (memory
+    # 8c68a434: the two truth tables must not drift).
+    if layer1_expired_override_applies(verification):
+        return "verification_passed"
     return "verification_failed"
 
 
@@ -932,17 +1061,40 @@ def _build_side_effects_summary(verification: dict | None, profile: str | None =
         "service_down": "ServiceDown",
     }
 
+    # W-83-5 root-fix: a detector gated off by an Unreadable capture channel
+    # is key-absent from ``detected`` — naively rendering it as ``Label: 0``
+    # reads as "checked, clean" and hid a lost capability across ≥6 cases
+    # (target_logs Unreadable → DependencyErrors: 0 mislabeled "cosmetic").
+    # ``_skipped_detectors`` (reserved key) makes the skip a first-class state.
+    skipped = detected.get("_skipped_detectors")
+    skipped = skipped if isinstance(skipped, dict) else {}
+
     parts = []
+    skipped_labels = []
     for d in detectors_for(profile):
+        label = _KEY_LABELS.get(d.key, d.key)
+        if d.key in skipped:
+            parts.append(f"{label}: SKIPPED")
+            skipped_labels.append(label)
+            continue
         items = detected.get(d.key, [])
         count = len(items) if isinstance(items, list) else 0
-        label = _KEY_LABELS.get(d.key, d.key)
         parts.append(f"{label}: {count}")
 
     total = sum(len(v) for v in detected.values() if isinstance(v, list))
+    caveat = ""
+    if skipped_labels:
+        caveat = (
+            f"; {len(skipped_labels)} check(s) NOT adjudicated "
+            f"(unreadable capture): {', '.join(skipped_labels)}"
+        )
     if total == 0:
-        return f"No collateral impact detected ({', '.join(parts)})"
-    return f"{total} collateral impact(s) detected ({', '.join(parts)})"
+        head = (
+            "No collateral impact detected among adjudicated checks"
+            if skipped_labels else "No collateral impact detected"
+        )
+        return f"{head} ({', '.join(parts)}){caveat}"
+    return f"{total} collateral impact(s) detected ({', '.join(parts)}){caveat}"
 
 
 def _derive_failure_reason(values: dict) -> str:
@@ -1003,7 +1155,16 @@ def duration_ms_from_timestamps(created_at: str, finished_at: str) -> int:
 def build_status_data(task_id: str, values: dict) -> dict:
     """Build a complete status data dict from LangGraph checkpoint values.
 
-    Used by both CLI AgentRunner.status() and Server status route.
+    TERMINAL-only surface: the sole caller is ``l4.adapter.state_to_task_result``
+    ("Extract TaskResult from graph final state"), reached only after the graph
+    has ENDED — the interrupted/paused branch returns before it. So the word is
+    derived from ``terminal_task_state`` (the floor-aware terminal single-source),
+    NOT the live-position ``infer_task_state``: a run whose verifier was cut by a
+    crash after injection landed reads "injected"/"unverified" here, matching the
+    crash envelope's ``data.result`` and the audit row, instead of a frozen
+    "injecting" that mislabels the outcome. (The CLI ``status`` command and the
+    server status route do NOT use this builder — they render the authoritative
+    TaskStore row, which the finalize chokepoint stamps from the same source.)
     """
 
     from chaos_agent.agent.spec.fault_spec import (
@@ -1033,7 +1194,10 @@ def build_status_data(task_id: str, values: dict) -> dict:
     failure_reason_raw = outcome.failure_reason
     merged_error = outcome.error
 
-    task_state = infer_task_state(values)
+    # terminal_task_state (not infer_task_state): this builder is a TERMINAL
+    # surface (see the docstring) — a verdict-less run that ENDED is failed /
+    # floored, never the live-position "injecting".
+    task_state = terminal_task_state(values)
     stage = infer_stage(values)
     status = infer_status(stage, task_state, values.get("operation", ""))
 
@@ -1118,6 +1282,7 @@ class AgentState(MessagesState):
     _catalogue_rejection_nudged: bool = False  # Guard: nudge only once before accepting rejection
     _identity_declaration_nudged: bool = False  # Guard: nudge once for an undeclared fault identity (B83)
     _identity_split_nudged: bool = False        # Guard: nudge once for a declaration/reviewed-identity split (B84)
+    _scope_vocab_nudged: bool = False           # Guard: nudge once for an unregistered fault_scope declaration (validate-before-freeze)
     _plan_text_stall_count: int = 0      # Guard: consecutive Phase-1 text-only stalls (no tool/skill); reset on progress, fail at max_plan_text_stalls
     plan_builder_round: int = 0          # Dialogue round counter within plan_builder
     planning_mode: Optional[str] = None  # None=auto; "guided" (options) | "expert" (direct structured plan)
@@ -1268,6 +1433,17 @@ class AgentState(MessagesState):
     # means the probe failed or matched nothing (negative entry, keeps the
     # fail-closed review).
     selector_name_probes: Optional[tuple[tuple[str, tuple[str, ...]], ...]] = None
+    # Observation binaries the preplan host-toolkit probe proved ABSENT on the
+    # target (ss/netstat/mpstat/sar/iostat/iotop on a minimal ubuntu host). The
+    # probe also publishes this as a planning-hint message for the agent planner,
+    # but ``baseline_capture``'s LLM derivation is a SEPARATE off-graph call that
+    # builds its own prompt and never reads the ``messages`` history — so the
+    # absence fact is mirrored here for that one consumer. Lets the primary
+    # baseline derive steer to the /proc kernel-interface form on its FIRST round
+    # instead of rediscovering the absence via an exit-127 + reactive retry (the
+    # proactive twin of baseline_capture's reactive poison seed). Host-scope only;
+    # None/empty on k8s channels and on fully-tooled hosts.
+    absent_host_binaries: Optional[tuple[str, ...]] = None
     injection_parsed_params: Optional[dict] = None  # issue-time parsed injection parameters, e.g. {"path": "/tmp", "percent": "85"}
     original_replicas: Optional[dict] = None     # kubectl scale-based faults: {resource -> count}
     kubeconfig: Optional[str] = None
@@ -1290,8 +1466,6 @@ class AgentState(MessagesState):
     side_effects: Optional[dict] = None
     baseline_data: Optional[dict] = None     # Pre-injection baseline (from baseline_capture node)
     target_metadata: Optional[dict] = None   # {pod_memory_limit_mb, active_same_action_experiments, ...}
-    disk_burn_post_check: Optional[dict] = None   # Post-injection I/O throughput verification
-    disk_fill_post_check: Optional[dict] = None   # Post-injection fill file verification
     se_snapshot: Optional[dict] = None       # Pre-injection side-effect snapshot
     force_override: bool = False             # CLI --force-override flag
     _execute_text_stall_count: int = 0       # Guard: consecutive text-only stalls (no tool/injection/replan); reset on any tool call, fail at max_execute_text_stalls
@@ -1311,6 +1485,7 @@ class AgentState(MessagesState):
     # the composite — a partially undone fault is still active).
     combo_blade_part: Optional[dict] = None
     metric_observations: Optional[list[dict]] = None  # Structured observation timeline (all nodes)
+    evidence_fingerprints: Optional[dict] = None  # D17: {tool_call_id: {tokens, numeric_fields, complete, tool_name, command}} format-agnostic value-presence fingerprints (all nodes)
     inject_verification_summary: Optional[str] = None  # Layer 2 observations for recover baseline
     reverify_count: int = 0              # Re-verification attempt count
     reverify_gaps: Optional[list[str]] = None    # Gap types that triggered re-verification

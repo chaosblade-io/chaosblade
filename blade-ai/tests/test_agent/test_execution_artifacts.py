@@ -22,12 +22,14 @@ from chaos_agent.agent.execution_artifacts import (
     debug_meta_scope,
     find_active_debug_pod,
     is_vehicle_name,
+    is_vehicle_rbac_verb_patch,
     issue_call_is_registered_teardown,
     make_teardown_matcher,
     parse_debug_pod_metadata,
     parse_drill_vehicle_markers,
     recovery_anchor_offsets,
     recovery_time_anchors,
+    settle_recovered_carriers,
 )
 from chaos_agent.agent.providers import FaultProviderRegistry
 from chaos_agent.config.settings import settings
@@ -274,6 +276,7 @@ async def test_cleanup_debug_artifacts_is_idempotent():
         "task-1",
         namespace="kubewiz",
         kind="pod",
+        target=None,
     )
     assert names == ["node-debugger-n1-abc12"]
     assert cleaned[0]["status"] == "cleaned"
@@ -497,6 +500,69 @@ async def test_cleanup_keeps_carrier_until_bounded_recovery_deadline():
     delete.assert_not_awaited()
     assert updated[0]["status"] == "recovery_armed"
     assert names == []
+
+
+def test_settle_recovered_carriers_disarms_armed_carrier():
+    # W-70-2: recovery CONFIRMED before the deadline → the carrier's promise is
+    # fulfilled, so the keep-while-armed hold must be released. Mirrors the
+    # manual-delete disarm (recovery_armed → active, deadline dropped) and
+    # stamps WHY (recovery_settled_by), symmetric to recovery_void.
+    artifacts = collect_execution_artifacts(_debug_messages())
+    artifacts[0].update({
+        "status": "recovery_armed",
+        "recovery_deadline_epoch": 1600,
+    })
+
+    settled = settle_recovered_carriers(artifacts, task_id="task-1")
+
+    assert settled == 1
+    assert artifacts[0]["status"] == "active"
+    assert "recovery_deadline_epoch" not in artifacts[0]
+    assert artifacts[0]["recovery_settled_by"] == "recover_graph"
+
+
+def test_settle_ignores_non_armed_carriers():
+    # Only an armed carrier holds a live promise; an already-active or cleaned
+    # artifact is untouched (idempotent, replay-safe).
+    artifacts = collect_execution_artifacts(_debug_messages())
+    artifacts[0]["status"] = "cleaned"
+
+    settled = settle_recovered_carriers(artifacts, task_id="task-1")
+
+    assert settled == 0
+    assert artifacts[0]["status"] == "cleaned"
+    assert "recovery_settled_by" not in artifacts[0]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_releases_armed_hold_when_recovery_settled():
+    # W-70-2 正向: an armed carrier whose recovery the recover graph CONFIRMED
+    # (settle → active) is four-deleted even though the deadline is still in the
+    # future — teardown keys on the settled FACT, not the clock. Exact
+    # complement of test_cleanup_keeps_carrier_until_bounded_recovery_deadline.
+    artifacts = collect_execution_artifacts(_debug_messages())
+    artifacts[0].update({
+        "status": "recovery_armed",
+        "recovery_deadline_epoch": 1600,
+    })
+    settle_recovered_carriers(artifacts, task_id="task-1")
+    delete = AsyncMock(return_value="confirmed")
+    with (
+        patch(
+            "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+        ),
+        patch(
+            "chaos_agent.agent.nodes.execute._debug_pod.delete_debug_pod",
+            new=delete,
+        ),
+    ):
+        updated, names = await cleanup_debug_pod_artifacts(
+            artifacts, kubeconfig="/tmp/kubeconfig", task_id="task-1",
+        )
+
+    assert delete.await_count == 1  # hold released though deadline 1600 > now 1000
+    assert updated[0]["status"] == "cleaned"
+    assert names == ["node-debugger-n1-abc12"]
 
 
 @pytest.mark.asyncio
@@ -986,6 +1052,172 @@ def test_teardown_matrix_batch_delete_disarms_recovery_carrier():
         "batch delete naming the armed carrier must disarm it"
     )
     assert "recovery_deadline_epoch" not in artifacts[0]
+
+
+# ---------------------------------------------------------------------------
+# Replay-disarm symmetry (case #13): ``collect_execution_artifacts`` rescans
+# the FULL message history every execute-loop iteration, seeding from the
+# prior pass's registry. The arming side already carries a replay guard
+# (``host_exec_seen_ids``) so a re-seen exec never re-stamps; the DELETE
+# disarm side had none. A carrier pod deleted and rebuilt under the SAME
+# name before it was armed (a node-migration rebuild — a legal, standard-
+# prescribed operation) leaves a delete in history that PRECEDES the arming.
+# On every rescan that old delete replayed against the SEEDED
+# ``recovery_armed`` status and disarmed it, while the arming's own seen-ids
+# guard blocked a re-stamp — so the armed state was structurally unstable and
+# the armed-before-inject gate rejected a carrier that WAS validly armed. The
+# symmetric ``disarm_seen_ids`` guard below makes each delete fire its disarm
+# at most once, at its own iteration, so it can never reach forward to kill a
+# LATER arming.
+# ---------------------------------------------------------------------------
+
+_RC_REPLAY_CARRIER = "drill-rc-x"
+
+
+def _rc_replay_registry():
+    """A recovery_carrier exactly as the screener registers it: active,
+    un-armed, with neither seen-id ledger present (both are created lazily by
+    collect via ``setdefault``)."""
+    return [{
+        "type": "recovery_carrier", "kind": "pod",
+        "name": _RC_REPLAY_CARRIER, "namespace": "default",
+        "status": "active",
+    }]
+
+
+def _rc_delete_messages(call_id: str):
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "kubectl",
+                "args": {
+                    "subcommand": "delete",
+                    "v_args": f"pod {_RC_REPLAY_CARRIER} -n default",
+                },
+                "id": call_id,
+            }],
+        ),
+        ToolMessage(
+            content=f'pod "{_RC_REPLAY_CARRIER}" deleted',
+            name="kubectl", tool_call_id=call_id,
+        ),
+    ]
+
+
+def _rc_arming_messages(call_id: str):
+    # The carrier's arming exec: an in-chain ``sleep N`` rollback timer (the
+    # recovery-carrier form — no host-family inverse, the sleep IS the bound).
+    # Mirrors case #13's compact-variable AND full-inline payloads, which arm
+    # identically because the collector reads the sleep, not the shell form.
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "kubectl",
+                "args": {
+                    "subcommand": "exec",
+                    "v_args": (
+                        f"{_RC_REPLAY_CARRIER} -n default -- sh -c "
+                        "'( sleep 300; kubectl scale deploy/x --replicas=3 ) "
+                        "& echo armed'"
+                    ),
+                },
+                "id": call_id,
+            }],
+        ),
+        ToolMessage(
+            content="armed", name="kubectl", tool_call_id=call_id,
+        ),
+    ]
+
+
+def test_delete_preceding_arming_survives_rescan_without_disarm():
+    """ROOT-CAUSE TEETH (case #13): a delete that PRECEDED the arming in
+    history must not disarm the seeded ``recovery_armed`` carrier on a later
+    rescan. Three collect passes reproduce the real execute-loop rhythm —
+    delete iteration, arming iteration, then a rescan of the same history."""
+    # Iteration N: the migration delete is the latest lifecycle event; the
+    # carrier is not armed yet, so nothing is disarmed — but the delete
+    # records its id in the symmetric ledger.
+    delete_only = _rc_delete_messages("tc-del-A")
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        pass_delete = collect_execution_artifacts(
+            delete_only, _rc_replay_registry(),
+        )
+    assert pass_delete[0]["status"] == "active"
+    assert pass_delete[0]["disarm_seen_ids"] == ["tc-del-A"]
+
+    # Iteration N+k: the carrier was rebuilt and armed. History now holds
+    # delete THEN arming; the delete replays as a no-op (already seen) so it
+    # cannot pre-empt the arming, which stamps normally.
+    full_history = delete_only + _rc_arming_messages("tc-arm-X")
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=2000,
+    ):
+        pass_arm = collect_execution_artifacts(full_history, pass_delete)
+    assert pass_arm[0]["status"] == "recovery_armed"
+    assert pass_arm[0]["host_exec_seen_ids"] == ["tc-arm-X"]
+    assert pass_arm[0]["recovery_deadline_epoch"] == 2300
+
+    # Iteration N+k+1 (THE TEETH): a rescan of the SAME full history seeded
+    # with the armed registry must NOT disarm. Before the guard, the old
+    # pre-arming delete flipped this back to ``active`` every rescan while
+    # the arming's seen-ids guard blocked a re-stamp — the exact structural
+    # instability that made case #13's injection win only by racing the
+    # disarming rescan.
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=9000,
+    ):
+        pass_rescan = collect_execution_artifacts(full_history, pass_arm)
+    assert pass_rescan[0]["status"] == "recovery_armed", (
+        "a delete that PRECEDED the arming must not disarm the seeded armed "
+        "carrier on rescan (case #13 replay-disarm root cause)"
+    )
+    assert pass_rescan[0]["recovery_deadline_epoch"] == 2300, (
+        "the arming must not re-stamp and slide the deadline on rescan"
+    )
+    assert pass_rescan[0]["disarm_seen_ids"] == ["tc-del-A"]
+
+
+def test_delete_following_arming_still_disarms_carrier():
+    """The replay guard must not neuter a GENUINE manual disarm: a delete
+    that FOLLOWS the arming in history (the standard §6 four-way sweep
+    running after the timer was armed) still flips armed → active on its own
+    iteration — it fires once, as the latest lifecycle event, exactly as it
+    did before the guard existed."""
+    arming = _rc_arming_messages("tc-arm-X")
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        armed = collect_execution_artifacts(arming, _rc_replay_registry())
+    assert armed[0]["status"] == "recovery_armed"
+
+    full = arming + _rc_delete_messages("tc-del-B")
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1500,
+    ):
+        disarmed = collect_execution_artifacts(full, armed)
+    assert disarmed[0]["status"] == "active"
+    assert "recovery_deadline_epoch" not in disarmed[0]
+    assert disarmed[0]["cleanup_tool_call_id"] == "tc-del-B"
+    assert disarmed[0]["disarm_seen_ids"] == ["tc-del-B"]
+
+
+def test_replayed_delete_records_disarm_id_once():
+    """collect rescans the full history every iteration; a delete's id must
+    be appended to ``disarm_seen_ids`` ONCE, not on every rescan — an
+    unbounded ledger would grow without limit across a long execute loop."""
+    delete_only = _rc_delete_messages("tc-del-A")
+    registry = _rc_replay_registry()
+    with patch(
+        "chaos_agent.agent.execution_artifacts.time.time", return_value=1000,
+    ):
+        for _ in range(4):
+            registry = collect_execution_artifacts(delete_only, registry)
+    assert registry[0]["disarm_seen_ids"] == ["tc-del-A"]
 
 
 # ---------------------------------------------------------------------------
@@ -1689,6 +1921,134 @@ def test_namespaced_delete_without_n_stays_poisoned():
 
 
 # ---------------------------------------------------------------------------
+# host-native-recovery-carrier — HOST face, Tier-2 (no-systemd) setsid twin
+#
+# The HOST face above exempts the Tier-1 systemd-run arm. The layered
+# carrier's Tier-2 (no-systemd) arm — ``setsid --fork sh -c 'sleep <N> &&
+# <inverse>'`` — arms the SAME deadline-fired payload by a different binary,
+# so it must be exempt on the SAME face by the SAME single-source discipline:
+# ToolGuard admits ``setsid`` ONLY as a detached timer (``_check_setsid`` —
+# every non-``--fork`` shape is UNSUPPORTED_FORM, rejected before the tool
+# runs), and the form primitive ``is_setsid_detached_timer`` is shared with
+# the guard, never re-derived here. Without this twin the no-systemd host's
+# arm-first order re-ran the R23 harm chain verbatim (arm pre-empts the
+# host_native slot, combo mis-mark, restored-session native takeover) — a
+# measured gap (both setsid arg shapes returned False before the fix).
+# ---------------------------------------------------------------------------
+
+_T2_SETSID_ARM = (
+    "setsid --fork sh -c 'sleep 420 && rm -f /drill-disk/app-archive.dat'"
+)
+_T2_SETSID_ARM_SHORT_FLAG = "setsid -f sh -c 'sleep 60 && truncate -s 0 /x'"
+# The canonical over-pipe-transport form (D8): the payload's FIRST statement
+# ``exec >/dev/null 2>&1`` severs the child's inherited stdio so the arm
+# returns at once instead of blocking the sleep window. The fd-sever lives
+# INSIDE the sh -c script, so the OUTER argv shape is unchanged — attribution
+# (``is_setsid_detached_timer`` inspects only the option region for ``--fork``,
+# never the script body) MUST stay exempt. This row pins that the stdio-sever
+# addendum did not drift the machinery face.
+_T2_SETSID_ARM_FD_SEVER = (
+    "setsid --fork sh -c 'exec >/dev/null 2>&1; sleep 420 && rm -f /drill-disk/app-archive.dat'"
+)
+#: (id, command, expect_exempt) — Tier-2 coordinate system. The timer rows
+#: are the gap (red before the fix); every other row pins the boundary: the
+#: exemption is EARNED by the detached-timer form alone (``--fork`` in the
+#: option region, no ``--wait``), and a bare setsid, a missing ``--fork``, a
+#: ``--wait`` re-block, or a fault binary all stay attributed.
+_T2_SETSID_MATRIX = [
+    ("setsid-fork-timer-is-machinery", _T2_SETSID_ARM, True),
+    ("setsid-f-short-flag-timer-is-machinery", _T2_SETSID_ARM_SHORT_FLAG, True),
+    ("setsid-fork-fd-sever-timer-is-machinery", _T2_SETSID_ARM_FD_SEVER, True),
+    ("bare-setsid-stays-attributed", "setsid nginx", False),
+    (
+        "setsid-missing-fork-stays-attributed",
+        "setsid sh -c 'sleep 5 && rm -f /x'",
+        False,
+    ),
+    (
+        "setsid-fork-wait-stays-attributed",
+        "setsid --fork --wait sh -c 'sleep 5 && rm -f /x'",
+        False,
+    ),
+    (
+        "fault-binary-stays-attributed",
+        "fallocate -l 50G /drill-disk/app-archive.dat",
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "command,expect_exempt",
+    [(m[1], m[2]) for m in _T2_SETSID_MATRIX],
+    ids=[m[0] for m in _T2_SETSID_MATRIX],
+)
+def test_host_call_machinery_face_setsid_twin(command, expect_exempt):
+    """HOST 面 Tier-2 主牙：host_inject × setsid detached-timer 载荷。
+    修复前 timer 格穿透（谓词只认 systemd-run——无-systemd 主机的
+    arm-first 抢注 host_native 槽）；钉住格：豁免由 detached-timer 形态
+    挣得（ToolGuard ``_check_setsid`` 准入单源），裸 setsid / 缺 --fork /
+    --wait / 故障二进制照常归因。"""
+    assert (
+        issue_call_is_registered_teardown(
+            "host_inject", {"command": command}, [],
+        )
+        is expect_exempt
+    )
+
+
+def test_host_face_setsid_exec_host_command_shape():
+    """argv 形态（exec_host_command 的 binary+args）：Tier-2 timer 判定
+    不依赖 command 字符串形态——与 Tier-1 同构，两种 args 形状同一判定。"""
+    call = {
+        "binary": "setsid",
+        "args": ["--fork", "sh", "-c", "sleep 300 && rm -f /drill-disk/x"],
+    }
+    assert issue_call_is_registered_teardown(
+        "exec_host_command", call, [],
+    )
+
+
+def test_host_face_setsid_requires_inject_tool_name():
+    """通道钉住（Tier-2）：host_read 不是注入载体，kubectl 通道不路由到
+    host 面——setsid 豁免域同样按工具名单源。"""
+    assert not issue_call_is_registered_teardown(
+        "host_read", {"command": _T2_SETSID_ARM}, [],
+    )
+    assert not issue_call_is_registered_teardown(
+        "kubectl", {"command": _T2_SETSID_ARM}, [],
+    )
+
+
+@pytest.mark.parametrize(
+    "argv,expect",
+    [
+        (["setsid", "--fork", "sh", "-c", "sleep 5 && rm -f /x"], True),
+        (["setsid", "-f", "sh", "-c", "sleep 5 && truncate -s 0 /x"], True),
+        # D8 fd-sever: the ``exec >/dev/null 2>&1;`` prefix lives INSIDE the
+        # script token, so the argv shape the predicate inspects is unchanged.
+        (
+            ["setsid", "--fork", "sh", "-c", "exec >/dev/null 2>&1; sleep 5 && rm -f /x"],
+            True,
+        ),
+        (["setsid", "--fork", "--wait", "sh", "-c", "x"], False),
+        (["setsid", "sh", "-c", "sleep 5 && rm -f /x"], False),
+        (["setsid", "nginx"], False),
+        (["setsid"], False),
+        (["systemd-run", "--on-active=5s", "rm", "-f", "/x"], False),
+        ([], False),
+    ],
+)
+def test_is_setsid_detached_timer_predicate(argv, expect):
+    """判据源单牙：``is_setsid_detached_timer`` 是准入与归因共享的单一
+    判据源（镜像 ``is_systemd_run_timer``）——只在 ``setsid`` + option 区
+    ``--fork``/``-f`` 且无 ``--wait``/``-w`` 时为真，其余二进制/形态一律假。"""
+    from chaos_agent.tools.guard import is_setsid_detached_timer
+
+    assert is_setsid_detached_timer(argv) is expect
+
+
+# ---------------------------------------------------------------------------
 # R25/G-8 — machinery≠mutation, BLADE-DEMOLITION face (exec-carried
 # blade destroy / revoke)
 #
@@ -2121,6 +2481,81 @@ def test_patch_verbs_ignore_failed_receipt_and_foreign_name():
 
 
 # ---------------------------------------------------------------------------
+# is_vehicle_rbac_verb_patch — the armed-before-inject construction exemption
+# (openspec carrier-rbac-patch-armed-exemption). Pure-predicate teeth; the
+# GATE-level behaviour is driven through the real tool_screener node in
+# test_screener.py::TestArmedBeforeInjectCarrierRbacPatchExemption.
+# ---------------------------------------------------------------------------
+
+
+def _carrier_with_role(verbs=("get", "patch"), name=_B85_CARRIER) -> dict:
+    carrier = _b85_carrier()
+    carrier["name"] = name
+    carrier["rbac_family"] = [{
+        "kind": "role", "name": name, "namespace": "ns",
+        "verbs": list(verbs),
+    }]
+    return carrier
+
+
+_LR_ADD_PATCH = (
+    f"role {_B85_CARRIER} -n ns --type=json -p "
+    "'[{\"op\":\"add\",\"path\":\"/rules/-\",\"value\":{\"apiGroups\":[\"\"],"
+    "\"resources\":[\"limitranges\"],\"verbs\":[\"get\",\"delete\"]}}]'"
+)
+
+
+def test_rbac_verb_patch_exempts_registered_carrier_role_addition():
+    """两步建栈第二步：对已登记载体 Role 的 add-only 追加动词 patch 判为
+    载具构造（放行侧）。这是 LimitRange误配/ResourceQuota超限 两族非齐动词
+    恢复载体绕开 armed_before_inject×B85 死锁的唯一合法路径。"""
+    assert is_vehicle_rbac_verb_patch(
+        [_carrier_with_role()], v_args=_LR_ADD_PATCH,
+    ) is True
+
+
+def test_rbac_verb_patch_rejects_unregistered_or_sibling_role():
+    """fail-closed：目标 Role 未在任一 recovery_carrier 的 rbac_family 登记
+    （含 #71 workaround 的兄弟名 drill-rc-*-lr）→ 不豁免。载具资产识别要求
+    精确命中已登记成员，与 _attach_recovery_carrier_rbac 的 exact-name 挂载
+    同源。"""
+    # 已登记载体是 drill-rc-b85；patch 打向未登记的兄弟名 → False
+    sibling = _LR_ADD_PATCH.replace(_B85_CARRIER, f"{_B85_CARRIER}-lr")
+    assert is_vehicle_rbac_verb_patch(
+        [_carrier_with_role()], v_args=sibling,
+    ) is False
+    # 无任何载体登记 → False
+    assert is_vehicle_rbac_verb_patch([], v_args=_LR_ADD_PATCH) is False
+
+
+def test_rbac_verb_patch_rejects_non_rbac_target_and_non_add_ops():
+    """fail-closed：①非 role/clusterrole 目标（受害靶/故障对象）不豁免；
+    ②remove/replace（收缩或改写既有授权）不豁免——豁免仅覆盖 add-only 扩权。"""
+    # ① 受害 deployment（即使载荷带 verbs 也不是载体 Role）
+    victim = _LR_ADD_PATCH.replace(f"role {_B85_CARRIER}", "deployment victim")
+    assert is_vehicle_rbac_verb_patch(
+        [_carrier_with_role()], v_args=victim,
+    ) is False
+    # ② remove 收缩授权
+    remove = (
+        f"role {_B85_CARRIER} -n ns --type=json -p "
+        "'[{\"op\":\"remove\",\"path\":\"/rules/0\"}]'"
+    )
+    assert is_vehicle_rbac_verb_patch(
+        [_carrier_with_role()], v_args=remove,
+    ) is False
+    # ② replace 改写授权（即便载荷含 verbs）
+    replace = (
+        f"role {_B85_CARRIER} -n ns --type=json -p "
+        "'[{\"op\":\"replace\",\"path\":\"/rules/0\",\"value\":"
+        "{\"verbs\":[\"delete\"]}}]'"
+    )
+    assert is_vehicle_rbac_verb_patch(
+        [_carrier_with_role()], v_args=replace,
+    ) is False
+
+
+# ---------------------------------------------------------------------------
 # R46: exec/debug flag arity — one shared reader
 # ---------------------------------------------------------------------------
 
@@ -2271,7 +2706,7 @@ def _sweep_claim(monkeypatch):
     calls: list = []
     holder = {"value": None, "raise": False}
 
-    async def fake_sweep(artifact, *, kubeconfig="", task_id=""):
+    async def fake_sweep(artifact, *, kubeconfig="", task_id="", target=None):
         calls.append((artifact, kubeconfig, task_id))
         if holder["raise"]:
             raise RuntimeError("claiming hook exploded")

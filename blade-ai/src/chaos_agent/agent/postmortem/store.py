@@ -8,9 +8,13 @@ Decisions:
   rsync / scrub independently of the agent's memory.
 - Plain markdown on disk (not JSON-wrapped) — users can ``cat`` /
   ``glow`` / ``less`` directly without unwrapping.
-- File header (`# Postmortem: ...`) added here, not by the LLM, so
-  the body always starts with the standardised `## Summary` and the
-  header stays consistent across calls.
+- Title + deterministic fact block (``# Postmortem: ...`` + the
+  program-rendered fault_type / namespace / status / duration / user
+  request / target / params) is produced by ``render_postmortem_markdown``
+  — the SINGLE renderer shared by this on-disk write AND the result
+  envelope's ``postmortem.markdown`` payload, so the two never diverge.
+  The LLM body always starts with the standardised ``## Summary`` and
+  carries only the judgment sections, never these facts.
 
 Safety hardening (R1/R2/R3 — 2026-05-26 round 2 review):
 - Files written with ``0o600`` (owner read/write only). Postmortems
@@ -107,6 +111,73 @@ def _path_for(task_id: str, root: Optional[Path] = None) -> Path:
     return base / f"{task_id}.md"
 
 
+def render_postmortem_markdown(
+    task_id: str,
+    markdown_body: str,
+    *,
+    header_meta: Optional[dict] = None,
+) -> str:
+    """Render the COMPLETE postmortem markdown: title + deterministic
+    fact block + LLM body.
+
+    SINGLE SOURCE for both persistence targets — :func:`save_postmortem`
+    writes exactly this string to disk and ``terminal_reports`` puts
+    exactly this string in the result envelope's ``postmortem.markdown``.
+    Rendering it once, here, is what makes the on-disk file and the
+    platform-consumed payload byte-identical instead of diverging: the
+    disk file used to carry a header the payload never saw, so the
+    platform (which reads ``postmortem.markdown``) got a body-only report
+    missing every deterministic fact.
+
+    The fact block is PROGRAM-rendered from values the framework already
+    knows (fault_type / namespace / status / duration / user request /
+    target selector / params) — zero-variance facts that must NOT be left
+    to the LLM to restate, since a model can drop, mis-copy or hallucinate
+    them. The LLM writes only the judgment sections that follow
+    (``## Summary`` onward), and its prompt tells it the facts above are
+    already rendered so it leaves them alone.
+
+    ``header_meta`` recognised keys: fault_type (preferred) / skill_name
+    (legacy), namespace, status, duration, generated_at, user_request,
+    target, params. Missing keys collapse silently — the fact block just
+    omits the unknown lines (no dangling empty label), and with none of
+    the three optional facts present the output is byte-identical to the
+    historical title + metadata-line header.
+    """
+    meta = header_meta or {}
+    skill = meta.get("fault_type") or meta.get("skill_name", "") or "unknown"
+    namespace = meta.get("namespace", "") or "unknown"
+    status = meta.get("status", "") or "unknown"
+    duration = meta.get("duration", "") or "unknown"
+    generated = meta.get("generated_at", "") or now_iso()
+
+    lines = [
+        f"# Postmortem: {skill} on {namespace}",
+        "",
+        f"**Task**: `{task_id}` | "
+        f"**Status**: {status} | "
+        f"**Duration**: {duration} | "
+        f"**Generated**: {generated}",
+    ]
+    # Deterministic fact lines — each its own paragraph (blank line before
+    # it) so markdown renders them on separate lines, and emitted ONLY when
+    # the value is known so a partial header_meta never leaves a dangling
+    # ``**Label**: `` with nothing after it.
+    for label, key in (
+        ("User request", "user_request"),
+        ("Target", "target"),
+        ("Parameters", "params"),
+    ):
+        value = str(meta.get(key, "") or "").strip()
+        if value:
+            lines.append("")
+            lines.append(f"**{label}**: {value}")
+    lines.append("")  # blank line separating the fact block from the body
+
+    fact_block = "\n".join(lines) + "\n"
+    return fact_block + markdown_body.lstrip() + "\n"
+
+
 def save_postmortem(
     task_id: str,
     markdown_body: str,
@@ -116,15 +187,16 @@ def save_postmortem(
 ) -> Path:
     """Write the postmortem markdown to disk and return the absolute path.
 
-    ``markdown_body`` is the LLM output (starts with ``## Summary``).
-    A standardised ``# Postmortem: <skill> on <namespace>`` header +
-    metadata line is prepended here so the on-disk file is self-
-    contained even when shared out of context.
+    ``markdown_body`` is the LLM output (starts with ``## Summary``). The
+    title + deterministic fact block is prepended by
+    :func:`render_postmortem_markdown` — the SAME renderer the caller uses
+    to build the result-envelope payload, so the file written here and the
+    ``postmortem.markdown`` the platform reads are byte-identical.
 
-    ``header_meta`` (optional) populates the metadata line. Recognised
-    keys: fault_type (preferred), skill_name (legacy), namespace, status,
-    duration, generated_at. Missing keys collapse silently — header just
-    omits the unknown bits.
+    ``header_meta`` (optional) populates the fact block. Recognised keys:
+    fault_type (preferred), skill_name (legacy), namespace, status,
+    duration, generated_at, user_request, target, params. Missing keys
+    collapse silently — the fact block just omits the unknown bits.
     """
     path = _path_for(task_id, root)
     # R1 — directory locked down to owner-only.
@@ -137,21 +209,13 @@ def save_postmortem(
     except OSError:
         pass  # best-effort; failure on shared FS is non-fatal
 
-    meta = header_meta or {}
-    skill = meta.get("fault_type") or meta.get("skill_name", "") or "unknown"
-    namespace = meta.get("namespace", "") or "unknown"
-    status = meta.get("status", "") or "unknown"
-    duration = meta.get("duration", "") or "unknown"
-    generated = meta.get("generated_at", "") or now_iso()
-
-    header = (
-        f"# Postmortem: {skill} on {namespace}\n\n"
-        f"**Task**: `{task_id}` | "
-        f"**Status**: {status} | "
-        f"**Duration**: {duration} | "
-        f"**Generated**: {generated}\n\n"
+    # Title + deterministic fact block + body, rendered by the SINGLE
+    # source shared with the result-envelope payload (see
+    # render_postmortem_markdown). The caller renders the same string from
+    # the same inputs for payload["markdown"], so disk and payload match.
+    content = render_postmortem_markdown(
+        task_id, markdown_body, header_meta=header_meta,
     )
-    content = header + markdown_body.lstrip() + "\n"
 
     # R3 — symlink guard. If a symlink sits at the target path (legit
     # use is rare; attacker-planted symlink would otherwise redirect

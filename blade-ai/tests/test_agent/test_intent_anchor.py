@@ -72,7 +72,12 @@ def test_from_cli_nl_prefills_node_identity_from_anchor():
     assert spec.user_description == _R4_INTENT
 
 
-def test_from_cli_nl_without_anchor_stays_on_lazy_derivation_path():
+def test_from_cli_nl_without_anchor_leaves_identity_empty():
+    # D1 (cli-nl-identity-from-declaration): there is no lazy probe-order
+    # derivation anymore. An unanchored intent leaves scope/names/labels EMPTY
+    # so the identity comes only from the planner's finish_planning declaration
+    # (or fails safety_check honestly with "No target specified") — never from
+    # whichever resource a kubectl probe happened to read first.
     spec = FaultSpec.from_cli_nl(input_text="对 default 命名空间的应用做演练")
     assert spec.scope == ""
     assert spec.names == ()
@@ -102,11 +107,10 @@ def _http_nl_request(text: str) -> SimpleNamespace:
 
 def test_http_nl_anchors_same_identity_as_cli_nl():
     """The same anchored text must yield the same identity from both NL
-    entry points — an HTTP NL request feeds the same agent_loop
-    lazy-derivation path (route_pipeline_start), so a CLI-only anchor would
-    leave the HTTP channel racing probe ORDER exactly like r4 did
-    (B76 review P2-1: probe-verified — the two constructors previously
-    disagreed on the same text)."""
+    entry points — an HTTP NL request feeds the same planning path
+    (route_pipeline_start), so a CLI-only anchor would leave the HTTP channel
+    without the node fallback the CLI has (B76 review P2-1: probe-verified —
+    the two constructors previously disagreed on the same text)."""
     cli_spec = FaultSpec.from_cli_nl(input_text=_R4_INTENT)
     http_spec = FaultSpec.from_http_request(_http_nl_request(_R4_INTENT))
     assert (http_spec.scope, http_spec.names, http_spec.labels) == (
@@ -144,11 +148,13 @@ def test_http_half_structured_request_keeps_explicit_fields():
 #
 # The node anchor pins the victim NAME the user typed. The namespace anchor
 # pins the victim NAMESPACE — the one identity dimension a MECHANISM case
-# states explicitly ("drill-lb 命名空间里应用 Pod …") but which lazy
-# derivation otherwise reverse-engineers from probe ORDER. Pre-filling it
-# gives the write-once derivation an authoritative ns to lock FIRST, so
-# agent_loop's namespace-consistency gate can then reject a mechanism
-# target's name (kube-proxy in kube-system) probed under a drill-lb victim.
+# states explicitly ("drill-lb 命名空间里应用 Pod …"). Pre-filling it gives the
+# entry spec an authoritative user-stated ns for the declaration chain
+# (extract_planning_metadata) to carry, rather than leaving it empty. (This
+# anchor once fed the write-once probe-order derivation and agent_loop's
+# namespace-consistency gate; D1 / cli-nl-identity-from-declaration removed
+# both — the anchor now stands as the ns prefill shared by the two NL
+# constructors and the node fallback.)
 
 # The verbatim intent of the failing run — a mechanism case naming TWO
 # same-kind pods (victim app Pod in drill-lb, mechanism kube-proxy in
@@ -183,8 +189,9 @@ def test_anchors_kubectl_flag_forms_pasted_into_intent():
 def test_two_distinct_namespaces_fail_safe_to_no_anchor():
     # AMBIGUITY IS THE SAFETY CONDITION: when the text names two distinct
     # namespaces the victim's cannot be told from the mechanism's, so no
-    # anchor is returned — the ns is left to the derivation path rather than
-    # guessed. Guessing wrong would re-open the franken-target race.
+    # anchor is returned — the ns is left empty for the planner's declaration
+    # rather than guessed. Guessing wrong would anchor the fault onto the
+    # mechanism's namespace instead of the victim's.
     assert extract_explicit_namespace_anchor(
         "drill-lb 命名空间的应用，重启 kube-system 命名空间的 kube-proxy",
     ) == ""
@@ -219,8 +226,9 @@ def test_empty_or_missing_text_yields_no_namespace_anchor():
 def test_from_cli_nl_prefills_namespace_from_anchor():
     spec = FaultSpec.from_cli_nl(input_text=_MECH_INTENT)
     # The ns anchor fires independently of the node anchor: this text names
-    # no "在节点 X 上" form, so scope/names stay lazy — but the victim ns is
-    # now authoritative instead of probe-order-derived.
+    # no "在节点 X 上" form, so scope/names stay EMPTY (D1 removed lazy
+    # probe-order derivation) — but the victim ns is now authoritative
+    # instead of probe-order-derived.
     assert spec.namespace == "drill-lb"
     assert spec.scope == ""
     assert spec.names == ()
@@ -233,8 +241,9 @@ def test_from_cli_nl_without_namespace_anchor_stays_empty():
 
 def test_http_nl_prefills_same_namespace_as_cli_nl():
     # Parity: the anchor is a property of the TEXT, not the transport — an
-    # HTTP NL request feeds the same lazy-derivation path, so a CLI-only ns
-    # anchor would leave the HTTP channel racing probe order.
+    # HTTP NL request feeds the same planning path (route_pipeline_start), so
+    # a CLI-only ns anchor would leave the HTTP channel without the namespace
+    # prefill the CLI has.
     cli_spec = FaultSpec.from_cli_nl(input_text=_MECH_INTENT)
     http_spec = FaultSpec.from_http_request(_http_nl_request(_MECH_INTENT))
     assert http_spec.namespace == cli_spec.namespace == "drill-lb"

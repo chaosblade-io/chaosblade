@@ -55,6 +55,56 @@ class TestComputeEnvInfo:
             assert result["blade_version"] == "chaosblade 1.7.0"
 
     @pytest.mark.asyncio
+    async def test_blade_version_host_scope_probes_host_blade(self):
+        """D1 regression: in a host-scoped drill the injection runs the REMOTE
+        host blade, so blade_version must report the host blade (probed via the
+        transport) and label the agent-local one as local — never present the
+        local vendor version as if it were the injection executor. That
+        conflation is what manufactured the spurious 'agent-side vs host-side
+        blade mismatch' narrative (local 1.9.0-alpha vs host 1.8.2)."""
+        with patch("chaos_agent.transports.TransportRegistry.resolve") as mock_resolve, \
+             patch("chaos_agent.agent.env_info._get_blade_version", new_callable=AsyncMock) as mock_local, \
+             patch("chaos_agent.agent.env_info._get_host_blade_version", new_callable=AsyncMock) as mock_host:
+            mock_resolve.return_value.name = "ssh"  # real profile_of -> HOST
+            mock_local.return_value = "1.9.0-alpha"
+            mock_host.return_value = "1.8.2"
+            result = await compute_env_info()
+        assert result["blade_version"] == (
+            "1.8.2 (target host blade; agent-local blade 1.9.0-alpha)"
+        )
+        mock_host.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_blade_version_host_scope_unprobed_fallback(self):
+        """D1: when the host blade probe fails (unreachable host), the field
+        must still say the local value is agent-local — never silently present
+        it as the host blade."""
+        with patch("chaos_agent.transports.TransportRegistry.resolve") as mock_resolve, \
+             patch("chaos_agent.agent.env_info._get_blade_version", new_callable=AsyncMock) as mock_local, \
+             patch("chaos_agent.agent.env_info._get_host_blade_version", new_callable=AsyncMock) as mock_host:
+            mock_resolve.return_value.name = "ssh"
+            mock_local.return_value = "1.9.0-alpha"
+            mock_host.return_value = ""  # probe failed
+            result = await compute_env_info()
+        assert result["blade_version"] == (
+            "(target host blade unprobed; agent-local blade 1.9.0-alpha)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_blade_version_non_host_scope_unchanged(self):
+        """D1: a non-host channel (local/k8s) executes with the agent-local
+        blade, so blade_version stays the plain local value with no host probe
+        and no label — the override must not fire outside host scope."""
+        with patch("chaos_agent.transports.TransportRegistry.resolve") as mock_resolve, \
+             patch("chaos_agent.agent.env_info._get_blade_version", new_callable=AsyncMock) as mock_local, \
+             patch("chaos_agent.agent.env_info._get_host_blade_version", new_callable=AsyncMock) as mock_host:
+            mock_resolve.return_value.name = "kubeconfig"  # real profile_of -> K8S
+            mock_local.return_value = "1.9.0-alpha"
+            result = await compute_env_info()
+        assert result["blade_version"] == "1.9.0-alpha"
+        mock_host.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_k8s_available_false(self):
         with patch("chaos_agent.agent.env_info._check_k8s_available", new_callable=AsyncMock) as mock:
             mock.return_value = False

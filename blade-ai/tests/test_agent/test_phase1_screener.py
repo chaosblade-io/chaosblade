@@ -182,9 +182,14 @@ class TestDirectMutationRejection:
         })
 
         assert result["screener_route"] == PHASE1_SCREENER_ROUTE_RETRY
-        # Truthful capability cause (names the profile in force) — the old
-        # generic "unavailable for the current environment" sentence is gone.
-        assert "not a registered capability profile" in result["messages"][0].content
+        # Truthful capability cause — the old generic "unavailable for the
+        # current environment" sentence is gone. Defect A2 (#34-R) sharpened
+        # this further: when the profile is UNKNOWN because a NON-EMPTY scope is
+        # unregistered, the refusal names the offending SCOPE (not a misleading
+        # "fix your kubeconfig"), so the assertion now pins the scope-specific
+        # message rather than the coarser "not a registered capability profile".
+        assert "typo_scope" in result["messages"][0].content
+        assert "registered fault domain" in result["messages"][0].content
         assert "phase1_readonly_violation" in result["messages"][0].content
 
 

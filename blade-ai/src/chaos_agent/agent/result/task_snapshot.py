@@ -382,6 +382,7 @@ class TaskSnapshot:
     stored_fault_spec: dict = field(default_factory=dict)
     experiment_uid: str = ""
     injection_method: str = ""
+    injection_channel: str = ""
     fault_handle: dict = field(default_factory=dict)
     skill_name: str = ""
     fault_type: str = ""
@@ -457,6 +458,12 @@ class TaskSnapshot:
         # column is the fallback for tasks finalized before R4.
         record_injection_method = str(record.get("injection_method") or "")
         session_injection_method = str(result_data.get("injection_method") or "")
+        # Injection-time transport channel (resolved name, e.g. "kubeconfig").
+        # Recover pins this instead of re-deriving the channel from ambient
+        # settings that may have drifted since injection (Case #87). Same
+        # finalize-persisted-first / record-fallback shape as injection_method.
+        record_injection_channel = str(record.get("injection_channel") or "")
+        session_injection_channel = str(result_data.get("injection_channel") or "")
         record_fault_handle = _coerce_json_dict(record.get("fault_handle"))
         session_fault_handle = _coerce_json_dict(result_data.get("fault_handle"))
 
@@ -491,6 +498,7 @@ class TaskSnapshot:
             stored_fault_spec = session_fault_spec or record_fault_spec
             execution_artifacts = session_artifacts or record_artifacts
             injection_method = session_injection_method or record_injection_method
+            injection_channel = session_injection_channel or record_injection_channel
             fault_handle = session_fault_handle or record_fault_handle
         else:
             target = record_target or session_target
@@ -514,6 +522,7 @@ class TaskSnapshot:
             stored_fault_spec = record_fault_spec or session_fault_spec
             execution_artifacts = record_artifacts or session_artifacts
             injection_method = record_injection_method or session_injection_method
+            injection_channel = record_injection_channel or session_injection_channel
             fault_handle = record_fault_handle or session_fault_handle
 
         return cls(
@@ -527,6 +536,7 @@ class TaskSnapshot:
             stored_fault_spec=stored_fault_spec,
             experiment_uid=experiment_uid,
             injection_method=injection_method,
+            injection_channel=injection_channel,
             fault_handle=fault_handle,
             skill_name=skill_name,
             fault_type=fault_type,
@@ -744,11 +754,22 @@ async def build_recover_initial_from_task_snapshot(
         "kube_context": snapshot.record.get("kube_context") or checkpoint_values.get("kube_context", "") or "",
         "kubewiz_cluster_uuid": checkpoint_values.get("kubewiz_cluster_uuid", "") or "",
         "kubewiz_profile": checkpoint_values.get("kubewiz_profile", "") or "",
-        # Injection-time channel, carried for the builder's cross-channel
-        # guard only — the recover graph's own channel comes from the
-        # carried connection override or the caller's settings, never this
-        # frozen value.
-        "kube_connection_mode": checkpoint_values.get("kube_connection_mode", "") or "",
+        # Injection-time channel, frozen so recover is channel-affine with the
+        # fault it undoes. Precedence: the LIVE checkpoint's own mode (an
+        # explicit override the injector passed) first, then the durable
+        # ``injection_channel`` the inject finalize resolved and persisted.
+        # Recover must NOT silently re-derive its channel from the caller's
+        # ambient settings — those can drift between inject and recover (Case
+        # #87: the operator flipped kube_connection_mode to a host channel, so
+        # a kubeconfig/k8s task resolved to ssh/host and fail-closed against
+        # the scope/transport guard). Both sources empty (a task injected
+        # before this field existed) leaves the key empty, and the recover
+        # builder then falls back to the caller's settings — legacy behavior.
+        "kube_connection_mode": (
+            checkpoint_values.get("kube_connection_mode", "")
+            or snapshot.injection_channel
+            or ""
+        ),
         "injection_method": (
             snapshot.injection_method or checkpoint_values.get("injection_method")
         ),
@@ -804,6 +825,66 @@ async def build_recover_initial_from_task_snapshot(
         inject_context=inject_context,
         connection_override=connection_override,
     )
+
+
+@dataclass(frozen=True)
+class TaskIdResolution:
+    """Outcome of expanding a human-supplied task id (full UUID or short prefix).
+
+    ``status`` is exactly one of:
+
+    - ``"resolved"``  — one task matches; ``task_id`` carries the full id
+      (identical to the input when the caller already passed a full id).
+    - ``"not_found"`` — no ``tasks`` row matches the id or prefix; ``task_id``
+      is empty. The caller falls through to the ordinary recover lookup so a
+      checkpoint-only task (no ``tasks`` row) still gets its chance, and the
+      existing ``TASK_NOT_FOUND`` terminal fires with its improved message.
+    - ``"ambiguous"`` — more than one task shares the prefix; ``candidates``
+      lists them newest-first. The caller MUST surface these and refuse to
+      choose, so a short id can never silently recover the wrong drill.
+    """
+
+    status: str
+    task_id: str = ""
+    candidates: tuple[str, ...] = ()
+
+
+async def resolve_full_task_id(candidate: str, *, store=None) -> TaskIdResolution:
+    """Expand a human-supplied task id (full UUID or unique short prefix).
+
+    Single source for the CLI's short-id convenience. Before this, ``blade-ai
+    recover --task-id inject-c28f25f5`` failed with a bare "Task not
+    recoverable" because both the snapshot lookup (``store.get``) and the
+    checkpoint lookup (``thread_id``) key on the *exact* full UUID. This
+    resolves a unique prefix against the authoritative task store so the
+    human surface accepts the same shorthand the ledger and logs print.
+
+    Fast path: an exact full-id hit returns immediately (no ``LIKE`` scan),
+    so the ordinary full-UUID call pays nothing extra. Only when the exact id
+    is absent do we prefix-scan.
+
+    The resolver never picks among multiple matches — ambiguity is handed back
+    to the caller to surface. That is the safety property: a shared or
+    multi-tenant store can never recover the wrong task off a colliding
+    prefix, because a collision is reported, not resolved.
+
+    ``store`` is an injection seam (a caller that already holds a ``TaskStore``
+    passes it; tests drive the real resolver against a real backend). ``None``
+    resolves the process-wide store.
+    """
+    if not candidate:
+        return TaskIdResolution(status="not_found")
+    if store is None:
+        from chaos_agent.persistence.task_store import get_task_store
+        store = await get_task_store()
+    if await store.get(candidate) is not None:
+        return TaskIdResolution(status="resolved", task_id=candidate)
+    matches = await store.find_ids_by_prefix(candidate)
+    if len(matches) == 1:
+        return TaskIdResolution(status="resolved", task_id=matches[0])
+    if not matches:
+        return TaskIdResolution(status="not_found")
+    return TaskIdResolution(status="ambiguous", candidates=tuple(matches))
 
 
 async def resolve_recover_initial_state(
@@ -982,8 +1063,10 @@ def _source_values_from_initial(
 
 __all__ = [
     "RecoverInitialResolution",
+    "TaskIdResolution",
     "TaskSnapshot",
     "build_recover_initial_from_task_snapshot",
     "load_task_snapshot",
+    "resolve_full_task_id",
     "resolve_recover_initial_state",
 ]

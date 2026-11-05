@@ -312,6 +312,182 @@ class TestInjectionToolCommand:
         # precondition rather than at channel selection.
         assert "capability gate" in out
 
+    @pytest.mark.asyncio
+    async def test_multiple_running_records_surface_shadow_diagnosis(self):
+        """When ≥2 prepare records are RUNNING, blade picks the OLDEST and a
+        stale record SHADOWS the target's live agent. The connection-refused
+        path must enumerate the records read-only and present the shadowing, so
+        the model self-corrects in one step instead of guessing which record
+        blade bound to (Case #3 run1 burned ~300 log lines on the generic
+        single-record message before finding the two records on its own).
+        """
+        from chaos_agent.agent.providers.chaosblade.cli_python import blade_python_create
+
+        # Verbatim shape of `blade status --type prepare` with the Case #3 run1
+        # residue: a live redis record (9527) shadowed by a stale HTTP-app
+        # record (9526) whose app was killed but whose record stayed Running.
+        prepare_status = (
+            '{"code":200,"success":true,"result":['
+            '{"Uid":"c12169b0f4502368","ProgramType":"python","Port":"9527",'
+            '"Pid":"/opt/redis_app/redis_app.py","Status":"Running",'
+            '"CreateTime":"2026-10-28T10:02:57Z"},'
+            '{"Uid":"746279a5b215d86a","ProgramType":"python","Port":"9526",'
+            '"Pid":"/opt/app/app.py","Status":"Running",'
+            '"CreateTime":"2026-10-23T06:50:39Z"}]}'
+        )
+        calls: list[list[str]] = []
+
+        async def _fake(cmd, target, **kw):
+            calls.append(list(cmd))
+            if "status" in cmd:
+                return CommandResult(stdout=prepare_status, stderr="", exit_code=0)
+            return CommandResult(
+                stdout='{"code":63064,"success":false,"error":"`http://127.0.0.1'
+                ":9526/create?target=redis`: http cmd failed, err: Get "
+                '\\"http://127.0.0.1:9526/create\\": dial tcp '
+                '127.0.0.1:9526: connect: connection refused"}',
+                stderr="",
+                exit_code=1,
+            )
+
+        with patch(
+            "chaos_agent.agent.providers.chaosblade.cli_python.execute_via_transport",
+            new=AsyncMock(side_effect=_fake),
+        ):
+            out = await blade_python_create.ainvoke(
+                {"target": "redis", "action": "delay", "flags": "--time 500"}
+            )
+
+        # A read-only enumeration was issued on the failure path.
+        assert any(
+            "status" in c and "--type" in c and "prepare" in c for c in calls
+        )
+        assert out.startswith("Error:")
+        # Both records named, with their script paths so the model can match
+        # against its target, and the bound (refused) port pinned.
+        assert "9527" in out and "9526" in out
+        assert "c12169b0f4502368" in out and "746279a5b215d86a" in out
+        assert "/opt/redis_app/redis_app.py" in out and "/opt/app/app.py" in out
+        assert "blade bound here" in out
+        # The documented selection rule + the revoke remedy for a stale shadow.
+        assert "OLDEST" in out
+        assert "SHADOW" in out
+        assert "blade_python_revoke" in out
+        # The other branch (target's own agent genuinely dead) stays available
+        # so the model is not pushed to revoke when a restart is the real fix.
+        assert "prerequisite failure" in out
+
+    @pytest.mark.asyncio
+    async def test_single_running_record_falls_back_to_restart_message(self):
+        """With only the target's own record RUNNING there is nothing to
+        disambiguate — the connection-refused cause IS a dead agent, so the
+        original app-restart prerequisite message must be preserved verbatim
+        (no shadow claim, no regression on the single-record path)."""
+        from chaos_agent.agent.providers.chaosblade.cli_python import blade_python_create
+
+        prepare_status = (
+            '{"code":200,"success":true,"result":['
+            '{"Uid":"c12169b0f4502368","ProgramType":"python","Port":"9527",'
+            '"Pid":"/opt/redis_app/redis_app.py","Status":"Running",'
+            '"CreateTime":"2026-10-28T10:02:57Z"}]}'
+        )
+
+        async def _fake(cmd, target, **kw):
+            if "status" in cmd:
+                return CommandResult(stdout=prepare_status, stderr="", exit_code=0)
+            return CommandResult(
+                stdout='{"code":63064,"success":false,"error":"dial tcp '
+                '127.0.0.1:9527: connect: connection refused"}',
+                stderr="",
+                exit_code=1,
+            )
+
+        with patch(
+            "chaos_agent.agent.providers.chaosblade.cli_python.execute_via_transport",
+            new=AsyncMock(side_effect=_fake),
+        ):
+            out = await blade_python_create.ainvoke(
+                {"target": "redis", "action": "delay", "flags": "--time 500"}
+            )
+
+        assert out.startswith("Error:")
+        assert "RESTARTED" in out
+        assert "PYTHONPATH" in out
+        assert "capability gate" in out
+        # No shadow diagnosis on the single-record path.
+        assert "SHADOW" not in out
+        assert "OLDEST" not in out
+
+    @pytest.mark.asyncio
+    async def test_shadow_enumeration_failure_degrades_to_restart_message(self):
+        """The diagnostic is best-effort: if the read-only enumeration raises or
+        returns unparseable output, the error path must still return the generic
+        precondition message rather than breaking — the enrichment may never
+        become a new failure mode on the failure path."""
+        from chaos_agent.agent.providers.chaosblade.cli_python import blade_python_create
+
+        async def _fake(cmd, target, **kw):
+            if "status" in cmd:
+                raise RuntimeError("transport blew up")
+            return CommandResult(
+                stdout='{"code":63064,"success":false,"error":"dial tcp '
+                '127.0.0.1:9527: connect: connection refused"}',
+                stderr="",
+                exit_code=1,
+            )
+
+        with patch(
+            "chaos_agent.agent.providers.chaosblade.cli_python.execute_via_transport",
+            new=AsyncMock(side_effect=_fake),
+        ):
+            out = await blade_python_create.ainvoke(
+                {"target": "redis", "action": "delay", "flags": "--time 500"}
+            )
+
+        assert out.startswith("Error:")
+        assert "RESTARTED" in out
+        assert "capability gate" in out
+
+    def test_render_shadow_diagnosis_none_below_two_records(self):
+        """The helper's None contract is what keeps the single-record fallback
+        intact: fewer than two RUNNING records means nothing to disambiguate."""
+        from chaos_agent.agent.providers.chaosblade.cli_python import (
+            _render_shadow_diagnosis,
+        )
+
+        assert _render_shadow_diagnosis([], "9526", "raw") is None
+        assert (
+            _render_shadow_diagnosis(
+                [{"uid": "u1", "port": "9527", "script": "/a.py", "createtime": ""}],
+                "9527",
+                "raw",
+            )
+            is None
+        )
+        # Two records → a diagnosis that pins the bound port and names both.
+        out = _render_shadow_diagnosis(
+            [
+                {"uid": "u1", "port": "9527", "script": "/a.py", "createtime": ""},
+                {"uid": "u2", "port": "9526", "script": "/b.py", "createtime": ""},
+            ],
+            "9526",
+            "raw-output",
+        )
+        assert out is not None
+        assert "blade bound here" in out
+        assert "u1" in out and "u2" in out
+        assert "raw-output" in out
+        # No bound port extractable → still enumerates, with a generic clause.
+        out2 = _render_shadow_diagnosis(
+            [
+                {"uid": "u1", "port": "9527", "script": "/a.py", "createtime": ""},
+                {"uid": "u2", "port": "9526", "script": "/b.py", "createtime": ""},
+            ],
+            "",
+            "raw",
+        )
+        assert out2 is not None and "blade bound here" not in out2
+
     def test_capability_gate_restricts_delivery_to_host_channels(self):
         """The framework already fails closed on a scope/transport mismatch.
 

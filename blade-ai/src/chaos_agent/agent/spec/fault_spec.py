@@ -294,6 +294,44 @@ class FaultSpec:
             return False
         return True
 
+    @property
+    def disk_mount_targets(self) -> tuple[str, ...]:
+        """The mount path(s) this disk fault saturates — the SINGLE
+        authority for target-driven df extraction (D4/B2).
+
+        The disk target path has NO single reliably-populated field, which
+        is exactly the trap the earlier fix fell into: it keyed extraction
+        on ``params["path"]`` and declared that "the single authoritative
+        key", but the real planning path stores a host disk-fill's mount in
+        ``names`` (for a host disk fault the mount IS the resource identity)
+        and leaves ``params`` empty — the ``--path`` value lives only in the
+        transient blade argv. A/A run inject-0242c9d6 proved it: with
+        ``params={}`` the extractor threaded no target, silently dropped the
+        ``/drill-disk`` df row and reported the root overlay's 5% as if it
+        were the target metric. Resolving the fact HERE, once, on the spec
+        that owns it, is what makes the spec the authority instead of any
+        one of the smeared downstream fields.
+
+        Precedence (scope-agnostic — no scope branch needed):
+          1. explicit ``params["path"]`` — the structured (``-p path=``)
+             declaration, kept first so that shape stays byte-identical;
+          2. else the absolute-path entries of ``names``. A mount always
+             starts with ``/`` while a node name / pod name / label selector
+             never does, so this cleanly separates a host disk-fill
+             (``names=["/drill-disk"]``) from a node/pod disk-fill
+             (``names=["node-1"]`` → no path here, falls through empty).
+
+        Empty for a non-disk fault, or when neither source declares a path —
+        the df parser then keeps only its additive overlay/nodefs alias
+        behaviour, so every root-fs target stays byte-identical.
+        """
+        if self.fault_target != "disk":
+            return ()
+        path = str((self.params or {}).get("path") or "").strip()
+        if path:
+            return (path,)
+        return tuple(str(n) for n in self.names if str(n).startswith("/"))
+
     # ---- Constructors -----------------------------------------------------
 
     @classmethod

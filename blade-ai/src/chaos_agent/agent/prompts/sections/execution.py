@@ -164,6 +164,56 @@ def get_execution_directives_section(
         "A tool error corrected by the tool's own feedback is a legitimate path,",
         "not a plan failure; the same method failing twice means replan, not a",
         "third attempt.",
+        # Silent-failure diagnostic carve (2026-10-30, live case #17 host
+        # syscall-error, inject run.log iter 17 = 111,782ms): the two-failure
+        # count above is keyed on METHOD IDENTITY, blind to EPISTEMIC STATE, so
+        # the executor read a decisive `--debug` diagnostic as "a third attempt
+        # of the same method" (run.log L2848), abandoned it, and emitted a
+        # false plan_invalid / changes_target_or_risk=true escalation on a
+        # 手段1-only contract with no fallback. The dud was SILENT (blade
+        # success:true + zero effect + Error:"" — the fe32a063 dud class), so
+        # the replan carried NO root cause to the replanner. This carve
+        # separates a blind re-run (correctly banned, aligned with the
+        # workflow.py anti-loop "no unchanged repetition without new evidence
+        # or hypothesis") from the ONE instrumented diagnostic that makes a
+        # silent failure decidable (the workflow.py:93 "safe discriminating
+        # action before abandoning a viable path"); it also honours the replan
+        # gate (replan.py "Replan ONLY when no action you can take still
+        # advances it") — the diagnostic IS such an action, so skipping it
+        # violates the gate too.
+        #
+        # Refinement (2026-10-30, run5 = A/A cross-sample replication of the
+        # decisive run4): the carve first offered "debug/verbose channel, OR
+        # its authoritative execution log" as EQUIVALENT alternatives. run4
+        # took the --debug branch, printed `strace: invalid inject argument
+        # 'openat:error=-2'` -> in-place -2->2, ZERO replan (46m51s). run5 took
+        # the log branch: grep of the FULL chaosblade.log (run5.log L7410)
+        # returned only its own bookkeeping records (phantom `Success`), never
+        # the sub-executor's launch error -> dead end -> version-confusion
+        # false story -> TWO replans (1h14m09s). The asymmetry is structural
+        # and universal to any wrapper-over-subexecutor tool: a persisted log
+        # records the PARENT's bookkeeping return code, only the debug channel
+        # captures the CHILD sub-executor's real stderr. So for a
+        # success-receipt dud the two are NOT epistemically equivalent — order
+        # debug OVER log, else the log branch re-serves the same phantom.
+        "That two-failure count targets BLIND repetition — the same command",
+        "re-run with no new information or hypothesis. It does not ban the one",
+        "instrumented diagnostic that makes a SILENT failure decidable: a step",
+        "that returns a success receipt yet produces no observable effect and",
+        "surfaces no error leaves you information-poor, not verdict-rich.",
+        "Before treating such a silent failure as a replan trigger, spend ONE",
+        "bounded instrumented action to expose the root cause. Prefer the",
+        "tool's own debug/verbose channel OVER its persisted execution log:",
+        "when a step returns a success receipt yet does nothing, the log often",
+        "records only the parent tool's bookkeeping Success and omits the",
+        "sub-executor's launch error — reading it just re-serves the same",
+        "phantom, while the debug channel surfaces the child's real stderr.",
+        "Replanning without the root cause hands the same blindness to the",
+        "next plan and, when no fallback method exists, forces a false 'goal",
+        "unreachable' escalation. This is the safe discriminating action, not",
+        "a third attempt: with the root cause in hand, either advance via a",
+        "corrected method or replan carrying the diagnosis — never replan",
+        "blind.",
     ]
 
     if plan:
@@ -181,16 +231,25 @@ def get_execution_directives_section(
             "escaping, or reorder steps — the plan froze them.",
         ])
 
-    # The behavioral-probe clause (2026-09-22, live case inject-3dae7b4f /
-    # r43): the two effect-watching bans above had swallowed the red-line
-    # obligation in SKILL.md ("行为判据未采集即视为未生效确认——不得结束执
-    # 行段；效果证据只能在故障存活期内采集；机制证据不能替代效果证据")
-    # — the live run's executor obeyed "then STOP" literally ("Per the
-    # directives: STOP, don't sample the effect") and finished 46s before
-    # the verifier's first behavioral probe, surviving only on window
-    # slack. The bans keep their carve (inject-9bf2dddd's 571s watching,
-    # inject-3a745506's planned observation steps); what they must NOT ban
-    # is the ONE probe that makes effect-evidence survival deterministic.
+    # The behavioral-probe carve-out (added 2026-09-22 for inject-3dae7b4f /
+    # r43) was REMOVED (2026-11, task-821d4bb4). It forced execute to probe
+    # the effect once before declaring complete, as a hedge for "verify might
+    # miss the window" — but the hedge became the hazard: in a degraded env
+    # the probe, plus the diagnosis loop its ambiguous (DNS-confounded) result
+    # triggered, burned 312s of a 300s self-clear window, so verify arrived
+    # post-mortem and falsely reported ``failed``. The root fix is
+    # generation-side, not a routing gate: deleting this carve-out is what
+    # compresses the execute tail (L) so the model finishes and hands off
+    # inside the window. Handoff stays receipt-driven — finish_execution
+    # (ledger terminal) or simply stopping tool_calls routes to verify; the
+    # router never infers "injection complete" from a read-only batch (that
+    # proxy cannot tell a post-injection observation from a multi-step
+    # injection's intermediate check, so it cuts multi-step cases mid-flight).
+    # The SKILL.md red-line ("效果证据在窗口内采齐；机制证据不能替代效果证据") is
+    # thereby discharged by the verification phase — the independent observer
+    # whose evidence actually counts for the verdict — instead of by the
+    # injector collecting evidence that verification's independence rule
+    # ("prior phase results are NOT evidence") discards.
     parts.extend([
         "",
         "### Multi-Step Execution",
@@ -199,16 +258,15 @@ def get_execution_directives_section(
         "decide whether the next step still applies. A step that observes or",
         "verifies the effect is verification work — skip it. A wait or pause",
         "the plan declares as a step is executed as written, not skipped.",
-        "Do not add effect observations after an issued step either; a later",
-        "phase verifies the effect, and watching for it here only consumes the",
-        "window. That ban targets repeated watching, not the single behavioral",
-        "probe that must precede declaring execution complete: probe the fault's",
-        "user-visible effect once (restarts, errors, latency — what a user of",
-        "the target would notice), because effect evidence dies with the fault",
-        "window and a mechanism readback (rules/spec confirmed) cannot",
-        "substitute for it. With the probe in hand and the LAST mutation step",
-        "issued, state what was issued and through which path, then STOP — the",
-        "system owns post-execution verification and recovery.",
+        "Do not add effect observations after an issued step either, and do NOT",
+        "probe the fault's user-visible effect (restarts, errors, latency) here",
+        "— not even once. Effect evidence is collected by the verification",
+        "phase. Probing here only burns the fault's self-clear window",
+        "before verification starts, and your probe is discarded anyway —",
+        "verification must observe independently, so prior-phase results are",
+        "not evidence. With the LAST mutation step issued, state what was",
+        "issued and through which path, then STOP — the system owns",
+        "post-execution verification and recovery.",
         "",
         "### Parameter Priority",
         "When conflicting sources specify a parameter value, follow this hierarchy",

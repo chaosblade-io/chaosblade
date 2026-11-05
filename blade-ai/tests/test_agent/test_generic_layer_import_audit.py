@@ -15,12 +15,14 @@ are not audited.
 Since providers-group-by-carrier the violation surface is PACKAGE-PREFIX
 based (D3), matching the physical layout: a carrier subpackage import at
 package top level (``providers.chaosblade`` — indistinguishable in syntax
-from the retired flat module, which is why the closed carrier enumeration
-exists: it separates carrier subpackages from ``registry``/``base``/the
-package ``__init__`` at the same depth), or a REGISTERED PROVIDER module
-by its fixed name (``<carrier>.provider`` / ``<carrier>.python_provider`` —
-the fixed-name arm also catches FUTURE carrier packages without touching
-this rule). The family facility modules (``verify`` /
+from the retired flat module, which is why the carrier enumeration exists:
+it separates carrier subpackages from ``registry``/``base``/the package
+``__init__`` at the same depth). That enumeration is DISCOVERED FROM DISK
+(the sub-directories of ``providers`` that are themselves packages), NOT
+hardcoded — so BOTH arms catch a future carrier with zero rule change: the
+package-top-level arm via disk discovery, and the REGISTERED PROVIDER module
+arm via its fixed name (``<carrier>.provider`` / ``<carrier>.python_provider``).
+The family facility modules (``verify`` /
 ``recover`` / ``classifier``) stay seam targets, carrying forward the
 phase-8 verdict that carrier-shared knowledge modules are legal for the
 generic layer.
@@ -57,16 +59,40 @@ GENERIC_DIRS = (
     "l4",
 )
 
-# Carrier subpackages under ``agent/providers`` (closed enumeration — at
-# package top level it is the only thing separating a carrier from
-# ``registry`` / ``base`` / the package ``__init__``).
-CARRIER_PACKAGES = frozenset(
-    {
-        "chaosblade",
-        "k8s_native",
-        "host_shell",
-    }
-)
+# Carrier subpackages under ``agent/providers`` — DISCOVERED FROM DISK, not
+# hardcoded. At package top level the physical layout is the only thing
+# separating a carrier from the flat seam modules: a carrier is a SUBPACKAGE (a
+# directory carrying its own ``__init__.py``), whereas the legal seam surface at
+# the same depth (``registry`` / ``base`` / ``message_scanning`` / ``uid_shapes``)
+# are flat MODULES (files). So "sub-directory of ``agent/providers`` that is
+# itself a package" IS the normative carrier criterion.
+_PROVIDERS_DIR = SRC_ROOT / "agent" / "providers"
+
+
+def _discover_carrier_packages(providers_dir: Path = _PROVIDERS_DIR) -> frozenset:
+    """Every sub-directory of ``providers_dir`` that is a package (carries an
+    ``__init__.py``) — the carrier subpackages.
+
+    Discovering rather than enumerating means a new carrier package lands in the
+    violation surface with ZERO rule change: ``faultdrill`` is caught today and
+    any future family tomorrow, matching the extensibility the fixed-name
+    provider-module arm (``PROVIDER_MODULES``) already guarantees — before this,
+    the package-top-level arm was the ONE place a new carrier could be added on
+    disk yet silently escape the audit (a hardcoded frozenset drifts the instant
+    a carrier directory appears and stops auditing that carrier's top-level
+    imports). Non-package directories (``__pycache__``) are excluded by the
+    ``__init__.py`` test; flat seam modules are excluded by ``is_dir()``.
+    """
+    if not providers_dir.is_dir():
+        return frozenset()
+    return frozenset(
+        entry.name
+        for entry in providers_dir.iterdir()
+        if entry.is_dir() and (entry / "__init__.py").is_file()
+    )
+
+
+CARRIER_PACKAGES = _discover_carrier_packages()
 
 # Registered provider module names inside a carrier package (fixed-name
 # arm — catches future carrier packages too, no rule change needed).
@@ -253,3 +279,51 @@ def test_audit_flags_future_carrier_package_provider_modules(tmp_path):
         ("agent/nodes/future_user.py", "chaos_agent.agent.providers.cloud_api.provider"),
         ("agent/nodes/future_user.py", "chaos_agent.agent.providers.cloud_api.python_provider"),
     }
+
+
+def test_carrier_packages_discovered_from_disk():
+    """The carrier set is the REAL on-disk subpackage layout, not a hardcoded
+    list: every directory under ``agent/providers`` that is a package is a
+    carrier (including ``faultdrill`` — the one the retired hardcoded frozenset
+    omitted, letting its package-top-level imports escape the audit), while the
+    flat seam modules and ``__pycache__`` are excluded."""
+    discovered = _discover_carrier_packages()
+    # Carriers = subpackages on disk. Asserted as membership (not equality with
+    # a hardcoded set) so the pin tracks disk truth rather than re-freezing it.
+    for carrier in ("chaosblade", "k8s_native", "host_shell", "faultdrill"):
+        assert carrier in discovered, f"{carrier} is a carrier subpackage on disk"
+    # Flat seam MODULES (files) and non-package dirs are NOT carriers.
+    for seam in ("registry", "base", "message_scanning", "uid_shapes", "__pycache__"):
+        assert seam not in discovered, f"{seam} is a flat module / non-package"
+    # The module-level constant is the discovery output (single source).
+    assert CARRIER_PACKAGES == discovered
+
+
+def test_discovery_tracks_new_carrier_without_rule_change(tmp_path):
+    """Extensibility pin for the package-top-level arm: point discovery at a
+    providers dir containing a NEW carrier subpackage plus a flat seam module
+    and a ``__pycache__`` — only the carrier is discovered. This is the property
+    the hardcoded frozenset lacked: a carrier added on disk is audited with zero
+    edit to this file."""
+    providers = tmp_path / "providers"
+    (providers / "cloud_api").mkdir(parents=True)
+    (providers / "cloud_api" / "__init__.py").write_text("", encoding="utf-8")
+    (providers / "registry.py").write_text("", encoding="utf-8")  # flat seam module
+    (providers / "__pycache__").mkdir()  # non-package dir
+    assert _discover_carrier_packages(providers) == frozenset({"cloud_api"})
+
+
+def test_package_top_level_import_of_disk_carrier_is_flagged(tmp_path):
+    """Regression for the LATENT escape the hardcoded set allowed: a generic
+    -layer module importing a disk carrier at PACKAGE TOP LEVEL
+    (``providers.faultdrill`` — len 4, syntactically identical to the retired
+    flat module) is now flagged, because ``faultdrill`` is discovered as a
+    carrier. Under the old frozenset this import was invisible to the audit."""
+    nodes_dir = tmp_path / "agent" / "nodes"
+    nodes_dir.mkdir(parents=True)
+    (nodes_dir / "leaky.py").write_text(
+        "from chaos_agent.agent.providers.faultdrill import something\n",
+        encoding="utf-8",
+    )
+    got = {(rel, module) for rel, module, _ in _iter_violations(tmp_path)}
+    assert ("agent/nodes/leaky.py", "chaos_agent.agent.providers.faultdrill") in got

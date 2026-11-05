@@ -1,15 +1,19 @@
 import logging
 
 import pytest
+import pytest_asyncio
 from pathlib import Path
 
 from chaos_agent.agent.result.task_snapshot import (
     TaskSnapshot,
     _rebuild_inject_verification_summary,
     build_recover_initial_from_task_snapshot,
+    resolve_full_task_id,
     resolve_recover_initial_state,
 )
+from chaos_agent.persistence.task_store import TaskStore
 from chaos_agent.persistence.task_store_backend import _TASK_COLUMNS
+from chaos_agent.persistence.task_store_sqlite import SQLiteBackend
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -342,6 +346,90 @@ async def test_recover_initial_from_task_snapshot_uses_snapshot_fields():
         {"artifact_id": "uid-debug", "type": "debug_pod"}
     ]
     assert initial["kubectl_exec_pod_name"] == "tool-pod-a"
+
+
+def test_snapshot_reads_injection_channel_record_and_session():
+    """The frozen injection_channel is read back on the TaskSnapshot, with the
+    same record/session precedence as injection_method (session wins when an
+    increment log is present, record otherwise)."""
+    record_only = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "skill_name": "pod-cpu-fullload",
+            "target": _target("demo"),
+            "injection_channel": "kubeconfig",
+        },
+        session=None,
+        has_increment_log=False,
+    )
+    assert record_only is not None
+    assert record_only.injection_channel == "kubeconfig"
+
+    session_wins = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "skill_name": "pod-cpu-fullload",
+            "target": _target("demo"),
+            "injection_channel": "kubeconfig",
+        },
+        session={
+            "result_summary": {"data": {"injection_channel": "ssh"}},
+            "messages": [],
+        },
+        has_increment_log=True,
+    )
+    assert session_wins is not None
+    assert session_wins.injection_channel == "ssh"
+
+
+@pytest.mark.asyncio
+async def test_recover_initial_pins_frozen_injection_channel():
+    """Case #87: the recover seed pins kube_connection_mode from the frozen
+    injection_channel when the checkpoint carries no explicit mode, so a
+    drifted ambient config cannot re-route the recover transport."""
+    snapshot = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "skill_name": "pod-cpu-fullload",
+            "target": _target("demo"),
+            "params": {"cpu-percent": "80"},
+            "injection_channel": "kubeconfig",
+        },
+        session={"messages": []},
+        has_increment_log=False,
+    )
+    assert snapshot is not None
+
+    initial = await build_recover_initial_from_task_snapshot(
+        snapshot,
+        record_task_id="task-recover",
+    )
+    assert initial["kube_connection_mode"] == "kubeconfig"
+
+
+@pytest.mark.asyncio
+async def test_recover_initial_channel_absent_when_neither_source():
+    """A task injected before the channel was frozen (no injection_channel,
+    empty checkpoint mode) leaves kube_connection_mode unset so recover falls
+    back to the caller's settings — legacy behavior preserved."""
+    snapshot = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "skill_name": "pod-cpu-fullload",
+            "target": _target("demo"),
+            "params": {"cpu-percent": "80"},
+        },
+        session={"messages": []},
+        has_increment_log=False,
+    )
+    assert snapshot is not None
+    assert snapshot.injection_channel == ""
+
+    initial = await build_recover_initial_from_task_snapshot(
+        snapshot,
+        record_task_id="task-recover",
+    )
+    assert not initial.get("kube_connection_mode")
 
 
 def test_runtime_recover_entrypoints_use_task_snapshot_resolver():
@@ -1176,3 +1264,83 @@ class TestCarrierReconciliationCompleteness:
                 f"{column}: hydration expression lost the record carrier "
                 f"(single-carrier copy is the F-6 shape)"
             )
+
+
+# ---------------------------------------------------------------------------
+# resolve_full_task_id — CLI short-id expansion (Case #87 顺带发现)
+# ---------------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def id_store(tmp_path):
+    """Real SQLite-backed TaskStore so the resolver is driven end-to-end
+    (real ``store.get`` fast path + real ``LIKE`` prefix scan), not a mock."""
+    backend = await SQLiteBackend.create(db_path=tmp_path / "ids.db")
+    store = TaskStore(backend=backend)
+    yield store
+    await backend.close()
+
+
+class TestResolveFullTaskId:
+    """``resolve_full_task_id`` expands a human-supplied short prefix to the
+    full task id. Before it, ``blade-ai recover --task-id inject-c28f25f5``
+    failed with a bare ``Task not recoverable`` because both the snapshot and
+    checkpoint lookups key on the exact full UUID. The four statuses are the
+    contract the CLI runner branches on; the safety property is that a
+    colliding prefix is surfaced as ``ambiguous`` and NEVER silently picked."""
+
+    @pytest.mark.asyncio
+    async def test_exact_full_id_resolves_via_fast_path(self, id_store):
+        full = "inject-c28f25f5-3101-420d-a4e6-7bc473efd72b"
+        await id_store.upsert(full, skill_name="s")
+        res = await resolve_full_task_id(full, store=id_store)
+        assert res.status == "resolved"
+        assert res.task_id == full
+
+    @pytest.mark.asyncio
+    async def test_unique_short_prefix_expands_to_full_id(self, id_store):
+        full = "inject-c28f25f5-3101-420d-a4e6-7bc473efd72b"
+        await id_store.upsert(full, skill_name="s")
+        res = await resolve_full_task_id("inject-c28f25f5", store=id_store)
+        assert res.status == "resolved"
+        assert res.task_id == full  # the whole point: short → full UUID
+
+    @pytest.mark.asyncio
+    async def test_unknown_prefix_is_not_found(self, id_store):
+        await id_store.upsert("inject-cafe0000-0000-0000-0000-000000000009", skill_name="s")
+        res = await resolve_full_task_id("inject-deadbeef", store=id_store)
+        assert res.status == "not_found"
+        assert res.task_id == ""
+
+    @pytest.mark.asyncio
+    async def test_empty_candidate_is_not_found(self, id_store):
+        res = await resolve_full_task_id("", store=id_store)
+        assert res.status == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_colliding_prefix_is_ambiguous_and_never_picks(self, id_store):
+        a = "inject-beef0000-0000-0000-0000-000000000001"
+        b = "inject-beef0000-0000-0000-0000-000000000002"
+        await id_store.upsert(a, skill_name="s", gmt_create="2026-10-22T10:00:00")
+        await id_store.upsert(b, skill_name="s", gmt_create="2026-10-22T11:00:00")
+        res = await resolve_full_task_id("inject-beef0000", store=id_store)
+        assert res.status == "ambiguous"
+        assert res.task_id == ""  # MUST NOT silently choose one to recover
+        assert set(res.candidates) == {a, b}
+        assert res.candidates[0] == b  # newest first in the surfaced list
+
+    @pytest.mark.asyncio
+    async def test_exact_id_wins_over_prefix_collision(self, id_store):
+        # A full id that is ALSO a prefix of a second id must resolve to itself
+        # via the exact fast path — otherwise the prefix scan would see two
+        # matches and wrongly report ambiguity for a precisely-specified id.
+        short = "inject-feed0000-0000-0000-0000-00000000000a"
+        longer = "inject-feed0000-0000-0000-0000-00000000000abc"
+        await id_store.upsert(short, skill_name="s")
+        await id_store.upsert(longer, skill_name="s")
+        res = await resolve_full_task_id(short, store=id_store)
+        assert res.status == "resolved"
+        assert res.task_id == short
+        # Reverse leg: the strict prefix (no exact hit) IS ambiguous, proving
+        # the fast path — not a broken scan — is what disambiguated above.
+        res2 = await resolve_full_task_id("inject-feed0000", store=id_store)
+        assert res2.status == "ambiguous"

@@ -101,6 +101,7 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("_catalogue_rejection_nudged", "planning", batch=False),
     _p("_identity_declaration_nudged", "planning", batch=False),
     _p("_identity_split_nudged", "planning", batch=False),
+    _p("_scope_vocab_nudged", "planning", batch=False),
     _p("_plan_text_stall_count", "planning", batch=0),
     _p("plan_builder_round", "planning", batch=0),
     _p("planning_mode", "planning", durable=True),
@@ -200,6 +201,14 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("vehicle_probe_misses", "execution", batch=None, recover=False),
     _p("exec_pod_node_bindings", "execution", batch=None, recover=False),
     _p("selector_name_probes", "execution", batch=None, recover=False),
+    # Preplan host-toolkit absence fact, mirrored to state for baseline's
+    # off-graph derive (the one consumer that cannot read the observation
+    # message). A per-task host fact: reset on batch advance so fault N's
+    # absent-binary set can never leak into fault N+1 (which may target a
+    # different host or a k8s channel), and cleared on recover entry (the
+    # recover graph runs no baseline derive). Not durable — preplan re-probes
+    # at the head of every run, so it never needs to survive compaction.
+    _p("absent_host_binaries", "execution", batch=None, recover=None),
     _p("injection_parsed_params", "execution", durable=True, batch=None),
     _p("original_replicas", "execution", durable=True, batch=None),
     _p("kubeconfig", "execution", durable=True),
@@ -218,8 +227,6 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("side_effects", "execution", durable=True, batch=None),
     _p("baseline_data", "execution", durable=True, batch=None),
     _p("target_metadata", "execution", durable=True, batch=None),
-    _p("disk_burn_post_check", "execution", batch=None),
-    _p("disk_fill_post_check", "execution", batch=None),
     _p("se_snapshot", "execution", batch=None),
     _p("force_override", "execution", batch=False),
     _p("_execute_text_stall_count", "execution", batch=0),
@@ -237,6 +244,7 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     # recover graph (never inherited, never durable).
     _p("combo_blade_part", "verification", batch=None, recover=None),
     _p("metric_observations", "verification", batch=None, recover=None),
+    _p("evidence_fingerprints", "verification", batch=None, recover=None),
     _p("inject_verification_summary", "verification", durable=True, batch=None),
     _p("reverify_count", "verification", batch=0, recover=0),
     _p("reverify_gaps", "verification", batch=None, recover=None),

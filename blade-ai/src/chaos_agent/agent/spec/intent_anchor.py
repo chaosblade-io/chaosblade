@@ -173,3 +173,97 @@ def extract_explicit_namespace_anchor(text: str) -> str:
                 found.append(candidate)
     # Uniqueness is the safety condition: exactly one distinct namespace named.
     return found[0] if len(found) == 1 else ""
+
+
+# ---------------------------------------------------------------------------
+# Non-node identity CORROBORATION — verify a proposal against the user's text.
+#
+# Why this is a verifier and not an anchor: a node victim can be anchored
+# PREVENTIVELY because "在节点 X 上 / on node X" is a narrow, stable
+# prepositional frame. A freely-named config object (ingress / configmap /
+# secret / service / …) has no such frame — the module header above records
+# the author's DELIBERATE refusal to grow a regex anchor for it (that is the
+# rejected "Fix3" route: prose phrasings are too ambiguous, coverage would be
+# inherently incomplete, and new kinds would need new patterns). Instead the
+# header DELEGATES non-node correctness to the planning-stage correction
+# channel: ``propose_plan_change`` re-reads the full sentence. This function is
+# the authority that channel consults, so the delegation is finally honoured
+# instead of being structurally closed (openspec
+# generalize-nonnode-victim-identity-correction, Fix1 路 A).
+#
+# Authority model (unforgeable): ``user_description`` is the FIXED entry-point
+# input — the LLM authors its proposal but cannot edit the text we corroborate
+# against. So "the proposed name AND kind literally occur, as whole tokens, in
+# the user's own request" is a deterministic check the LLM cannot fake,
+# mirroring how the node path trusts only the user-written anchor and never the
+# proposal's echoed description.
+# ---------------------------------------------------------------------------
+
+
+def user_text_corroborates(
+    user_description: str,
+    scope: str,
+    names: "tuple[str, ...] | list[str]",
+) -> bool:
+    """Verify — NOT parse — that the user's OWN entry text backs a proposed
+    non-node identity ``(scope, names)``.
+
+    Triple narrowing; fail-closed (return ``False``) on ANY miss so a doubtful
+    correction is honestly refused rather than guessed:
+
+    1. ``scope`` canonicalises to a real, NON-node/host kind (node/host
+       identity belongs to :func:`extract_explicit_node_anchor`, never here);
+    2. every proposed NAME occurs as a whole token — the same
+       ``(?<![A-Za-z0-9._-])`` / ``(?![A-Za-z0-9._-])`` boundary discipline the
+       namespace anchor uses, so "entry" never matches inside "entrypoint";
+    3. the KIND occurs as a whole token — ``canonicalise_kind(scope)`` OR any
+       of its ``KIND_ALIASES`` aliases (the single-source English kind
+       vocabulary, so a newly-registered kind is covered with no hardcoded
+       list here).
+
+    A pure-Chinese kind mention ("入口") has no English alias and fails closed —
+    an intentional trade-off (honest refusal over a forgeable widening), not a
+    bug. The CALLER pairs this with its own ``fault_target`` domain check.
+    """
+    # Function-local import: ``target_guard.classifier`` is a leaf today, but
+    # keeping the kind vocabulary import off this module's import edge avoids
+    # any future spec↔target_guard cycle (same discipline as the providers /
+    # mechanism_writes local imports elsewhere).
+    from chaos_agent.agent.target_guard.classifier import (
+        KIND_ALIASES,
+        canonicalise_kind,
+    )
+
+    if not user_description:
+        return False
+    canon = canonicalise_kind(scope or "")
+    if not canon or canon in ("node", "host"):
+        # Anchored kinds are verified by extract_explicit_node_anchor; an
+        # unknown kind has no vocabulary to match against — both fail closed.
+        return False
+    proposed = [str(n).strip() for n in (names or ()) if str(n).strip()]
+    if not proposed:
+        return False
+
+    def _whole_token(token: str) -> bool:
+        if not token:
+            return False
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9._-])" + re.escape(token) + r"(?![A-Za-z0-9._-])",
+            re.IGNORECASE,
+        )
+        return bool(pattern.search(user_description))
+
+    # (2) every proposed name must appear verbatim as a whole token.
+    if not all(_whole_token(name) for name in proposed):
+        return False
+
+    # (3) the kind must appear: canonical form OR any registered alias.
+    kind_tokens = {canon}
+    kind_tokens.update(
+        alias for alias, mapped in KIND_ALIASES.items() if mapped == canon
+    )
+    if not any(_whole_token(tok) for tok in kind_tokens):
+        return False
+
+    return True

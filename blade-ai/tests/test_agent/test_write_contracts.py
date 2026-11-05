@@ -840,7 +840,13 @@ REJECTED_WRITE_AUTHORITY: dict[str, int] = {
     # replaced was mechanically futile (write-once ``names`` cannot be
     # corrected on the retry path -> it spun to MAX_AGENT_LOOP), so it now
     # terminates as a rejected safety verdict instead.
-    "agent/nodes/gates/safety_check.py": 4,
+    # +1 (defect A1, #34-R): the unregistered-scope vocabulary fail-fast. A
+    # non-empty fault_spec.scope that family_for_scope does not recognize (e.g.
+    # the catalogue category "workload" mistaken for a concrete resource scope)
+    # previously sailed through the truthiness-only check and surfaced late as
+    # PROFILE_UNKNOWN -> empty toolset -> kubeconfig-misattributed refusals; it
+    # now terminates at the freeze gate as a rejected prerequisite verdict.
+    "agent/nodes/gates/safety_check.py": 5,
 }
 
 

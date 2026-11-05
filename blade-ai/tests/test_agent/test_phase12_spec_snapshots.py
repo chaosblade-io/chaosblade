@@ -42,7 +42,11 @@ class TestIntentVocabularySnapshot:
     def test_intent_scopes(self):
         assert INTENT_SCOPES == (
             "pod", "node", "container", "deployment", "statefulset",
-            "daemonset", "service", "host", "python",
+            "daemonset", "service", "ingress", "configmap", "secret",
+            # cronjob: victim-own-body scope for CronJob_任务异常 (4.2/4.3),
+            # registered in fault_registry → derived here after secret.
+            "cronjob",
+            "host", "python",
         )
 
     def test_intent_targets(self):

@@ -747,7 +747,10 @@ from chaos_agent.agent.nodes.side_effect._side_effect_detectors import (  # noqa
     HostSnapshot,
     ProcessDeathDetector,
     ServiceDownDetector,
+    _OBSERVER_DIAGNOSTIC_EXACT,
+    _is_injection_mechanism_process,
     _is_kernel_thread,
+    _is_observer_diagnostic,
     _parse_df_mounts,
     _parse_process_comms,
     _parse_systemctl_services,
@@ -792,6 +795,75 @@ class TestHostObserverParsers:
                      "watchdogd"):
             assert _is_kernel_thread(name) is False, name
 
+    def test_parse_process_comms_filters_injection_mechanism(self):
+        # ChaosBlade mechanism processes (blade ``chaos_*`` executors, the
+        # setsid/sh/sleep self-recovery timer arm, the strace syscall injector)
+        # churn independently of the fault and must never reach the snapshot,
+        # otherwise ProcessDeathDetector reports them as false "collateral
+        # deaths" — the same invariant the kernel-thread filter completes.
+        out = (
+            "systemd\nsshd\nnginx\nbash\n"
+            "chaos_os\nchaos_dns\nchaos_stracedel\nchaos_occupynetwork\n"
+            "setsid\nsh\nsleep\nstrace\n"
+        )
+        assert _parse_process_comms(out) == {"systemd", "sshd", "nginx", "bash"}
+
+    def test_is_injection_mechanism_process(self):
+        # chaos_ prefix covers every blade executor variant (comm is truncated
+        # to 15 chars but the prefix always survives).
+        for name in ("chaos_os", "chaos_dns", "chaos_straceerror",
+                     "chaos_stracedel", "chaos_occupynetwork",
+                     "chaos_filldisk"):
+            assert _is_injection_mechanism_process(name) is True, name
+        # The arm wrapper + syscall injector.
+        for name in ("setsid", "sh", "sleep", "strace"):
+            assert _is_injection_mechanism_process(name) is True, name
+        # Real daemons / workload shells are NOT mechanism processes — their
+        # host-wide disappearance is a genuine side effect we must still report.
+        for name in ("systemd", "sshd", "nginx", "bash", "redis", "python",
+                     "stress-ng", "victim"):
+            assert _is_injection_mechanism_process(name) is False, name
+
+    def test_parse_process_comms_filters_observer_diagnostics(self):
+        # The observer's OWN diagnostic binaries (run concurrently with the ps
+        # snapshot) contaminate the baseline — self-observation. They churn
+        # independently of the fault and must never reach the snapshot.
+        out = (
+            "systemd\nsshd\nnginx\nbash\n"
+            "ps\ndf\nsystemctl\ndmesg\n"
+        )
+        assert _parse_process_comms(out) == {"systemd", "sshd", "nginx", "bash"}
+
+    def test_is_observer_diagnostic(self):
+        for name in ("ps", "df", "systemctl", "dmesg"):
+            assert _is_observer_diagnostic(name) is True, name
+        # Real daemons / workload are NOT observer diagnostics — a service going
+        # down is surfaced by ServiceDownDetector via the services channel, and
+        # a genuine victim's death must still reach ProcessDeathDetector.
+        for name in ("systemd", "sshd", "nginx", "bash", "redis", "python",
+                     "victim", "dmesgd"):
+            assert _is_observer_diagnostic(name) is False, name
+
+    def test_observer_diagnostic_set_matches_capture_commands(self):
+        # Drift guard: the exclusion set MUST equal the binaries HostObserver
+        # actually spawns in its concurrent diag gather. If a diagnostic is
+        # added to _capture_host / fetch_post_inject_state without adding its
+        # binary to _OBSERVER_DIAGNOSTIC_EXACT, it would leak into the process
+        # snapshot as a fresh phantom "death" — this test catches that.
+        import inspect
+        import re
+
+        spawned: set[str] = set()
+        for meth in (HostObserver._capture_host, HostObserver.fetch_post_inject_state):
+            src = inspect.getsource(meth)
+            # first quoted token of each _run_host_diag([...]) argv = the binary
+            spawned.update(re.findall(r'_run_host_diag\(\s*\[\s*"([^"]+)"', src))
+        assert spawned == set(_OBSERVER_DIAGNOSTIC_EXACT), (
+            f"observer diagnostic exclusion set drifted from the capture "
+            f"commands: spawned={sorted(spawned)} "
+            f"excluded={sorted(_OBSERVER_DIAGNOSTIC_EXACT)}"
+        )
+
     def test_parse_df_mounts(self):
         out = (
             "Filesystem     1024-blocks    Used Available Capacity Mounted on\n"
@@ -824,6 +896,58 @@ class TestProcessDeathDetector:
         after = _host_after(processes={"nginx"})
         ctx = _make_ctx(target_names=["victim"], profile="host", target="process")
         # victim is the target — its death is intended, not collateral.
+        assert ProcessDeathDetector().detect(before, after, ctx) == []
+
+    def test_injection_mechanism_churn_not_reported_as_collateral(self):
+        # End-to-end regression for the live DNS-hijack false positive: the
+        # before-snapshot carried the blade mechanism processes (chaos_os + the
+        # setsid/sh/sleep arm + strace from a concurrent syscall drill); they
+        # self-recovered inside the window, so a plain name-set diff reported 4
+        # phantom "collateral deaths". Filtering them at capture time (mirrors
+        # _parse_process_comms) means the detector sees only real workload and
+        # reports NOTHING — no genuine victim died here.
+        raw_before = "nginx\nsshd\nchaos_os\nsh\nsleep\nstrace\n"
+        raw_after = "nginx\nsshd\n"
+        before = _host_before(processes=_parse_process_comms(raw_before))
+        after = _host_after(processes=_parse_process_comms(raw_after))
+        ctx = _make_ctx(target_names=[], profile="host", target="network")
+        assert ProcessDeathDetector().detect(before, after, ctx) == []
+
+    def test_real_death_still_reported_alongside_mechanism_churn(self):
+        # The filter must NOT swallow a genuine victim: sshd really died while
+        # the mechanism processes churned — only sshd is reported.
+        raw_before = "nginx\nsshd\nchaos_os\nsh\nsleep\nstrace\n"
+        raw_after = "nginx\n"
+        before = _host_before(processes=_parse_process_comms(raw_before))
+        after = _host_after(processes=_parse_process_comms(raw_after))
+        ctx = _make_ctx(target_names=[], profile="host", target="network")
+        assert ProcessDeathDetector().detect(before, after, ctx) == [
+            {"process": "sshd"}
+        ]
+
+    def test_observer_diagnostic_self_contamination_not_reported(self):
+        # End-to-end regression for the live DNS-hijack A' arm: the observer's
+        # own `dmesg` (run concurrently with the before-side `ps`) was caught
+        # alive in the baseline, then had exited by the after-side `ps`, so the
+        # name-set diff reported a phantom "dmesg death". Filtering the
+        # observer's diagnostic binaries at capture time means the detector sees
+        # only real workload and reports NOTHING.
+        raw_before = "nginx\nsshd\ndmesg\nps\ndf\nsystemctl\n"
+        raw_after = "nginx\nsshd\n"
+        before = _host_before(processes=_parse_process_comms(raw_before))
+        after = _host_after(processes=_parse_process_comms(raw_after))
+        ctx = _make_ctx(target_names=[], profile="host", target="network")
+        assert ProcessDeathDetector().detect(before, after, ctx) == []
+
+    def test_mechanism_and_diagnostic_churn_together_report_nothing(self):
+        # The full DNS-hijack phantom set (A arm: chaos_os/sh/sleep/strace;
+        # A' arm: + dmesg) filtered together — a real host run where nothing
+        # but the apparatus churned yields zero collateral.
+        raw_before = "nginx\nsshd\nchaos_os\nsh\nsleep\nstrace\ndmesg\nsystemctl\n"
+        raw_after = "nginx\nsshd\n"
+        before = _host_before(processes=_parse_process_comms(raw_before))
+        after = _host_after(processes=_parse_process_comms(raw_after))
+        ctx = _make_ctx(target_names=[], profile="host", target="network")
         assert ProcessDeathDetector().detect(before, after, ctx) == []
 
 
@@ -1075,6 +1199,56 @@ class TestPostInjectCaptureErrors:
         assert state.capture_errors == {}
 
 
+class TestTargetLogsChannelGate:
+    """The target-pod logs channel must fire only for a workload target.
+
+    r9 inject-6450ed4d regression: a Secret-target apiserver-write fault
+    (scope=secret) issued ``kubectl logs drill-tls-secret`` → NotFound (exit 1),
+    a spurious capture_error. Gated on ``is_workload_scope`` so non-workload
+    targets skip the channel entirely."""
+
+    async def test_logs_channel_skipped_for_non_workload_scope(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+        from chaos_agent.models.command_result import CommandResult
+
+        sources: list[str] = []
+
+        async def fake_execute(cmd, target, timeout=0, task_id="",
+                               source="", expect_profile=None, **kwargs):
+            sources.append(source)
+            return CommandResult(exit_code=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        await det.fetch_post_inject_state(
+            "default", "", "2026-01-01T00:00:00Z", ["drill-tls-secret"],
+            scope="secret",
+        )
+        assert "se-detect-logs" not in sources    # no pod → no logs channel
+        assert "se-detect-endpoints" in sources   # namespace channels still run
+
+    async def test_logs_channel_fires_for_workload_scope(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+        from chaos_agent.models.command_result import CommandResult
+
+        sources: list[str] = []
+
+        async def fake_execute(cmd, target, timeout=0, task_id="",
+                               source="", expect_profile=None, **kwargs):
+            sources.append(source)
+            return CommandResult(exit_code=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        await det.fetch_post_inject_state(
+            "default", "", "2026-01-01T00:00:00Z", ["web-0"],
+            scope="pod",
+        )
+        assert "se-detect-logs" in sources        # workload target → logs fire
+
+
 class TestUnreadableChannelGate:
     """B77 tri-state gate: a detector whose declared channel is Unreadable
     (``capture_errors``) must be SKIPPED — "not captured" is never adjudicated
@@ -1179,7 +1353,7 @@ class TestHostObserverCaptureErrors:
     async def test_failed_diags_recorded_as_unreadable(self, monkeypatch):
         from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
 
-        async def fake_diag(command, timeout=10):
+        async def fake_diag(command, timeout=10, *, target=None):
             # ps and dmesg fail; df and systemctl succeed.
             if command[:2] == ["ps", "-e"]:
                 return None
@@ -1208,7 +1382,7 @@ class TestHostObserverCaptureErrors:
     async def test_healthy_diags_leave_errors_empty(self, monkeypatch):
         from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
 
-        async def fake_diag(command, timeout=10):
+        async def fake_diag(command, timeout=10, *, target=None):
             return "some output\n"
 
         monkeypatch.setattr(det, "_run_host_diag", fake_diag)
@@ -1380,7 +1554,7 @@ class TestBeforeCaptureRecordsErrors:
     async def test_host_baseline_records_failed_diags(self, monkeypatch):
         from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
 
-        async def fake_diag(command, timeout=10):
+        async def fake_diag(command, timeout=10, *, target=None):
             return None if command[:2] == ["ps", "-e"] else "ok\n"
 
         monkeypatch.setattr(det, "_run_host_diag", fake_diag)
@@ -1403,3 +1577,199 @@ class TestBeforeCaptureRecordsErrors:
             snap, after, _make_ctx(profile="host", target="process"),
         )
         assert "process_deaths" not in results
+
+
+class TestWorkloadLogsChannelResolution:
+    """W-83-5 root-fix (essence A): under a workload scope the target_logs
+    channel must address a RESOLVED pod, never the bare workload name.
+
+    Before the fix, ``kubectl logs <deployment-name>`` resolved the bare name as
+    a Pod → NotFound → target_logs Unreadable → DependencyErrorDetector silently
+    skipped for the whole deployment/statefulset/daemonset class (≥6 cases
+    mislabeled "cosmetic"). The channel now resolves through the shared
+    ``target_identity`` seam; an unresolvable target yields a VISIBLE
+    "unresolved" capture_error, never a doomed bare-name query."""
+
+    async def test_deployment_logs_address_the_resolved_pod(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+        from chaos_agent.models.command_result import CommandResult
+
+        issued: list[list[str]] = []
+
+        async def fake_execute(cmd, target, timeout=0, task_id="",
+                               source="", expect_profile=None, **kwargs):
+            tokens = [str(t) for t in cmd]
+            issued.append(tokens)
+            joined = " ".join(tokens)
+            # selector discovery: get deployment <name> -o jsonpath=...matchLabels
+            if "matchLabels" in joined:
+                return CommandResult(
+                    exit_code=0, stdout='{"app": "drill-http-victim"}', stderr="",
+                )
+            # pod resolution: get pods -l <sel> -o jsonpath=...metadata.name
+            if "pods" in tokens and "-l" in tokens:
+                return CommandResult(
+                    exit_code=0, stdout="drill-http-victim-6b7-abcde", stderr="",
+                )
+            if "logs" in tokens:
+                return CommandResult(exit_code=0, stdout="app started\n", stderr="")
+            return CommandResult(exit_code=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        state = await det.fetch_post_inject_state(
+            "default", "", "2026-01-01T00:00:00Z", ["drill-http-victim"],
+            scope="deployment",
+        )
+        # The logs command must target the RESOLVED pod, NOT the workload name.
+        logs_cmds = [c for c in issued if "logs" in c]
+        assert len(logs_cmds) == 1
+        assert "drill-http-victim-6b7-abcde" in logs_cmds[0]
+        assert "drill-http-victim" not in logs_cmds[0]  # bare workload name gone
+        # logs captured cleanly → channel NOT unreadable → detector can run.
+        assert "target_logs" not in state.capture_errors
+        assert state.target_logs == "app started\n"
+
+    async def test_unresolvable_workload_marks_channel_unresolved(self, monkeypatch):
+        """Discovery finds a selector but no pod matches → resolve returns None →
+        target_logs is Unreadable with an explicit "unresolved" diagnosis, and
+        NO bare-workload-name logs query is issued (the #61 invariant)."""
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+        from chaos_agent.models.command_result import CommandResult
+
+        issued: list[list[str]] = []
+
+        async def fake_execute(cmd, target, timeout=0, task_id="",
+                               source="", expect_profile=None, **kwargs):
+            tokens = [str(t) for t in cmd]
+            issued.append(tokens)
+            joined = " ".join(tokens)
+            if "matchLabels" in joined:
+                return CommandResult(exit_code=0, stdout='{"app": "gone"}', stderr="")
+            if "pods" in tokens and "-l" in tokens:
+                return CommandResult(exit_code=0, stdout="", stderr="")  # no match
+            return CommandResult(exit_code=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        state = await det.fetch_post_inject_state(
+            "default", "", "2026-01-01T00:00:00Z", ["drill-http-victim"],
+            scope="deployment",
+        )
+        # No logs command at all — never a bare-workload-name query.
+        assert not [c for c in issued if "logs" in c]
+        # Visible absence, with the workload name NOT substituted for a pod.
+        assert "target_logs" in state.capture_errors
+        assert "unresolved" in state.capture_errors["target_logs"]
+
+    async def test_pod_scope_logs_still_addresses_literal_name(self, monkeypatch):
+        """pod scope is unchanged: names[0] IS the literal pod, zero resolution
+        queries, logs fires on it (guards the pre-existing behavior)."""
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+        from chaos_agent.models.command_result import CommandResult
+
+        issued: list[list[str]] = []
+
+        async def fake_execute(cmd, target, timeout=0, task_id="",
+                               source="", expect_profile=None, **kwargs):
+            issued.append([str(t) for t in cmd])
+            return CommandResult(exit_code=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        await det.fetch_post_inject_state(
+            "default", "", "2026-01-01T00:00:00Z", ["web-0"], scope="pod",
+        )
+        logs_cmds = [c for c in issued if "logs" in c]
+        assert len(logs_cmds) == 1
+        assert "web-0" in logs_cmds[0]
+        # pod scope issues NO selector-discovery query.
+        assert not [c for c in issued if "matchLabels" in " ".join(c)]
+
+
+class TestSkippedDetectorSurfacing:
+    """W-83-5 root-fix (essence B): a detector gated off by an Unreadable
+    channel must surface as a first-class SKIPPED state — never as ``Label: 0``
+    (a clean zero that hid the lost capability across ≥6 cases)."""
+
+    def test_run_all_detectors_records_skipped_into_out_param(self):
+        after = PostInjectState(
+            target_logs="",
+            capture_errors={"target_logs": "exit=1: pods not found"},
+        )
+        skipped: dict[str, str] = {}
+        results = run_all_detectors(None, after, _make_ctx(), skipped_out=skipped)
+        assert "dependency_errors" not in results       # key-absent (skipped)
+        assert "dependency_errors" in skipped            # but REPORTED
+        assert "target_logs" in skipped["dependency_errors"]
+
+    def test_skipped_out_is_optional_back_compat(self):
+        """Callers that don't pass skipped_out still work (no signature break)."""
+        after = PostInjectState(capture_errors={"target_logs": "exit=1: x"})
+        results = run_all_detectors(None, after, _make_ctx())
+        assert "dependency_errors" not in results
+
+    def test_summary_renders_skipped_not_zero(self):
+        from chaos_agent.agent.state import _build_side_effects_summary
+        summary = _build_side_effects_summary(
+            {"side_effects": {"_skipped_detectors": {
+                "dependency_errors": "not adjudicated — unreadable: target_logs",
+            }}},
+            "k8s",
+        )
+        assert "DependencyErrors: SKIPPED" in summary
+        # The cosmetic-mislabel zero must be gone (invariant, not just new text):
+        assert "DependencyErrors: 0" not in summary
+        assert "NOT adjudicated" in summary
+
+    def test_summary_unskipped_still_counts_zero(self):
+        """Guard against over-suppression: a detector that RAN and found nothing
+        still renders ``: 0`` (only genuinely-skipped ones show SKIPPED)."""
+        from chaos_agent.agent.state import _build_side_effects_summary
+        summary = _build_side_effects_summary({"side_effects": {}}, "k8s")
+        assert "ContainerRestarts: 0" in summary
+        assert "SKIPPED" not in summary
+        assert "No collateral impact detected (" in summary
+
+
+class TestPodAddressingInvariant:
+    """Upper-level invariant guard: no pod-level observation command in the
+    side-effect observer may be addressed by a raw workload name — pod
+    addressing must flow through the ``target_identity`` seam. This pins the
+    W-83-5 CLASS (any future logs/exec/top channel), not just this instance,
+    and asserts baseline delegates to the same single source."""
+
+    def test_logs_channel_addressed_by_seam_resolved_pod(self):
+        import inspect
+        import re
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+
+        src = inspect.getsource(det.fetch_post_inject_state)
+        assert "resolve_target_pod_name" in src, (
+            "the logs channel must resolve the pod via the shared seam"
+        )
+        # The `logs` command's first positional (the pod/name argument) must be
+        # the seam-resolved pod, never target_names[0] (the W-83-5 signature).
+        m = re.search(
+            r'build_kubectl_cmd\(\s*"logs",\s*\[\s*([A-Za-z_][A-Za-z0-9_]*)',
+            src,
+        )
+        assert m is not None, "logs channel construction not found"
+        assert m.group(1) == "resolved_pod", (
+            f"logs addressed by {m.group(1)!r}; must be the seam-resolved pod "
+            "(a bare target_names[0] resolves as a Pod → NotFound → W-83-5)"
+        )
+
+    def test_baseline_pod_resolution_delegates_to_seam(self):
+        import inspect
+        from chaos_agent.agent.nodes.baseline import baseline_capture as bc
+
+        src = inspect.getsource(bc._resolve_target_pod)
+        assert "_seam_resolve_pod_by_selector" in src, (
+            "baseline _resolve_target_pod must delegate the selector→pod query "
+            "to the shared target_identity seam (single source), not hand-roll "
+            "a second copy of the query"
+        )

@@ -633,6 +633,60 @@ class TestDerivedProperties:
         assert spec.is_namespace_wide
 
 
+class TestDiskMountTargets:
+    """``FaultSpec.disk_mount_targets`` — the SINGLE authority for the disk
+    fault's mount path (D4/B2). The path has no single reliably-populated
+    field: the real NL host disk-fill carries it in ``names`` with params
+    empty, while the structured/k8s shape carries it in ``params["path"]``.
+    """
+
+    def test_params_path_wins(self):
+        spec = FaultSpec(
+            scope="host", fault_target="disk", fault_action="fill",
+            names=("/other",), params={"path": "/drill-disk", "percent": "90"},
+        )
+        assert spec.disk_mount_targets == ("/drill-disk",)
+
+    def test_real_host_shape_falls_through_to_names(self):
+        # A/A run inject-0242c9d6's actual shape: params empty, mount in names.
+        spec = FaultSpec(
+            scope="host", fault_target="disk", fault_action="fill",
+            names=("/drill-disk",), params={},
+        )
+        assert spec.disk_mount_targets == ("/drill-disk",)
+
+    def test_node_resource_name_is_not_a_mount(self):
+        # node/pod disk-fill names a resource, not a path → no absolute entry.
+        spec = FaultSpec(
+            scope="node", fault_target="disk", fault_action="fill",
+            names=("node-1",), params={"percent": "90"},
+        )
+        assert spec.disk_mount_targets == ()
+
+    def test_non_disk_fault_yields_empty(self):
+        # Gated on fault_target so a stray params["path"] on a cpu fault can't
+        # leak a bogus df target.
+        spec = FaultSpec(
+            scope="pod", namespace="ns", fault_target="cpu",
+            fault_action="fullload", params={"path": "/data"},
+        )
+        assert spec.disk_mount_targets == ()
+
+    def test_blank_params_path_falls_through_to_names(self):
+        spec = FaultSpec(
+            scope="host", fault_target="disk", fault_action="fill",
+            names=("/drill-disk",), params={"path": "   "},
+        )
+        assert spec.disk_mount_targets == ("/drill-disk",)
+
+    def test_multiple_absolute_names_preserved_in_order(self):
+        spec = FaultSpec(
+            scope="host", fault_target="disk", fault_action="fill",
+            names=("/data", "node-1", "/var/lib"), params={},
+        )
+        assert spec.disk_mount_targets == ("/data", "/var/lib")
+
+
 # ---------------------------------------------------------------------------
 # Immutability
 # ---------------------------------------------------------------------------
@@ -1041,7 +1095,11 @@ class TestDefensiveNormalisation:
 class TestIntentVocabularySnapshot:
     _EXPECTED_SCOPES = (
         "pod", "node", "container", "deployment", "statefulset",
-        "daemonset", "service", "host", "python",
+        "daemonset", "service", "ingress", "configmap", "secret",
+        # cronjob: victim-own-body scope for CronJob_任务异常 (4.2/4.3),
+        # registered in fault_registry → derived here after secret.
+        "cronjob",
+        "host", "python",
     )
     _EXPECTED_TARGETS = (
         "cpu", "mem", "network", "disk", "process",

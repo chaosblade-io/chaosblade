@@ -121,6 +121,29 @@ def _split_by_ownership(
     return owned, allowed
 
 
+def _visible_tool_names(names: set[str], profile: str) -> set[str]:
+    """The single visibility rule shared by every capability context.
+
+    A tool is profile-gated IFF it is provider-owned (domain-specific). The
+    domain-agnostic remainder — graph control tools (``finish_execution``,
+    ``request_replan``, ``update_progress``, ``submit_*``) and MCP tools — is
+    NEVER profile-bound and stays visible under EVERY profile, including an
+    unsupported / unresolved one. That is deliberate: stripping them is what
+    turned an unsupported environment into a spin, because the model lost the
+    very exits (finish / replan / report) it needed to stop honestly, while
+    every injection tool was already gone. Only the provider half is gated by
+    ``profile``; under an unsupported profile no provider matches, so
+    ``allowed_names`` is empty and no injection tool leaks. The
+    ``get_environment_profile`` guard keeps that explicit rather than relying
+    on the empty-``allowed_names`` side effect alone.
+    """
+    owned_names, allowed_names = _split_by_ownership(names, profile)
+    active = set(names) - owned_names
+    if get_environment_profile(profile) is not None:
+        active |= allowed_names
+    return active
+
+
 @dataclass(frozen=True)
 class AgentCapabilityContext:
     """Capabilities that are valid for one LLM invocation."""
@@ -131,6 +154,16 @@ class AgentCapabilityContext:
     provider_candidates: tuple[str, ...]
     active_tool_names: frozenset[str]
     supported: bool
+    # Why ``profile`` fail-closed to UNKNOWN (one of the ``PROFILE_UNKNOWN_*``
+    # constants), or None when it resolved. The capability DECISION is identical
+    # for every cause (expose no provider tool), but the OPERATOR remediation is
+    # not, so the cause rides alongside the profile instead of being flattened
+    # into the single "unknown" string and re-derived downstream. Additive and
+    # default-None: every existing consumer reads ``profile`` / ``supported``
+    # only and is unaffected. ``supported=False`` with ``unknown_reason=None``
+    # is the unregistered-PHASE branch (a wiring bug), not an unsupported
+    # environment.
+    unknown_reason: str | None = None
 
     def prompt_fragment(self) -> str:
         environment = get_environment_profile(self.profile)
@@ -144,12 +177,65 @@ class AgentCapabilityContext:
         return environment.prompt_fragment(self.phase)
 
 
-def resolve_profile_for_state(state: dict | None) -> str:
-    """Resolve one profile only when scope and transport agree.
+# Why a profile fail-closed to PROFILE_UNKNOWN. The capability DECISION is the
+# same for all three (expose no provider tool, fail closed), but the OPERATOR
+# remediation differs, so the cause is carried out beside the profile instead of
+# being flattened into the single "unknown" string. Before this the cause was
+# destroyed at resolve time and ``explain_tool_refusal`` had to re-call
+# ``family_for_scope`` to recover cause ①, while causes ② and ③ both fell into
+# one misleading "fix your kubeconfig" line — which sent #87 (a scope/transport
+# CONFLICT, kubeconfig perfectly healthy) debugging in the wrong direction.
+#: scope is non-empty but not a registered fault domain → fix the case frontmatter.
+PROFILE_UNKNOWN_SCOPE_UNREGISTERED = "scope_unregistered"
+#: scope and transport each resolve to a DIFFERENT valid profile → channel drift;
+#: recover must use the injection-time channel, not the ambient one (#87).
+PROFILE_UNKNOWN_CONFLICT = "profile_conflict"
+#: the transport channel is invalid / unprofiled → fix kube_connection_mode /
+#: kubeconfig / host fields.
+PROFILE_UNKNOWN_CHANNEL = "channel_unresolvable"
+
+
+@dataclass(frozen=True)
+class ProfileVerdict:
+    """The resolved profile plus the full diagnostic for WHY it is UNKNOWN.
+
+    ``profile`` is byte-identical to what :func:`resolve_profile_for_state`
+    returned before (every existing consumer reads only that string). The extra
+    fields are the diagnostic the single source already computed as locals —
+    carried out so the message layer names the exact cause instead of
+    re-deriving it. ``reason`` is None whenever ``profile`` resolved (k8s/host).
+    """
+
+    profile: str
+    reason: str | None = None
+    scope_profile: str = ""
+    transport_profile: str = ""
+
+    @property
+    def supported(self) -> bool:
+        """True iff a real environment profile resolved.
+
+        Mirrors ``AgentCapabilityContext.supported`` (both are
+        ``get_environment_profile(profile) is not None``) so the loop entry
+        gates can fail fast straight off the verdict without building a whole
+        tool-visibility context. By construction this is the exact negation of
+        ``reason is not None`` — every UNKNOWN return sets a reason, every
+        resolved return clears it — but stating it through the same
+        ``get_environment_profile`` predicate keeps the two ``supported``
+        surfaces from ever diverging.
+        """
+        return get_environment_profile(self.profile) is not None
+
+
+def resolve_profile_verdict(state: dict | None) -> ProfileVerdict:
+    """Resolve one profile only when scope and transport agree, and say WHY not.
 
     The fault scope describes the requested fault domain while the transport
     describes the environment that would actually receive commands. A mismatch
-    is unsafe: it must not expose either environment's execution tools.
+    is unsafe: it must not expose either environment's execution tools. Three
+    distinct conditions fail closed to UNKNOWN — an unregistered scope, a
+    scope/transport conflict, and an unresolvable channel — and each carries a
+    different remediation, so the cause is returned alongside the profile.
     """
     state = state or {}
     spec_data = state.get("fault_spec")
@@ -163,13 +249,48 @@ def resolve_profile_for_state(state: dict | None) -> str:
         # and external callers can bypass normal FaultSpec construction, so an
         # unregistered value must not inherit the transport default.
         if family is None:
-            return PROFILE_UNKNOWN
+            return ProfileVerdict(
+                PROFILE_UNKNOWN, PROFILE_UNKNOWN_SCOPE_UNREGISTERED,
+            )
         scope_profile = family.profile
 
     transport_profile = profile_of(resolve_channel_name(state))
     if scope_profile and transport_profile != scope_profile:
-        return PROFILE_UNKNOWN
-    return scope_profile or transport_profile
+        # One branch, two causes: the transport resolved to a DIFFERENT valid
+        # profile (a genuine scope/transport conflict — #87, the recover channel
+        # drifted off the injection scope), or the transport itself is
+        # unresolvable while the scope is fine. The remediation differs, so name
+        # them apart instead of collapsing both into "conflict".
+        reason = (
+            PROFILE_UNKNOWN_CHANNEL
+            if transport_profile == PROFILE_UNKNOWN
+            else PROFILE_UNKNOWN_CONFLICT
+        )
+        return ProfileVerdict(
+            PROFILE_UNKNOWN, reason,
+            scope_profile=scope_profile, transport_profile=transport_profile,
+        )
+    profile = scope_profile or transport_profile
+    if profile == PROFILE_UNKNOWN:
+        # No fault scope declared AND no resolvable channel — nothing to act on.
+        return ProfileVerdict(
+            PROFILE_UNKNOWN, PROFILE_UNKNOWN_CHANNEL,
+            scope_profile=scope_profile, transport_profile=transport_profile,
+        )
+    return ProfileVerdict(
+        profile, None,
+        scope_profile=scope_profile, transport_profile=transport_profile,
+    )
+
+
+def resolve_profile_for_state(state: dict | None) -> str:
+    """Resolve one profile only when scope and transport agree.
+
+    Thin string-preserving wrapper over :func:`resolve_profile_verdict`. Every
+    existing consumer reads the bare profile string and is unaffected by the
+    reason the verdict now also carries.
+    """
+    return resolve_profile_verdict(state).profile
 
 
 def build_capability_context(
@@ -183,7 +304,8 @@ def build_capability_context(
     stay visible. Provider-contributed tools are visible only if their OWNING
     provider supports the resolved environment profile.
     """
-    profile = resolve_profile_for_state(state)
+    verdict = resolve_profile_verdict(state)
+    profile = verdict.profile
     environment = get_environment_profile(profile)
 
     names = {getattr(tool, "name", "") for tool in (available_tools or ())}
@@ -207,17 +329,18 @@ def build_capability_context(
             provider_candidates=(),
             active_tool_names=frozenset(),
             supported=False,
+            unknown_reason=verdict.reason,
         )
 
-    owned_names, allowed_names = _split_by_ownership(names, profile)
-
-    # Unsupported or conflicting environments receive no tools at all. This
-    # prevents a generic graph tool from advancing an unvalidated request to a
-    # later mutation-capable phase.
-    active: set[str] = set()
-    if environment is not None:
-        active = names - owned_names
-        active.update(allowed_names)
+    # Visibility is profile-gated ONLY for provider-owned (domain-specific)
+    # tools. Domain-agnostic control/MCP tools stay visible even when the
+    # profile is unsupported, so the model keeps its finish/replan/report exits
+    # instead of spinning on an empty toolset. The old "no tools at all" rule
+    # feared a control tool advancing an unvalidated request to a mutation
+    # phase — but every mutation phase re-resolves the same unsupported profile
+    # and strips its provider tools there too, so no mutation is reachable; the
+    # only effect of the old rule was removing the exits.
+    active = _visible_tool_names(names, profile)
 
     return AgentCapabilityContext(
         profile=profile,
@@ -228,6 +351,7 @@ def build_capability_context(
         ) if environment else (),
         active_tool_names=frozenset(active),
         supported=environment is not None,
+        unknown_reason=verdict.reason,
     )
 
 
@@ -247,11 +371,10 @@ def build_intent_discovery_context(
     environment = get_environment_profile(profile)
     names = {getattr(tool, "name", "") for tool in (available_tools or ())}
     names.discard("")
-    owned_names, allowed_names = _split_by_ownership(names, profile)
-    active: set[str] = set()
-    if environment is not None:
-        active = names - owned_names
-        active.update(allowed_names)
+    # Same visibility rule as build_capability_context (see _visible_tool_names):
+    # domain-agnostic tools are never profile-bound, so an unresolved transport
+    # still leaves the model its control exits.
+    active = _visible_tool_names(names, profile)
     return AgentCapabilityContext(
         profile=profile,
         phase="intent_discovery",
@@ -261,6 +384,12 @@ def build_intent_discovery_context(
         ) if environment else (),
         active_tool_names=frozenset(active),
         supported=environment is not None,
+        # Discovery resolves from transport alone (it deliberately ignores a
+        # provisional scope), so the ONLY way it lands on UNKNOWN is an
+        # unresolvable channel — never a scope cause.
+        unknown_reason=(
+            None if environment is not None else PROFILE_UNKNOWN_CHANNEL
+        ),
     )
 
 
@@ -274,34 +403,55 @@ def filter_tools_for_context(
     ]
 
 
-def is_tool_name_allowed_for_context(
-    tool_name: str, state: dict | None, phase: str,
+def _allowance_verdict(
+    tool_name: str, profile: str, *, phase: str | None = None,
 ) -> bool:
-    """Return whether a static ToolNode may execute a provider tool.
+    """The single runtime allowance rule, mirroring :func:`_visible_tool_names`.
 
-    ``bind_tools`` is not an enforcement boundary: restored checkpoints can
-    carry tool calls produced under a previous context. Phase screeners use
-    this helper before dispatching to a static ToolNode.
+    Two orthogonal gates, in this order:
+
+    1. An unregistered ``phase`` (when one is supplied) is a CALLER wiring bug
+       — a typo'd phase string — and fails closed for EVERY tool, control
+       tools included. This is NOT the "unsupported environment" condition; it
+       means the gate cannot even locate itself in the graph, so it refuses
+       rather than guesses.
+    2. Profile support gates ONLY provider-owned (domain-specific) tools. A
+       domain-agnostic tool (graph control, MCP) is never profile-bound and is
+       allowed under every profile, so an unsupported environment strips the
+       injection tools but leaves the model its finish/replan/report exits
+       instead of stranding it on an empty toolset.
     """
-    profile = resolve_profile_for_state(state)
-    if get_environment_profile(profile) is None:
-        return False
-    # Unregistered phase → fail closed. The old ``return True`` meant a typo in
-    # a screener's phase string silently disabled runtime enforcement for every
-    # tool it screened.
-    if _PHASE_TO_PROVIDER_PHASE.get(phase) is None:
+    if phase is not None and _PHASE_TO_PROVIDER_PHASE.get(phase) is None:
         logger.error(
-            "is_tool_name_allowed_for_context: unregistered phase %r "
-            "(known: %s) — refusing %r",
+            "capability gate consulted with unregistered phase %r (known: %s) "
+            "— refusing %r rather than guessing",
             phase, sorted(_PHASE_TO_PROVIDER_PHASE), tool_name,
         )
         return False
-    owners = provider_tool_owners()
-    tool_owners = owners.get(tool_name)
+    tool_owners = provider_tool_owners().get(tool_name)
     # Not provider-owned (graph control tools, MCP tools) → not profile-bound.
     if not tool_owners:
         return True
+    if get_environment_profile(profile) is None:
+        return False
     return _tool_allowed_for_profile(tool_owners, profile, tool_name)
+
+
+def is_tool_name_allowed_for_context(
+    tool_name: str, state: dict | None, phase: str,
+) -> bool:
+    """Return whether a static ToolNode may execute a tool call.
+
+    ``bind_tools`` is not an enforcement boundary: restored checkpoints can
+    carry tool calls produced under a previous context. Phase screeners use
+    this helper before dispatching to a static ToolNode. Provider tools are
+    profile-gated; domain-agnostic control/MCP tools are allowed regardless of
+    profile, and an unregistered phase fails closed for both (see
+    :func:`_allowance_verdict`).
+    """
+    return _allowance_verdict(
+        tool_name, resolve_profile_for_state(state), phase=phase,
+    )
 
 
 def tool_call_field(call: object, field: str, default: str = "") -> str:
@@ -353,6 +503,77 @@ def tool_call_allowed(
         return False
 
 
+def _unknown_environment_explanation(
+    verdict: ProfileVerdict, state: dict | None,
+) -> tuple[str, str]:
+    """The cause-specific ``(reason, suggestion)`` for an unresolved profile.
+
+    SINGLE renderer shared by :func:`explain_tool_refusal` (per-tool refusal)
+    and the execute / recover entry gates (loop terminal), so the operator sees
+    the same accurate cause whichever surface reports it. The cause is read off
+    the verdict the single source already computed — NOT re-derived here. The
+    old code re-called ``family_for_scope`` to recover the scope cause and lumped
+    the conflict and channel causes into ONE misleading "fix your kubeconfig"
+    line, which sent #87 (a scope/transport CONFLICT on a perfectly healthy
+    kubeconfig) debugging in the wrong direction, and #34-R (an unregistered
+    scope) after a config that was never broken.
+    """
+    if verdict.reason == PROFILE_UNKNOWN_SCOPE_UNREGISTERED:
+        _spec = (state or {}).get("fault_spec")
+        _scope = str(_spec.get("scope") or "") if isinstance(_spec, dict) else ""
+        from chaos_agent.agent.spec.fault_spec import INTENT_SCOPES
+        return (
+            f"the fault scope in force ({_scope!r}) is not a "
+            "registered fault domain, so no capability profile "
+            "resolves and no provider tool can be dispatched "
+            f"(valid scopes: {', '.join(INTENT_SCOPES)})",
+            "Correct the fault scope to a registered domain — the "
+            "source is the case frontmatter / spec authoring, not "
+            "the cluster. No tool choice and no kubeconfig change "
+            "can work around an unregistered scope.",
+        )
+    if verdict.reason == PROFILE_UNKNOWN_CONFLICT:
+        return (
+            f"the fault scope resolves to the '{verdict.scope_profile}' profile "
+            f"but the transport channel in force resolves to "
+            f"'{verdict.transport_profile}', so the two disagree and neither "
+            "environment's execution tools may be exposed",
+            "This is a channel/scope mismatch, not a broken kubeconfig. "
+            "The fault must be recovered on the channel it was injected "
+            "through (the injection-time channel), not the ambient one — "
+            "align kube_connection_mode with the injection scope, then "
+            "retry. No tool choice can work around the mismatch.",
+        )
+    # CHANNEL_UNRESOLVABLE (or a defensively-None reason): the transport channel
+    # itself is invalid / unprofiled, so no environment resolves.
+    return (
+        f"the environment profile in force ({verdict.profile or '<unresolved>'}) "
+        "is not a registered capability profile, so no provider tool can "
+        "be dispatched",
+        "Fix the environment configuration (kubeconfig / host transport) "
+        "so a supported profile resolves, then retry. No tool choice can "
+        "work around an unsupported environment.",
+    )
+
+
+def explain_unsupported_environment(
+    verdict: ProfileVerdict, state: dict | None,
+) -> str:
+    """One operator-facing terminal sentence for an unresolved profile.
+
+    Shared by the loop ENTRY gates (``execute_loop`` and the recover verifier)
+    that must fail fast on ``profile=UNKNOWN``: a deterministic dead-end the
+    ReAct loop can neither repair nor converge on by retrying, so the gate
+    terminates in O(1) with zero tokens instead of running ``bind_tools([])``
+    until the budget is burned. Both gates name the SAME cause off the SAME
+    verdict through the one renderer (:func:`_unknown_environment_explanation`)
+    that ``explain_tool_refusal`` uses — neither re-derives it, so the per-tool
+    refusal wording and the loop-terminal wording can never drift apart.
+    """
+    reason, suggestion = _unknown_environment_explanation(verdict, state)
+    return f"{reason}. {suggestion}"
+
+
 def explain_tool_refusal(
     tool_name: str, state: dict | None, phase: str = "",
     *, discovery: bool = False,
@@ -384,19 +605,23 @@ def explain_tool_refusal(
         "Use only tools bound for the current environment.",
     )
     try:
-        profile = (
-            profile_of(resolve_channel_name(state)) if discovery
-            else resolve_profile_for_state(state)
-        )
-        if get_environment_profile(profile) is None:
-            return (
-                f"the environment profile in force ({profile or '<unresolved>'}) "
-                "is not a registered capability profile, so no provider tool can "
-                "be dispatched",
-                "Fix the environment configuration (kubeconfig / host transport) "
-                "so a supported profile resolves, then retry. No tool choice can "
-                "work around an unsupported environment.",
+        if discovery:
+            # Discovery resolves from transport alone and deliberately ignores a
+            # provisional scope (see docstring), so its ONLY UNKNOWN cause is an
+            # unresolvable channel — never a scope cause.
+            _transport_profile = profile_of(resolve_channel_name(state))
+            verdict = ProfileVerdict(
+                _transport_profile,
+                None if get_environment_profile(_transport_profile) is not None
+                else PROFILE_UNKNOWN_CHANNEL,
             )
+        else:
+            verdict = resolve_profile_verdict(state)
+        # Bound once from the verdict so the cross-profile tail below (which
+        # names the environment in force) sees it on BOTH paths.
+        profile = verdict.profile
+        if get_environment_profile(profile) is None:
+            return _unknown_environment_explanation(verdict, state)
         if phase and _PHASE_TO_PROVIDER_PHASE.get(phase) is None:
             # A screener passed a phase string the registry does not know. This
             # is a wiring bug, not something the model can repair — say so
@@ -496,27 +721,31 @@ def is_tool_name_allowed_for_intent_discovery(
     """Allow a provider discovery tool only for the current transport.
 
     Unlike ``is_tool_name_allowed_for_context``, this intentionally ignores a
-    provisional semantic scope. Intent may recognize any registered family;
-    only its read-only probe must match the environment it is inspecting.
+    provisional semantic scope and carries no phase gate (discovery is a single
+    read-only surface). Intent may recognize any registered family; only its
+    read-only probe must match the environment it is inspecting. Domain-agnostic
+    tools stay allowed regardless of transport (see :func:`_allowance_verdict`).
     """
-    profile = profile_of(resolve_channel_name(state))
-    if get_environment_profile(profile) is None:
-        return False
-    owner = provider_tool_owners().get(tool_name)
-    if not owner:
-        return True
-    return _tool_allowed_for_profile(owner, profile, tool_name)
+    return _allowance_verdict(
+        tool_name, profile_of(resolve_channel_name(state)),
+    )
 
 
 __all__ = [
     "AgentCapabilityContext",
+    "PROFILE_UNKNOWN_CHANNEL",
+    "PROFILE_UNKNOWN_CONFLICT",
+    "PROFILE_UNKNOWN_SCOPE_UNREGISTERED",
+    "ProfileVerdict",
     "build_capability_context",
     "build_intent_discovery_context",
     "explain_tool_refusal",
+    "explain_unsupported_environment",
     "filter_tools_for_context",
     "is_tool_name_allowed_for_context",
     "is_tool_name_allowed_for_intent_discovery",
     "resolve_profile_for_state",
+    "resolve_profile_verdict",
     "screen_tool_calls",
     "tool_call_allowed",
     "tool_call_field",

@@ -379,7 +379,14 @@ class TestInferTaskState:
         assert infer_task_state(state) == "injected"
 
     def test_l1_skipped_l2_skipped_returns_failed(self):
-        """Non-ChaosBlade: L1=skipped + L2=skipped → failed (no verification at all)."""
+        """Non-ChaosBlade: L1=skipped + L2=skipped + level=PARTIAL → failed.
+
+        This is the CONTRADICTORY shape (Layer 2 never ran, yet the level
+        claims "partial") — no floor produces it (the native floor always emits
+        level="unverified"), so it stays fail-closed. The honest floor shape
+        (level="unverified") is pinned by
+        test_l1_skipped_l2_skipped_unverified_returns_unverified below.
+        """
         state = {
             "operation": "inject",
             "verification": {
@@ -389,6 +396,47 @@ class TestInferTaskState:
             },
         }
         assert infer_task_state(state) == "failed"
+
+    def test_l1_skipped_l2_skipped_unverified_returns_unverified(self):
+        """B88 (native arm): L1=skipped + L2=skipped + level=unverified →
+        unverified, NOT failed.
+
+        This is the exact shape ``verification_floor_from_layer1`` emits for a
+        native/faultdrill-carrier fault when the no-LLM / crash floor runs
+        (Layer 2 never completed). Layer 1 is skipped BY DESIGN for a native
+        fault, so there is no positive proof — but the floor's conservative
+        level="unverified" is honest ignorance, distinct from counter-evidence.
+        Previously the native path matched only l2=="unknown" and let this fall
+        through to the terminal "failed" — the a82984a3 dangerous "cluster
+        unaffected" false-negative while the live carrier still owes recovery.
+        Mirrors the ChaosBlade L549 ``("passed", "skipped")`` fold.
+        """
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "unverified",
+                "layer1": {"status": "skipped"},
+                "layer2": {"status": "skipped"},
+            },
+        }
+        assert infer_task_state(state) == "unverified"
+
+    def test_l1_warning_l2_skipped_unverified_returns_unverified(self):
+        """B88 (warning arm): L1=warning + L2=skipped + level=unverified →
+        unverified. The floor preserves a warning Layer 1 (CLI timeout, fault
+        may have taken effect) with l2="skipped" + level="unverified"; the same
+        vocabulary gap made it fall through to "failed". Symmetric with the
+        native arm — the floor always emits l2="skipped", so every non-passing
+        L1 polarity must honour the honest level."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "unverified",
+                "layer1": {"status": "warning"},
+                "layer2": {"status": "skipped"},
+            },
+        }
+        assert infer_task_state(state) == "unverified"
 
     def test_l1_skipped_l2_failed_returns_failed(self):
         """Non-ChaosBlade: L1=skipped + L2=failed → failed."""
@@ -401,6 +449,116 @@ class TestInferTaskState:
             },
         }
         assert infer_task_state(state) == "failed"
+
+    def test_l1_failed_expired_l2_passed_verified_returns_injected(self):
+        """Expired Layer1 (Destroyed record) + Layer2 verified → injected.
+
+        Live-run regression (procload_d17fix, task inject-76414f92): the agent
+        proved Means-1 blade ``success:true`` was a false positive, destroyed its
+        UID, and delivered the fault via UID-less Means-2. Layer1 tracked the
+        Destroyed record → failed + expired=True, while Layer2 verified the live
+        fault → level=verified. The task-state face used to fall through to
+        "failed" (envelope 4002 → exit 1) with an EMPTY failure reason, because
+        only ``_infer_failure_detail`` carried the exemption. Now single-sourced
+        via ``layer1_expired_override_applies``.
+        """
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "verified",
+                "layer1": {"status": "failed", "expired": True},
+                "layer2": {"status": "passed"},
+            },
+        }
+        assert infer_task_state(state) == "injected"
+
+    def test_l1_failed_not_expired_l2_passed_returns_failed(self):
+        """NEGATIVE (teeth): a genuine Layer1 failure (record live, NOT expired)
+        is a real veto even if Layer2 passed — the override must not fire."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "verified",
+                "layer1": {"status": "failed"},  # no "expired"
+                "layer2": {"status": "passed"},
+            },
+        }
+        assert infer_task_state(state) == "failed"
+
+    def test_l1_failed_expired_l2_partial_returns_failed(self):
+        """NEGATIVE (teeth): expired Layer1 + Layer2 only PARTIAL → still failed.
+        The override is strict on Layer2 == passed.
+
+        LEGACY shape since the Bug3 root fix: the provider now emits
+        ``warning`` (not ``failed``) for an expired record, so new runs never
+        reach this branch — they take the lenient warning path (see
+        ``test_l1_warning_expired_l2_partial_returns_injected``). This test
+        still guards the belt-and-suspenders override for OLD checkpoints that
+        recorded ``failed``+``expired``."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "partial",
+                "layer1": {"status": "failed", "expired": True},
+                "layer2": {"status": "partial"},
+            },
+        }
+        assert infer_task_state(state) == "failed"
+
+    def test_l1_failed_expired_l2_passed_level_unverified_returns_failed(self):
+        """NEGATIVE (teeth): expired Layer1 + Layer2 passed but level NOT
+        verified → still failed. The override is strict on level == verified.
+
+        LEGACY shape since the Bug3 root fix (see the sibling test): new runs
+        emit ``warning`` for expiry and never reach the strict override."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "partial",
+                "layer1": {"status": "failed", "expired": True},
+                "layer2": {"status": "passed"},
+            },
+        }
+        assert infer_task_state(state) == "failed"
+
+    def test_l1_warning_expired_l2_partial_returns_injected(self):
+        """Bug3 root fix (terminal face): an expired record is an abstention, so
+        the provider now labels it ``warning`` — for BOTH sub-cases (early
+        destroy AND timeout expiry). A timeout-expired record + Layer2 partial
+        (level partial) therefore reaches the lenient defer-to-Layer2 warning
+        branch → ``injected``, IDENTICAL to the early-destroy horn.
+
+        Before the fix the timeout-expiry horn was labeled ``failed`` and fell
+        through to ``failed`` here (envelope 4002 → exit 1) while the
+        physically-identical early-destroy horn returned ``injected`` — a
+        non-determinism driven purely by which side of the --timeout boundary
+        the record was destroyed on (live: ce40e733 elapsed 180.775s vs
+        timeout 180s landed failed; f57e631e elapsed 94.1s landed warning)."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "partial",
+                "layer1": {"status": "warning", "expired": True},
+                "layer2": {"status": "partial"},
+            },
+        }
+        assert infer_task_state(state) == "injected"
+
+    def test_l1_warning_expired_l2_unknown_returns_unverified(self):
+        """Bug3 root fix companion: expired (warning) + Layer2 unknown +
+        level unverified → ``unverified`` (honest ignorance), matching the
+        early-destroy horn. The old timeout-expiry ``failed`` label forced
+        ``failed`` here instead — the fourth of the five divergences the
+        deterministic probe caught."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "unverified",
+                "layer1": {"status": "warning", "expired": True},
+                "layer2": {"status": "unknown"},
+            },
+        }
+        assert infer_task_state(state) == "unverified"
 
     def test_replan_exhausted_no_experiment_uid_returns_failed(self):
         """Replan was attempted but graph completed without experiment_uid or verification → failed."""
@@ -578,6 +736,38 @@ class TestInferPhase:
                 "level": "unverified",
                 "layer1": {"status": "passed"},
                 "layer2": {"status": "failed"},
+            },
+        }
+        assert infer_phase(state) == "verification_failed"
+
+    def test_l1_failed_expired_l2_passed_verified_returns_verification_passed(self):
+        """Expired Layer1 (Destroyed record) + Layer2 verified →
+        verification_passed. Aligned with infer_task_state's "injected" via the
+        single-sourced ``layer1_expired_override_applies`` (memory 8c68a434: the
+        two truth tables must not drift)."""
+        state = {
+            "operation": "inject",
+            "experiment_uid": "abc123",
+            "skill_name": "cpu-stress",
+            "verification": {
+                "level": "verified",
+                "layer1": {"status": "failed", "expired": True},
+                "layer2": {"status": "passed"},
+            },
+        }
+        assert infer_phase(state) == "verification_passed"
+
+    def test_l1_failed_not_expired_returns_verification_failed(self):
+        """NEGATIVE (teeth): a genuine (non-expired) Layer1 failure stays
+        verification_failed even with Layer2 passed."""
+        state = {
+            "operation": "inject",
+            "experiment_uid": "abc123",
+            "skill_name": "cpu-stress",
+            "verification": {
+                "level": "verified",
+                "layer1": {"status": "failed"},  # no "expired"
+                "layer2": {"status": "passed"},
             },
         }
         assert infer_phase(state) == "verification_failed"
@@ -963,6 +1153,18 @@ class TestBuildStatusDataExposedFields:
     def test_failure_reason_empty_when_absent(self):
         data = build_status_data("t-fr2", {})
         assert data["failure_reason"] == ""
+
+    def test_verdictless_ended_run_is_terminal_not_in_progress(self):
+        """Cure B (terminal-surface single-source): build_status_data's only
+        caller is the l4 final-state extractor — a TERMINAL point. A run whose
+        live-position word froze at "injecting" (verifier cut by a crash, no
+        durable Layer-1 floor) must derive from terminal_task_state, so status
+        is the terminal "failed" — NOT the live-position "in_progress" the raw
+        infer_task_state produced (the #20 probe: a dead run read as still
+        running). Discriminates the cure: pre-cure this returns "in_progress"."""
+        data = build_status_data("t-ended", {"operation": "inject"})
+        assert data["status"] == "failed"
+        assert data["status"] != "in_progress"
 
     def test_intent_confidence_passes_through(self):
         """PR-A2 — intent_confidence is needed by the intent_confirm panel

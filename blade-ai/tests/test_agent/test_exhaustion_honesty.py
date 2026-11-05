@@ -656,11 +656,21 @@ class TestEmptyTurnIsNotAConclusion:
 
     @patch("chaos_agent.agent.router.settings")
     def test_tool_calls_win_even_with_empty_content(self, mock_settings):
-        """Empty content plus tool_calls is a normal ReAct turn, not silence."""
+        """Empty content plus tool_calls is a normal ReAct turn, not silence.
+
+        The batch MUTATES (``kubectl scale``) on purpose: this test isolates
+        "tool_calls present ⇒ the ReAct branch wins over ``_is_empty_ai_turn``",
+        which must hold regardless of the fault state. A READ-ONLY batch after
+        the fault is committed is a different, legitimate exit — arm-then-
+        handoff routes it to the verifier (task-821d4bb4) — and is covered by
+        ``test_router.py::TestShouldContinueExecuteLoop``. Using a mutation here
+        keeps the two concerns from conflating: a still-arming batch never
+        triggers the handoff, so "continue" stays the honest expectation.
+        """
         mock_settings.max_execute_loop = 100
         mock_settings.max_inject_seconds = 0
         msg = AIMessage(content="", tool_calls=[
-            {"name": "kubectl", "args": {"subcommand": "get"}, "id": "c1"},
+            {"name": "kubectl", "args": {"subcommand": "scale"}, "id": "c1"},
         ])
         state = {"execute_loop_count": 50, "experiment_uid": "uid-1", "messages": [msg]}
         assert should_continue_execute_loop(state) == "continue"

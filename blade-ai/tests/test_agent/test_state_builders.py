@@ -67,3 +67,24 @@ def test_build_inject_initial_state_copies_mutable_inputs():
     assert state["messages"] == ["handoff"]
     assert state["batch_submit_args"] == {"faults": [{"scope": "pod"}]}
     assert state["fault_spec"] == {"scope": "pod", "fault_target": "network"}
+
+
+def test_ssh_port_hydrates_to_none_when_unset():
+    """ground-truth-single-authority D1: an unset ssh_port is stored as None,
+    never a truthy placeholder 22 (which masked settings.ssh_port and caused
+    B3).  from_state then resolves None -> settings -> protocol default."""
+    state = build_inject_initial_state(
+        task_id="task-port",
+        fault_spec={"scope": "pod", "fault_target": "cpu"},
+    )
+    assert state["ssh_port"] is None
+
+
+def test_ssh_port_preserves_explicit_value():
+    """An explicitly-passed ssh_port is stored verbatim as a state override."""
+    state = build_inject_initial_state(
+        task_id="task-port-2",
+        fault_spec={"scope": "pod", "fault_target": "cpu"},
+        ssh_port=2222,
+    )
+    assert state["ssh_port"] == 2222

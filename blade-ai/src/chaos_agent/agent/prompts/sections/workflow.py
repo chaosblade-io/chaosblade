@@ -1,6 +1,8 @@
 """Workflow sections: two-phase workflow, NL mode, verification strategy, replan."""
 
 from chaos_agent.agent.prompts.reminder import (
+    CONCURRENT_BATCH_FACT,
+    LEDGER_BATCH_FACT,
     PARALLELIZE_PRINCIPLE,
     SYSTEM_REMINDER_DECLARATION,
 )
@@ -68,6 +70,7 @@ def get_core_principles_section() -> str:
 - An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target
 - Preserve the reviewed FaultSpec; the only way to change it is `propose_plan_change`, otherwise `finish_planning` as-is
 - {PARALLELIZE_PRINCIPLE}
+- {LEDGER_BATCH_FACT}
 - {SYSTEM_REMINDER_DECLARATION}"""
 
 
@@ -100,24 +103,28 @@ _EXECUTOR_PRINCIPLES: tuple[str, ...] = (
     # receipt/trace/effect triad: exit on receipt; effect observation
     # belongs to verification, a missing effect flows back via replan.
     # Wording frozen by tests/test_agent/test_prompts.py (receipt authority).
-    # 2026-09-22 M1 fix (r68 review, live case inject-3dae7b4f/r43): this
-    # primacy-zone bullet kept an UNCONDITIONAL "STOP + do not sample"
-    # while the execution-directives rewrite (same date) conditioned STOP
-    # on the behavioral probe — two competing exit rules in one prompt,
-    # and the live model's "Per the directives: STOP, don't sample the
-    # effect" quoted this bullet's verbs. Same carve as the directives:
-    # the ban targets repeated watching; the ONE behavioral probe
-    # precedes STOP (effect evidence dies with the fault window).
-    "A step is complete when its mutation is ISSUED — the receipt (experiment handle or success status; lacking one, a single check that the mutated object is in place) is sufficient proof. When ALL steps are issued and the one behavioral probe of the fault's user-visible effect is in hand, STOP — beyond that probe, do not wait for, sample, or stabilize the fault effect: verification is automatic, and a missing effect returns to you through replan",
+    # 2026-11 (task-821d4bb4): this bullet's 2026-09-22 behavioral-probe
+    # carve ("STOP once the ONE probe is in hand") was REMOVED. That carve
+    # made the executor probe the effect before declaring complete, as a
+    # hedge for "the verifier might miss the fault window" (inject-3dae7b4f)
+    # — but the hedge became the hazard: a post-arm probe plus the diagnosis
+    # loop its ambiguous (DNS-confounded) result triggered ran 312s against
+    # a 300s self-clear window, so verification arrived post-mortem. The
+    # root fix is generation-side: deleting the carve compresses the execute
+    # tail (L) so the model finishes and hands off inside the window. Handoff
+    # stays receipt-driven (finish_execution / stopping tool_calls); the router
+    # never infers completion from a read-only batch. STOP is unconditional
+    # again — issue every step, then stop.
+    "A step is complete when its mutation is ISSUED — the receipt (experiment handle or success status; lacking one, a single check that the mutated object is in place) is sufficient proof. When ALL steps are issued, STOP — do not probe, wait for, sample, or stabilize the fault effect: the independent verifier collects effect evidence with the whole remaining window, and a missing effect returns to you through replan",
     # The STOP rule's ACTION (#39 third-retest tail tension): "STOP" alone
     # read as "output a text conclusion", which the stall guard answered
     # with EXECUTION REQUIRED — the model then burned rounds alternating
     # text and redundant read-only probes, pressured toward out-of-authority
     # actions. The clean exit is a TOOL CALL the harness recognises.
-    # (2026-09-22 M1 fix, same ruling as the receipt bullet above: the
-    # declare trigger carries the same behavioral-probe condition so this
-    # ACTION bullet cannot re-open the unconditional-exit hole.)
-    "When ALL steps are issued and the one behavioral probe is in hand, declare it by calling `finish_execution` with a 1-3 sentence summary — that is the STOP action; a text-only conclusion is not an exit, and verification starts automatically after the call",
+    # (2026-11, task-821d4bb4: the declare trigger no longer carries a
+    # behavioral-probe condition — the executor stops on the last ISSUED step
+    # and calls finish_execution, whose ledger terminal routes to verification.)
+    "When ALL steps are issued, declare it by calling `finish_execution` with a 1-3 sentence summary — that is the STOP action; a text-only conclusion is not an exit, and verification starts automatically after the call",
     # Residue cleanup before switching + method-switch discipline; the
     # safety guard, not the doc, arbitrates danger. Wording frozen by
     # tests/test_agent/test_factory.py (partial-failure cleanup guidance).
@@ -132,6 +139,23 @@ _EXECUTOR_PRINCIPLES: tuple[str, ...] = (
     # reminder.PARALLELIZE_PRINCIPLE). The receipt-sequencing of mutation
     # steps is the "safety requires ordering" arm of the principle.
     PARALLELIZE_PRINCIPLE,
+    # Companion fact (single-sourced in reminder.py, shared with the planner
+    # and the verifier). The trace census shows the model does NOT treat this
+    # pair as the "independent" arm above — it treats it as ORDERED, then reads
+    # "must land first" as "needs its own turn", burning a separate record turn
+    # (~15s median) before the terminal call in 78.9% of boundaries even with
+    # the principle present. This supplies the missing distinction: order
+    # within a turn is preserved, so only a RESULT dependency forces a later
+    # turn. Evidence and the full census live at the definition site.
+    LEDGER_BATCH_FACT,
+    # Second companion fact (single-sourced in reminder.py, shared with the
+    # verifier and recover). LEDGER_BATCH_FACT covers the order state/record
+    # writes are COMBINED; this covers the fact that the calls themselves run
+    # CONCURRENTLY, so an observation batched with the action whose effect it
+    # should see may sample before that effect lands. Ground truth and the
+    # full incident (inject-b3d0df6e, Step-8 recovery race) live at the
+    # definition site.
+    CONCURRENT_BATCH_FACT,
 )
 
 

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from chaos_agent.agent.spec.fault_spec import FaultSpec
+    from chaos_agent.transports import TransportTarget
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,8 @@ class FeasibilityChecker(Protocol):
     requires_metrics_server: bool
 
     async def assess(
-        self, spec: "FaultSpec", kubeconfig: str
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> FeasibilityReport | None: ...
 
 
@@ -117,7 +119,8 @@ class FeasibilityProbe(Protocol):
     target: str   # "mem" | "cpu" | "disk"
 
     async def measure(
-        self, spec: "FaultSpec", kubeconfig: str
+        self, spec: "FaultSpec", kubeconfig: str,
+        *, xport_target: TransportTarget | None = None,
     ) -> Measurement | None: ...
 
 
@@ -153,12 +156,32 @@ def profile_for_spec(spec: "FaultSpec") -> str:
 async def assess_feasibility(
     spec: "FaultSpec",
     kubeconfig: str = "",
+    *,
+    xport_target: TransportTarget | None = None,
+    network_mechanism: str = "",
 ) -> FeasibilityReport | None:
     """Single entry point — safety_check calls this once per turn.
 
-    Returns None when no checker exists for the fault_target or the
-    checker cannot determine feasibility (missing data). None is
-    equivalent to OK — fail-open.
+    Return semantics (essence-B unified guard: "could not determine" is a
+    FIRST-CLASS state, never laundered into "feasible"):
+      - ``None`` — the check does NOT APPLY: no checker is registered for the
+        fault_target, the spec is incomplete, or the target legitimately has
+        no ceiling to assess headroom against. Treated as OK downstream
+        (advisory-only, fail-open) — but reserved for genuine not-applicable.
+      - ``SKIPPED`` report — the check RAN but could not reach a verdict:
+        metrics-server unavailable, target unresolvable, the usage/capacity
+        read returned nothing, or the checker raised. VISIBLE, never silent.
+      - ``OK`` / ``TIGHT`` / ``IMPOSSIBLE`` — an actual headroom verdict.
+
+    ``network_mechanism`` is the case frontmatter's declared injection
+    mechanism for ``network`` faults (``netfilter`` / ``userspace-bind`` /
+    ``resolver``; ``""`` = undeclared). It is forwarded ONLY to a checker that
+    opts in via the ``consumes_network_mechanism`` capability flag — the same
+    per-checker-flag dispatch as ``requires_metrics_server``, so this entry
+    point never hard-codes which fault_target cares (the network availability
+    checker uses it to skip the netfilter-only iptables/interface probes for
+    non-netfilter mechanisms). Undeclared/empty → the consumer fails safe to
+    the netfilter preconditions (byte-identical to pre-declaration behaviour).
     """
     checker = _REGISTRY.get(spec.fault_target)
     if checker is None:
@@ -167,7 +190,9 @@ async def assess_feasibility(
         from chaos_agent.agent.spec.fault_registry import is_host_scope
         if checker.requires_metrics_server and not is_host_scope(spec.scope):
             from chaos_agent.agent.spec._feasibility_checkers import is_metrics_server_available
-            if not await is_metrics_server_available(kubeconfig):
+            if not await is_metrics_server_available(
+                kubeconfig, target=xport_target,
+            ):
                 return FeasibilityReport(
                     severity=FeasibilitySeverity.SKIPPED,
                     headroom=0.0,
@@ -177,14 +202,41 @@ async def assess_feasibility(
                     message="metrics-server unavailable — headroom check skipped",
                     recommendation="Install metrics-server for pre-injection feasibility assessment",
                 )
-        return await checker.assess(spec, kubeconfig)
+        if getattr(checker, "consumes_network_mechanism", False):
+            return await checker.assess(
+                spec, kubeconfig, xport_target=xport_target,
+                network_mechanism=network_mechanism,
+            )
+        return await checker.assess(spec, kubeconfig, xport_target=xport_target)
     except Exception as exc:
         logger.warning(
             "feasibility checker failed for fault_target=%s: %s",
             spec.fault_target,
             exc,
         )
-        return None
+        # Essence-B unified guard: a REGISTERED checker that raised could not
+        # determine feasibility — that is a capability loss, not evidence of
+        # feasibility. Returning ``None`` here would launder the error into
+        # "None ≡ OK" (a silent green on the confirm card). Surface it as a
+        # first-class SKIPPED, matching the metrics-server-unavailable and
+        # probe-read-failure paths. (``checker is None`` above — no checker
+        # exists — stays ``None``: that is genuine not-applicable, not failure.)
+        return FeasibilityReport(
+            severity=FeasibilitySeverity.SKIPPED,
+            headroom=0.0,
+            current_value="",
+            limit_value="",
+            target_value="",
+            message=(
+                f"feasibility check errored for target '{spec.fault_target}': "
+                f"{exc} — headroom check skipped"
+            ),
+            recommendation=(
+                "The checker raised before producing a verdict; treat headroom "
+                "as unknown and verify the target's capacity manually before "
+                "injecting"
+            ),
+        )
 
 
 # Import checkers to trigger registration at module load time.

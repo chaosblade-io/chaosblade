@@ -26,7 +26,13 @@ from chaos_agent.agent.prompts.sections.recovery import (
 from chaos_agent.agent.prompts.sections.plan_builder import (
     get_plan_builder_critical_rules_section,
 )
-from chaos_agent.agent.prompts.reminder import PARALLELIZE_PRINCIPLE
+from chaos_agent.agent.prompts.reminder import (
+    CONCURRENT_BATCH_FACT,
+    LEDGER_BATCH_FACT,
+    PARALLELIZE_PRINCIPLE,
+)
+from chaos_agent.agent.prompts.sections import recovery as recovery_section
+from chaos_agent.agent.prompts.sections import verification as verification_section
 from chaos_agent.agent.prompts.sections.execution import (
     _execution_steps_only,
     get_execution_directives_section,
@@ -182,29 +188,40 @@ class TestSectionFunctions:
         assert "verification work" in section
         assert "skip it" in section
 
-    def test_execution_directives_behavioral_probe_obligation(self):
-        # Live case inject-3dae7b4f: the executor obeyed "then STOP" over
-        # the red line (行为判据未采集不得结束执行段 — SKILL.md 生效确认
-        # 硬门禁) and finished 46s before the verifier's first behavioral
-        # probe, surviving only on fault-window slack. The watching bans
-        # keep their carve (9bf2dddd / 3a745506 anchors above); the ONE
-        # probe that makes effect-evidence survival deterministic is now
-        # an explicit pre-finish obligation.
+    def test_execution_directives_forbid_effect_probe(self):
+        # task-821d4bb4: the former ONE behavioral-probe carve-out (live case
+        # inject-3dae7b4f) was REMOVED. It forced execute to probe the effect
+        # once before declaring complete as a hedge for "verify might miss the
+        # window" — but in a degraded env the probe plus the diagnosis loop its
+        # DNS-confounded result triggered burned 312s of a 300s self-clear
+        # window, so verify arrived post-mortem and falsely reported ``failed``.
+        # This pins the REPLACEMENT contract: execute never probes (not even
+        # once); effect evidence is the verification phase's. The repeated-
+        # watching ban is untouched — see
+        # test_execution_directives_skip_planned_observation_steps.
         section = get_execution_directives_section()
         # Line-wrapping in the source strings breaks raw substring matches,
         # so the assertions run on the whitespace-normalised text (the same
         # trick test_planned_wait_step_exemption uses).
         flat = " ".join(section.split())
-        # (1) the ban is narrowed: repeated watching, not the single probe
-        assert "That ban targets repeated watching" in flat
-        assert "the single behavioral probe" in flat
-        # (2) red-line substance: window mortality + mechanism cannot
-        # substitute for effect evidence
-        assert "effect evidence dies with the fault window" in flat
-        assert "mechanism readback (rules/spec confirmed) cannot" in flat
-        assert "substitute for it" in flat
-        # (3) STOP is conditional on the probe being in hand
-        assert "With the probe in hand and the LAST mutation step" in flat
+        # (1) the probe is banned outright — no single-probe carve-out survives
+        assert "do NOT probe the fault's user-visible effect" in flat
+        assert "not even once" in flat
+        # (2) effect evidence migrated to the verification phase. The removed
+        #     auto-route claim must NOT creep back into THIS section: the
+        #     router no longer infers completion from a read-only batch, so
+        #     the prompt must not promise an auto-route "the moment your last
+        #     mutation lands" (negative constraint — the high-value wording
+        #     tier; the arm-then-handoff twin is guarded in the core-principles
+        #     test, since that phrase only ever lived in the workflow bullet)
+        assert "Effect evidence is collected by the verification phase" in flat
+        assert "the moment your last mutation lands" not in flat
+        # (3) independence rationale: the probe would be discarded anyway
+        assert "prior-phase results are not evidence" in flat
+        # (4) STOP is unconditional on the LAST step being ISSUED (no probe gate)
+        assert "then STOP" in flat
+        # (5) the removed carve-out wording must not creep back
+        assert "the single behavioral probe" not in flat
 
     def test_verification_heuristics_encodes_timeout_discipline(self):
         # Postmortem lesson (task-e951696f) generalized: a timeout/failed
@@ -415,6 +432,94 @@ class TestSectionFunctions:
         assert "## Environment" in section
         assert "blade_version: 1.7.0" in section
         assert "k8s_available: True" in section
+
+
+class TestConcurrentBatchFact:
+    """inject-b3d0df6e (host端口占用案 Step-8 recovery race) root fix.
+
+    The model batched [start-svc, wait, show-svc] in ONE turn; the batch ran
+    CONCURRENTLY (show completed @140ms, start @171ms), so show sampled a
+    pre-start "dead" state. Told by LEDGER_BATCH_FACT that "calls take effect
+    in the order you issue them", the model rejected the true race ("No,
+    they're ordered") and mis-attributed the stale read to the loop guard,
+    burning ~94s. Fix: present the missing concurrency fact from a single
+    source (reminder.CONCURRENT_BATCH_FACT) in the action+observation nodes,
+    and scope LEDGER_BATCH_FACT's verb to "recorded" so the pair is coherent.
+    """
+
+    def test_rendered_in_action_observation_nodes(self):
+        # Consistency invariant: the rendered text IS the authoritative
+        # constant — a hardcoded divergent copy would fail this.
+        for name, section in (
+            ("executor", get_executor_core_principles_section()),
+            ("verifier", get_verifier_core_principles_section()),
+            ("recover", get_recover_core_principles_section()),
+        ):
+            assert CONCURRENT_BATCH_FACT in section, name
+
+    def test_absent_from_read_only_nodes(self):
+        # Isolation: the read-only planner / plan-builder issue no external
+        # action whose effect a sibling call could race to observe.
+        assert CONCURRENT_BATCH_FACT not in get_core_principles_section()
+        assert CONCURRENT_BATCH_FACT not in get_plan_builder_critical_rules_section()
+
+    def test_single_source_hot_tracking_verifier_and_recover(self, monkeypatch):
+        # Single-source hot-tracking: repoint the section module's binding and
+        # the rendered text must follow — proving it reads the imported
+        # constant live, not a baked-in literal.
+        sentinel = "SENTINEL_CONCURRENT_FACT_XYZ"
+        monkeypatch.setattr(verification_section, "CONCURRENT_BATCH_FACT", sentinel)
+        monkeypatch.setattr(recovery_section, "CONCURRENT_BATCH_FACT", sentinel)
+        assert sentinel in get_verifier_core_principles_section()
+        assert sentinel in get_recover_core_principles_section()
+
+    def test_parallelize_single_source_not_diluted(self):
+        # The count==1-pinned directive must survive the new companion line.
+        assert get_executor_core_principles_section().count(PARALLELIZE_PRINCIPLE) == 1
+        assert get_verifier_core_principles_section().count(PARALLELIZE_PRINCIPLE) == 1
+        assert get_recover_core_principles_section().count(PARALLELIZE_PRINCIPLE) == 1
+
+    def test_ledger_verb_scoped_to_recorded(self):
+        # Old-value reverse assertion: the over-claiming physical-execution
+        # verb is gone; the scoped "recorded" verb (true for state writes,
+        # which is LEDGER_BATCH_FACT's actual domain) stays.
+        planner = get_core_principles_section()
+        assert "take effect in the order you issue them" not in planner
+        assert "are recorded in the order you issue them" in planner
+        assert LEDGER_BATCH_FACT in planner  # still rendered, still single-sourced
+
+    def test_disambiguation_against_ledger_args_test(self):
+        # inject-0ba742bd (R2 re-inject) residual fix. The first live A/A
+        # confirmed the concurrency fact landed, but exposed a lexical
+        # collision: LEDGER_BATCH_FACT defines a RESULT dependency as a call
+        # "whose arguments depend on another's output", so the model classified
+        # systemctl-start→status as an ORDER dependency (status args never
+        # mention start's output) and batched them in one turn — sampling a
+        # "6ms ago" transient state. The disambiguation clause below must be
+        # present in every action+observation node so an effect-observation is
+        # caught even when the ORDER rule seems to license batching it.
+        for name, section in (
+            ("executor", get_executor_core_principles_section()),
+            ("verifier", get_verifier_core_principles_section()),
+            ("recover", get_recover_core_principles_section()),
+        ):
+            assert "even when the observation's arguments" in section, name
+            assert "never mention the action's output" in section, name
+            assert "reads the action's EFFECT, not its return value" in section, name
+        # Old-value reverse assertion: the pre-disambiguation ending that let
+        # the model reach the ORDER test unchallenged is gone.
+        assert (
+            "RESULT dependency, not an ORDER one: give that observation its own "
+            "later turn."
+        ) not in get_executor_core_principles_section()
+
+    def test_disambiguation_scoped_to_effect_not_ledger_waste(self):
+        # Guard against over-broadening: the clause is scoped to observing an
+        # action's EFFECT, so it must NOT discourage batching a progress record
+        # with the phase-terminal call (LEDGER_BATCH_FACT's domain — reviving
+        # that waste is the F2 regression the census fixed).
+        assert "Give that observation its own later turn." in CONCURRENT_BATCH_FACT
+        assert LEDGER_BATCH_FACT not in CONCURRENT_BATCH_FACT
 
 
 class TestBuildInjectSystemPrompt:
@@ -851,36 +956,42 @@ class TestExecutorEffectObservationBoundary:
         # multi-step / hybrid injections never stop after the first receipt.
         assert "A step is complete when its mutation is ISSUED" in section
         assert "When ALL steps are issued" in section
-        # 2026-09-22 M1 fix (r68 review, live r43): STOP is conditioned on
-        # the ONE behavioral probe — this primacy-zone bullet must agree
-        # with the execution directives' carve instead of competing with
-        # them (the old unconditional "When ALL steps are issued, STOP" +
-        # ban is what the live model quoted: "STOP, don't sample the
-        # effect"). The three verbs keep their force, but only BEYOND that
-        # probe — repeated watching stays banned, the single probe is owed.
+        # 2026-11 (task-821d4bb4): STOP is UNCONDITIONAL again — the
+        # 2026-09 behavioral-probe carve ("STOP once the ONE probe is in
+        # hand") was removed. The root fix is generation-side (deleting the
+        # carve compresses the execute tail so the model finishes inside the
+        # window); handoff stays receipt-driven, so the executor must NOT
+        # probe / wait / sample the effect here.
+        assert "When ALL steps are issued, STOP" in section
         assert (
-            "When ALL steps are issued and the one behavioral probe of the "
-            "fault's user-visible effect is in hand, STOP" in section
-        )
-        assert (
-            "beyond that probe, do not wait for, sample, or stabilize the "
+            "do not probe, wait for, sample, or stabilize the "
             "fault effect" in section
         )
         # the replan channel is named so the right-to-switch-method survives
         assert "returns to you through replan" in section
+        # the removed carve-out must not linger anywhere in the section
+        assert "the one behavioral probe" not in section
+        # the removed arm-then-handoff auto-route claim must not creep back
+        # into the principle bullet — it named a router gate that no longer
+        # exists and promised routing "the moment your last mutation lands"
+        assert "arm-then-handoff" not in section
+        assert "the moment your last mutation lands" not in section
         # (The REMEMBER twin of this test is gone with the 2026-09-20
         # execute cleanup — the executor mirror was removed; recency rides
         # the message tail, so this primacy carrier is the rule's only one.)
 
-    def test_finish_execution_action_carries_probe_condition(self):
-        # M1 (same ruling): the finish_execution ACTION bullet taught the
-        # unconditional declare trigger "When ALL steps are issued" — a
-        # second hole the model could finish through, bypassing the probe.
+    def test_finish_execution_action_declares_on_all_steps_issued(self):
+        # 2026-11 (task-821d4bb4): the declare trigger no longer carries a
+        # behavioral-probe condition — the executor stops on the last ISSUED
+        # step and calls finish_execution, whose ledger terminal routes to verify.
         section = get_executor_core_principles_section()
         assert (
-            "When ALL steps are issued and the one behavioral probe is in "
-            "hand, declare it by calling `finish_execution`" in section
+            "When ALL steps are issued, declare it by calling "
+            "`finish_execution`" in section
         )
+        # the STOP action is still the tool call, not a printed conclusion
+        # (test_finish_execution.py pins this phrase too).
+        assert "a text-only conclusion is not an exit" in section
 
     def test_receipt_authority_wording_not_eroded(self):
         # The old phrasing taught the model that its receipt cannot be
@@ -975,3 +1086,39 @@ class TestExecutorPlanContractDiscipline:
         # re-deriving.
         assert "Do NOT re-derive command texts" not in section
         assert "in their written order" not in section
+
+    def test_silent_failure_diagnostic_carve_present(self):
+        """Minimal wiring assertion for the silent-failure diagnostic carve
+        (live case #17 host syscall-error, iter 17 = 111,782ms burned on a
+        rule conflict that ended in a false plan_invalid escalation).
+
+        The two-failure→replan rule counts attempts by METHOD IDENTITY and,
+        read literally, banned the ONE `--debug` diagnostic that would have
+        exposed the silent dud's root cause. This only freezes the structural
+        fact that the carve renders (and does not weaken the base rule) — per
+        the prompt-change testing discipline, the behavioural flip is proven by
+        the live A/A re-run, not by this wording assertion.
+        """
+        section = get_execution_directives_section()
+        flat = " ".join(section.split())
+        # the base two-failure rule is untouched (no regression)
+        assert "failing twice means replan" in section
+        # the carve distinguishes blind repetition from instrumented diagnosis
+        assert "BLIND repetition" in flat
+        assert "instrumented diagnostic" in flat
+        # the silent-failure trigger is defined (success receipt, no effect,
+        # no surfaced error) and the exit forbids a blind replan
+        assert "success receipt yet produces no observable effect" in flat
+        assert "never replan blind" in flat
+        # run5 A/A refinement: debug/verbose channel is ordered OVER the
+        # persisted execution log for a success-receipt dud (the log records
+        # only the parent's bookkeeping Success, so it re-serves the phantom).
+        assert "debug/verbose channel OVER its persisted execution log" in flat
+        assert "records only the parent tool's bookkeeping Success" in flat
+        # the carve is unconditional (not plan-gated): a silent dud can occur
+        # with or without a frozen plan
+        assert "instrumented diagnostic" in " ".join(
+            get_execution_directives_section(
+                plan="## Execution Steps\n1. issue the mutation\n"
+            ).split()
+        )

@@ -75,7 +75,14 @@ def build_inject_initial_state(
         "ssh_host": ssh_host or "",
         "ssh_user": ssh_user or "",
         "ssh_key_path": ssh_key_path or "",
-        "ssh_port": ssh_port if ssh_port else 22,
+        # Connection-parameter hydration contract (ground-truth-single-authority
+        # D1): a field the caller did NOT explicitly set is stored as None — never
+        # a truthy placeholder.  Seeding ``22`` here short-circuited the
+        # transport seam's ``state.get("ssh_port") or
+        # settings.ssh_port`` fallback and masked the config-authoritative port
+        # (B3).  None lets the seam resolve to settings; the protocol default
+        # (22) is applied only when BOTH state and settings are unset.
+        "ssh_port": ssh_port,
         "created_at": created_at or now_iso(),
         "interaction_mode": interaction_mode,
         "dry_run": bool(dry_run),

@@ -14,6 +14,7 @@ from chaos_agent.agent.postmortem.generator import generate_postmortem, make_sum
 from chaos_agent.agent.postmortem.store import (
     postmortem_exists,
     read_postmortem,
+    render_postmortem_markdown,
     save_postmortem,
 )
 
@@ -168,6 +169,42 @@ class TestBuildContext:
         assert ctx["fault_type"] == "pod-network-loss"
         assert ctx["skill_name"] == "pod-network-loss"
 
+    def test_large_tool_call_args_are_bounded(self):
+        """K2: a tool_call carrying a huge arg (embedded YAML / long shell
+        command) must be size-bounded so MAX_MESSAGES is a TRUE ceiling on
+        the upload surface. Before the fix args rode through unbounded
+        while content was capped at 500 — the documented privacy knob only
+        half-delivered. Mutation guard: removing the _bound_tool_call_args
+        call (args passed raw) must fail this test."""
+        from langchain_core.messages import AIMessage
+        from chaos_agent.agent.postmortem.builder import _MAX_TOOL_CALL_ARGS_CHARS
+
+        big = "x" * 5000
+        msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "kubectl", "args": {"spec": big},
+                         "id": "1", "type": "tool_call"}],
+        )
+        ctx = build_postmortem_context({"messages": [msg]})
+        args = ctx["messages"][0]["tool_calls"][0]["args"]
+        assert isinstance(args, str), "oversized args should collapse to a truncated string"
+        assert len(args) <= _MAX_TOOL_CALL_ARGS_CHARS + 20
+        assert "truncated" in args
+
+    def test_small_tool_call_args_kept_structured(self):
+        """K2 counterpart: normal small args are returned UNCHANGED (still
+        a structured dict) — the bound must not alter the common case."""
+        from langchain_core.messages import AIMessage
+
+        msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "kubectl", "args": {"subcommand": "get"},
+                         "id": "1", "type": "tool_call"}],
+        )
+        ctx = build_postmortem_context({"messages": [msg]})
+        args = ctx["messages"][0]["tool_calls"][0]["args"]
+        assert args == {"subcommand": "get"}
+
 
 # ─── generator ─────────────────────────────────────────────────────
 
@@ -265,6 +302,120 @@ class TestGenerator:
         out = await generate_postmortem({"task_id": "x"}, llm, timeout=5)
         assert out == body  # unchanged
 
+    @pytest.mark.asyncio
+    async def test_system_prompt_directs_english_output(self):
+        """The report body must be produced in English. Assert on the
+        SystemMessage actually handed to the LLM (not the module constant)
+        so the test pins the real prompt reaching the model. Mutation
+        guard: reverting the directive to the old Chinese default must
+        fail this test."""
+        from langchain_core.messages import AIMessage
+        llm = AsyncMock()
+        llm.ainvoke = AsyncMock(return_value=AIMessage(content="## Summary\nOK"))
+        await generate_postmortem({"task_id": "x"}, llm, timeout=5)
+
+        system_content = llm.ainvoke.call_args[0][0][0].content
+        assert "Write in English" in system_content
+        assert "Write in Chinese" not in system_content
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_background_delegates_facts_to_program(self):
+        """Root-fix contract: the Background guidance asks the model ONLY
+        for the facts the execution trace reveals — the concrete injection
+        / recovery ACTIONS and the RESOLVED target — and explicitly tells
+        it the deterministic facts (fault type / namespace / status /
+        duration / user request / target selector / parameters) are already
+        program-rendered in the header above ``## Summary`` so it must NOT
+        restate them.
+
+        This REPLACES the earlier ``..._requires_concrete_actions`` test,
+        which pinned the rejected "LLM restates every deterministic fact"
+        contract (it asserted ``Target object:`` / ``Fault type:`` /
+        ``Parameters:`` bullets). Those zero-variance facts now come from
+        ``render_postmortem_markdown`` (single source, disk == payload);
+        leaving them to the model reintroduced transcription variance and a
+        second drifting copy. Mutation guards: (a) re-adding a ``Fault
+        type:`` / ``Parameters:`` bullet must fail; (b) dropping the "do not
+        restate" directive must fail; (c) dropping the action bullets must
+        fail."""
+        from langchain_core.messages import AIMessage
+        llm = AsyncMock()
+        llm.ainvoke = AsyncMock(return_value=AIMessage(content="## Summary\nOK"))
+        await generate_postmortem({"task_id": "x"}, llm, timeout=5)
+
+        system_content = llm.ainvoke.call_args[0][0][0].content
+        # Model-owned facts: the ACTIONS + resolved target (trace-only).
+        assert "`Injection action:`" in system_content
+        assert "`Recovery action:`" in system_content
+        assert "`Resolved target:`" in system_content
+        # A concrete operation, NOT the carrier enum.
+        assert "carrier enum" in system_content
+        assert "kubectl_native" in system_content
+        # Deterministic facts are NO LONGER model bullets (program renders
+        # them). Assert on the backtick bullet labels so the "do not
+        # restate" prose mentioning "fault type" doesn't false-positive.
+        assert "`Fault type:`" not in system_content
+        assert "`Parameters:`" not in system_content
+        assert "`User request:`" not in system_content
+        assert "`Target object:`" not in system_content
+        # The delegation directive itself must be present.
+        assert "Do NOT restate" in system_content
+        assert "already rendered by the program" in system_content
+
+    @pytest.mark.asyncio
+    async def test_generate_accepts_heading_case_and_whitespace_variants(self):
+        """K1: a legal ``## Summary`` variant (lowercase / extra space /
+        leading or trailing whitespace) must NOT be rejected as a refusal.
+        Before the fix the gate demanded the exact literal ``## Summary``,
+        so these valid reports were silently dropped (postmortem=None,
+        nothing archived). Mutation guard: reverting the gate to
+        ``_REQUIRED_HEADING not in markdown`` must fail this test."""
+        from langchain_core.messages import AIMessage
+        variants = [
+            "## summary\nlowercase heading body",
+            "##  Summary\ndouble space after hashes",
+            "## Summary \ntrailing space on heading",
+            "  ## Summary\nleading whitespace before heading",
+        ]
+        for body in variants:
+            llm = AsyncMock()
+            llm.ainvoke = AsyncMock(return_value=AIMessage(content=body))
+            out = await generate_postmortem({"task_id": "x"}, llm, timeout=5)
+            assert out != "", f"valid variant wrongly rejected: {body!r}"
+
+    @pytest.mark.asyncio
+    async def test_generate_still_rejects_refusal_without_summary(self):
+        """K1 counterpart: the normalised gate must STILL reject a refusal
+        that has no Summary heading at all — loosening case-sensitivity
+        must not let junk through."""
+        from langchain_core.messages import AIMessage
+        llm = AsyncMock()
+        llm.ainvoke = AsyncMock(
+            return_value=AIMessage(content="I'm sorry, I cannot help with that."),
+        )
+        out = await generate_postmortem({"task_id": "x"}, llm, timeout=5)
+        assert out == ""
+
+    def test_gate_and_make_summary_agree_on_heading_variants(self):
+        """K1 single-source invariant: the REAL acceptance gate
+        (``_validate_and_bound``) and the downstream summary extractor
+        must agree on every heading variant — no variant accepted by one
+        and rejected by the other (the old bug: gate exact-match vs
+        extractor case-insensitive). Asserting on the gate function itself
+        (not the helper) so a mutation that bypasses the helper at the
+        gate is caught here too."""
+        from chaos_agent.agent.postmortem.generator import (
+            _validate_and_bound,
+            make_summary,
+        )
+        for body in (
+            "## Summary\ncanonical body",
+            "## summary\nlowercase body",
+            "##  Summary\nextra space body",
+        ):
+            assert _validate_and_bound(body) != "", body  # gate accepts
+            assert make_summary(body) != "", body          # extractor agrees
+
 
 # ─── store ─────────────────────────────────────────────────────────
 
@@ -297,6 +448,80 @@ class TestStore:
         assert "stale-skill" not in text
         assert "**Status**: verified" in text
         assert "**Duration**: 47s" in text
+
+    def test_render_emits_deterministic_fact_block(self):
+        """The program-rendered fact block must carry the deterministic
+        facts (user request / target selector / params) ABOVE the LLM body,
+        so the platform — which reads ``postmortem.markdown`` — sees them.
+        These are exactly the facts the old body-only payload dropped."""
+        body = "## Summary\nHPA maxed out."
+        out = render_postmortem_markdown(
+            "task-abc12345", body,
+            header_meta={
+                "fault_type": "pod-cpu-fullload", "namespace": "cms",
+                "status": "verified", "duration": "47s",
+                "generated_at": "2026-11-04T10:00:00",
+                "user_request": "saturate CPU on the cms drill pod",
+                "target": "cms/app=drill", "params": "cpu-percent=80",
+            },
+        )
+        assert "# Postmortem: pod-cpu-fullload on cms" in out
+        assert "**User request**: saturate CPU on the cms drill pod" in out
+        assert "**Target**: cms/app=drill" in out
+        assert "**Parameters**: cpu-percent=80" in out
+        # Fact block precedes the LLM body.
+        assert out.index("**Parameters**") < out.index("## Summary")
+        assert "HPA maxed out." in out
+
+    def test_render_byte_identical_to_legacy_header_without_extra_facts(self):
+        """With none of the three optional facts present the render must be
+        byte-identical to the historical ``title + metadata line + body``
+        header — so existing disk-format consumers see no change. Guards the
+        refactor that moved header construction into the shared renderer."""
+        body = "## Summary\nAll good."
+        out = render_postmortem_markdown(
+            "task-abc12345", body,
+            header_meta={"skill_name": "k8s", "namespace": "demo",
+                         "status": "verified", "duration": "47s",
+                         "generated_at": "G"},
+        )
+        legacy = (
+            "# Postmortem: k8s on demo\n\n"
+            "**Task**: `task-abc12345` | **Status**: verified | "
+            "**Duration**: 47s | **Generated**: G\n\n"
+            "## Summary\nAll good.\n"
+        )
+        assert out == legacy
+
+    def test_render_omits_empty_fact_lines(self):
+        """A partial header_meta must not leave dangling ``**Label**: ``
+        lines with nothing after them."""
+        out = render_postmortem_markdown(
+            "task-abc12345", "## Summary\nx",
+            header_meta={"fault_type": "pod-mem-load", "namespace": "cms",
+                         "target": "cms/app=drill"},  # no user_request/params
+        )
+        assert "**Target**: cms/app=drill" in out
+        assert "**User request**" not in out
+        assert "**Parameters**" not in out
+
+    def test_save_postmortem_disk_equals_rendered_payload(self, tmp_path):
+        """Single-source invariant at the store level: the file written to
+        disk must be byte-identical to what ``render_postmortem_markdown``
+        produces for the same inputs — which is what ``terminal_reports``
+        puts in ``payload['markdown']``. This is the nail that keeps disk
+        and payload from ever diverging again."""
+        body = "## Summary\nAll good."
+        meta = {"fault_type": "pod-cpu-fullload", "namespace": "cms",
+                "status": "verified", "duration": "47s",
+                "generated_at": "2026-11-04T10:00:00",
+                "user_request": "saturate CPU", "target": "cms/app=drill",
+                "params": "cpu-percent=80"}
+        save_postmortem("task-abc12345", body, root=tmp_path, header_meta=meta)
+        on_disk = read_postmortem("task-abc12345", root=tmp_path)
+        assert on_disk == render_postmortem_markdown(
+            "task-abc12345", body, header_meta=meta,
+        )
 
     def test_invalid_task_id_rejected(self, tmp_path):
         for bad in ("", "../etc/passwd", "task-", "TASK-ABC", "task abc",

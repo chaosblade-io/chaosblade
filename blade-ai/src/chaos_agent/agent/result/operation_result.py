@@ -18,6 +18,7 @@ from chaos_agent.agent.result.operation_outcome import (
     read_operation_outcome,
     read_recover_verification,
     read_verification_side_effects,
+    synthesize_recover_verification_floor,
 )
 from chaos_agent.agent.result.verdict import RecoverVerdict
 from chaos_agent.agent.state import (
@@ -103,6 +104,38 @@ def build_recovery_handle(values: Mapping[str, Any]) -> dict[str, Any] | None:
     if handle:
         return dict(handle)
     return None
+
+
+def _resolved_injection_channel(values: Mapping[str, Any]) -> str:
+    """Freeze the RESOLVED transport channel name actually used to inject.
+
+    Durable recover-context fact — same class as ``injection_method`` /
+    ``fault_handle``. A bare CLI inject carries an EMPTY
+    ``kube_connection_mode`` override, so the channel in force is resolved
+    from ambient settings at run time and never persisted anywhere. Recover
+    runs in a LATER process whose ambient settings may have drifted (Case
+    #87: the operator flipped ``kube_connection_mode`` to a host channel
+    between inject and recover), which would resolve the WRONG transport and
+    fail-closed an otherwise recoverable task. Freezing the resolved name at
+    finalize lets the recover builder pin the injection-time channel instead
+    of re-deriving it from drifted settings (see the recover-state builder in
+    ``state_mgmt.recovery_state``).
+
+    Returns the empty string when resolution fails (``resolve_channel_name``
+    yields the ``unknown`` sentinel) so recover keeps its ambient-settings
+    fallback rather than freezing a poison value that would itself resolve to
+    ``unknown``.
+    """
+    # Lazy import — result layer stays free of transport imports at import
+    # time (same discipline as the execution_artifacts import above).
+    from chaos_agent.transports import channel_profiles, resolve_channel_name
+
+    try:
+        channel = resolve_channel_name(dict(values))
+    except Exception:
+        return ""
+    # A registered channel name only; the ``unknown`` sentinel is not one.
+    return channel if channel in channel_profiles() else ""
 
 
 def build_inject_data_from_state(
@@ -213,6 +246,12 @@ def build_inject_data_from_state(
         # durable identity that survives across a process restart. TaskSnapshot
         # feeds them back into the recover initial state.
         "injection_method": state_values.get("injection_method"),
+        # Resolved transport channel used to inject (durable recover-context
+        # fact). Recover pins this instead of re-deriving the channel from
+        # ambient settings that may have drifted since injection — see
+        # ``_resolved_injection_channel``. Empty when unresolvable so recover
+        # keeps its settings fallback.
+        "injection_channel": _resolved_injection_channel(state_values),
         "fault_handle": materialize_fault_handle(state_values),
         "recovery_handle": build_recovery_handle(state_values),
         "duration_ms": duration_ms_out,
@@ -265,6 +304,7 @@ def build_unknown_inject_data(
         "fault_type": "",
         "experiment_uid": experiment_uid or "",
         "injection_method": None,
+        "injection_channel": "",
         "fault_handle": None,
         "duration_ms": 0,
         "fault_spec": {},
@@ -311,6 +351,17 @@ def build_inject_status_data_from_state(
         "result": result,
         "fault_type": fault_type_from_state(state),
         "targets": target_list_from_state(state),
+        # Owed-teardown single source (W-78R-1): EVERY terminal builder must
+        # carry ``vehicle_teardown_pending`` (the R13-1 invariant its own
+        # predicate docstring legislates). This legacy crash/failed shape used
+        # to omit it, so a carrier armed mid-run and orphaned by an uncaught
+        # exception was recorded in the audit row but never surfaced on the
+        # user-facing crash envelope — the operator was never told to run
+        # ``blade-ai recover`` and the elevated-RBAC stack lingered until
+        # manual discovery. Reads the single-sourced predicate, never
+        # re-derives. Empty ([]) when ``values`` predates the carrier (e.g.
+        # the server async-accept "pending" response passes initial_state).
+        "vehicle_teardown_pending": pending_vehicle_teardown(state),
     }
     if include_experiment_uid:
         experiment_uid_out = (
@@ -349,10 +400,49 @@ def recover_task_state_from_values(values: Mapping[str, Any]) -> str:
         "recovery_level",
         "recovered" if is_recovered else "failed",
     )
-    return recovery_task_state_from_level(
+    base = recovery_task_state_from_level(
         level,
         recovered=is_recovered,
         layer1_status=layer1_status,
+    )
+    # Durable-evidence floor (a82984a3 root cure, recover arm; verdict face —
+    # Route B). "No verdict" is NOT "no evidence": a run can END (an
+    # ``httpx.ReadTimeout`` kills the recover verifier loop mid-adjudication)
+    # AFTER the destroy landed and Layer 1 confirmed the experiment record is
+    # gone — leaving ``recover_layer1_cache`` durable in the checkpoint while
+    # the LLM's ``submit_recover_verification`` emission never survived the
+    # stream. Fail-closing that to "failed" mislabels a completed recovery as a
+    # failed one (the recover twin of the a82984a3 divergence). So before
+    # fail-closing, consult the SAME deterministic floor the inject side uses
+    # (:func:`synthesize_recover_verification_floor`): it is gated on
+    # ``layer1.is_passed()``, so it lifts ONLY a confirmed-landed destroy to the
+    # honest "unverified" and never masks a known failed/in-progress one.
+    #
+    # The floor fills ONLY the silence a CRASH leaves. It fires solely when the
+    # state carries NEITHER a real verdict (``verification``) NOR a deliberate
+    # terminal classification (``failure_reason``). A recover verifier cut by
+    # its wall-clock / loop budget WRITES ``failure_reason`` —
+    # RECOVERY_VERIFICATION_TIMEOUT / WALL_CLOCK_TIMEOUT (the W-56-8 publisher:
+    # a budget-cut recovery is a FAILURE on every surface, never a success and
+    # never a mid-flight word). That is the node speaking a deliberate verdict,
+    # and the floor must not second-guess it — a crashed node writes no reason
+    # at all, which is exactly the silence the floor is for. Mirrors
+    # ``terminal_task_state``'s inject consult ("a real verdict already drove
+    # state — never second-guess it").
+    if base != TaskState.FAILED.value or verification or outcome.failure_reason:
+        return base
+    floor = synthesize_recover_verification_floor(values)
+    if floor is None:
+        return base
+    floor_layer1 = floor.get("layer1")
+    return recovery_task_state_from_level(
+        floor["level"],
+        recovered=False,
+        layer1_status=(
+            floor_layer1.get("status", "")
+            if isinstance(floor_layer1, Mapping)
+            else ""
+        ),
     )
 
 
@@ -442,14 +532,33 @@ def build_recover_cli_failure_data_from_state(
     *,
     experiment_uid: str = "",
     error: str = "",
+    recover_state_values: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the legacy local-CLI recover failure data shape."""
+    """Build the legacy local-CLI recover failure data shape.
+
+    ``recover_state_values`` is the recover graph's OWN final checkpoint (a82984a3
+    root cure, recover arm). The crash arms used to build this envelope purely
+    from the INJECT state with a hard-coded ``{"result": {"recovered": False}}``,
+    so a recovery that had actually destroyed the experiment before an
+    ``httpx.ReadTimeout`` killed the verifier loop still reported "failed" — the
+    recover twin of the inject divergence, and worse (it never even read the
+    recover checkpoint). When the caller supplies the recover checkpoint the
+    label is derived from it through :func:`recover_task_state_from_values`,
+    which consults the durable-evidence floor: a confirmed-landed destroy reads
+    "unverified", anything else fail-closes to "failed". Absent a checkpoint the
+    original fail-closed shape stands (no evidence, no upgrade).
+    """
 
     inject_state = dict(inject_state_values or {})
     if experiment_uid and not inject_state.get("experiment_uid"):
         inject_state["experiment_uid"] = experiment_uid
+    recover_projection = dict(recover_state_values or {})
+    if not recover_projection:
+        recover_projection = {"result": {"recovered": False}}
+    if error and not recover_projection.get("error"):
+        recover_projection["error"] = error
     data = build_recover_cli_data_from_state(
-        {"result": {"recovered": False}, "error": error or ""},
+        recover_projection,
         inject_task_id,
         inject_state,
     )

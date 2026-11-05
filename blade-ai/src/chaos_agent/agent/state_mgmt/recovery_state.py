@@ -184,11 +184,24 @@ def build_recover_initial_from_checkpoint(
     })
     # Channel must travel with the credentials snapshot: a carried kubewiz
     # profile under a leftover kubeconfig-mode channel (or vice versa) would
-    # resolve the wrong transport in ``TransportTarget.from_state``.  Only a
-    # non-empty carried mode writes the key — entries that carry no mode
-    # keep channel resolution on the caller's settings (current behavior).
-    if conn.get("kube_connection_mode"):
-        initial["kube_connection_mode"] = conn["kube_connection_mode"]
+    # resolve the wrong transport in ``resolve_transport_target``.
+    # Precedence mirrors the credential fields above — an explicitly carried
+    # connection override (the recovering caller's session-bound environment)
+    # wins; otherwise the injection-time frozen channel pins recover to the
+    # SAME transport the fault was injected on. Recover is channel-affine: it
+    # must NOT re-derive its channel from ambient settings that may have
+    # drifted since injection (Case #87 — the operator switched
+    # kube_connection_mode to a host channel between inject and recover, and a
+    # kubeconfig/k8s task then resolved to ssh/host and fail-closed against the
+    # scope/transport guard). Only when NEITHER source carries a mode does the
+    # key stay absent, so channel resolution falls back to the caller's
+    # settings (legacy behavior for tasks injected before the channel froze).
+    _channel_mode = (
+        conn.get("kube_connection_mode")
+        or inject_values.get("kube_connection_mode")
+    )
+    if _channel_mode:
+        initial["kube_connection_mode"] = _channel_mode
     return initial
 
 

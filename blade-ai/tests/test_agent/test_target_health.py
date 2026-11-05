@@ -144,7 +144,7 @@ class TestAssessTargetHealth:
     async def test_node_with_disk_pressure(self, monkeypatch):
         from chaos_agent.agent import target_health
 
-        async def fake_query(name, kc):
+        async def fake_query(name, kc, *, xport_target=None):
             return [
                 {"type": "DiskPressure", "status": "True"},
             ]
@@ -159,7 +159,7 @@ class TestAssessTargetHealth:
     async def test_pod_evicted(self, monkeypatch):
         from chaos_agent.agent import target_health
 
-        async def fake_query(name, ns, kc):
+        async def fake_query(name, ns, kc, *, xport_target=None):
             return {"phase": "Failed", "reason": "Evicted"}
 
         monkeypatch.setattr(target_health, "_query_pod_status", fake_query)
@@ -358,7 +358,7 @@ class TestResolvePodNames:
     async def test_labels_resolve_all_pods(self, monkeypatch):
         from chaos_agent.agent import target_health
 
-        async def fake_resolve(t, kc):
+        async def fake_resolve(t, kc, *, xport_target=None):
             assert t.get("labels")
             return ["accounting-6fb-qn2vr", "accounting-6fb-xqhdd", "accounting-6fb-zf458"]
 
@@ -366,7 +366,7 @@ class TestResolvePodNames:
 
         queried_pods = []
 
-        async def fake_status(name, ns, kc):
+        async def fake_status(name, ns, kc, *, xport_target=None):
             queried_pods.append(name)
             return {"phase": "Running"}
 
@@ -383,12 +383,12 @@ class TestResolvePodNames:
     async def test_one_unhealthy_pod_among_healthy(self, monkeypatch):
         from chaos_agent.agent import target_health
 
-        async def fake_resolve(t, kc):
+        async def fake_resolve(t, kc, *, xport_target=None):
             return ["pod-a", "pod-b", "pod-c"]
 
         monkeypatch.setattr(target_health, "_resolve_pod_names", fake_resolve)
 
-        async def fake_status(name, ns, kc):
+        async def fake_status(name, ns, kc, *, xport_target=None):
             if name == "pod-b":
                 return {"phase": "Failed", "reason": "Evicted"}
             return {"phase": "Running"}
@@ -421,10 +421,10 @@ class TestResolvePodNames:
     async def test_all_pods_healthy(self, monkeypatch):
         from chaos_agent.agent import target_health
 
-        async def fake_resolve(t, kc):
+        async def fake_resolve(t, kc, *, xport_target=None):
             return ["accounting-6fb-qn2vr"]
 
-        async def fake_status(name, ns, kc):
+        async def fake_status(name, ns, kc, *, xport_target=None):
             return {"phase": "Running"}
 
         monkeypatch.setattr(target_health, "_resolve_pod_names", fake_resolve)
@@ -499,7 +499,7 @@ class TestRegisterHealthChecker:
     async def test_register_new_scope(self):
         class MyChecker:
             scope = "service"
-            async def check(self, target, kubeconfig):
+            async def check(self, target, kubeconfig, *, xport_target=None):
                 return HealthReport(
                     target=target,
                     overall=HealthSeverity.WARN,
@@ -541,7 +541,7 @@ class TestSafetyCheckIntegration:
         )
         monkeypatch.setattr(settings, "target_health_check_enabled", True)
 
-        async def fake_query(name, kc):
+        async def fake_query(name, kc, *, xport_target=None):
             return [{"type": "DiskPressure", "status": "True"}]
 
         monkeypatch.setattr(
@@ -602,7 +602,7 @@ class TestSafetyCheckIntegration:
         )
         monkeypatch.setattr(settings, "target_health_check_enabled", True)
 
-        async def fake_query(name, kc):
+        async def fake_query(name, kc, *, xport_target=None):
             return [{"type": "DiskPressure", "status": "True"}]
 
         monkeypatch.setattr(

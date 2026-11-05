@@ -6,9 +6,8 @@ without any binary ``k8s``/``host`` branch:
 
   1. scope -> profile resolution (``profile_of_scope`` / ``profile_for_spec``)
   2. guard cross-profile drift (a third profile is coarse drift vs. k8s)
-  3. observation-layer scope -> channel registry
-  4. side-effect node capture gate driven by ``observer.can_capture(spec)``
-  5. network feasibility fail-open for a non-k8s profile
+  3. side-effect node capture gate driven by ``observer.can_capture(spec)``
+  4. network feasibility fail-open for a non-k8s profile
 
 Nothing here ships a real third environment — the fake registrations are torn
 down by the autouse fixture, so the production registries are untouched.
@@ -17,7 +16,6 @@ from __future__ import annotations
 
 import pytest
 
-from chaos_agent.agent.nodes.execute import _effect_channels as ec
 from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as sed
 from chaos_agent.agent.nodes.side_effect._side_effect_detectors import (
     PostInjectState,
@@ -47,7 +45,6 @@ VM_SCOPE = "vm"
 def _register_fake_vm_environment():
     """Register a throwaway third profile/scope and restore every registry."""
     fam_snapshot = dict(fr._REGISTRY)
-    chan_snapshot = dict(ec._EFFECT_CHANNEL_FACTORIES)
     obs_snapshot = dict(sed._OBSERVERS)
 
     fr.register_family(
@@ -64,8 +61,6 @@ def _register_fake_vm_environment():
     finally:
         fr._REGISTRY.clear()
         fr._REGISTRY.update(fam_snapshot)
-        ec._EFFECT_CHANNEL_FACTORIES.clear()
-        ec._EFFECT_CHANNEL_FACTORIES.update(chan_snapshot)
         sed._OBSERVERS.clear()
         sed._OBSERVERS.update(obs_snapshot)
 
@@ -94,37 +89,6 @@ def test_guard_flags_third_profile_as_cross_profile_drift():
     assert decision.verdict == GuardVerdict.REJECT_DRIFT
 
 
-async def test_effect_channel_registry_accepts_third_scope():
-    """A newly-registered scope resolves to its factory; unknown scopes with
-    no factory still return None."""
-
-    class _DummyChannel:
-        scope = VM_SCOPE
-        pod_name = ""
-        node_name = ""
-
-        async def run(self, command: str) -> str:
-            return "ok"
-
-        async def sample(self, probe) -> str:
-            return "ok"
-
-    async def _factory(req):
-        return _DummyChannel()
-
-    ec.register_effect_channel(VM_SCOPE, _factory)
-
-    channel = await ec.resolve_effect_channel(
-        VM_SCOPE, names="vm-1", namespace="", kubeconfig="", task_id="", state=None,
-    )
-    assert isinstance(channel, _DummyChannel)
-
-    missing = await ec.resolve_effect_channel(
-        "no_such_scope", names="", namespace="", kubeconfig="", task_id="", state=None,
-    )
-    assert missing is None
-
-
 async def test_se_snapshot_not_skipped_when_namespace_not_required():
     """An observer whose ``can_capture`` returns True is never skipped for
     lacking a namespace — the node consults the observer, not ``== k8s``."""
@@ -135,10 +99,10 @@ async def test_se_snapshot_not_skipped_when_namespace_not_required():
         def can_capture(self, spec):
             return True
 
-        async def capture_base_snapshot(self, spec, kubeconfig, task_id=""):
+        async def capture_base_snapshot(self, spec, kubeconfig, task_id="", *, xport_target=None):
             return SideEffectSnapshot(captured_at="t", namespace="")
 
-        async def fetch_post_inject_state(self, spec, kubeconfig, injection_start_time, task_id=""):
+        async def fetch_post_inject_state(self, spec, kubeconfig, injection_start_time, task_id="", *, xport_target=None):
             return PostInjectState(captured_at="t")
 
         def summarize(self, snapshot):
