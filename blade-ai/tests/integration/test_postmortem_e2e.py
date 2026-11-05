@@ -228,7 +228,18 @@ class TestPostmortemE2E:
         # File written to the patched directory
         written = Path(pm["path"])
         assert written.is_file()
-        assert "# Postmortem: " in written.read_text(encoding="utf-8")
+        on_disk = written.read_text(encoding="utf-8")
+        assert "# Postmortem: " in on_disk
+
+        # Root-fix invariant: the payload markdown the platform reads is
+        # byte-identical to the on-disk file — both come from the single
+        # render_postmortem_markdown source. Before the fix the payload was
+        # body-only while the disk carried the header, so the deterministic
+        # facts never reached the platform.
+        assert pm["markdown"] == on_disk
+        # The deterministic header/fact block is now IN the payload.
+        assert "# Postmortem: " in pm["markdown"]
+        assert "**Task**: `task-e2e12345`" in pm["markdown"]
 
     @pytest.mark.asyncio
     async def test_terminal_pipeline_graceful_on_llm_timeout(

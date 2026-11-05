@@ -282,6 +282,45 @@ class TestApprovalCycleFromSpec:
         state = {}  # no fault_spec — defensive
         assert _freeze_from_state(state) is None
 
+    async def test_deterministic_verdict_survives_gate_refreeze(self):
+        # Regression (openspec mechanism-invariant-trust-boundary): the
+        # confirmation gate's approved re-freeze is the SINGLE approval point
+        # for a widened contract — it MUST carry the frozen
+        # ``deterministic_verdict`` forward verbatim, or every drill passing
+        # the gate would silently lose the rule binding and demote verify
+        # back to the drift-prone LLM triple.
+        spec = FaultSpec(
+            scope="statefulset", namespace="ns", names=("web-0",),
+            fault_target="rollingupdate", fault_action="partition-stuck",
+        )
+        dv = {"target": "statefulset", "action": "partition-stall",
+              "expected": {"Partition": "2"}}
+        state = {
+            "fault_spec": spec.to_dict(),
+            "approved_target": {
+                "scope": "statefulset",
+                "deterministic_verdict": dv,
+            },
+        }
+        approved = _freeze_from_state(state)
+        assert approved is not None
+        assert approved["deterministic_verdict"] == dv
+
+    async def test_absent_deterministic_verdict_stays_absent_on_refreeze(self):
+        # Byte-identical contract: a snapshot without the declaration must
+        # NOT gain the key on re-freeze (legacy drills unchanged).
+        spec = FaultSpec(
+            scope="pod", namespace="ns", names=("pod-a",),
+            fault_target="cpu", fault_action="fullload",
+        )
+        state = {
+            "fault_spec": spec.to_dict(),
+            "approved_target": {"scope": "pod"},
+        }
+        approved = _freeze_from_state(state)
+        assert approved is not None
+        assert "deterministic_verdict" not in approved
+
 
 # ---------------------------------------------------------------------------
 # CLI NL path — does NOT go through intent_clarification (only TUI does).
@@ -291,7 +330,7 @@ class TestApprovalCycleFromSpec:
 
 
 @pytest.mark.asyncio
-class TestCliNlPathSpecDerivation:
+class TestCliNlPathSpecFromDeclaration:
     """CLI NL (``blade-ai inject --input "..."``) skips intent_clarification
     (route_pipeline_start checks interaction_mode). The placeholder
     spec written at entry has empty scope/blade_target/blade_action/names
@@ -299,29 +338,28 @@ class TestCliNlPathSpecDerivation:
     prepositional node form; "对节点 X 注入" deliberately does not).
 
     For the inject to actually proceed, the spec must get populated
-    DURING agent_loop's planning phase — either:
-      - extract_planning_metadata lands the planner's explicit identity
-        declaration (finish_planning fault_scope/target/action — after
-        the #49 hijack legislation NOTHING is mined from
-        skill_case_content; a case doc is a menu, not the contract), OR
-      - agent_loop derives namespace/names from LLM's kubectl get probes.
+    DURING agent_loop's planning phase from the planner's explicit identity
+    declaration: extract_planning_metadata lands finish_planning's
+    fault_scope/target/action AND its victim selector
+    (fault_namespace/fault_names/fault_labels). After the #49 hijack
+    legislation NOTHING is mined from skill_case_content (a case doc is a
+    menu, not the contract), and after D1 (cli-nl-identity-from-declaration)
+    agent_loop no longer derives namespace/names from kubectl probe order —
+    the declaration is the ONLY authoritative source.
 
-    Without that, safety_check rejects with "No target specified".
+    Without it, safety_check rejects with "No target specified".
     """
 
     async def test_cli_nl_placeholder_spec_can_reach_safety_check(
         self, tmp_memory_dir, monkeypatch,
     ):
         """Full CLI NL flow: entry placeholder → LLM planning →
-        extract_planning_metadata lands the declared identity triple
-        + agent_loop derives namespace/names → safety_check sees a
-        complete spec and accepts."""
+        extract_planning_metadata lands the declared identity triple AND
+        the declared victim selector (fault_names) → safety_check sees a
+        complete spec and accepts. No probe-order derivation (D1)."""
         from langchain_core.messages import AIMessage, ToolMessage
         from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
             extract_planning_metadata,
-        )
-        from chaos_agent.agent.nodes.execute.agent_loop import (
-            _derive_spec_fields_from_kubectl_get,
         )
 
         monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
@@ -380,6 +418,7 @@ class TestCliNlPathSpecDerivation:
                             "fault_scope": "node",
                             "fault_target": "cpu",
                             "fault_action": "fullload",
+                            "fault_names": ["my-node"],
                         },
                         "id": "tc_fp",
                     }],
@@ -392,7 +431,9 @@ class TestCliNlPathSpecDerivation:
             ],
         }
 
-        # Stage 1: extract_planning_metadata lands the DECLARED identity
+        # Stage 1: extract_planning_metadata lands the DECLARED identity —
+        # the triple AND the victim selector (fault_names) declared on
+        # finish_planning. No probe-order derivation feeds this (D1).
         ep_result = await extract_planning_metadata(state)
         state.update(ep_result)
         spec_after_ep = read_fault_spec(state)
@@ -402,28 +443,22 @@ class TestCliNlPathSpecDerivation:
         )
         assert spec_after_ep.fault_target == "cpu"
         assert spec_after_ep.fault_action == "fullload"
-
-        # Stage 2: simulate agent_loop deriving namespace/names from a
-        # ``kubectl get`` probe LLM issued.
-        derived = _derive_spec_fields_from_kubectl_get(
-            v_args="node my-node",
-            blacklist=[],
+        assert spec_after_ep.names == ("my-node",), (
+            "extract_planning_metadata should land the declared victim "
+            "selector (fault_names) — D1 removed the probe-order path"
         )
-        updates = {k: v for k, v in derived.items()
-                   if not getattr(spec_after_ep, k, None)}
-        if updates:
-            state["fault_spec"] = spec_after_ep.replace(**updates).to_dict()
 
-        # Stage 3: safety_check must now accept (spec is_complete)
+        # Stage 2: safety_check must now accept (spec is_complete purely
+        # from the declaration).
         with patch("chaos_agent.agent.nodes.gates.safety_check.sync_to_store",
                    new=AsyncMock()):
             sc_result = await safety_check(state)
         assert sc_result["safety_status"] != "rejected", (
-            f"safety_check rejected even after lazy derivation: "
+            f"safety_check rejected a fully-declared spec: "
             f"{sc_result.get('safety_reason')}"
         )
 
-        # And the derived names should be visible to baseline_capture
+        # And the declared names should be visible to baseline_capture
         final_spec = read_fault_spec(state)
         assert final_spec.names == ("my-node",)
         assert final_spec.scope == "node"

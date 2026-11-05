@@ -62,6 +62,25 @@ def _isolate_task_store(tmp_path, monkeypatch):
     # gate treats an empty token as "issue reporting off".
     monkeypatch.setattr(_settings_mod.settings, "github_token", "", raising=False)
 
+    # Config-resolution seam (single point of closure). settings.py resolves
+    # the config path via ``_active_config_file()``, which reads the env var
+    # ``BLADE_AI_CONFIG_DIR`` FIRST (on every call) and only falls back to the
+    # module-level ``_CONFIG_FILE`` when it is absent. Config tests isolate by
+    # monkeypatching ``_CONFIG_FILE`` — the LOWER-priority seam — so an ambient
+    # ``BLADE_AI_CONFIG_DIR`` silently overrides every one of those patches and
+    # leaks whatever ``$BLADE_AI_CONFIG_DIR/config.json`` holds (in practice the
+    # developer's real ``~/.blade-ai/config.json``) into the suite. This is not
+    # hypothetical: the drill-isolation workflow exports ``BLADE_AI_CONFIG_DIR``
+    # routinely (see skills/*/CASE_实测记录.md), and a full regression launched
+    # from such a shell turned 6 test_settings.py cases red — deterministically,
+    # though green in a clean shell (which is why it masqueraded as a flake).
+    # Neutralising it here (the same hermetic posture as the kube/LLM/github
+    # guards above) makes ``_CONFIG_FILE`` monkeypatching authoritative for ALL
+    # tests, present and future. Tests that genuinely exercise the redirect
+    # (test_wizard, test_factory_integration) ``setenv`` it themselves; being
+    # non-autouse they run AFTER this fixture, so their value still wins.
+    monkeypatch.delenv("BLADE_AI_CONFIG_DIR", raising=False)
+
     # R+L carrier-image resilience (run5): the discovery set and the
     # once-per-process lazy-refresh latch are process-global mutable state
     # the preplan probe / guard-time refresh write. Reset both per test, and

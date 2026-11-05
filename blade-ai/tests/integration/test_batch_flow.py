@@ -210,14 +210,21 @@ class TestBatchFlow:
         assert len(results) == 3
         for i, r in enumerate(results):
             assert r["experiment_uid"] == f"blade-uid-{i}"
-            # The stub never runs a verifier, so no verdict is recorded — and a
-            # terminal record without a verdict is FAILED, not "injecting".
-            # ``batch_next`` shares ``terminal_task_state`` with the
-            # single-injection result builder precisely so both report this the
-            # same way; before that, batch said "injecting" (in progress, at a
-            # point where nothing is in progress) while the single path said
-            # "injected" (a success claim with no evidence).
-            assert r["task_state"] == "failed"
+            # The contract this test pins is AGREEMENT: ``batch_next`` shares
+            # ``terminal_task_state`` with the single-injection result builder
+            # so the same situation is never reported two ways (before that,
+            # batch said "injecting" while the single path said "injected").
+            # That agreement still holds. What changed is the WORD for a state
+            # carrying durable Layer-1 evidence (a82984a3 root cure: "no
+            # verdict" ≠ "no evidence"). Fault 0's stub plants its OWN
+            # ``inject_layer1_cache`` = passed — in production that cache only
+            # exists if a verifier iteration confirmed the experiment ran — so
+            # its honest terminal word is now "injected" even though the stub
+            # ran no LLM verifier. Faults 1-2 carry no cache (the per-fault
+            # reset the sibling test pins clears fault 0's before fault 1
+            # starts), so they stay fail-closed "failed".
+            expected_state = "injected" if i == 0 else "failed"
+            assert r["task_state"] == expected_state
             assert r["task_id"].startswith("inject-")
 
     @pytest.mark.asyncio
