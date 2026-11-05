@@ -68,8 +68,8 @@
 # 0) 先测容器运行时目录所在分区的基线
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host df -h /var/lib/containerd
 
-# 0b) 【弹药实测，必做】只读求和节点现有镜像层总量：DiskPressure 触发后
-#     kubelet 会回收未使用镜像层（实测可回收 ~4GiB），填充量若只略超阈值，
+# 0b) 【弹药探测，必做】只读求和节点现有镜像层总量：DiskPressure 触发后
+#     kubelet 会回收未使用镜像层（如可回收 ~4GiB），填充量若只略超阈值，
 #     GC 回收后使用率回落到阈值以下，DiskPressure 反复翻转、驱逐链路不稳定
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host crictl images
 
@@ -112,5 +112,5 @@ kubectl delete pods --field-selector=status.phase=Failed
 - 与 ChaosBlade `--percent` 不同，此方式需手动计算填充字节数
 - 自恢复基于 systemd-run transient timer 到期自动回收填充文件（payload 为幂等家族逆 `truncate -s 0`），补齐了 ChaosBlade `--timeout` 的自恢复能力；timer 由宿主 PID 1 管理，debug pod 被 DiskPressure 驱逐也不影响到期触发；被驱逐的 Pod 由上层控制器自动重建，Evicted 残留记录需手动清理
 - 同名 transient timer 重复武装会报 `Unit blade-restore-diskfill.service was already loaded`（上次武装命令执行失败时 unit 以 failed 状态残留所致）；重武装**换一个唯一 unit 名**（如 `blade-restore-diskfill-2`）即可，不得用 systemctl stop/reset-failed 清理（banned verb，会被宿主命令守卫拒绝）；武装命令成功执行过的 unit 到期后自动卸载，可直接重武装同名
-- **驱逐豁免的实测判据是 Pod priority，不是 toleration**：kubelet 驱逐按 QoS/优先级排序，system-node-critical 类高优先级 Pod（多数系统 DaemonSet）实测幸存；toleration 只影响准入调度，不影响驱逐排序——验证时不要把"带 toleration"当作豁免证据
+- **驱逐豁免的判据是 Pod priority，不是 toleration**：kubelet 驱逐按 QoS/优先级排序，system-node-critical 类高优先级 Pod（多数系统 DaemonSet）通常幸存；toleration 只影响准入调度，不影响驱逐排序——验证时不要把"带 toleration"当作豁免证据
 - **DiskPressure 存续期会产生两类 Evicted 记录**：资源驱逐型（message 含 `low on resource: ephemeral-storage`，驱逐已有 Pod）与准入拒绝型（message 含 `The node had condition: [DiskPressure]`，调度期拒绝新建 Pod）。统计爆炸半径时须按 message 区分代际，不得混计；压力解除后两类记录均会停止产生

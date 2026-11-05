@@ -90,7 +90,7 @@ action**，语义不等价。手段按**当前执行凭证的 RBAC** 路由：�
 
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Corefile 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，**全落靶 ns kube-system**，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权（GET 探测 + 写动词 SSAR 全查）→ 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告。通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用。装配不可用形态（对号入座即降级正文 SOP；计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：执行凭证无 kube-system 建权（栈构建 fail-closed 报告会精确指出缺哪权）/ 无 cm patch（注入 partial——载体保留至 TTL 对未注入靶标 no-op fire 后自然收敛，降级前按 receipt 的 recovery_handle 处置载体）/ SSAR 403）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Corefile 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，**全落靶 ns kube-system**，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权（GET 探测 + 写动词 SSAR 全查）→ 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告。通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用。装配不可用形态（对号入座即降级正文 SOP；计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：执行凭证无 kube-system 建权（栈构建 fail-closed 报告会精确指出缺哪权）/ 无 cm patch（注入 partial——载体保留至 TTL 对未注入靶标 no-op fire 后自然收敛，降级前按 receipt 的 recovery_handle 处置载体）/ SSAR 403）：
 
 ```yaml
 targetRef:                                # 靶（kube-system 基础设施对象；主路径建模路径 A 形态）
@@ -407,13 +407,13 @@ server 块合并）。全程只用 `cm create/delete` + `deployments patch` 三�
    为窗口内 primary evidence 而非仅凭自身事后观察）。verify 消耗在日志考古上的预算应转向：白盒恢复
    确认（Corefile 回读比对）+ 事后解析恢复探针 + 执行器轨迹里的中段采样记录
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活：
+**持续性检查**——故障窗口内故障必须持续存活：
 1. 白盒主证复查：路径 A 回读 Corefile template 块仍在；路径 B 独立 ConfigMap 仍在且
    args 仍含追加项——**配置即状态**，配置存活即故障存活（新 Pod 滚动重建也会带注入配置，
    不存在单点失效形态）
-2. 窗口中段复查（时点公式 + 单批采集）：以「注入生效确认」为时点锚（生效确认探针
+2. 窗口中段复查（时点锚 + 自判间隔）：以「注入生效确认」为时点锚（生效确认探针
    即注入验证第 3 条形态；reload 路径生效 ≤2 分钟，未生效时短间隔重探而非盲等），
-   生效后一次 `time_wait 60`（避 CoreDNS 缓存 30s），到点**同轮下发**三条探针：
+   生效后隔多久复测由你依本故障传播特性自判（CoreDNS 负缓存约 30s，复测须跨过该缓存窗才不被旧缓存误导；无固定间隔），到点**下发**复测探针：
    白盒复查（本节第 1 条形态）+ 行为复查（注入验证第 3 条形态）+ 对照复查
    （注入验证第 4 条形态），**具体记录命令与输出**——效果证据须在故障存活期内
    采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告

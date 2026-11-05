@@ -22,7 +22,7 @@ mechanism_writes:
 **用例名称** PVC未绑定 导致 Pod_Pending
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载并还原 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载并还原 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -52,7 +52,7 @@ restorePatches:                           # 恢复域：载体 TTL 到点自治�
 durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- 道具 PVC（引用不存在 StorageClass、永远 Pending 的瞬态对象）为 execute 计划 manifest 步骤（走 front matter mechanism_writes 立法条目）；收尾清理步删除。
+- 道具 PVC（引用不存在 StorageClass、永远 Pending 的瞬态对象）为 execute 计划 manifest 步骤（走 front matter mechanism_writes 立法条目）；**它是 apply-native object-write 注入、绝非 setup，必须排在载体武装之后创建（armed-before-inject 硬序，见标准件第四节「create 域道具对象是故障生效动作、绝非 setup」），并登记进装配器 `extra_delete` 使载体 TTL 自治恢复 + `blade-ai recover` 重放都删除它**（收尾清理步为其带外兜底）。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
 ## 故障现象
@@ -76,7 +76,17 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 
 ## 演练步骤
 （主路径 = 载体配方经 `faultdrill_assemble_carrier` 一次调用执行；手动序列仅当装配器 fail-closed 报告不可用时作降级兜底。注意：本用例需要临时修改 Deployment 添加 volume 引用，这是故障注入的必要操作，不违反安全红线。目标应用无需预先配置 PVC——注入的目的就是添加一个无法绑定的 PVC 依赖。恢复步骤会还原所有修改）：
-1. 使用 `kubectl apply -f` 创建一个引用不存在的 StorageClass 的 PVC（通过 `stdin_data` 传入 YAML；走 frontmatter mechanism_writes 道具立法条目）：
+1. **基线捕获**（restorePatches 的基线值来源，两条路径共用；只读 setup，可前置完成）——记录 volumes/volumeMounts 数组基线与 maxUnavailable 原值：
+   ```bash
+   kubectl get deployment <deployment-name> -n <namespace> \
+     -o jsonpath='{.spec.template.spec.volumes}'
+   kubectl get deployment <deployment-name> -n <namespace> \
+     -o jsonpath='{.spec.template.spec.containers[<container-index>].volumeMounts}'
+   kubectl get deployment <deployment-name> -n <namespace> \
+     -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}'
+   ```
+2. 调用 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、target_name=<deployment-name>、target_namespace=<namespace>、patches/restore_patches=载体配方数组、duration_seconds=<duration>、**extra_delete=`[{"kind":"PersistentVolumeClaim","name":"app-data-claim","namespace":"<namespace>"}]`**——把步骤 3 的道具 PVC 登记进载体 TTL 自治恢复 + `blade-ai recover` 重放的删除清单，闭合非 patch 域 residue）——patches 里的 maxUnavailable 100% 确保滚动更新能完成（故障注入的新 Pod 不会 Ready，默认策略下 K8s 不会终止旧 Pod，导致滚动更新死锁），工具内同步完成建栈+验权+**武装**+注入（patch 域：给 Deployment 加引用 app-data-claim 的 volume/volumeMount）+readback，回执 status=success 即注入落地且载体已武装；status=partial = 载体已武装但注入未确认，勿重建载体，用 `blade-ai recover` 提前收敛
+3. **创建道具 PVC（必须排在步骤 2 装配器武装之后——armed-before-inject 硬序，见标准件第四节「create 域道具对象是故障生效动作、绝非 setup」）**：道具 PVC 的 `kubectl apply -f`（inline manifest、kind=PersistentVolumeClaim ∈ 持久故障对象族）本身就是一次 object-write 注入，**武装前创建会被 target_guard 判 `REJECT_BANNED armed-before-inject`**（无恢复载体的无界对象写）；装配器已在步骤 2 同步武装，此处再创建（走 frontmatter mechanism_writes 道具立法条目，通过 `stdin_data` 传入 YAML）：
    ```yaml
    apiVersion: v1
    kind: PersistentVolumeClaim
@@ -90,16 +100,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
        requests:
          storage: 10Gi
    ```
-2. 基线捕获（restorePatches 的基线值来源，两条路径共用）——记录 volumes/volumeMounts 数组基线与 maxUnavailable 原值：
-   ```bash
-   kubectl get deployment <deployment-name> -n <namespace> \
-     -o jsonpath='{.spec.template.spec.volumes}'
-   kubectl get deployment <deployment-name> -n <namespace> \
-     -o jsonpath='{.spec.template.spec.containers[<container-index>].volumeMounts}'
-   kubectl get deployment <deployment-name> -n <namespace> \
-     -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}'
-   ```
-3. 调用 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、target_name=<deployment-name>、target_namespace=<namespace>、patches/restore_patches=载体配方数组、duration_seconds=<duration>）——patches 里的 maxUnavailable 100% 确保滚动更新能完成（故障注入的新 Pod 不会 Ready，默认策略下 K8s 不会终止旧 Pod，导致滚动更新死锁），工具内同步完成建栈+验权+武装+注入+readback，回执 status=success 即注入落地且载体已武装；status=partial = 载体已武装但注入未确认，勿重建载体，用 `blade-ai recover` 提前收敛
+   （步骤 2 的 patch 先引用、本步后创建 PVC 之间有 ~1s 间隙，事件史会多一条 transient `persistentvolumeclaim "app-data-claim" not found`——**benign 预期，非缺陷**：K8s 允许 volume 引用不存在的 PVC，Pod 照样 Pending，稳态收敛到注入验证判据 4 的 `unbound immediate PersistentVolumeClaims`，勿据 transient 事件判注入失败。主路径下装配器把「武装 + patch 域注入」绑成一次原子调用，道具 create 域只能排在其后，故此间隙不可消除、也无需消除。）
 4. 等待 Pod 滚动更新完成，确认所有旧 Pod 已被替换；观察新 Pod 的状态
 5. ⚠️ **效果采样职责**（两条路径共用）：必须在**注入生效后、恢复执行前**的窗口中段完成一次效果采样并
    记录输出——`kubectl get pods -l <pod-label> -n <ns>`（确认新 Pod 全部
@@ -132,16 +133,16 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl exec <宿主Pod> -n <宿主ns> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-pvc.sh; ( sleep <duration>; sh /tmp/blade-restore-pvc.sh ) >/tmp/restore.log 2>&1 & echo armed'
    ```
    无可用外部宿主时按 **恢复载体标准件**（`references/carrier/recovery-carrier.md`）自建载体栈
-   （busybox/curl 镜像、Pod/SA/Role/RoleBinding 四对象同名、同靶点命名空间）——
+   （curl-capable 镜像〔见标准件 §4，busybox 无 curl 不可用〕、Pod/SA/Role/RoleBinding 四对象同名、同靶点命名空间）——
    载体内无 kubectl，武装形态改用标准件第四节的 SA token REST 模板（本用例 =
    PATCH deployment 摘卷 + DELETE PVC，Role 按标准件第二节推导），长 REST 载荷的
    字节压力按标准件第七节处置链（紧凑变量形态 → 拆串联 → base64 两步法/分块并行）同样适用；自建栈时启用自断授权尾步（标准件第四节：**最后一个**恢复 curl（DELETE PVC）升 `curl -sf` 并以 `&&` 链自删 DELETE 自己的 Binding（本用例 namespaced 栈删 `rolebindings/drill-rc-<hash>`），Role 建栈后按标准件第二节两步建栈法 json-patch 追加独立自删规则（**严禁把自删 flag 合并进 create 命令**——pflag 并集复制会污染主恢复规则，主授权规则带锁名即 GET 目标资源 403、case 不可执行）；fail-open——主恢复未确认成功则授权保留，字节挤不下就不带，完整形态与五纪律以标准件第四节为准）；标准件亦建不起来时按标准件第八节降级——
    任务如实失败收尾，不得注入（无自动恢复通道即无注入许可，不存在
-   「Agent 在线保活」形态）。（基线捕获与效果采样职责见主路径步骤 2/5，两条路径共用。）
+   「Agent 在线保活」形态）。（基线捕获与效果采样职责见主路径步骤 1/5，两条路径共用。）
    倒计时从武装时刻起算：先校验后武装、与注入紧邻（≤60s）；武装后发生任何修复须先
    `kubectl exec <宿主Pod> -n <宿主ns> -- sh -c 'pkill -f blade-restore-pv[c]; true'`
    停旧定时器再全额重武装（见 SKILL.md 安全红线「故障窗口完整」）
-3. 使用 `kubectl patch` 修改应用 A 的 Deployment，添加引用该 PVC 的 volume 和 volumeMount；等待 Pod 滚动更新完成，观察新 Pod 的状态
+3. **创建道具 PVC（排在步骤 2 武装之后、本步 patch 注入之前——armed-before-inject 硬序同标准件第四节；YAML 同主路径步骤 3。fallback 下武装〔步骤 2〕与注入分离，故先建 PVC 再 patch，PVC 先于 volume 引用到位、无主路径那条 transient `not found` 间隙）**，再使用 `kubectl patch` 修改应用 A 的 Deployment，添加引用该 PVC 的 volume 和 volumeMount；等待 Pod 滚动更新完成，观察新 Pod 的状态
 4. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段——主路径下此项随 restorePatches 由载体 TTL 还原，无需手动执行）
 
 ## 注入验证

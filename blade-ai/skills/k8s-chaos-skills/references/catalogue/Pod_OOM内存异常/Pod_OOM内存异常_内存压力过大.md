@@ -51,8 +51,8 @@ with open("/tmp/memcache-warmup.pid", "w") as f:
 time.sleep(<recovery-seconds>)              # 到期进程退出即自动释放
 EOF
 nohup python /tmp/mem_stress.py >/dev/null 2>&1 &'
-# 方案2'（闭环 cgroup 计数，perl；#47 实测后立法的首选形态）：固定分配量估算对解释器开销的
-# 假设不可靠——perl 的 SvGROW 超额分配使每块驻留 RSS 放大 ~1.26x（实测：请求 398Mi →
+# 方案2'（闭环 cgroup 计数，perl；首选形态）：固定分配量估算对解释器开销的
+# 假设不可靠——perl 的 SvGROW 超额分配使每块驻留 RSS 放大 ~1.26x（如请求 398Mi →
 # VmRSS 502.75Mi，占 limit 98.3%，距 OOMKill 仅一步）。闭环形态不假设开销，直接读 cgroup
 # 计数器分配到目标水位，解释器放大被闭环自动吸收；块更小（4Mi）且过冲只剩单块余量：
 kubectl exec <pod-name> -n <namespace> -- sh -c 'cat > /tmp/mem_stress.pl << "EOF"
@@ -81,7 +81,7 @@ kubectl exec <pod-name> -n <namespace> -- sh -c '
   echo $! > /tmp/memcache-warmup.pid
 '
 ```
-倒计时从武装时刻起算：内存驻留与到期释放定时在同一载荷内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'kill $(cat /tmp/memcache-warmup.pid) 2>/dev/null; pkill -f mem_stress.p[y]; true'` 停掉旧驻留进程（方案2/3 通吃），再重跑对应方案的注入命令原子重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）。#47 实测：注入成功后 Agent 框架层崩溃且自动回滚失败（无人清理的最坏情形），正是载荷内原子 timer 到期自释放收的尾（600s 精确自清，memory 压力残留归零）——窗口自持设计不依赖任何上层存活
+倒计时从武装时刻起算：内存驻留与到期释放定时在同一载荷内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'kill $(cat /tmp/memcache-warmup.pid) 2>/dev/null; pkill -f mem_stress.p[y]; true'` 停掉旧驻留进程（方案2/3 通吃），再重跑对应方案的注入命令原子重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）。载荷内原子 timer 到期自释放正是为覆盖最坏情形（注入成功后 Agent 框架层崩溃且自动回滚失败、无人清理）——timer 到期自清收尾（如 600s 精确自清、memory 压力残留归零），窗口自持设计不依赖任何上层存活
 
 `<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
 （= duration + grace，见 SKILL.md 双数窗口契约）——方案1 stress-ng 的 `--timeout`、
@@ -120,7 +120,7 @@ kubectl exec <pod-name> -n <namespace> -- \
 注意事项：
 - stress-ng `--vm-bytes` 按系统内存百分比计算，非 Pod cgroup 百分比，需手动转算绝对值
 - **严禁一次性构造全量分配**（`bytearray(总量)`、`perl "x"x总量`）：瞬时峰值约为目标量 2 倍，即使增量算对了也会越过余量被 OOMKill——分块（每块 100MB + 短间隔）是唯一稳妥写法
-- **perl 分块的驻留量也有放大，不只是瞬时峰值**（#47 实测）：SvGROW 超额分配使每块实际 RSS ≈ 请求量 ×1.26——固定分配量估算会把累计驻留推到 98%+ 水位（距 OOMKill 一步）。perl 载体一律用方案 2' 闭环 cgroup 计数形态，让分配量由实测计数器收敛而非估算
+- **perl 分块的驻留量也有放大，不只是瞬时峰值**：SvGROW 超额分配使每块实际 RSS ≈ 请求量 ×1.26——固定分配量估算会把累计驻留推到 98%+ 水位（距 OOMKill 一步）。perl 载体一律用方案 2' 闭环 cgroup 计数形态，让分配量由闭环计数器收敛而非估算
 - dd 管道方案驻留时长 = sleep 挂管道的时长（到期 EOF → tail 退出 → 释放），且逐块拷贝速度慢于分块分配，仅作无 python/perl 时的保底
 - 无 cgroup 感知能力，可能直接触发 OOMKill 而非停留在“接近 Limit”状态
 - **量必须按增量算**（分配量 = limit × 目标百分比 − 当前用量）。按目标百分比的绝对值直接分配会越过剩余余量触发 OOMKill——注入进程被杀、效果不出现，表现为「执行了但 top 无变化」

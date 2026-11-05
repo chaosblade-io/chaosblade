@@ -173,7 +173,7 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
 > - 同一事实（如实验是否生效）确认一次即可，不要重复查询。
 > - `kubectl get pod -w` 会持续阻塞，验证时用不带 `-w` 的单次查询。
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活，而非注入一次即消失：
+**持续性检查**——故障窗口内故障必须持续存活，而非注入一次即消失：
 1. 手段1：窗口中段复查 `blade status --uid <experiment_uid>` 仍为 Success/Running
 2. 手段2 路径A：窗口中段在目标容器内复查 `iptables -S` 仍含 DROP 规则
 3. 手段2 路径B：以日志为准——`INJECTED` 已现而 `RECOVERED` 未现即窗口仍开、规则仍活

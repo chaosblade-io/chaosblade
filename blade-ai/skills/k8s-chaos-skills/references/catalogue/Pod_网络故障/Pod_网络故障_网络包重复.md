@@ -187,7 +187,7 @@ kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
    kubectl logs <pod-name> -n <namespace> --tail=30
    ```
 5. 确认 Pod 状态仍为 Running、无 RESTARTS（duplicate 不杀连接，只耗带宽与 CPU）
-6. **持续性检查（必做）**——netem 是状态型故障，规则存活即故障存活：白盒主证为
+6. **持续性检查**——netem 是状态型故障，规则存活即故障存活：白盒主证为
    `tc qdisc show dev eth0` 仍显示 `netem ... duplicate` 规则（手段1 实验未 destroy 且未到
    `--timeout`；手段2 路径A 武装定时器未走完）；路径B 以日志为准：`INJECTED` 已现而
    `RECOVERED` 未现即窗口仍开（链条严格串行，两标记之间的规则快照即生效主证）。有界佐证

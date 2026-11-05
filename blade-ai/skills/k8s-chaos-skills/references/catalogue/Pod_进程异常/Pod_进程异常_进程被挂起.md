@@ -28,7 +28,9 @@ kubelet 周期探测累积失败（需连续失败达 failureThreshold，存在�
 3. 所有入站请求超时，服务完全不可用（模拟应用死锁场景）
 4. 容器重启**不出现**（预期阴性：无 Liveness 探针或探针未达 failureThreshold 时——
    出现即 Liveness 触发，按故障定位约束②记录为「故障导致重启」并核对窗口缩短量）
-5. 同节点其他 Pod 零影响、节点 Conditions 无漂移（预期阴性——出现即爆炸半径失控）
+5. 同节点其他 Pod 相对自身基线零新增影响、节点 Conditions 无注入新增漂移（预期
+   阴性——相对自身基线出现新增漂移即爆炸半径失控；预存异常 Pod 按自身节奏的
+   基线内自重不在此列）
 
 ## 资源准备
 1. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（多容器混存时
@@ -72,10 +74,12 @@ kubelet 周期探测累积失败（需连续失败达 failureThreshold，存在�
    kubectl get pods -n <namespace> -l <label-selector> -o wide
    kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
      'grep State /proc/$(pgrep -x <process-name>)/status'
-   kubectl get pods -A -o wide --field-selector spec.nodeName=<node-name> --no-headers
+   # 同节点 Pod 逐 Pod restartCount 基线（爆炸半径 delta 对照的零点，紧凑 jsonpath 抗截断）
+   kubectl get pods -A --field-selector spec.nodeName=<node-name> -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.phase}:{.status.containerStatuses[0].restartCount}{"\n"}{end}'
    ```
-   记录：进程正常状态 `S (sleeping)`（恢复对照）、Pod RESTARTS 基线、同节点
-   Pod 清单（爆炸半径对照）
+   记录：进程正常状态 `S (sleeping)`（恢复对照）、Pod RESTARTS 基线、**同节点各 Pod
+   restartCount 基线并显式锁定预存异常 Pod 的基线态**（CrashLoopBackOff/长期 Pending/
+   Terminating 的 Pod 窗口内按自身节奏继续自重属基线内、非注入所致，计划点名供 verifier 勿误判）
 
 ## 演练步骤
 1. 记录注入前基线（资源准备第 5 条全部输出）
@@ -104,7 +108,7 @@ kubelet 周期探测累积失败（需连续失败达 failureThreshold，存在�
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   '( sleep <recovery-seconds>; kill -CONT $(pgrep -x <process-name>); echo PROCSTOP_RESTORED >> /tmp/procstop.evd ) >/dev/null 2>&1 & \
-   kill -STOP $(pgrep -x <process-name>) && echo PROCSTOP_INJECTED >> /tmp/procstop.evd'
+   kill -STOP $(pgrep -x <process-name>) && echo PROCSTOP_INJECTED > /tmp/procstop.evd'
 ```
 
 `<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`
@@ -205,13 +209,24 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    # ⚠️ 关键顺序：先用 systemd-run 登记定时 THAWED，再写 FROZEN。
    #    冻结后该容器无法 exec 进入（进程被冻结无法响应），且 debug pod 可能先于
    #    解冻被删除 —— 定时器由宿主机 systemd(PID 1) 管理，不受 debug pod 生命周期影响。
+   #    --collect：fire 后瞬态单元被 systemd 无条件回收（成功/失败均不残留），
+   #    与 Node_CPU 案同源；缺它时失败态单元不被 GC 会留残留，逼出下方禁令里的清理步。
    kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
      -- chroot /host sh -c '
-       systemd-run --on-active=<recovery-seconds>s --unit=blade-thaw-<containerID前12位> \
+       systemd-run --collect --on-active=<recovery-seconds>s --unit=blade-thaw-<containerID前12位> \
          sh -c "echo THAWED > <freezer.state 路径>" &&
        echo FROZEN > <freezer.state 路径>
      '
    ```
+
+> **路径 B 无任何定时器拆除义务（规划期一次定案，勿逐次重推）**：上方 `systemd-run
+> --collect` 武装的解冻瞬态单元 fire 后由 systemd 无条件自 GC（`--collect` 保证成功
+> 或失败态都回收），且 THAWED 载荷幂等（解冻后框架派发的恢复或提前恢复再写一次
+> THAWED 无害）——**因此不存在需要清理的定时器残留**。严禁在 execute 计划里另加
+> `systemctl stop/reset-failed blade-thaw-*` 或 pkill 清理步：`systemctl` 是 host
+> 域禁词，plan 级禁词扫描会判「PLAN/GUARD INCOMPATIBILITY」强制重写整份计划、白烧
+> 一轮规划。如需确认零残留，只做只读
+> `ls /run/systemd/transient/`（fire 后应为空），无需任何管理动词。
 
 ## 注入验证
 （手段1/手段2 路径 A 共用；路径 B 差异单列。本用例判据全部是只读
@@ -226,10 +241,12 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    ```
    procps 输出 STAT 列显示 T；/proc 输出 `State:\tT (stopped)`（正常运行为
    `State:\tS (sleeping)`）
-   **路径 B 效果判据形态完全不同（云内核 5.10 级）**：cgroup freezer
-   冻结的进程 **/proc State 仍显示 S、内核栈仍显示原睡眠栈（如 hrtimer_nanosleep）、
-   wchan=0、PF_FROZEN 不显示**——这些「看起来没冻结」是正常表象，**不是判死证据，
-   严禁据此推断注入失败**。路径 B 的效果判据用以下两条：
+   **路径 B 效果判据形态完全不同**：cgroup freezer 冻结的进程 **/proc State 依内核
+   与 cgroup 版本而变——可能仍显示 S（原睡眠栈如 hrtimer_nanosleep、wchan=0、
+   PF_FROZEN 不显示），也可能转为 D（disk sleep；cgroup-v1 refrigerator 把冻结任务
+   置于 TASK_UNINTERRUPTIBLE）**。S 与 D 都是冻结的正常表象、**均非判死证据，严禁据
+   任一推断注入失败（或据 D 推断冻结更深/更成功）**——path B 判据不由 /proc State
+   承担，一次观测到的具体字母（S 或 D）不得固化为普世断言。路径 B 的效果判据用以下两条：
    - **机制主证**：`freezer.state` 读回 `FROZEN`（空 cgroup 写 FROZEN 也立即成立，
      必须配合下一条行为学判据交叉）
    - **行为学判据（决定性）**：`timeout 5 kubectl exec <pod> -- echo ok` 挂住超时
@@ -252,14 +269,18 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    RESTARTS 零漂移；路径 B 读 `freezer.state` 输出 `FROZEN` 而非 exec）
 4. Liveness 探针事件（配置了才有）——探针失败由 kubelet 周期探测累积触发，存在
    传播延迟：**首查未见事件不构成反证**，挂起的直接证据是第 1 条的进程 T 状态
-5. **爆炸半径交叉确认**：
+5. **爆炸半径交叉确认**（判据 = 逐 Pod 对照自身基线的 delta、非绝对态，详见 SKILL.md「爆炸半径验证判据」）：
    ```bash
-   kubectl get node <node-name> -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}'
-   kubectl get pods -A -o wide --field-selector spec.nodeName=<node-name> --no-headers
+   # 节点 Conditions 定点查标准项（云厂商 NPD 十余项自定义 condition 时全量单行 jsonpath 会截断）
+   kubectl get node <node-name> -o jsonpath='Ready={.status.conditions[?(@.type=="Ready")].status} MemoryPressure={.status.conditions[?(@.type=="MemoryPressure")].status} DiskPressure={.status.conditions[?(@.type=="DiskPressure")].status} PIDPressure={.status.conditions[?(@.type=="PIDPressure")].status}{"\n"}'
+   # 每 Pod 一行紧凑 jsonpath（-o wide 在数十 Pod 节点截断，且 RESTARTS 列聚合 initContainer 重启）
+   kubectl get pods -A --field-selector spec.nodeName=<node-name> -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.phase}:{.status.containerStatuses[0].restartCount}{"\n"}{end}'
    ```
-   节点 Conditions 与基线一致；同节点 Pod 与基线清单一致（无 Evicted、无异常
-   重启）——进程级故障不外溢
-6. **持续性检查（必做）**——占用是状态型故障，挂起存活即故障存活：45s 后复查
+   节点 Conditions 与基线一致；同节点 Pod 逐 Pod 对照资源准备第 5 条记录的自身
+   restartCount 基线，**无注入新增的** Evicted/重启漂移——进程级故障不外溢。预存异常
+   Pod（CrashLoopBackOff/长期 Pending/Terminating）窗口内按自身节奏的继续自重属基线内、
+   非注入所致，勿误判为失控
+6. **持续性检查**——占用是状态型故障，挂起存活即故障存活：45s 后复查
    进程 STAT 仍为 T（或 /proc State 仍 stopped）
 7. 路径 A 补自证链：`cat /tmp/procstop.evd` 含 `PROCSTOP_INJECTED`（含
    `PROCSTOP_RESTORED` 即窗口已关，如实报告实际时长）
@@ -280,19 +301,22 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    不再显示 T）
 1a. **路径 B 恢复主证**：`freezer.state` 读回 `THAWED` + **exec 恢复响应**
    （`timeout 5 kubectl exec <pod> -- echo ok` 立即回显——与冻结期的挂住超时形成
-   行为学对照）；进程 State 全程为 S 不是恢复证据（见注入验证第 1 条路径 B 说明）
+   行为学对照）；进程 State（无论冻结期观测到 S 还是 D）全程不是恢复证据（见注入
+   验证第 1 条路径 B 说明）
 2. 服务恢复响应：wget localhost:<port> 正常返回
 3. 路径 A：证据文件含 `PROCSTOP_RESTORED`（双标记齐备 = 注入与还原全程自证）
 4. Pod 状态 Running、RESTARTS 与基线一致（或按 Liveness 分支 +1 且与事件对账）
-5. 爆炸半径最终对照：节点 Conditions 与同节点 Pod 清单与基线一致——进程级故障
-   全程未外溢的最终证据
+5. 爆炸半径最终对照：节点 Conditions 无注入新增漂移；同节点 Pod 逐 Pod 对照自身
+   基线无注入新增的 Evicted/重启漂移（预存自重 Pod 的基线内漂移排除归因）——进程级
+   故障全程未外溢的最终证据
 
 ## 基准事实
 - **根因**：容器内应用主进程收到 SIGSTOP 信号被内核挂起，进程不退出但完全停止
   执行，无法处理任何请求
 - **必现现象**：进程状态变为 T（Stopped）；应用端口请求全部超时；Pod 状态保持
   Running（进程 PID 仍存在）——T 状态与端口超时为路径 A 形态；**路径 B（freezer）
-  形态：进程 State 保持 S、内核栈保持原样（内核不暴露冻结态），必现现象是
+  形态：内核不以单一稳定字母暴露冻结态——进程 State 依内核/cgroup 版本保持 S（原
+  睡眠栈）或转为 D（refrigerator→TASK_UNINTERRUPTIBLE），必现现象是
   exec 挂住超时 + freezer.state=FROZEN**（冻结中 `timeout 6
   kubectl exec -- echo` rc=1 无输出，解冻后立即回显 rc=0——冻结/解冻行为学
   对照干净可逆）

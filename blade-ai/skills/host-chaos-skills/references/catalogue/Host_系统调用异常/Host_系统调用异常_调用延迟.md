@@ -1,5 +1,8 @@
 **用例名称** 调用延迟 导致 Host_系统调用异常
 
+## 故障定位
+持续型故障——目标进程的某个系统调用在故障窗口内被持续注入延迟，使其单次耗时显著增加、应用响应变慢但不报错；窗口结束（`--timeout` 到期 / 武装的自恢复载体到期）即自动恢复。**手段1（ChaosBlade）**与**手段2（原生命令）**是并列的注入手段，都让目标 syscall 变慢，按环境能力选用：主机装有 ChaosBlade（`blade version` 可用）→ 手段1（`blade create strace delay`，可精确指定延迟量与注入位置、实验 UID 统一生命周期管理）；否则手段2（借原生 strace attach 的跟踪开销制造延迟，非精确、约 10-100x 减速）。`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
+
 ## 故障现象
 1. 特定系统调用执行时间显著增加
 2. 应用 IO 操作、内存分配等变慢
@@ -12,7 +15,7 @@
 
 ## 演练步骤
 1. 确认目标进程 PID 和关键系统调用：`strace -c -p <pid> -e trace=<syscall> &`（采样 5 秒后 Ctrl+C）
-2. 使用 ChaosBlade 注入系统调用延迟
+2. 注入系统调用延迟 —— **手段1（ChaosBlade）**（主机无 blade 时改用文末**手段2（原生命令）**）
 
 ```bash
 blade create strace delay --pid <pid> --syscall-name <syscall> --time <delay> --delay-loc enter --timeout <duration>
@@ -30,18 +33,35 @@ blade create strace delay --pid <pid> --syscall-name <syscall> --time <delay> --
 3. 观察应用性能变化
 
 ## 注入验证
-1. `strace -T -p <pid> -e trace=<syscall>` 确认该系统调用耗时增加
-2. （可选，仅当演练方提供了应用访问入口时）确认响应延迟增大；无入口时上述 strace 耗时证据成立即可判定
-3. 确认延迟是否符合注入的时间值
+> 判据可达性（ptrace 排他）：手段1（`blade create strace delay`，底层派生 `strace -p <pid> -f -e inject=…`）与手段2（原生 `strace -p <pid> -e trace=<syscall> -T`）在故障窗内**独占目标进程的 ptrace slot**——Linux 一进程同时只能被一个 tracer attach，故窗内**第二次** `strace -T -p <pid>` 必然失败（`ptrace: Operation not permitted`）。因此 `strace -T -p <pid>` **不是窗内可用判据**，只在 ptrace 释放后（见「恢复验证」）可达。窗内主判据收敛为下述 ① 行为级 + ② 机制归因白盒证，二者均无需二次 ptrace、始终可达（详见 `references/criterion-reachability.md`）。
+
+**① 行为级主证（演练方提供应用访问入口时首选）**
+1. 用只读 HTTP/RPC 探针对应用入口测端到端响应时间（如 `curl -sS -o /dev/null -w '%{time_total}' <url>`），确认响应延迟从基线显著上升、升幅与注入的 `--time` 量级相符
+2. 延迟应稳定贯穿故障窗且**不报错**（区别于「调用返回错误」：本 case 只慢不错）
+
+**② 机制归因白盒证（无应用入口时主证；始终可达、无需二次 ptrace）**
+3. `pgrep -a strace` 见注入器命令行，其规则文本含目标 syscall 与延迟量（手段1 形如 `-e inject=<syscall>:delay_enter=<delay>`；手段2 为 attach 到目标 pid 的 `strace -p <pid>`），证明延迟注入器确已 attach 目标进程
+4. `cat /proc/<pid>/status` 读 `TracerPid` 行由 `0` 变为**非 0**（= 注入器 strace 的 pid）、`State` 行为被跟踪态（`t (tracing stop)`），证明目标进程确被 ptrace attach
+5. （可选交叉）`ss -ltnp` 观察目标监听 socket 的 `Recv-Q` 由 0 转为积压（accept 被延迟 → 连接堆积），作为延迟生效的旁证
+
+**③ 判定规则**
+- 有应用入口：以 ① 端到端延迟上升为主证、② 白盒证为归因佐证
+- 无应用入口：以 ② 白盒证（注入器 attach + `TracerPid` 非 0 + 规则文本含目标 syscall/延迟量）为主证即可判定延迟已注入
+- **不得**以窗内 `strace -T -p <pid>`（第二次 attach）作判据——它在窗内结构性不可达（见上方判据可达性）
 
 ## 注入恢复
+**手段1（ChaosBlade）**——销毁实验即恢复（`--timeout` 到期亦自动恢复）：
 ```bash
 blade destroy <experiment-uid>
 ```
 
+**手段2（原生命令）**——见文末「手段2（原生命令）」块的恢复命令（先停武装的定时器 `systemctl stop blade-kill-strace.timer`，再 `pgrep -x strace` 取 strace 自身 PID 后 `kill` 终止，目标进程随即恢复原速）
+
 ## 恢复验证
-1. `strace -T -p <pid> -e trace=<syscall>` 确认系统调用耗时恢复正常
-2. （可选，有访问入口时）确认应用响应延迟恢复正常
+> 判据可达性：注入器（手段1 blade 实验销毁 / 手段2 原生 strace 被 timer 或手动 kill）退出后**已释放 ptrace slot**，故此处 `strace -T -p <pid>` 第二次 attach **可达**（与故障窗内相反）——这是本 case 中唯一能直接测得 syscall 耗时的时机。
+1. `strace -T -p <pid> -e trace=<syscall>` 确认该系统调用耗时恢复到基线（ptrace 已释放，可正常 attach）
+2. 白盒脱离证：`pgrep -x strace` 输出为空（注入器 strace 已终止）+ `cat /proc/<pid>/status` 的 `TracerPid` 回到 `0`、`State` 回到 `S (sleeping)`（目标进程不再被跟踪）
+3. （可选，有访问入口时）确认应用响应延迟恢复正常
 
 ## 基准事实
 - **根因**：特定系统调用出现异常延迟（如磁盘慢、网络抖动导致的底层延迟）
@@ -49,9 +69,9 @@ blade destroy <experiment-uid>
 
 ---
 
-## 降级方案（原生命令）
+**手段2（原生命令）**
 
-> 当 ChaosBlade 不可用时，难以直接实现系统调用级别的精确延迟注入。以下为近似方案。
+> 与手段1（ChaosBlade）并列的注入手段，借原生 strace attach 的跟踪开销制造系统调用延迟（非精确、约 10-100x 减速）；主机未装 ChaosBlade 时选用本手段。
 
 前提条件：需安装 `strace` 或具备 BPF/eBPF 工具
 

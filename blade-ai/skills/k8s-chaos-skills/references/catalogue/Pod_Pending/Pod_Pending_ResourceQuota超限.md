@@ -4,6 +4,11 @@
 # 恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+
 # 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
 # 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
+# ⚠️ 本 case 例外：装配器对 #13 结构性不兼容——两段式注入的道具
+# quota 必须卡在「武装之后、扩副本之前」，而装配器单次原子调用无法把独立的
+# quota 创建步插进这个缝（quota 先建则载体 Pod 被准入拒、后建则新副本已逃逸），
+# 故正文 recovery-carrier SOP 拆序是 #13 的唯一可行主路径，不是条件降级。
+# recovery_channel 仍为 apiserver-write（SOP 的 SA-token REST 也是 apiserver 写）。
 recovery_channel: apiserver-write
 # 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
 # 自身（patch workload 的 replicas 属受害者域内，名字匹配放行），无跨对象写
@@ -16,7 +21,7 @@ recovery_channel: apiserver-write
 **用例名称** ResourceQuota超限 导致 Pod_Pending
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -34,7 +39,7 @@ restorePatches:                           # 恢复域：载体 TTL 到点自治�
 durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- 道具 quota（`kubectl create quota --hard=pods=<不超过当前Pod数>`——上限低于存量 Pod 数的瞬态约束对象）为 execute 计划 manifest/kubectl 步骤；收尾清理步删除；故障解除判据 = 副本回基线且全部 Running。
+- 道具 quota（`kubectl create quota --hard=pods=<压住当前非终止态 Pod 数>`——`hard` 定容基准是**非终止态 Pod 数**而非 `kubectl get pods` 原始行数：ResourceQuota 的 `pods` 只统计非终止态（Pending/Running）Pod，命名空间内 Job/CronJob 残留的终止态 Pod（Succeeded/Failed）会使原始行数虚高、`hard` 浮在 quota 实际 `used` 之上留出余量而故障不现，见注意事项——上限压住存量非终止态 Pod 的瞬态约束对象）为 execute 计划 manifest/kubectl 步骤；收尾清理步删除；故障解除判据 = 副本回基线且全部 Running。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
 ## 故障现象
@@ -50,7 +55,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl create sa drill-rc-<hash> -n <namespace>
    kubectl create role drill-rc-<hash> -n <namespace> --verb=get,patch --resource=deployments/scale
    kubectl create rolebinding drill-rc-<hash> -n <namespace> --role=drill-rc-<hash> --serviceaccount=<namespace>:drill-rc-<hash>
-   kubectl run drill-rc-<hash> -n <namespace> --image=busybox:1.36 --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
+   kubectl run drill-rc-<hash> -n <namespace> --image=curlimages/curl:latest --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
    # 载体 Pod 注册后追加第二资源族（两步法——多 flag 单命令 verbs 并集广播，
    # 会产生 delete×deployments/scale + patch×resourcequotas 超授权面，见标准件第一节立法）
    kubectl patch role drill-rc-<hash> -n <namespace> --type=json \
@@ -71,21 +76,26 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
 
 ## 演练步骤
-（主路径 = 基线捕获 → 创建道具 quota（步骤 3 前半，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方），副本扩容注入+武装+readback 工具内同步完成；以下手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
-1. **基线捕获**：记录 Pod 总数与 workload 副本数（restorePatches 的基线值来源，两条路径共用）
+（**本 case 装配器结构性不兼容——手动 SOP 是唯一可行主路径，非降级兜底**：本故障是**两段式注入**，道具 quota 必须**卡在「武装之后、扩副本之前」**——① quota 先于载体 Pod 建 → 载体 Pod 本身被 ResourceQuota 准入拒绝（`hard pods ≤ 存量` 时新 Pod 一律 Forbidden），装配器 fail-closed；② 载体建栈+武装+扩副本先于 quota → 新副本在 quota 存在前就被成功创建，事后建 quota 不会回收它们，故障签名（DESIRED>READY / FailedCreate `exceeded quota`）根本不出现。`faultdrill_assemble_carrier` 的「建栈+验权+武装+注入(replicas patch)+readback」是**单次原子调用**，无法把独立于 patch 域的 quota 创建步插进「武装与扩副本之间」，调 hard 值也无法让装配器-优先序稳健成立——故本 case 属"结构性无法程序化"类，**必须走下方手动 SOP 的拆序**：载体建栈+武装 → 创建道具 quota → 扩副本注入。（"主路径"一词在本 case 有两义，勿混：装配器路径对 #13 不可用；下方步骤 2 的"主路径"仅指标准件 REST **武装形态**，与装配器无关。））：
+1. **基线捕获**：记录**非终止态 Pod 数**（道具 quota `hard` 的定容基准——ResourceQuota 的 `pods` 只统计非终止态 Pod，`kubectl get pods` 原始行数含终止态会高于 quota 实际 `used`，见注意事项）与 workload 副本数（restorePatches 的基线值来源，两条路径共用）
    ```bash
-   kubectl get pods -n <namespace> --no-headers
+   # 非终止态 Pod 数（= quota used 的计数集合；排除 Succeeded/Failed 的 Job/CronJob 残留，其 STATUS 列显示为 Completed/Error）
+   kubectl get pods -n <namespace> --no-headers --field-selector='status.phase!=Succeeded,status.phase!=Failed' | wc -l
    kubectl get <workload-kind> <name> -n <namespace> -o jsonpath={.spec.replicas}
    ```
+   （载体 Pod 已在此步前建好并 Running，本身计入非终止态；`hard` 取此数减一个小余量保证 binding，见注意事项与演练步骤 3）
 2. **先武装定时自恢复，再注入**（主路径 = 资源准备第 3 条的标准件 REST 武装——载体内无 kubectl，恢复动作用 SA token 直调 apiserver。恢复命令幂等：定时器到期自动恢复为主，Agent 在演练结束时主动执行同一组命令兜底，定时器迟到重复执行无副作用。载体内 `sh -c` 同时解决 exec-form 通道不解释裸 `( sleep … ) &` 语法的问题；载体 Pod 为单副本 `--restart=Never`，定位不到定时器进程即视为异常，中止本次演练改人工恢复）
    ```bash
    # 主路径：标准件武装（资源准备第 3 条的完整命令，REST 形态）
    kubectl exec drill-rc-<hash> -n <namespace> -- sh -c '( sleep <duration>; curl -s -X PATCH --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" -H "Content-Type: application/merge-patch+json" -d "{\"spec\":{\"replicas\":<基线副本数>}}" https://kubernetes.default.svc/apis/apps/v1/namespaces/<namespace>/deployments/<name>/scale; curl -s -X DELETE --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" https://kubernetes.default.svc/api/v1/namespaces/<namespace>/resourcequotas/<quota-name> ) >/tmp/restore.log 2>&1 & echo armed'
    ```
    倒计时从武装时刻起算：武装与注入必须是紧邻步骤（≤60s）；武装后发生任何修复须先停旧定时器再全额重武装：`kubectl exec drill-rc-<hash> -n <namespace> -- sh -c 'pkill -f resourcequota[s]; true'`（见 SKILL.md 安全红线「故障窗口完整」）
-3. **注入**：创建上限低于当前 Pod 数的配额，再调高 workload 副本数，新副本即被准入控制拒绝
+3. **注入**：创建压住当前非终止态 Pod 数的配额，再调高 workload 副本数，新副本即被准入控制拒绝
    ```bash
-   kubectl create quota <quota-name> --hard=pods=<不超过当前Pod总数> -n <namespace>
+   # hard = 非终止态 Pod 数（含已武装载体 Pod）− 小余量，保证 used >= hard → 新副本必被拒（勿用含终止态的原始行数，见注意事项）
+   kubectl create quota <quota-name> --hard=pods=<非终止态Pod数减余量> -n <namespace>
+   # 扩副本前回读闸门：确认 quota 已 binding（used >= hard），否则说明 hard 定高了、故障不会出现，须重定 hard
+   kubectl get resourcequotas.v1. <quota-name> -n <namespace> -o jsonpath='{.status.used.pods}/{.status.hard.pods}'
    kubectl scale <workload-kind> <name> -n <namespace> --replicas=<基线副本数+增量>
    ```
 
@@ -100,8 +110,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl get resourcequotas.v1. <quota-name> -n <namespace>
    ```
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活（quota 是状态型故障，quota 存活即故障存活）：
-以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效；RS 控制器 FailedCreate 重试有 backoff，事件非秒级连发属正常，READY 不收敛即持续中），生效后一次 `time_wait 30`（间隔 = 2 × 传播上限：本案为规则/字段/进程型即时生效故障，无传播过程，30s 为最小复测窗，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
+**持续性检查**——故障窗口内故障必须持续存活（quota 是状态型故障，quota 存活即故障存活）：
+以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效；RS 控制器 FailedCreate 重试有 backoff，事件非秒级连发属正常，READY 不收敛即持续中）——生效确认只证明某一刻故障已落地，不证明它在整个窗口持续存活；持续性复测要把「稳态故障」与「传播收敛窗内的瞬时态」分开：待传播收敛后再次观测仍见故障态才算坐实持续。本故障传播特性：本案为规则/字段/进程型即时生效故障，无传播过程。隔多久复测、复测几次由你依该传播特性与故障形态自行判断（无固定间隔、无固定探针数），到点**下发**复测探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
 1. 白盒复查：quota 仍存在且 `used` 仍顶在 `hard`（配置即状态）
 2. 行为复查：READY 仍 < DESIRED 持续不收敛（同注入验证第 1 条形态）
 3. 事件复查：FailedCreate 事件 LAST SEEN 相比注入时有新增（仍在被准入拒绝）
@@ -131,6 +141,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - **必现现象**：READY < DESIRED 持续不收敛；ReplicaSet FailedCreate 事件含 `exceeded quota`；无 Pending Pod 对象产生
 
 ## 注意事项
+- **道具 quota 的 `hard=pods` 定容基准是「非终止态 Pod 数」，不是 `kubectl get pods` 的原始行数**：ResourceQuota 的 `pods` 资源按上游语义只统计非终止态（Pending/Running）Pod，`.status.phase` 为 Succeeded/Failed 的 Pod（表格 STATUS 列显示为 Completed/Error）不计入 `used`。命名空间内若有 Job/CronJob 历史残留的终止态 Pod，原始行数会显著高于 quota 的 `used`；据原始行数定 `hard` 会让 `hard` 落在 `used` 之上留出余量，扩出的新副本被正常准入而非拒绝，故障签名（READY<DESIRED / FailedCreate `exceeded quota`）根本不出现——终止态残留占比越大越易触发。定容须用 `--field-selector=status.phase!=Succeeded,status.phase!=Failed` 数非终止态 Pod（演练步骤 1），`hard` 取该数减一个小余量（如 2~3，保证 `used >= hard` 且抗窗口内 CronJob 瞬时增减）；**已武装的载体 Pod 本身是非终止态 Pod、也计入 `used`，定容时须一并计入**。扩副本前用注入验证第 3 条回读确认 quota 已 binding（`used >= hard`）再 scale。
 - chaosblade 无 ResourceQuota/准入类故障靶点，本用例为 kubectl-native 专属注入
 - 优先选择无 HPA 的 workload 作靶点：存在 HPA 时其会在约 15s 内收回手动扩出的副本，抢占故障窗口与定时器动作
 - 部分托管集群安装了抢占短名的 CRD（如 `quotas.quotas.alibabacloud.com`），`kubectl get/delete quota` 会命中 CRD 并报 NotFound——必须使用组限定写法 `resourcequotas.v1.`

@@ -1,8 +1,11 @@
 **用例名称** 内存占用过大 导致 Host_内存使用率过高
 
+## 故障定位
+持续型故障——内存占用进程（blade `mem load` / stress-ng `--vm`）存活即故障存活，匿名内存被 pin 住贯穿整个故障窗口；窗口结束（`--timeout` 到期或实验销毁）即自动释放。**手段1（ChaosBlade）**与**手段2（原生命令）**是并列的注入手段，底层效果等价（都是分配并驻留匿名内存、抬高 `free -m` used），按环境能力选用：主机装有 ChaosBlade（`blade version` 可用）→ 手段1（实验 UID 统一生命周期管理）；否则手段2。`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
+
 ## 故障现象
-1. 主机物理内存使用率持续超过 90%
-2. 系统 Swap 使用率升高
+1. 主机物理内存使用率持续超过目标百分比
+2. （参数依赖，非必然）Swap 使用率可能升高——`ram` 模式将匿名内存 pin 在 RAM，仅在压力超出可回收余量时才触及 swap
 3. 可能触发 OOM Killer 杀死进程
 
 ## 资源准备
@@ -11,7 +14,7 @@
 
 ## 演练步骤
 1. 记录当前内存基线：`free -m`
-2. 使用 ChaosBlade 注入内存压力
+2. 注入内存压力 —— **手段1（ChaosBlade）**（主机无 blade 时改用文末**手段2（原生命令）**）
 
 ```bash
 blade create mem load --mode ram --mem-percent <percent> --timeout <duration>
@@ -19,7 +22,7 @@ blade create mem load --mode ram --mem-percent <percent> --timeout <duration>
 
 参数说明：
 - `--mode ram`：直接占用物理内存
-- `--mem-percent`：内存使用率百分比（如 80、90）
+- `--mem-percent`：目标内存使用率百分比（如 80、90）——占用 N% × MemTotal 的匿名内存，默认不含 buffer/cache（`--include-buffer-cache` 才计入）；分配语义详见「注入验证」定案
 - `--avoid-being-killed`：可选，防止被 OOM Killer 杀死
 - `--rate`：可选，内存占用速率（MB/s）
 - `--timeout`：超时自动恢复（秒）
@@ -27,14 +30,21 @@ blade create mem load --mode ram --mem-percent <percent> --timeout <duration>
 3. 观察内存使用率及应用运行状态
 
 ## 注入验证
-1. `free -m` 确认可用内存显著减少
-2. `vmstat 1` 确认 swap 使用变化
+1. `free -m` 确认可用内存显著减少（`used` 逼近目标百分比 × MemTotal、MemAvailable 跌破余量）
+2. `vmstat 1` / `free -m` 观察 swap：是否升高**取决于参数与内存余量，非必然**（见下方定案）
 3. `dmesg | tail` 观察是否有 OOM 相关日志
 
+> **定案（勿重推）——`--mem-percent` 分配语义与 swap 行为**：
+> - `--mode ram --mem-percent N` 目标是占用 **N% × MemTotal 的匿名内存**，默认不含 buffer/cache；因此 `free -m` 的 `used` 会逼近 N% × MemTotal，判据「used 达目标水位」可满足。
+> - 内核优先**回收 page cache**（buff/cache 下降）满足分配，而非必然换出。swap 只在压力超出可回收余量、且系统启用 swap 并达阈值时才升高；`--mem-percent` 留出余量时 swap 可全程不动——**swap 未升高不代表注入失败**。
+> - 判死/判成应以 `free -m` used 达目标水位 + MemAvailable 跌破余量为权威判据，**不得依赖「swap 升高」「OOM 触发」这类参数依赖现象**。
+
 ## 注入恢复
+**手段1（ChaosBlade）**——销毁实验即恢复（`--timeout` 到期亦自动恢复）：
 ```bash
 blade destroy <experiment-uid>
 ```
+**手段2（原生命令）**——见文末「手段2（原生命令）」块的恢复命令（stress-ng `--timeout` 自停 / 手动 kill）
 
 ## 恢复验证
 1. `free -m` 确认内存使用率恢复正常
@@ -42,13 +52,14 @@ blade destroy <experiment-uid>
 
 ## 基准事实
 - **根因**：异常进程大量占用物理内存，导致系统可用内存不足，可能触发 OOM Killer
-- **必现现象**：物理内存使用率持续超过目标百分比；Swap 使用升高；可能出现进程被 OOM Kill
+- **必现现象**：物理内存使用率持续超过目标百分比（`free -m` used 达 N% × MemTotal、MemAvailable 跌破余量）
+- **参数依赖现象（非必现）**：Swap 使用升高（取决于内存余量与是否启用 swap）；进程被 OOM Kill（取决于是否超出总内存及 `--avoid-being-killed`）
 
 ---
 
-## 降级方案（原生命令）
+**手段2（原生命令）**
 
-> 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
+> 与手段1（ChaosBlade）并列的注入手段，效果等价（stress-ng `--vm` 分配并驻留匿名内存抬高 used）；主机未装 ChaosBlade 时选用本手段。本手段属 **Branch B（自停型手段2）**——stress-ng 自带 `--timeout` 前台跑满窗口后自行退出即恢复、无需外挂载体；发射经 host_inject 前台直发，本地等待超时返回 outcome UNKNOWN 即预期且完整的发射回执（命令在主机续跑），随后**一条只读探针对账**即为权威回执，**严禁** setsid/systemd-run/nohup/`&` 包裹故障命令追同步返回；发射语义详见 `references/carrier/recovery-carrier.md` §〇 Branch B。
 
 前提条件：主机需安装 `stress-ng`
 

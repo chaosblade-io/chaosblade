@@ -102,6 +102,8 @@ blade create disk burn --write --path /home --size 20 --timeout 120
 
 ## 网络
 
+> `blade create network` 的可用 action 集随 ChaosBlade 版本而异，注入前一律以目标机 `blade create network --help` 探测为准。常见 action 为 `dns / dns_down / drop / occupy / delay / loss / corrupt / duplicate / reorder`（无带宽限速 action——带宽受限走原生 tc tbf，见 catalogue `Host_网络故障_网络带宽受限`）；下列各 action 的必填 flag 与 scoping matcher 以目标机 `--help` 输出为准。
+
 ### `blade create network dns`
 
 DNS 劫持实验。
@@ -150,6 +152,112 @@ blade create network drop --string-pattern "mysql-primary.db.internal" --network
 ```bash
 blade create network occupy --port 8080 --force --timeout 60
 ```
+
+### `blade create network delay`
+
+网络延迟实验（底层 tc netem delay）。
+
+| 参数 | 说明 |
+|------|------|
+| `--time <毫秒>` | 延迟时长（**必填**，单位 ms） |
+| `--interface <网卡>` | 目标网卡名（**必填**，不硬编码 eth0，先 `ip route get <target-ip>` 看 `dev`） |
+| `--offset <毫秒>` | 延迟抖动范围（可选） |
+| `--destination-ip <IP>` | 目的 IP 收窄（爆炸半径纪律，只作用到目标的流量） |
+| `--exclude-ip <IP>` | 排除的目的 IP |
+| `--local-port <port>` / `--remote-port <port>` | 端口收窄（与 `--exclude-port` 互斥） |
+| `--exclude-port <port>` | 排除端口（如 `22` 保护 SSH，支持逗号分隔与区间 `22,8000-8080`） |
+
+示例：
+```bash
+blade create network delay --time 3000 --interface eth0 --destination-ip 10.0.0.5 --timeout 60
+blade create network delay --time 500 --offset 100 --interface eth0 --exclude-port 22 --timeout 120
+```
+
+### `blade create network loss`
+
+网络丢包率实验（部分丢包，底层 tc netem loss；区别于 `drop` 的 100% 隔离）。
+
+| 参数 | 说明 |
+|------|------|
+| `--percent <N>` | 丢包率百分比（**必填**，`[0, 100]`） |
+| `--interface <网卡>` | 目标网卡名（**必填**，不硬编码 eth0） |
+| `--destination-ip <IP>` | 目的 IP 收窄 |
+| `--exclude-ip <IP>` | 排除的目的 IP |
+| `--local-port <port>` / `--remote-port <port>` | 端口收窄（与 `--exclude-port` 互斥） |
+| `--exclude-port <port>` | 排除端口（如 `22` 保护 SSH） |
+
+示例：
+```bash
+blade create network loss --percent 30 --interface eth0 --destination-ip 10.0.0.5 --timeout 60
+blade create network loss --percent 10 --interface eth0 --exclude-port 22 --timeout 120
+```
+
+### `blade create network corrupt`
+
+报文损坏实验（底层 tc netem corrupt）。
+
+| 参数 | 说明 |
+|------|------|
+| `--percent <N>` | 损坏率百分比（**必填**，正整数） |
+| `--interface <网卡>` | 目标网卡名（**必填**，不硬编码 eth0） |
+| `--destination-ip <IP>` | 目的 IP 收窄 |
+| `--exclude-port <port>` | 排除端口（如 `22` 保护 SSH） |
+
+示例：
+```bash
+blade create network corrupt --percent 80 --interface eth0 --destination-ip 10.0.0.5 --timeout 60
+```
+
+### `blade create network duplicate`
+
+报文重复实验（底层 tc netem duplicate）。
+
+| 参数 | 说明 |
+|------|------|
+| `--percent <N>` | 重复率百分比（**必填**，正整数） |
+| `--interface <网卡>` | 目标网卡名（**必填**，不硬编码 eth0） |
+| `--destination-ip <IP>` | 目的 IP 收窄 |
+| `--exclude-port <port>` | 排除端口（如 `22` 保护 SSH） |
+
+示例：
+```bash
+blade create network duplicate --percent=10 --interface=eth0 --timeout 60
+```
+
+### `blade create network reorder`
+
+报文乱序实验（底层 tc netem reorder，**必须伴随 delay**：`--time` 默认 10ms，裸 reorder 会被内核拒绝）。
+
+| 参数 | 说明 |
+|------|------|
+| `--correlation <C>` | 相关性百分比（**必填**，`[0, 100]`） |
+| `--percent <N>` | 乱序率百分比（**必填**，正整数） |
+| `--interface <网卡>` | 目标网卡名（**必填**，不硬编码 eth0） |
+| `--gap <G>` | 间隔（可选，每 `<G>` 个包触发一次乱序） |
+| `--time <毫秒>` | 伴随延迟（可选，默认 10ms——reorder 隐含伴随 delay） |
+| `--destination-ip <IP>` | 目的 IP 收窄 |
+| `--exclude-port <port>` | 排除端口（如 `22` 保护 SSH） |
+
+示例：
+```bash
+blade create network reorder --correlation 50 --percent 25 --gap 2 --interface eth0 --destination-ip 10.0.0.5 --timeout 60
+```
+
+### `blade create network dns_down`
+
+DNS 不可用实验（阻断域名解析，区别于 `dns` 的劫持到错误 IP）。**无 interface/目的 IP scoping——是主机级全局 DNS 阻断，仅按域名白名单放行**。
+
+| 参数 | 说明 |
+|------|------|
+| `--allow_domain <域名列表>` | 放行的域名（可选，逗号分隔；其余域名解析全部阻断） |
+| `--timeout <秒>` | 到期自动恢复 |
+
+示例：
+```bash
+blade create network dns_down --allow_domain test1.com,test2.com --timeout 60
+```
+
+> 带宽限速无对应 blade action（`blade create network` 不提供 bandwidth/tbf 形态）——「网络带宽受限」走原生 `tc qdisc ... tbf`，见 catalogue `Host_网络故障_网络带宽受限`。
 
 ## 进程
 
@@ -226,7 +334,12 @@ blade create process load --count 1000 --user nobody --timeout 120
 | `--count <N>` | 追加次数（默认 1） |
 | `--interval <seconds>` | 追加间隔（秒） |
 | `--enable-base64` | 内容使用 base64 编码 |
-| `--enable-backup` | 启用备份（destroy 时恢复原文件） |
+| `--enable-backup` | 创建原始快照 `<file>.chaos-blade-backup-<uid>`（后缀件）。**这是恢复的可依赖基石——无论 destroy 是否自动还原，快照都在，可手动 `cp` 回写** |
+| `--delete-file` | destroy 时删除文件（默认 false）。**其对 append 还原的作用随版本而变（版本相对事实）**，不得作为恢复正确性的唯一依赖 |
+
+> ⚠️ **append 恢复的版本无关原则**：destroy 的内容还原语义**随 ChaosBlade 版本变化**，且工具自带 `--help` 都可能与实现矛盾（勿照抄 help 例子）。恢复正确性只应依赖三条版本无关不变量：①`--enable-backup=true` 必建快照 `<file>.chaos-blade-backup-<uid>`；②恢复侧带外新鲜读靶（`md5sum`/`cat`）独立核实，绝不以「Destroyed / verified」为凭；③未自动还原即用该快照手动 `cp` 回写 + `rm` 快照。
+>
+> 版本相对实测（**1.8.2**，`file_append.go` L270-357 + 实弹坐实，换版本须重测）：`--enable-backup=true --delete-file=true` → destroy 自动回写还原（日志 `original content restored`）；`--enable-backup=true` 单独 → preserve 不还原（日志 `appended file and backup preserved`）；`--delete-file=true` 单独 → 删文件。`--help` 例1 注释 "destroy will restore original file" 与实现矛盾。
 
 示例：
 ```bash

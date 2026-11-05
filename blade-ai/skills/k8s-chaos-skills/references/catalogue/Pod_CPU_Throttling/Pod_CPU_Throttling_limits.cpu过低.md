@@ -5,6 +5,8 @@
 # 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
 # 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
+# 载体由 faultdrill_assemble_carrier 程序化建栈、结构性自拆（fail-closed 路径 + 恢复句柄清理链 + 武装定时器自删 → apiserver ownerRef GC 级联）；降级路径不自建可自撤 RBAC 栈，正文无需传输载体自撤授权类知识。
+carrier_teardown: assembler-managed
 # 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
 # 自身（patch Deployment 模板的 resources 属受害者域内，名字匹配放行），无跨
 # 对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash>
@@ -16,7 +18,7 @@ recovery_channel: apiserver-write
 **用例名称** limits.cpu过低 导致 Pod_CPU_Throttling
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 CPU limits；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 CPU limits；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -73,7 +75,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 4. 观察 Pod CPU throttle 指标变化及应用响应延迟
 
 ## 注入验证
-1. 进入容器查看 CPU cgroup 统计（路径按 cgroup 版本选择——同一集群混合 cgroup 视图是常态，勿按集群或 K8s 版本假设，一律以容器内探针实测为准：`ls /sys/fs/cgroup/cgroup.controllers` 存在即 v2，absent 即 v1；2026-09-15 实测本集群 terway 靶容器为 v1 视图，字段名为 `throttled_time`——两个版本字段名均以实际读到的为准）：v2 路径 `cat /sys/fs/cgroup/cpu.stat`（字段 `nr_throttled`、`throttled_usec`，微秒）；v1 路径 `cat /sys/fs/cgroup/cpu/cpu.stat`（字段 `nr_throttled`、`throttled_time`）。确认 `nr_throttled` 已高于注入前读数、节流时间已增长——两者是单调递增计数器，高于基线即节流已发生，无需反复采样观察增长（可看 `nr_throttled/nr_periods` 占比）。内核归因强化判据（可选）：同目录读 `cpu.cfs_quota_us`/`cpu.cfs_period_us`，quota/period 比值应等于注入后 limits（如 5000/100000 = 50m）——证明 limits 降低真实传导进内核 CFS bandwidth controller，而非仅 API 对象变化。verify 期 exec 探针内层勿带 `2>/dev/null` 重定向——redirect 形态会被只读屏拒（不可证明形态，改道重发即可，但会烧一轮）
+1. 进入容器查看 CPU cgroup 统计（路径按 cgroup 版本选择——同一集群混合 cgroup 视图是常态，勿按集群或 K8s 版本假设，一律以容器内探针探测为准：`ls /sys/fs/cgroup/cgroup.controllers` 存在即 v2，absent 即 v1；如 terway 靶容器为 v1 视图，字段名为 `throttled_time`——两个版本字段名均以实际读到的为准）：v2 路径 `cat /sys/fs/cgroup/cpu.stat`（字段 `nr_throttled`、`throttled_usec`，微秒）；v1 路径 `cat /sys/fs/cgroup/cpu/cpu.stat`（字段 `nr_throttled`、`throttled_time`）。确认 `nr_throttled` 已高于注入前读数、节流时间已增长——两者是单调递增计数器，高于基线即节流已发生，无需反复采样观察增长（可看 `nr_throttled/nr_periods` 占比）。内核归因强化判据（可选）：同目录读 `cpu.cfs_quota_us`/`cpu.cfs_period_us`，quota/period 比值应等于注入后 limits（如 5000/100000 = 50m）——证明 limits 降低真实传导进内核 CFS bandwidth controller，而非仅 API 对象变化。verify 期 exec 探针内层勿带 `2>/dev/null` 重定向——redirect 形态会被只读屏拒（不可证明形态，改道重发即可，但会烧一轮）
 2. `kubectl top pod <pod-name> -n <namespace>` 确认 Pod CPU 使用率接近 limits
 3. （可选，仅当演练方提供了应用访问入口时）确认请求延迟显著增大；无入口时上述 throttling 与 CPU 证据成立即可判定
 

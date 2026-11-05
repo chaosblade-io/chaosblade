@@ -43,7 +43,7 @@
    退避重试，双方谁的 attach 重试先成功谁赢，无法预先指定）：
    - **结局 A**：占用者抢先 attach 到 `<占用节点>` 转 Running，新 Pod 调度到其他节点后卡
      ContainerCreating 并反复报 Multi-Attach error
-   - **结局 B（实测出现过镜像反转）**：新 Pod 抢先 attach 转 Running，占用者反卡
+   - **结局 B（可能出现镜像反转）**：新 Pod 抢先 attach 转 Running，占用者反卡
      ContainerCreating（其 attach 重试已进入长退避）
    两种结局均视为注入生效——**判定标志是“恰好一方 Running、另一方 ContainerCreating 且报
    Multi-Attach error”，不绑定哪一方胜出**

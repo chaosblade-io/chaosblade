@@ -27,21 +27,20 @@
 2. 如果 Sidecar 容器配置了独立 Liveness 探针，探针超时后可能触发容器重启
 3. 如果无 Liveness 探针，Sidecar 持续不可用但 Pod 状态仍显示 Running
 4. 模拟 Sidecar 死锁/卡死场景，主容器依赖 Sidecar 的功能不可用
-5. 主容器不受影响（预期阴性：主容器 restartCount 零漂移、exec 正常——出现漂移即
-   爆炸半径失控）
+5. 主容器不受影响（预期阴性：主容器 restartCount 相对自身基线零漂移、exec 正常——
+   相对自身基线出现新增漂移即爆炸半径失控）
 
 ## 资源准备
 1. 确认目标 Pod 包含多个容器，明确 Sidecar 容器名称；确认目标 Pod 所在 namespace 和 labels
 2. **多容器靶接线（靶为单容器 Pod 时）**：业务靶常见单容器形态——用 JSON patch 给靶
    Deployment 模板追加一个 sidecar 容器（演练资产，结束拆线归还）。sidecar 须同时承载
    **可挂起的受害服务进程**（验证「挂起期间服务无响应、恢复后服务复活」现象面）：socat
-   监听 + sleep 保活（镜像选**节点缓存或 VPC registry 可达**镜像，VPC 受限网络下
-   docker.io 公网镜像会 `ImagePullBackOff`；terway 类 CNI 镜像自带 socat 且 busybox
-   工具集完整——kill/pgrep/ps 可用，路径 A 直接成立，节点缓存零拉取风险。
-   **镜像覆盖定案（免推导）**：CNI 组件镜像与 terway-eniip DS 同 tag 时由
-   kube-system DaemonSet 全节点常驻缓存——规划期至多单命令复核 DS
-   `ready/desired`，勿逐节点或全表扫描重新论证覆盖面（定案全文见
-   `references/environment/node-cached-images.md`））：
+   监听 + sleep 保活（镜像须选**节点本地缓存或内网 registry 可达**的镜像——受限
+   网络下公网镜像可能 `ImagePullBackOff`；且镜像须自带 socat + busybox 工具集
+   （kill/pgrep/ps 可用），路径 A 方能直接成立、节点缓存零拉取风险。
+   **具体镜像选型与节点缓存覆盖面属环境特定事实**——规划期至多单命令复核承载
+   全节点常驻缓存的 DaemonSet `ready/desired`，勿逐节点或全表扫描重新论证；
+   本集群的镜像选型定案见 `references/environment/node-cached-images.md`）：
    ```bash
    kubectl patch deployment <deployment-name> -n <namespace> --type='json' \
      -p='[{"op":"add","path":"/spec/template/spec/containers/-","value":{"name":"drill-sidecar","image":"<节点缓存镜像>","command":["sh","-c","socat TCP-LISTEN:8080,fork,reuseaddr EXEC:/bin/cat & sleep 7200"]}}]'
@@ -92,9 +91,13 @@
    kubectl get pods -n <namespace> -l <label-selector> -o wide
    kubectl exec <pod-name> -n <namespace> -c <sidecar-container-name> -- sh -c \
      'grep State /proc/$(pgrep -x <process-name>)/status'
+   # 同节点 Pod 逐 Pod restartCount 基线（爆炸半径 delta 对照的零点，紧凑 jsonpath 抗截断）
+   kubectl get pods -A --field-selector spec.nodeName=<node-name> -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.phase}:{.status.containerStatuses[0].restartCount}{"\n"}{end}'
    ```
    记录：进程正常状态 `S (sleeping)`（恢复对照）、两容器 restartCount 基线、
-   sidecar 受害服务连通基线（`echo PING | socat -T 3 - TCP:127.0.0.1:<port>` 回显）
+   sidecar 受害服务连通基线（`echo PING | socat -T 3 - TCP:127.0.0.1:<port>` 回显）、
+   **同节点各 Pod restartCount 基线并显式锁定预存异常 Pod 的基线态**（CrashLoopBackOff/
+   长期 Pending/Terminating 的 Pod 窗口内按自身节奏继续自重属基线内、非注入所致，计划点名供 verifier 勿误判）
 
 ## 演练步骤
 
@@ -179,12 +182,16 @@
    `kubectl describe pod` 查探针失败事件——探针失败需连续失败达
    failureThreshold 才触发，存在传播延迟：**首查未见事件不构成反证**，挂起的
    直接证据是第 1 条的进程状态
-5. **爆炸半径交叉确认**：
+5. **爆炸半径交叉确认**（判据 = 逐 Pod 对照自身基线的 delta、非绝对态，详见 SKILL.md「爆炸半径验证判据」）：
    ```bash
-   kubectl get pods -A -o wide --field-selector spec.nodeName=<node-name> --no-headers
+   # 每 Pod 一行紧凑 jsonpath（-o wide 在数十 Pod 节点截断，且其 RESTARTS 列聚合
+   # initContainer 重启、与主容器 restartCount 不一致，直读容器级天然绕开聚合陷阱）
+   kubectl get pods -A --field-selector spec.nodeName=<node-name> -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.phase}:{.status.containerStatuses[0].restartCount}{"\n"}{end}'
    ```
-   同节点 Pod 与基线清单一致（无 Evicted、无异常重启）——进程级故障不外溢
-6. **持续性检查（必做）**——状态型故障，挂起存活即故障存活。白盒主证（单独
+   同节点 Pod 逐 Pod 对照资源准备第 6 条记录的自身 restartCount 基线，**无注入新增的**
+   Evicted/重启漂移——进程级故障不外溢。预存异常 Pod（CrashLoopBackOff/长期 Pending/
+   Terminating）窗口内按自身节奏的继续自重属基线内、非注入所致，勿误判为失控
+6. **持续性检查**——状态型故障，挂起存活即故障存活。白盒主证（单独
    充分）：`grep State /proc/$(pgrep -x <进程名>)/status` 仍为 T（或路径 B
    freezer.state 仍 FROZEN）；白盒不可查时有界佐证（≤60s 静观后复查状态不变）
 7. 路径 A 补自证链：`cat /tmp/procstop.evd` 含 `PROCSTOP_INJECTED`（含
@@ -268,7 +275,7 @@ sidecar 常是 distroless 的极简镜像（istio-proxy、各类 driver-registra
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <sidecar-container-name> -- sh -c \
   '( sleep <recovery-seconds>; kill -CONT $(pgrep -x <process-name>); echo PROCSTOP_RESTORED >> /tmp/procstop.evd ) >/dev/null 2>&1 & \
-   kill -STOP $(pgrep -x <process-name>) && echo PROCSTOP_INJECTED >> /tmp/procstop.evd'
+   kill -STOP $(pgrep -x <process-name>) && echo PROCSTOP_INJECTED > /tmp/procstop.evd'
 ```
 
 `<recovery-seconds>`：安全网窗总时长（秒），取 prompt 下发的 `recovery_timer_seconds`

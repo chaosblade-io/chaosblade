@@ -87,13 +87,16 @@ kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=<PVC挂载路径>/f
 自治到期落地；手段1 的 `--timeout` 由引擎在派发前按同一单源钉定，文档占位符保持
 `<duration>` 不动
 
-恢复命令（提前恢复）：
+恢复命令（提前恢复）——**必须拆成两次 exec：先停定时器，再删填充文件**：
 ```bash
-# 先终止已武装的清理定时器（及仍在写入的 dd），再删除填充文件——已武装定时器不会随
-# 手动恢复取消，迟到的 rm 会误删后续轮次的填充文件（第二轮 dd 写入中被上一轮
-# 300s 定时器的 rm 删掉文件名，dd 继续写 unlinked inode，空间占用持续到 dd 退出）
-kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f fill_file; rm -f <PVC挂载路径>/fill_file'
+# (a) 先终止已武装的清理定时器（及仍在写入的 dd）：单独一次 exec，pkill 模式串用
+#     [e] 守卫防自杀、命令行内无字面 fill_file
+kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f fill_fil[e]; true'
+# (b) 删除填充文件：另一次 exec
+kubectl exec <pod-name> -n <namespace> -- sh -c 'rm -f <PVC挂载路径>/fill_file; true'
 ```
+**禁止把 pkill 与 rm 合并进同一条 sh -c**（如旧写法 `sh -c 'pkill -f fill_file; rm -f <PVC挂载路径>/fill_file'`）：合并后执行恢复的 shell 自身命令行含字面 `fill_file`，`pkill -f fill_file` 会匹配到这个 shell 自己 → 先把自己 SIGTERM（退出码 143），后续 `rm` 不执行、填充文件残留、提前恢复失效；且未加 `[e]` 守卫的 pkill 即使单独下发也会自杀。拆开后 (a) 用 `fill_fil[e]` 守卫（与上文「武装后修复」处停旧定时器同形态），命令行无字面 `fill_file`，守卫成立——仍能匹配真实定时器 subshell 与 dd（二者 cmdline 含字面 `fill_file`）。
+**为何必须先 pkill**：已武装定时器不会随手动恢复取消，迟到的 rm 会误删后续轮次的填充文件（第二轮 dd 写入中被上一轮 300s 定时器的 rm 删掉文件名，dd 继续写 unlinked inode，空间占用持续到 dd 退出）。停定时器只杀 subshell，其 `sleep` 子进程成孤儿但无害：父 subshell 已死，到期不再触发 `rm`。
 
 注意事项：
 - `fallocate` 分配速度快（仅分配元数据），`dd` 实际写入数据速度较慢但更真实（19.5G

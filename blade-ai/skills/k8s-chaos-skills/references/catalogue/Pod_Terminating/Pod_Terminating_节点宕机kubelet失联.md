@@ -2,10 +2,10 @@
 # 受害者作用域参考（route A，非强制 hint）：本用例受害者是 Pod（Pod_Terminating），
 # 供 planner 填 finish_planning 的 fault_scope 时参照。这是「参考」而非「边界」——case
 # 可能写错，模型仍须理解真实语义后自行判断、不盲从本字段；代码不校验、不覆盖（无
-# enforcement）。它只降低同一 case 在 pod/node 声明间摇摆的概率（#53/#56 根因），不改
+# enforcement）。它只降低同一 case 在 pod/node 声明间摇摆的概率，不改
 # 变授权：node 级机制写的授权仍由下方 mechanism_writes 派生条目确定性兜底。
 fault_scope: pod
-# 机制写入集立法（write-set approval contract，W-56-1 派生节点授权）：
+# 机制写入集立法（write-set approval contract，派生节点授权）：
 # 本用例受害者是 Pod（Pod_Terminating），但故障机制必须写受害者所在的宿主机
 # node——手段1 chaosblade node-network drop（blade 路径，effective.scope=node +
 # fault_target=network）、手段2 kubectl debug node + chroot /host iptables DROP
@@ -39,7 +39,7 @@ mechanism_writes:
 ## 演练步骤
 1. 定位运行应用 A 的目标节点
 2. 先对目标节点注入网络切断（chaosblade node-network drop 即全量丢包，不需要 --percent，设置 `--timeout <duration>`；手段2 为 iptables OUTPUT DROP dport 6443——见下方命令模板），模拟节点宕机导致 kubelet 失联
-3. 注入生效后紧邻（≤60s）执行 `kubectl delete pod <pod> --wait=false` 触发 Terminating——**顺序必须注入先行（实测立法）**：删除指令经 kubelet watch 推送，事件传播 <1s，「删除先行」会被 kubelet 抢先完成清理（故障不出现）；注入先行使 kubelet 失联收不到删除事件，Pod 容器存活而对象卡 Terminating（正是本 case 故障现象：指令无法执行）。`--wait=false` 必须显式：kubelet 失联时 Pod 永不消失，默认等待会把 delete 命令挂死直至超时
+3. 注入生效后紧邻（≤60s）执行 `kubectl delete pod <pod> --wait=false` 触发 Terminating——**顺序必须注入先行**：删除指令经 kubelet watch 推送，事件传播 <1s，「删除先行」会被 kubelet 抢先完成清理（故障不出现）；注入先行使 kubelet 失联收不到删除事件，Pod 容器存活而对象卡 Terminating（正是本 case 故障现象：指令无法执行）。`--wait=false` 必须显式：kubelet 失联时 Pod 永不消失，默认等待会把 delete 命令挂死直至超时
 4. 观察 Pod Terminating 状态持续时间
 
 ## 注入验证
@@ -106,5 +106,5 @@ ssh root@<node-ip> 'iptables -D OUTPUT -p tcp --dport 6443 -j DROP'
 注意事项：
 - 屏蔽 6443 端口后节点与控制面断开，kubectl 无法达节点，SSH 仍可达
 - systemd-run 创建的 transient timer 由宿主机 PID 1 管理，debug Pod 被删除也不影响恢复
-- 建议超时设置 30-120 秒（实测立法）：窗口上限的真实约束是**外部节点自愈通道竞态**——部分集群存在 NotReady 后 2-5 分钟自动介入修复的通道（本集群实测 217-292s），介入会把节点拉回 Ready、抢在注入方恢复之前，与演练恢复语义竞态；窗口设计须满足 NotReady 存续期显著短于介入线（120s 窗口时 NotReady 存续 ~80s）。超时上限公式 = 自愈介入线 − NotReady 宽限期（node-monitor-grace-period 默认 40s）− 恢复收敛余量
+- 建议超时设置 30-120 秒：窗口上限的真实约束是**外部节点自愈通道竞态**——部分集群存在 NotReady 后 2-5 分钟自动介入修复的通道（介入线约 200-300s，以当次探测为准），介入会把节点拉回 Ready、抢在注入方恢复之前，与演练恢复语义竞态；窗口设计须满足 NotReady 存续期显著短于介入线（120s 窗口时 NotReady 存续 ~80s）。超时上限公式 = 自愈介入线 − NotReady 宽限期（node-monitor-grace-period 默认 40s）− 恢复收敛余量
 - 适用场景：测试当节点失联时 Pod 的 Terminating 状态会持续多久

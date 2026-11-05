@@ -1,5 +1,8 @@
 **用例名称** DNS劫持 导致 Host_网络故障
 
+## 故障定位
+持续型故障——目标主机对特定域名的解析在故障窗口内被劫持到错误 IP，使依赖该域名的应用访问失败或被导向错误服务；窗口结束（`--timeout` 到期 / 武装的自恢复载体到期）即自动恢复。**手段1（ChaosBlade）**与**手段2（原生命令）**是并列的注入手段，都让目标域名的解析结果偏离真实 IP，按环境能力选用：主机装有 ChaosBlade（`blade version` 可用）→ 手段1（`blade create network dns`，注入层为 `/etc/hosts`、按域名精确劫持，`--replace` 控制是否覆盖已有本地解析记录，实验 UID 统一生命周期管理）；否则手段2（借 `iptables` nat 表把本机发出的 DNS 查询 DNAT 重定向到指定解析器，覆盖面比改 `/etc/hosts` 更广——绕过 hosts 的应用同样受影响）。`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
+
 ## 故障现象
 1. 域名解析返回错误 IP
 2. 应用访问特定域名失败或被导向错误服务
@@ -10,8 +13,8 @@
 2. 确认目标域名及劫持目标 IP
 
 ## 演练步骤
-1. 记录当前 DNS 解析基线：`nslookup <domain>` 或 `dig <domain>`
-2. 使用 ChaosBlade 注入 DNS 劫持
+1. 记录当前 DNS 解析基线——与注入验证判据**同口径**走 hosts-honoring 解析路径：`getent hosts <domain>`（或 `ping -c1 <domain>` 读解析到的真实 IP）。不用 `nslookup`/`dig` 作基线：它们绕过 `/etc/hosts` 只查 DNS 服务器，与本 case 手段1 注入层（改 `/etc/hosts`）及 `ping` 判据错配，且 dnsutils 非最小靶机默认装（缺失即 exit 127）；仅手段2（iptables DNAT 53 层重定向 DNS 查询本身）下 nslookup 才与观测面一致
+2. 注入 DNS 劫持 —— **手段1（ChaosBlade）**（主机无 blade 时改用文末**手段2（原生命令）**）
 
 ```bash
 blade create network dns --domain <target-domain> --ip <redirect-ip> --timeout <duration>
@@ -26,13 +29,16 @@ blade create network dns --domain <target-domain> --ip <redirect-ip> --timeout <
 3. 观察域名解析结果及应用连通性变化
 
 ## 注入验证
-1. `ping <domain>` 确认解析到错误 IP（ping 走完整 resolver、/etc/hosts 优先）。⚠️ 不要用 nslookup 作判据——ChaosBlade network dns 的注入层是 /etc/hosts（与 k8s pod-network dns 同源，`--replace` 即「已有本地解析记录是否覆盖」语义），nslookup 只查 DNS 服务器、不读 hosts，验不出劫持；仅降级方案（iptables DNAT 53 层，DNS 查询本身被重定向到伪造解析器）下 nslookup 才有效
+1. `ping <domain>` 确认解析到错误 IP（ping 走完整 resolver、/etc/hosts 优先）。⚠️ 不要用 nslookup 作判据——ChaosBlade network dns 的注入层是 /etc/hosts（与 k8s pod-network dns 同源，`--replace` 即「已有本地解析记录是否覆盖」语义），nslookup 只查 DNS 服务器、不读 hosts，验不出劫持；仅手段2（iptables DNAT 53 层，DNS 查询本身被重定向到伪造解析器）下 nslookup 才有效
 2. 观察应用访问该域名时是否超时或返回错误
 
 ## 注入恢复
+**手段1（ChaosBlade）**——销毁实验即恢复（`--timeout` 到期亦自动恢复）：
 ```bash
 blade destroy <experiment-uid>
 ```
+
+**手段2（原生命令）**——见文末「手段2（原生命令）」块的恢复命令（先停武装的定时器 `systemctl stop blade-restore-dnsnat.timer`，再按注入的 `-A` 参数逐字精确 `-D` 删除 DNAT 规则，本机 DNS 查询随即恢复直连原解析器）
 
 ## 恢复验证
 1. `ping <domain>` 确认解析回到注入前基线 IP（nslookup 不读 /etc/hosts，注入期间与恢复后返回相同结果，不能作恢复判据）
@@ -44,9 +50,9 @@ blade destroy <experiment-uid>
 
 ---
 
-## 降级方案（原生命令）
+**手段2（原生命令）**
 
-> 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
+> 与手段1（ChaosBlade）并列的注入手段，借 `iptables` nat 表把本机发出的 DNS 查询 DNAT 重定向到指定解析器（覆盖面比改 `/etc/hosts` 更广——绕过 hosts 的应用同样受影响）；主机未装 ChaosBlade 时选用本手段。
 
 前提条件：具备 root 权限，且主机 iptables 支持 nat 表
 

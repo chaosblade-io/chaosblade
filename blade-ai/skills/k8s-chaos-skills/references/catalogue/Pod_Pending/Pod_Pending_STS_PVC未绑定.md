@@ -23,7 +23,7 @@ mechanism_writes:
 **用例名称** PVC未绑定（StatefulSet 靶） 导致 Pod_Pending
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -47,7 +47,7 @@ restorePatches:                           # 恢复域：载体 TTL 到点自治�
 durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- 道具 PVC 为 execute 计划 manifest 步骤（走 front matter mechanism_writes 立法条目）；收尾清理步删除。
+- 道具 PVC（引用不存在 StorageClass、永远 Pending 的瞬态对象）为 execute 计划 manifest 步骤（走 front matter mechanism_writes 立法条目）；**它是 apply-native object-write 注入、绝非 setup，必须排在载体武装之后创建（armed-before-inject 硬序，见标准件第四节「create 域道具对象是故障生效动作、绝非 setup」），并登记进装配器 `extra_delete` 使载体 TTL 自治恢复 + `blade-ai recover` 重放都删除它**（收尾清理步为其带外兜底）。
 - 删除卡住的错误 revision Pod（revision-hash 不等标签选择器——正文 OrderedReady 立法：控制器对 Pending 错误 revision Pod 零动作）保留为 execute 计划收尾步骤。
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（删卡住 Pod、删演练 PVC）保留为 execute 计划普通 kubectl 步骤。
 
@@ -91,7 +91,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    StatefulSet 做破坏性实验」红线（本用例非破坏性）
 
 ## 演练步骤
-（主路径 = 基线捕获（步骤 1）→ 创建道具 PVC（步骤 2，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=StatefulSet、patches=模板卷挂载注入、restorePatches=模板还原、duration_seconds=<duration>），模板注入+武装+readback 工具内同步完成；步骤 3-4 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底。updateStrategy 为 `OnDelete` 时主路径同样须在装配器注入后手动删除最高序号 Pod 触发重建，见步骤 1 注）：
+（主路径 = 基线捕获（步骤 1，只读 setup）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=StatefulSet、patches=模板卷挂载注入、restorePatches=模板还原、duration_seconds=<duration>、**extra_delete=`[{"kind":"PersistentVolumeClaim","name":"sts-unbound-claim","namespace":"<namespace>"}]`**），模板注入+**武装**+readback 工具内同步完成 → **再创建道具 PVC（步骤 2，两条路径共用）**。**armed-before-inject 硬序**：道具 PVC 的 `apply -f`（inline manifest、kind=PersistentVolumeClaim ∈ 持久故障对象族）本身就是一次 object-write 注入，**必须排在装配器武装之后**——武装前创建会被 target_guard 判 `REJECT_BANNED armed-before-inject`（见标准件第四节「create 域道具对象是故障生效动作、绝非 setup」）；主路径下装配器把「武装+模板注入」绑成一次原子调用，道具 PVC 排其后，故「模板先引用、PVC 后到位」有 ~1s benign 间隙（事件史多一条 transient `sts-unbound-claim not found`，稳态收敛到预期 unbound 签名，非缺陷）。步骤 3-4 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底（fallback 下武装〔步骤 3〕与注入〔步骤 4〕分离，道具 PVC 排在步骤 3 武装后、步骤 4 patch 前创建，无 transient 间隙）。updateStrategy 为 `OnDelete` 时主路径同样须在装配器注入后手动删除最高序号 Pod 触发重建，见步骤 1 注）：
 1. **基线捕获**（恢复对照基准；restorePatches 的基线值来源，两条路径共用。Agent 读取输出并记录原始 JSON。updateStrategy
    输出为空即默认 `RollingUpdate`；`rollingUpdate.partition` 非零时仅序号 ≥
    partition 的副本参与更新，最高序号仍会更新、故障照常成立，但需在方案中知悉）：
@@ -109,7 +109,12 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    时模板变更不触发滚动，注入步骤 4 的 patch 后须**手动删除最高序号 Pod** 触发
    重建；`RollingUpdate`（默认）不需要）
 2. 使用 `kubectl apply -f` 创建一个引用不存在的 StorageClass 的 PVC（通过
-   `stdin_data` 传入 YAML）：
+   `stdin_data` 传入 YAML）。**armed-before-inject 硬序**：此 `apply -f`（inline
+   manifest、kind=PersistentVolumeClaim ∈ 持久故障对象族）本身就是一次 object-write
+   注入、绝非 setup——**主路径下排在 `faultdrill_assemble_carrier` 武装之后执行**
+   （见演练步骤头注；此步与装配器调用先后关系以头注为准，勿按编号字面把本步摆在
+   武装前，否则被 target_guard 判 `REJECT_BANNED armed-before-inject`）；fallback
+   下排在步骤 3 武装后、步骤 4 patch 前创建，并把本 PVC 登记进装配器 `extra_delete`：
    ```yaml
    apiVersion: v1
    kind: PersistentVolumeClaim
@@ -128,16 +133,20 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    revision Pod + ③删除演练 PVC——**②是 STS 用例的必要动作，不可省略**：OrderedReady
    更新策略下控制器只删除/重建 Running 且 Ready 的错误 revision Pod，对卡在
    Pending（Unschedulable）的错误 revision Pod **零动作**（K8s 官方语义：控制面等
-   待更新后的 Pod Running 且 Ready 才推进前序序号；实测恢复后 12 分钟零 delete
-   事件，手动删除后 45 秒收敛）。删除用 revision-hash 不等标签选择器限定卡住 Pod：
+   待更新后的 Pod Running 且 Ready 才推进前序序号；恢复后控制器对卡住 Pending Pod 零 delete
+   事件，须手动删除才收敛）。删除用 revision-hash 不等标签选择器限定卡住 Pod：
    `-l '<pod-label>,controller-revision-hash!=<基线revision名>'`——注入期 pod-0
    始终停在基线 revision（OrderedReady 从高序号推进，卡在最高序号时低序号未动），
    迟到重执行时健康 Pod 的 hash 已等于基线，选择器匹配空集，零副作用幂等。
    **恢复顺序即安全顺序：先模板、次删卡住 Pod、后删 PVC**——模板还原使重建 Pod 不再引用
-   演练 PVC；Pending Pod 从未挂载过该 PVC（pvc-protection finalizer 不阻删，实测
-   PVC 在 Pending Pod 引用期间删除成功）。**武装点定案：步骤 1-2 均为 setup，武装
-   推迟至步骤 4 模板 patch 紧邻前执行**——机械照抄步骤位置会让 setup 时间侵蚀
-   故障窗口）。定时器宿主形态二选一：
+   演练 PVC；Pending Pod 从未挂载过该 PVC（pvc-protection finalizer 不阻删，
+   PVC 在 Pending Pod 引用期间可删除成功）。**武装点定案：步骤 1（基线捕获）为
+   setup；步骤 2 创建道具 PVC 是 apply-native object-write 注入（故障生效动作、
+   绝非 setup，见标准件第四节），受 armed-before-inject 门约束必须排在武装之后**
+   ——故 fallback 下的真实顺序为「武装（本步）→ 创建道具 PVC（步骤 2 的 YAML）→
+   模板 patch（步骤 4）」，**勿按编号字面把 PVC 创建摆在武装前**（会被 target_guard
+   判 `REJECT_BANNED armed-before-inject`）；机械照抄步骤位置既让 setup 时间侵蚀
+   故障窗口、又触发门拦）。定时器宿主形态二选一：
    - 集群内有 kubectl 且具备恢复 RBAC 的常驻工具 Pod（宿主要求见 SKILL.md 安全
      红线；宿主凭证与当前执行凭证一致时可直接复用资源准备第 4 条检查结果）。恢复
      三动作（幂等顺序执行）：
@@ -150,14 +159,14 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
        ) >/tmp/restore.log 2>&1 & echo armed'
      ```
    - 无可用外部宿主时按**恢复载体标准件**（`references/carrier/recovery-carrier.md`）
-     自建载体栈（busybox/curl 镜像、Pod/SA/Role/RoleBinding 四对象同名、同靶点
+     自建载体栈（curl-capable 镜像〔见标准件 §4，busybox 无 curl 不可用〕、Pod/SA/Role/RoleBinding 四对象同名、同靶点
      命名空间）。Role 覆盖三个恢复动作（含卡住 Pod 删除；verb 清单按钦定恢复形态推导，
      换恢复形态时以恢复脚本实际载荷动词为准重建——见标准件第二节形态无关总则、第三节写动词 SSAR 对账）：
      ```bash
      # 两步法（多 flag 单命令 verbs 并集广播，三族全部 rule 均携带
      # [get,patch,delete,list] 超授权面——见标准件第一节立法）
      kubectl create role drill-rc-<hash> -n <namespace> --verb=get,patch --resource=statefulsets
-     # 载体 Pod 注册后，单条 json-patch 追加两族（实测一次成型、三 rule 零交叉）：
+     # 载体 Pod 注册后，单条 json-patch 追加两族（一次成型、三 rule 零交叉）：
      kubectl patch role drill-rc-<hash> -n <namespace> --type=json \
        -p '[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["persistentvolumeclaims"],"verbs":["get","delete"]}},{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["pods"],"verbs":["get","list","delete"]}}]'
      ```
@@ -165,13 +174,13 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
      json patch（Content-Type: application/json-patch+json），volumes 与
      volumeMounts 两 op 合一个文档；基线为空的字段对应 op 用 remove（对不存在
      路径仅报错不误删）；卡住 Pod 删除 = GET pods（labelSelector 含
-     `controller-revision-hash!=<基线>`）后逐个 DELETE。Pod 名提取管道是实测
+     `controller-revision-hash!=<基线>`）后逐个 DELETE。Pod 名提取管道是已知
      踩坑点：apiserver 回 pretty-printed JSON（`"name": "xxx"` 冒号后带空格），
-     `grep '"name"' | cut -d\" -f4` 类管道实测返回**零个名字**（步骤②静默
-     no-op，恢复必失败）；实证可用的形态是 token 化后整行精确匹配（见下方
+     `grep '"name"' | cut -d\" -f4` 类管道会返回**零个名字**（步骤②静默
+     no-op，恢复必失败）；可用的形态是 token 化后整行精确匹配（见下方
      代码块）；勿用 `grep -o`：会从 revision hash（形如
      `<sts-name>-5f5785...`）里截出 `<sts-name>-5` 假阳性。**恢复脚本写入后、
-     武装前，必须对提取管道做一次只读实证**：GET 本靶全部 Pod（不带 hash 过滤）
+     武装前，必须对提取管道做一次只读校验**：GET 本靶全部 Pod（不带 hash 过滤）
      + 本地跑同一管道，返回恰为真实 Pod 名集合才可武装；不一致则改管道，
      不得带病武装。PVC 删除单次 DELETE。恢复动作**先模板、次卡住 Pod、后
      PVC**（顺序依据见上）；两种顺序均收敛：
@@ -245,10 +254,9 @@ PersistentVolumeClaims` 与 PVC 的 `storageclass.storage.k8s.io
 unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完成，恢复确认
 （Pod Running + PVC 清理 + revision 收敛）走演练结束后的带外核验
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活（配置型故障：注入卷在 Pod
+**持续性检查**——故障窗口内故障必须持续存活（配置型故障：注入卷在 Pod
 模板 spec、PVC Pending，字段在即故障在）：
-以「注入生效确认」为时点锚（注入验证第 1-4 条通过 = 生效），生效后一次
-`time_wait 30`（间隔 = 2 × 传播上限：本案为规则/字段/进程型即时生效故障，无传播过程，30s 为最小复测窗，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在
+以「注入生效确认」为时点锚（注入验证第 1-4 条通过 = 生效）——生效确认只证明某一刻故障已落地，不证明它在整个窗口持续存活；持续性复测要把「稳态故障」与「传播收敛窗内的瞬时态」分开：待传播收敛后再次观测仍见故障态才算坐实持续。本故障传播特性：本案为规则/字段/进程型即时生效故障，无传播过程。隔多久复测、复测几次由你依该传播特性与故障形态自行判断（无固定间隔、无固定探针数），到点**下发**复测探针并**具体记录命令与输出**——效果证据须在
 故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工
 介入后如实报告：
 1. 白盒复查：模板 volumes 仍含 `sts-unbound-claim` 引用（`kubectl get
@@ -256,7 +264,7 @@ unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完
    jsonpath='{.spec.template.spec.volumes}'`）且 PVC 仍 Pending（配置即状态）
 2. 行为复查：最高序号 Pod 仍 Pending、READY 仍 < DESIRED 不收敛
 3. 事件复查：FailedScheduling 事件 LAST SEEN 相比注入时有新增（调度器仍在
-   周期性重试）——**新式事件形态注（实测）**：部分集群对进入 unschedulable
+   周期性重试）——**新式事件形态注**：部分集群对进入 unschedulable
    队列的 Pod 不重发 FailedScheduling（单次 eventTime、count/series 空，LAST SEEN
    原地变老），此时本条判据结构性不可达，如实记 partial，持续性证明由第 1/2 条
    承载（配置即状态 + 行为不收敛）；勿把事件不前进误判为故障已恢复
@@ -279,8 +287,8 @@ unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完
    ```
    （`<idx>` 为挂载注入卷的容器 index；多容器且注入目标非第一容器时用其实际
    index。**②不可省略**——OrderedReady 控制器对非 Running/Ready 的错误 revision
-   Pod 零动作，不删则 STS 永不回 READY==DESIRED（实测：恢复后 12 分钟零 delete
-   事件，手动删除后 45 秒收敛））
+   Pod 零动作，不删则 STS 永不回 READY==DESIRED（控制器对卡住 Pending Pod 零 delete
+   事件，须手动删除才收敛））
 2. 等待滚动更新完成（被卡序号的 Pod 由步骤 ②触发重建为基线 Pod 并调度运行；
    判据见恢复验证第 1 条，勿用 rollout status）
 

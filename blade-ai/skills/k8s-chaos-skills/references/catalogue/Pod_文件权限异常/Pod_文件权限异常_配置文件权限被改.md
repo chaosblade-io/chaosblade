@@ -49,7 +49,7 @@
    ```bash
    kubectl exec <pod-name> -n <namespace> -- sh -c '
      ( sleep <recovery-seconds>; chmod <原始权限数字> <配置文件路径>; echo PERMS_RESTORED >> /tmp/perm.evd ) >/tmp/perms-restore.log 2>&1 &
-     echo PERMS_CHANGED >> /tmp/perm.evd
+     echo PERMS_CHANGED > /tmp/perm.evd
      ls -l <配置文件路径> >> /tmp/perm.evd
      chmod 000 <配置文件路径>
      ls -l <配置文件路径> >> /tmp/perm.evd'

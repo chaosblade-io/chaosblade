@@ -1,3 +1,17 @@
+---
+# 注入机制声明（network 故障专属）：本用例的手段1（blade `pod-network occupy`）与
+# 手段2（kubectl-native：容器内 nc/socat 抢占端口）本质都是**用户态 bind 占用**——
+# 在目标容器里起一个监听进程 bind 住端口，使其他进程无法 bind（`Address already in
+# use`）。它**不触碰 netfilter/tc**：既不需要容器内有 `iptables`，也不依赖某个网卡
+# `interface` 存在。故此处声明 `network_mechanism: userspace-bind`，供注入前可行性
+# 检查器（NetworkFeasibilityChecker）读到后**跳过** iptables/interface 探测——否则
+# 会对本用例发一条事实错误的 TIGHT 建议（"iptables 不可用 → 优先 blade operator /
+# netadmin debug 容器"），把规划者从真正可行、且本用例明确列为平等手段的
+# kubectl-native bind 路径上引开。未声明该字段的 network 用例检查器 fail-safe 回退到
+# netfilter 前置（照跑 iptables/interface 探测，行为与声明前逐字节一致）。
+network_mechanism: userspace-bind
+---
+
 **用例名称** 端口被占用 导致 Pod_网络故障
 
 ## 故障定位
@@ -98,7 +112,7 @@ operator 健康）
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'pkill -x <原应用进程名> 2>/dev/null; \
    socat TCP-LISTEN:<port>,fork,reuseaddr /dev/null >/dev/null 2>&1 & echo $! > /tmp/portbind-agent.pid; \
-   echo PORTBIND_INJECTED >> /tmp/portbind-agent.evd; \
+   echo PORTBIND_INJECTED > /tmp/portbind-agent.evd; \
    ( sleep <recovery-seconds>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid; echo PORTBIND_RESTORED >> /tmp/portbind-agent.evd ) >/dev/null 2>&1 &'
 ```
 结构说明：
@@ -123,20 +137,46 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 让框架在观察窗终点主动派发的恢复先于自治到期落地；手段1 的 `--timeout` 由引擎在
 派发前按同一单源钉定，文档占位符保持 `<duration>` 不动
 
-**执行期效果自证探针（强烈推荐，注入载荷后、进入验证前执行）**——bind 探针是
-变异形态操作（后台起进程再 kill），**verify 阶段的 read-only 纪律会结构性拒绝它**
-（曾见 readonly_phase_violation 拒绝记录，被迫现场改用白盒替代）。正确位置是
-执行期：注入载荷落地后立即追加一条探针载荷，把效果主证在注入时刻写进证据文件：
+**bind 探针原语（本用例效果主证的唯一判据；执行期正向 / 恢复期反向共用此单一定义，
+两处引用不得各自另写命令块——见恢复验证第 2 条）**——端口占用的效果语义是「其他
+进程无法 bind」，故主证 = 一个独立的 bind 探针：在靶容器内后台起一个监听进程尝试
+bind `<port>`，`sleep 2` 后用 `kill -0 $P` 判它是否存活——**存活 = bind 成功（端口
+空闲）；已退出 = bind 失败（端口被占，`Address already in use`）**。探针本身是变异
+形态操作（起后台进程再 kill），**verify 阶段的 read-only 纪律会结构性拒绝它**（曾见
+readonly_phase_violation 拒绝记录，被迫现场改用白盒替代），故只能在执行期（注入载荷
+落地后、进入验证前）或带外人工执行，不要在 verify 阶段重试。
+
+两种镜像形态同构（判读完全一致，按容器工具二选一）：
+- socat 形态：`socat TCP-LISTEN:<port>,fork[,reuseaddr] /dev/null >/dev/null 2>&1 &`
+- nc 形态（有 nc 无 socat 的 busybox 类镜像）：`nc -l -p <port> -e cat >/dev/null 2>&1 &`
+  （nc 无 reuseaddr 对应项，bind 成功即存活，正/反判读不变）
+
+reuseaddr 语义决定探针极性，正/反两向勿混用：
+- **正向探针（执行期，验占用生效）不加 reuseaddr**：严格排他测试——占用进程持有时，
+  无 reuseaddr 的探针必 bind 失败退出。`BIND_REJECTED` = 注入生效，效果主证在注入时刻
+  写进证据文件 `/tmp/portbind-agent.evd`（与自证链标记同构，不受窗口时序约束）；探针
+  竟存活（`PROBE_BIND_UNEXPECTEDLY_OK`）= 注入未生效，立即按恢复命令处置。
+- **反向探针（恢复期，验端口释放）加 reuseaddr**：容忍 TIME_WAIT 残留，使「释放后可
+  立即重 bind」成为可靠判据——占用进程终止后探针应 bind 成功并存活 2 秒（`BIND_OK` =
+  释放确证）；探针 bind 失败退出（`BIND_STILL_BUSY`）= 占用进程仍在，恢复未完成
+  （勿以 Pod Running 状态替代本判据）。
+
+正向探针载荷（socat 形态，写证据文件）：
 ```bash
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'socat TCP-LISTEN:<port>,fork /dev/null >/dev/null 2>&1 & P=$!; sleep 2; \
    if kill -0 $P 2>/dev/null; then kill $P; echo PROBE_BIND_UNEXPECTEDLY_OK >> /tmp/portbind-agent.evd; \
    else echo BIND_REJECTED >> /tmp/portbind-agent.evd; fi'
 ```
-判读：`BIND_REJECTED` 写入证据文件 = 效果主证在注入时刻被捕获（与自证链标记同构，
-不受窗口时序约束）；`PROBE_BIND_UNEXPECTEDLY_OK` = 注入未生效，立即按恢复命令处置。
-探针进程存活检测不可省——bind 成功的 socat 会挂住 exec（前台裸跑会挂到超时）。
-有 nc 无 socat 的镜像换 `nc -l -p <port> -e cat` 同构探针（判读相同）
+反向探针载荷（socat 形态，reuseaddr + stdout 判读；恢复验证第 2 条即引用此载荷）：
+```bash
+kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
+  'socat TCP-LISTEN:<port>,fork,reuseaddr /dev/null >/dev/null 2>&1 & P=$!; sleep 2; \
+   if kill -0 $P 2>/dev/null; then echo BIND_OK; kill $P; else echo BIND_STILL_BUSY; fi'
+```
+探针进程存活检测不可省——bind 成功的监听进程会挂住 exec（前台裸跑会挂到超时）。
+nc-only 镜像把两载荷的 `socat TCP-LISTEN:<port>,fork[,reuseaddr] /dev/null` 整体换成
+`nc -l -p <port> -e cat`，其余（sleep/kill -0/判读标记）逐字不变。
 
 **路径 B —— nc 抢占（有 nc 的 busybox 类镜像；无 nc 时本路径不可用）**
 
@@ -159,7 +199,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'pkill -x <原应用进程名> 2>/dev/null; \
    ( nc -l -l -p <port> -e cat ) >/dev/null 2>&1 & echo $! > /tmp/portbind-agent.pid; \
-   echo PORTBIND_INJECTED >> /tmp/portbind-agent.evd; \
+   echo PORTBIND_INJECTED > /tmp/portbind-agent.evd; \
    ( sleep <recovery-seconds>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid; echo PORTBIND_RESTORED >> /tmp/portbind-agent.evd ) >/dev/null 2>&1 &'
 ```
 （自证链、重武装纪律、执行期效果自证探针与路径 A 完全一致）
@@ -179,8 +219,11 @@ read-only 纪律约束：探针类变异形态操作（后台起进程+kill 的 
 2. **效果交叉验证（verify 阶段可用形态）——双层白盒观测**：占用进程持有的
    LISTEN socket 本身就是导致 bind 失败的状态，用两个独立观测层交叉确证：
    - ss/netlink 层：`ss -tlnp` 见 `<port>` LISTEN 归属 socat/nc 进程
-   - 内核层：`cat /proc/net/tcp`（端口十六进制，如 18080 = 0x46A0）见
-     `00000000:<HEXPORT> ... 0A`（0A = LISTEN）行——与 ss 观测互为独立佐证
+   - 内核层：`cat /proc/net/tcp` **或 `/proc/net/tcp6`**（端口十六进制，如
+     18080 = 0x46A0）见 `<HEXPORT> ... 0A`（0A = LISTEN）行——与 ss 观测互为
+     独立佐证。**两表皆须查**：占用进程绑 IPv6 通配 `:::<port>` 时（busybox nc
+     无 host 参数即此形态，netstat 显示 `:::<port>`、ss 显示 `*:<port>`）行落
+     tcp6 表而 tcp4 表为空，勿因 `/proc/net/tcp` 空即判内核层交叉失败
    - （bind 不可用的直接证明只能由执行期探针提供，见手段2；verify 阶段不要
      尝试重跑探针形态——会被 readonly 纪律拒绝，如实换用本条白盒交叉即可，
      不要重试被拒的变异形态探针）
@@ -192,7 +235,7 @@ read-only 纪律约束：探针类变异形态操作（后台起进程+kill 的 
 4. **预期阴性声明（无监听负载形态）**：以下现象**不出现且不作为失败证据**——
    应用日志报 `Address already in use`（无应用要 bind）、健康检查失败（无探针端口）、
    Service 端点异常（原本无端点流量）。效果主证以第 2 条 bind 探针为准
-5. **持续性检查（必做）**——占用是状态型故障，监听 socket 存活即故障存活：白盒主证
+5. **持续性检查**——占用是状态型故障，监听 socket 存活即故障存活：白盒主证
    为 `ss -tlnp` 仍见 `<port>` LISTEN（手段1 实验未 destroy 且未到 `--timeout`；
    手段2 定时器未走完）。手段2 以证据文件为准：`PORTBIND_INJECTED` 已现而
    `PORTBIND_RESTORED` 未现即窗口仍开。若窗口内提前恢复，说明故障窗口契约未达成，
@@ -227,13 +270,11 @@ read-only 纪律约束：探针类变异形态操作（后台起进程+kill 的 
    的 LISTEN 行（与基线快照一致）；手段2 证据文件应新增 `PORTBIND_RESTORED`、
    PID 文件已删除；`/proc/net/tcp` 无 `<HEXPORT>` 的 0A 行（交叉佐证）
 2. bind 探针反向确认（端口可复用；执行期或带外人工执行，Agent 主动恢复路径可跑）：
-   ```bash
-   kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
-     'socat TCP-LISTEN:<port>,fork,reuseaddr /dev/null >/dev/null 2>&1 & P=$!; sleep 2; \
-      if kill -0 $P 2>/dev/null; then echo BIND_OK; kill $P; else echo BIND_STILL_BUSY; fi'
-   ```
-   探针存活 2 秒 = 端口可 bind = 释放确证；`BIND_STILL_BUSY` = 占用进程仍在，恢复
-   未完成（勿以 Pod Running 状态替代本判据）
+   直接跑手段2「bind 探针原语」的**反向探针载荷**（reuseaddr + stdout 判读，单一定义
+   在手段2 注入节，此处不另写命令块以免漂移）。判读：探针存活 2 秒 = `BIND_OK` = 端口
+   可 bind = 释放确证；`BIND_STILL_BUSY` = 占用进程仍在，恢复未完成（勿以 Pod Running
+   状态替代本判据）。nc-only 镜像同样按原语换成 `nc -l -p <port> -e cat`（正向探针曾
+   只有 socat 变体覆盖不到 nc 镜像的恢复期，单源化后反向探针一并继承 nc 形态）
 3. 原应用有监听时：确认应用重新监听目标端口、服务恢复可达、Pod Running 且 Ready、
    Service Endpoints 包含该 Pod
 4. 确认 Pod RESTARTS 与基线一致（无注入引发的额外重启；自然重启周期工作负载按

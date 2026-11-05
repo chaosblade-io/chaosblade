@@ -124,7 +124,7 @@ durationSeconds: <duration>               # 演练窗口（正文定时器 sleep
    **不要**以"存量调用仍正常"反推注入未生效
 3. 确认应用 A 依赖 DNS 的新发起调用出现解析错误（可观察项；应用无对外调用时以第 2 条为准）
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活，而非注入一次即消失：
+**持续性检查**——故障窗口内故障必须持续存活，而非注入一次即消失：
 1. 窗口中段复查 `kubectl get pods -n kube-system -l <coredns-label>` 仍无 Running Pod——
    若有 Pod 重建，说明有其他控制器/人工介入恢复了副本数，取证 `kubectl get deployment`
    的 replicas 与事件后如实报告

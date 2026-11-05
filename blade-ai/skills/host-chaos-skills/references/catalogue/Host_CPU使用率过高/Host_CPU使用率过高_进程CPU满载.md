@@ -1,5 +1,8 @@
 **用例名称** 进程CPU满载 导致 Host_CPU使用率过高
 
+## 故障定位
+持续型故障——CPU 压测进程存活即满载存活，贯穿整个故障窗口；窗口结束（`--timeout` 到期进程退出 / 实验销毁）即自动恢复。**手段1（ChaosBlade）**与**手段2（原生命令）**是并列的注入手段，底层效果等价（都是起 busy 进程占满 CPU、抬高使用率与 Load），按环境能力选用：主机装有 ChaosBlade（`blade version` 可用）→ 手段1（实验 UID 统一生命周期管理）；否则手段2。`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
+
 ## 故障现象
 1. 主机 CPU 使用率持续超过 90%
 2. 系统 Load Average 显著升高
@@ -11,7 +14,7 @@
 
 ## 演练步骤
 1. 记录当前 CPU 基线：`top -bn1 | head -5` 或 `vmstat 1 3`
-2. 使用 ChaosBlade 注入 CPU 满载
+2. 注入 CPU 满载 —— **手段1（ChaosBlade）**（主机无 blade 时改用文末**手段2（原生命令）**）
 
 ```bash
 blade create cpu fullload --cpu-percent <percent> --timeout <duration>
@@ -31,9 +34,11 @@ blade create cpu fullload --cpu-percent <percent> --timeout <duration>
 3. （可选，仅当演练方提供了应用访问入口时）确认请求延迟增大；无入口时上述 CPU 与 Load 证据成立即可判定
 
 ## 注入恢复
+**手段1（ChaosBlade）**——销毁实验即恢复（`--timeout` 到期亦自动恢复）：
 ```bash
 blade destroy <experiment-uid>
 ```
+**手段2（原生命令）**——见文末「手段2（原生命令）」块的恢复命令（stress-ng `--timeout` 自停 / 手动 kill PID）
 
 ## 恢复验证
 1. `top` 确认 CPU 使用率恢复正常水平
@@ -45,9 +50,9 @@ blade destroy <experiment-uid>
 
 ---
 
-## 降级方案（原生命令）
+**手段2（原生命令）**
 
-> 当 ChaosBlade 不可用时，可使用 `stress-ng` 实现等效 CPU 满载。
+> 与手段1（ChaosBlade）并列的注入手段，效果等价（`stress-ng --cpu` 起 busy 进程占满 CPU）；主机未装 ChaosBlade 时选用本手段。本手段属 **Branch B（自停型手段2）**——stress-ng 自带 `--timeout` 前台跑满窗口后自行退出即恢复、无需外挂载体；发射经 host_inject 前台直发，本地等待超时返回 outcome UNKNOWN 即预期且完整的发射回执（命令在主机续跑），随后**一条只读探针对账**即为权威回执，**严禁** setsid/systemd-run/nohup/`&` 包裹故障命令追同步返回；发射语义详见 `references/carrier/recovery-carrier.md` §〇 Branch B。
 
 前提条件：主机已安装 `stress-ng`。
 
@@ -83,5 +88,5 @@ kill <stress-ng-pid>
 ```
 
 注意事项：
-- **若 `stress-ng` 未安装**：主机原生 CPU 满载降级不可行（`host_inject` 的安全护栏仅放行故障二进制，`sh`/`bash` 等 shell 解释器被拒，无法用 shell 死循环兜底）。此时应明确报告“host 原生 CPU 降级不可行”并交回 replan 重新规划（例如换用其它已安装工具或改用 ChaosBlade）。
+- **若 `stress-ng` 未安装**：手段2（原生 CPU 满载）不可行（`host_inject` 的安全护栏放行**故障二进制 + 单条只读诊断**〔`top`/`mpstat`/`df`/`ps`/`ss`/`cat` 等，无管道/重定向〕，但 `sh`/`bash` 等 shell 解释器仍被拒，无法用 shell 死循环兜底）。此时应明确报告“手段2 原生 CPU 满载不可行”并交回 replan 重新规划（例如换用其它已安装工具或改用手段1 ChaosBlade）。
 - 与 ChaosBlade 相比，原生方式缺少集中式实验记录，需自行记录 PID 以便恢复。

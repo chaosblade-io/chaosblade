@@ -6,6 +6,8 @@
 # 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC 不可授/验权 403）
 # 时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
+# 载体由 faultdrill_assemble_carrier 程序化建栈、结构性自拆（fail-closed 路径 + 恢复句柄清理链 + 武装定时器自删 → apiserver ownerRef GC 级联）；降级路径不自建可自撤 RBAC 栈，正文无需传输载体自撤授权类知识。
+carrier_teardown: assembler-managed
 # 机制写入集立法（write-set approval contract）：本用例的故障机制需要写受害者
 # 覆盖之外的对象——靶是 Deployment（Pod 的 owner），patch imagePullSecrets/
 # imagePullPolicy/maxUnavailable 属受害者自身域内（名字匹配放行），但注入要
@@ -26,7 +28,7 @@ mechanism_writes:
 **用例名称** 凭证缺失或过期 导致 Pod_镜像拉取失败
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（凭证道具 Secret 的创建/删除为非 patch 域动作，走 execute 计划步骤+frontmatter 立法条目）；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（凭证道具 Secret 的创建/删除为非 patch 域动作，走 execute 计划步骤+frontmatter 立法条目）；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -119,7 +121,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-imgsecret.sh; ( sleep <duration>; sh /tmp/blade-restore-imgsecret.sh ) >/tmp/restore.log 2>&1 & echo armed'
    ```
    倒计时从武装时刻起算：先校验后武装、与注入紧邻（≤60s）；武装后发生任何修复须先 `kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'pkill -f blade-restore-imgsecre[t]; true'` 停旧定时器再全额重武装（见 SKILL.md 安全红线「故障窗口完整」）
-   ⚠️ 载体 RBAC 前置（形态无关立法——#51 B85 判例：规划期钦定 PUT/update 而 Agent
+   ⚠️ 载体 RBAC 前置（形态无关立法——规划期钦定 PUT/update 而 Agent
    合法切换 json-patch 恢复后 Role 未联动追加 patch，timer fire PATCH 403 静默失败、
    仅 DELETE 成功部分恢复）：Role verbs 以**恢复脚本载荷实际使用的全部写动词**为准
    （REST 映射：PATCH→patch / PUT→update / DELETE→delete / POST→create），不以规划期
@@ -129,7 +131,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    SelfSubjectAccessReview 或 `kubectl auth can-i <verb> <resource> -n <namespace>`，
    如 `can-i patch deployments` / `can-i update deployments` / `can-i delete secrets`
    按实际动词集），任一 no/false 则先补 Role 重验再武装——GET 200 只证明凭证链路正确，
-   写动词授权从未被验证（#51 实弹翻车路径）。（恢复输出落 /tmp/restore.log 可带外
+   写动词授权从未被验证（恢复静默失败的高发路径）。（恢复输出落 /tmp/restore.log 可带外
    取证，静默期已消除）
 4. 创建一个包含无效凭证的 Secret 来替换原有的有效凭证：
    ```bash

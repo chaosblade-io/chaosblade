@@ -9,7 +9,7 @@
 1. 已生成 Agent hook:`blade prepare python --port <port> --python-path <解释器> --target-script <应用入口脚本>`(两参数均必填,hook 文件 `sitecustomize.py` 落在入口脚本所在目录;blade 自带 agent 库,无需 pip install;端口须空闲)
 2. 目标 Python 应用已以 `PYTHONPATH=<hook 目录>:$PYTHONPATH` **重启**,Agent 才在应用进程内监听;且应用使用 `redis` 客户端库
 3. 已记录注入前该接口的成功率基线,以及**数据库的 QPS/负载基线**(用于观测穿透)
-4. 确认应用日志可见异常堆栈
+4. 确认应用会把被捕获的异常外显到某个可观测通道(日志堆栈 **或** 接口错误响应体 **或** trace)——`throwCustomException` 只保证在应用进程内抛出配置的异常,是否落日志由应用自身的 `except` 处理决定,不保证
 
 > prepare 返回 success 与 `blade status --type prepare` 显示 `Running` 都**不代表 Agent 已存活**,只是记录状态。真实状态由注入结果反推:报 `no running python preparation record found` 说明缺 prepare(可当场补做);报 `connect: connection refused` 说明 Agent 不在进程内(需重启应用,演练中无法补做,按前置条件不满足上报)。不要尝试用 curl 等命令探活——它们不在 Agent 可执行白名单内。
 
@@ -27,11 +27,11 @@
 
 ## 注入验证
 1. **（主证据，必做）** 调用依赖缓存的接口,确认读缓存失败(返回错误或走回源分支)
-2. 查看应用日志确认抛出的正是配置的异常类型与消息:
+2. 确认应用外显的异常类型与消息正是配置值——经应用实际暴露的通道核实(日志堆栈行 **或** 接口错误响应体/降级响应内嵌的 type+message **或** trace),不预设异常一定落日志:
    ```
    redis.exceptions.ConnectionError: chaos drill: redis unavailable
    ```
-   - 若日志中看到的是 `RuntimeError` 而非配置的类型,说明该异常类名**无法在应用进程内导入**,Agent 已静默降级为 `RuntimeError`。此时应用「按 Redis 异常类型判断是否回源」的逻辑不会被真正验证,应改用应用确实能导入的类名重注
+   - 若看到的是 `RuntimeError` 而非配置的类型(无论在日志还是响应体),说明该异常类名**无法在应用进程内导入**,Agent 已静默降级为 `RuntimeError`。此时应用「按 Redis 异常类型判断是否回源」的逻辑不会被真正验证,应改用应用确实能导入的类名重注
 3. 观察数据库侧 QPS/负载是否随之上升——这是缓存穿透真实发生的证据;若数据库无变化,说明应用有本地兜底或直接返回错误,需据实记录而非判定注入失败
 4. **（诊断，仅当上述效果未出现时执行）**查询实验状态——机制回执为机制代言不为结果代言，实验在册仅证明拦截规则已注册（用于区分「实验未在册」与「在册但应用未命中拦截点」），不构成效果证据:
    ```bash
@@ -49,7 +49,7 @@
 ## 恢复验证
 1. 再次调用接口,确认恢复命中缓存并正常返回
 2. `blade status --uid <uid>` 状态为 Destroyed
-3. 确认数据库 QPS/负载回落到基线,应用日志不再出现注入的异常
+3. 确认数据库 QPS/负载回落到基线,应用外显通道(日志/响应体)不再出现注入的异常
 
 ## 基准事实
 - **根因**：Agent 在应用进程内拦截 `redis.client.Redis.execute_command`，命中 matcher 时**不执行真实命令**而直接抛出配置的异常（受控中断），因此 Redis 服务端从未收到该命令

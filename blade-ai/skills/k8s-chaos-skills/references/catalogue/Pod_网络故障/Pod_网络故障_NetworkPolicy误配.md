@@ -9,7 +9,7 @@ recovery_channel: apiserver-write
 # NetworkPolicy（新对象、带 drill-netpol- 前缀、不触及既有资源）。**新对象也必须
 # 立法**——networkpolicy 不在 pod 受害靶的 scope 及其 secondary_scopes 内，drift
 # 守卫第 4 步对 approved=pod / effective=networkpolicy 判 scope drift 直接拒绝，
-# 注入根本到不了 execute 阶段的 armed 门（#65 实测根因；此前误判「新对象无需条目」）。
+# 注入根本到不了 execute 阶段的 armed 门。
 # namespace 走 namespace_from: victim 派生：netpol 靠 podSelector 选中同 ns 的靶 Pod，
 # 必须建在受害者运行时所在 ns，而可移植 case 无法硬编码该 ns（换靶即失效）；freeze 时
 # 由确定性代码物化为 spec.namespace（无需集群查询，受害者 ns 已知），与
@@ -74,14 +74,14 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl create sa drill-rc-<hash> -n <namespace>
    kubectl create role drill-rc-<hash> -n <namespace> --verb=get,delete --resource=networkpolicies
    kubectl create rolebinding drill-rc-<hash> -n <namespace> --role=drill-rc-<hash> --serviceaccount=<namespace>:drill-rc-<hash>
-   kubectl run drill-rc-<hash> -n <namespace> --image=busybox:1.36 --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
+   kubectl run drill-rc-<hash> -n <namespace> --image=curlimages/curl:latest --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
    ```
    （镜像按标准件第九节判别法选定；SA/Role/RoleBinding 须先于载体 Pod 创建。定名后按标准件第九节做精确同名冲突预检。）
    载体创建后武装前**必须先做 SA 真实 token 验权**（禁 `can-i --as` 假放行，见标准件第三节——Role verbs 以恢复脚本实际载荷动词 DELETE 为准；验权探针 GET 目标 netpol 404 属预期——对象尚未创建，验权判据是「非 403」）：
    ```bash
    kubectl exec drill-rc-<hash> -n <namespace> -- sh -c '( sleep <recovery-seconds>; curl -s -X DELETE --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" https://kubernetes.default.svc/apis/networking.k8s.io/v1/namespaces/<namespace>/networkpolicies/drill-netpol-<hash> ) >/tmp/restore.log 2>&1 & echo armed'
    ```
-   （倒计时从武装时刻起算：先校验后武装、与注入紧邻 ≤60s——本用例注入序列只有 create netpol 一条快命令，武装紧邻其前执行即可；武装后发生任何修复须先停旧定时器再全额重武装：`kubectl exec drill-rc-<hash> -n <namespace> -- sh -c 'pkill -f networkpolicie[s]; true'`，见 SKILL.md 安全红线「故障窗口完整」。自断授权尾步——标准件第四节立法：主恢复 curl 为裸 `-s`（body 天然落 restore.log，按取证包裹律 K1 界定无需再包裹），尾步在其后以 `&&` 链一条 `curl -sf -X DELETE` 自删自己的 Binding（本用例 namespaced 栈删 `rolebindings/drill-rc-<hash>`）；**自删规则须在武装之后**按标准件第二节两步建栈法 json-patch 追加（不可在建栈 Role 时同期追加——armed-before-inject 门禁止武装前 patch 载体 Role、会被 REJECT_BANNED；自删规则只在定时器 fire 时消费，武装后、注入前这条秒级 patch 补上完全来得及，执行序见标准件第九节）；**严禁把自删 flag 合并进 create 命令**——pflag 并集复制会污染主恢复规则，主授权规则带锁名即 GET 目标资源 403、case 不可执行）。fail-open：主恢复未确认成功则授权保留；字节挤不下就不带——完整形态与五纪律以标准件第四节为准。演练结束后按标准件第六节四连删除并带外核实零残留：
+   （倒计时从武装时刻起算：先校验后武装、与注入紧邻 ≤60s——本用例注入序列只有 create netpol 一条快命令，武装紧邻其前执行即可；武装后发生任何修复须先停旧定时器再全额重武装：`kubectl exec drill-rc-<hash> -n <namespace> -- sh -c 'pkill -f networkpolicie[s]; true'`，见 SKILL.md 安全红线「故障窗口完整」。自断授权尾步——标准件第四节立法：主恢复 curl 为裸 `-s`（body 天然落 restore.log，按取证包裹律 K1 界定无需再包裹），尾步在其后以 `&&` 链一条 `curl -sf -X DELETE` 自删自己的 Binding（本用例 namespaced 栈删 `rolebindings/drill-rc-<hash>`）；**自删规则须在武装之后**按标准件第二节两步建栈法 json-patch 追加（不可在建栈 Role 时同期追加——此为 §9 执行序约定、**非门强制**：armed-before-inject 门已放行「载体自身已登记 Role 的 add-only 追加动词 patch」、仅拒受害靶/未登记同名 role/replace-remove 收缩；自删规则只在定时器 fire 时消费、豁免于武装前 SSAR 硬门，武装后、注入前这条秒级 patch 补上完全来得及，执行序见标准件第九节）；**严禁把自删 flag 合并进 create 命令**——pflag 并集复制会污染主恢复规则，主授权规则带锁名即 GET 目标资源 403、case 不可执行）。fail-open：主恢复未确认成功则授权保留；字节挤不下就不带——完整形态与五纪律以标准件第四节为准。演练结束后按标准件第六节四连删除并带外核实零残留：
    ```bash
    kubectl delete pod drill-rc-<hash> -n <namespace> --ignore-not-found
    kubectl delete rolebinding drill-rc-<hash> -n <namespace> --ignore-not-found
@@ -92,7 +92,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 ## 演练步骤
 （主路径 = 基线捕获（步骤 1）→ 标准件武装（资源准备第 5 条，`<recovery-seconds>` 取 prompt 下发的 recovery_timer_seconds）→ create 演练道具 NetworkPolicy（步骤 3）；本 case 注入是 create 新对象，无装配器调用）：
 
-> **爆炸半径分类（定案）**：`target-only`——写入集只有一个新建演练道具 NetworkPolicy（新对象不构成"影响其他资源"）；但 consequence 影响面 = selector 匹配范围内全部 Pod 的流量策略（资源准备第 4 条的波及面清单），写入 `blast_radius_detail` 注明，勿因 consequence 抬档（与既有节点 taint 的 cluster-wide 场景不同——本 case 无跨 ns 持久资源写入）。
+> **爆炸半径分类（定案，defer SKILL.md L41 + recovery-carrier §9）**：声明 `blast_radius_scope=namespace-wide`——双重依据：①故障本体写入集含新建 ns 级演练道具 NetworkPolicy，按 SKILL.md L41 末句「写入集里除 target 与一次性载体外只有 ns 内对象即为 namespace-wide」（新 NetworkPolicy 是 ns 内对象、非无 RBAC 的一次性调试载体）；②恢复走 apiserver-write 四件套 carrier，新增 namespaced RBAC 授权面（§9①）。定案免推导，勿在 target-only↔namespace-wide 间重复仲裁。consequence 影响面 = selector 匹配范围内全部 Pod 的流量策略（资源准备第 4 条的波及面清单），写入 `blast_radius_detail` 注明；与既有节点 taint 的 cluster-wide 场景不同——本 case 无跨 ns 持久资源写入，勿抬到 cluster-wide。
 
 1. **基线捕获**：记录注入前连通性基线（恢复验证的对照锚点，两条路径共用）
    ```bash
@@ -131,7 +131,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```bash
    kubectl exec <test-pod> -n <namespace> -- wget -qO- --timeout=5 <目标服务地址>
    ```
-   预期超时/拒绝。**CNI 策略同步有传播窗（calico/cilium 实测 5-15s）**——注入后立即探测可能仍通，等 15s 再采；15s 后仍通则核对 selector 是否真的匹配靶 Pod（`kubectl get pods -n <namespace> -l <selector> -o name` 应列出靶 Pod）
+   预期超时/拒绝。**CNI 策略同步有传播窗（calico/cilium 约 5-15s）**——注入后立即探测可能仍通，等 15s 再采；15s 后仍通则核对 selector 是否真的匹配靶 Pod（`kubectl get pods -n <namespace> -l <selector> -o name` 应列出靶 Pod）
 3. 确认靶 Pod 本身 Running（策略不改变 Pod 生命周期）：
    ```bash
    kubectl get pod <pod-name> -n <namespace> -o jsonpath={.status.phase}
@@ -141,8 +141,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 > - **严禁为不适用的方向反复更换查询方式找证据**。注入 Ingress-only 时出向必然通，查到"通"是必然而非失败。
 > - 同一事实（策略是否在位）确认一次即可，不要重复查询。
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活（配置型故障：netpol 对象在即故障在）：
-以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效），生效后一次 `time_wait 30`（间隔 = 2 × 传播上限：CNI 策略同步 5-15s → 30s，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
+**持续性检查**——故障窗口内故障必须持续存活（配置型故障：netpol 对象在即故障在）：
+以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效）——生效确认只证明某一刻故障已落地，不证明它在整个窗口持续存活；持续性复测要把「稳态故障」与「传播收敛窗内的瞬时态」分开：待传播收敛后再次观测仍见故障态才算坐实持续。本故障传播特性：CNI 策略同步 5-15s。隔多久复测、复测几次由你依该传播特性与故障形态自行判断（无固定间隔、无固定探针数），到点**下发**复测探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
 1. 白盒复查：netpol 对象仍存在且 spec 未变（同注入验证第 1 条）
 2. 行为复查：被拒方向连通性探测仍失败（同注入验证第 2 条）
 3. 稳定性复查：靶 Pod RESTARTS 计数无增长、phase 仍 Running（排除策略外因素导致的状态漂移）
@@ -172,7 +172,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 ## 基准事实
 - **根因**：一个 selector 过宽或规则语义错误的 NetworkPolicy 被创建，CNI 按其白名单模型对匹配 Pod 执行流量拒绝——模拟运维误配策略/安全组规则错误下发/多租户策略串扰场景
 - **必现现象**：NetworkPolicy 对象在位且 selector 匹配靶 Pod；被拒方向流量超时/拒绝；Pod 本身 Running 不受影响；Pod netns 内无演练注入的 iptables 规则（与数据面注入形态的白盒区别）
-- **传播窗事实**：CNI 策略生效与撤销均有 5-15s 传播窗（calico/cilium 实测量级）——注入验证与恢复验证的行为判据都要计入该窗口，窗口内探测结果不作裁决依据
+- **传播窗事实**：CNI 策略生效与撤销均有 5-15s 传播窗（calico/cilium 量级）——注入验证与恢复验证的行为判据都要计入该窗口，窗口内探测结果不作裁决依据
 - **作用域边界**：仅 selector 匹配的 Pod 受影响；同命名空间未被选中的 Pod、其他命名空间 Pod 均不受影响
 
 ## 注意事项

@@ -54,7 +54,7 @@
 
 前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；恢复需 SSH 访问权限
 
-注入命令（**双 timer 形态——2026-09-15 实测定案，单命令原子形态存在「载体自噬」结构缺陷，见下方注意事项**）：
+注入命令（**双 timer 形态——单命令原子形态存在「载体自噬」结构缺陷，见下方注意事项**）：
 ```bash
 # 通过 kubectl debug node 武装两个宿主机 systemd transient 定时器后立即退出：
 #   T+20s   → kill -STOP containerd（延迟触发，让 debug pod 在冻结生效前退出）
@@ -82,7 +82,7 @@ ssh root@<node-ip> 'kill -CONT $(pidof containerd)'
 ```
 
 注意事项：
-- **载体自噬结构缺陷（2026-09-15 实测三 attempt 定案）**：若用单命令原子形态（登记恢复后同步执行 `kill -STOP`），debug pod 自身在 STOP 生效后卡 `Pending/ContainerCreating`——kubelet 冻结无法上报容器退出，工具层 one-shot cap 与故障窗口同时到期，注入命令调用方在窗口结束前拿不到回执，后续删 Pod 步骤无法在窗口内落地（两次实测 attempt 载荷正确但演练效果为零）。双 timer 形态（STOP 延迟 20s 触发）让 debug pod 在冻结生效前 `Succeeded/exit 0` 秒退，是唯一可行形态；净冻结窗 = `<recovery-seconds>`（= prompt 下发的 `recovery_timer_seconds` = D+G 安全网窗，CONT 定时器从同一武装时刻起算、扣除 20s 结构性前置后即净窗）。**本 case 特例**：containerd 冻结后 Agent 无法主动恢复（见"提前恢复必须人工带外执行"），CONT 定时器是唯一恢复路径——框架不派发主动恢复，故安全网窗即实际冻结窗
+- **载体自噬结构缺陷**：若用单命令原子形态（登记恢复后同步执行 `kill -STOP`），debug pod 自身在 STOP 生效后卡 `Pending/ContainerCreating`——kubelet 冻结无法上报容器退出，工具层 one-shot cap 与故障窗口同时到期，注入命令调用方在窗口结束前拿不到回执，后续删 Pod 步骤无法在窗口内落地（两次 attempt 载荷正确但演练效果为零）。双 timer 形态（STOP 延迟 20s 触发）让 debug pod 在冻结生效前 `Succeeded/exit 0` 秒退，是唯一可行形态；净冻结窗 = `<recovery-seconds>`（= prompt 下发的 `recovery_timer_seconds` = D+G 安全网窗，CONT 定时器从同一武装时刻起算、扣除 20s 结构性前置后即净窗）。**本 case 特例**：containerd 冻结后 Agent 无法主动恢复（见"提前恢复必须人工带外执行"），CONT 定时器是唯一恢复路径——框架不派发主动恢复，故安全网窗即实际冻结窗
 - **通道幽灵错误处置范式**：注入命令回执报基础设施错误（如 `No executor available for cluster`）不代表载荷未执行——用只读 API 证据（节点事件/debug pod 生命周期）+ 宿主机 journal（`systemd` 的 STOP/CONT Started/Succeeded 日志对）判定载荷实际执行状态，勿据通道错误直接重试（重复 STOP 会叠加冻结窗口）
 - 挂起 containerd 后节点上所有容器操作均失效（包括 kubectl debug/exec/logs），恢复只能通过 systemd 定时器自愈或 SSH 带外
 - 删除触发步骤用 `kubectl delete pod <name> --wait=false`：优雅终止需 kubelet 经 CRI 确认，冻结期旧 Pod 卡 `Terminating` 数十秒属预期形态，`--wait=false` 让命令立即返回不占用窗口

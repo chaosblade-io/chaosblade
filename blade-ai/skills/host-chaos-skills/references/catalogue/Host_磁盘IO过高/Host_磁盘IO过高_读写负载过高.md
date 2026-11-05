@@ -1,17 +1,21 @@
 **用例名称** 读写负载过高 导致 Host_磁盘IO过高
 
+## 故障定位
+持续型故障——磁盘 IO 压测（burn / fio）进程存活即高负载存活，贯穿整个故障窗口；窗口结束（`--timeout` / `--runtime` 到期进程退出 / 实验销毁）即自动恢复，无持久残留（不改文件内容/分区/配置，仅测试文件占空间需回收）。**手段1（ChaosBlade）**与**手段2（原生命令）**是并列的注入手段，底层效果等价（都是起密集读写占满磁盘 IO 带宽、抬高 %util 与 iowait），按环境能力选用：主机装有 ChaosBlade（`blade version` 可用）→ 手段1（实验 UID 统一生命周期管理）；否则手段2（需 `fio`，仅有 `dd` 见文末替代写法）。`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
+
 ## 故障现象
 1. 磁盘 %util 持续接近 100%
 2. IO Wait（wa）显著升高
 3. 应用读写延迟增大，吞吐下降
 
 ## 资源准备
-1. 确认目标主机上 ChaosBlade 已安装（`blade version`）
+1. 确认目标主机上 ChaosBlade 已安装（`blade version`）；未装则走文末**手段2（原生命令）**（需 `fio`，仅有 `dd` 见替代写法）
 2. 确认监控系统可观测磁盘 IO（如 `iostat -xd 1`、Prometheus node_exporter）
+3. **爆炸半径约束**：`--path` 默认 `/` 会对根分区施加 IO 压力——在容器/共享宿主上会波及整块磁盘。演练须把 `--path`（及手段2 的 `<path>`）指向一个**专用有界分区**（如固定大小 loop 设备挂载点），把 IO 半径锁死在该分区内，严禁打根 overlay
 
 ## 演练步骤
 1. 记录当前 IO 基线：`iostat -xd 1 3`（关注 %util、r/s、w/s）
-2. 使用 ChaosBlade 注入磁盘 IO 高负载
+2. 注入磁盘 IO 高负载 —— **手段1（ChaosBlade）**（主机无 blade 时改用文末**手段2（原生命令）**）
 
 ```bash
 blade create disk burn --read --write --path <target-path> --timeout <duration>
@@ -32,9 +36,11 @@ blade create disk burn --read --write --path <target-path> --timeout <duration>
 3. （可选，仅当演练方提供了应用访问入口时）确认读写延迟增大；无入口时上述 %util 与 iowait 证据成立即可判定
 
 ## 注入恢复
+**手段1（ChaosBlade）**——销毁实验即恢复（`--timeout` 到期亦自动恢复）：
 ```bash
 blade destroy <experiment-uid>
 ```
+**手段2（原生命令）**——见文末「手段2（原生命令）」块的恢复命令（fio `--runtime` 自停 / 回收测试文件）
 
 ## 恢复验证
 1. `iostat -xd 1` 确认 %util 回落到正常水平
@@ -46,9 +52,9 @@ blade destroy <experiment-uid>
 
 ---
 
-## 降级方案（原生命令）
+**手段2（原生命令）**
 
-> 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
+> 与手段1（ChaosBlade）并列的注入手段，效果等价（`fio` 起密集读写占满磁盘 IO 带宽、抬高 %util 与 iowait）；主机未装 ChaosBlade 时选用本手段。
 
 前提条件：主机需具备 `fio`（若只有 `dd`，见文末替代写法）
 

@@ -9,11 +9,16 @@
 目标目录在独立块设备（PVC/云盘）上才允许"打满到目标百分比"；落在节点根盘
 （容器 rootfs overlay、emptyDir，即此形态：无任何独立卷，`/` 与 `/tmp`
 同一 overlay，同盘还有 kubelet、容器运行时与同节点全部 Pod）时，打满 = 节点
-`DiskPressure` = 驱逐同节点所有 Pod（同节点常含 zookeeper、node-local-dns、
-terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身的载体 Pod）——
+`DiskPressure` = 驱逐同节点所有 Pod（同节点常含 CNI、节点 DNS、存储插件等系统
+组件与有状态生产负载，甚至可能有演练通道自身的载体 Pod）——
 此时**只允许有界小增量填充**（设计：8G，使用率 32%→约 39%），"应用写入
-失败/ENOSPC"现象声明为**预期阴性**。`duration_seconds` 是必填的故障窗口契约，
-未给定时先向用户确认。
+失败/ENOSPC"现象声明为**预期阴性**。**无独立卷填充有两条相互独立的驱逐路径，
+小增量上界必须同时满足两者**：① 节点根盘空间逼近 kubelet 阈值 → 节点
+`DiskPressure` → 驱逐**同节点全部** Pod（节点级，见资源准备第 3 条）；② 容器
+rootfs/emptyDir 用量计入**该 Pod 的 `ephemeral-storage`**，若容器声明了
+`ephemeral-storage` limit 且「基线用量 + 填充量」超过它 → kubelet 只驱逐
+**该 Pod 自身**（单 Pod 级，且节点 `DiskPressure` 仍为 False，故只看节点条件的
+交叉确认看不到它）。`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
 ## 故障现象
 1. Pod 视角 `df` 使用率上升（独立卷靶：可达目标百分比；无独立卷靶：上升声明的增量）
@@ -40,8 +45,17 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
    kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].volumeMounts}'
    # b) 无独立卷时：记录文件系统基线与驱逐爆炸半径
    kubectl exec <pod-name> -n <namespace> -c <container> -- df -k <目标目录>
-   kubectl get node <node-name> -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}'
-   kubectl get pods -A -o wide --field-selector spec.nodeName=<node-name> --no-headers
+   # 节点 Conditions 定点查关注项（节点可能带十余项云厂商 NPD 自定义 condition，
+   # 全量单行 jsonpath 会被输出预算截断→逼出重查）
+   kubectl get node <node-name> -o jsonpath='DiskPressure={.status.conditions[?(@.type=="DiskPressure")].status} Ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+   # 每 Pod 一行紧凑 jsonpath（-o wide 在数十 Pod 节点截断丢 RESTARTS/状态，且其
+   # RESTARTS 列聚合 initContainer 重启、与主容器 restartCount 不一致）
+   kubectl get pods -A --field-selector spec.nodeName=<node-name> -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.phase}:{.status.containerStatuses[0].restartCount}{"\n"}{end}'
+   # c) 无独立卷时：查容器是否声明 ephemeral-storage limit（第二条驱逐路径，见下）
+   kubectl get pod <pod-name> -n <namespace> \
+     -o jsonpath='{range .spec.containers[*]}{.name}: lim={.resources.limits.ephemeral-storage} req={.resources.requests.ephemeral-storage}{"\n"}{end}'
+   # d) fallocate 可行性：overlayfs 需 kernel≥4.16（见资源准备第 4 条），只读核实
+   kubectl get node <node-name> -o jsonpath='{.status.nodeInfo.kernelVersion}'
    ```
    - 目标目录挂独立卷（PVC/云盘 csi）→ 允许打满设计（`--percent`/算量到 95%+），
      填满只影响本 Pod
@@ -50,7 +64,19 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
      （imagefs/nodefs available < 15%/10% 触发硬驱逐）。定量示例（典型靶）：
      117.7G 总量、80.9G 可用，填 8G 后 available 仍约 62%，使用率 32%→约 39%，
      安全；填到打满（约 63G+）必然触发 DiskPressure——**禁止**
-   - 同节点 Pod 清单必须先记录（恢复验证时对照：无驱逐/无重启漂移即爆炸半径未失控）
+   - **第二条驱逐路径（ephemeral-storage limit，无独立卷靶必查）**：rootfs/emptyDir
+     填充计入该 Pod 的 `ephemeral-storage` 用量。用资源准备第 3 条 c) 读容器
+     `resources.limits/requests.ephemeral-storage`：**声明了 limit** 且「当前 Pod
+     ephemeral 用量 + 填充量」超过它 → kubelet 驱逐**该 Pod 自身**（单 Pod，节点
+     `DiskPressure` 仍 False，只看节点条件的交叉确认看不到它）。故小增量上界 =
+     min(节点 available 余量, 若有 limit 则 limit − 当前 Pod ephemeral 用量)；
+     **未声明 limit** → 此路径不适用（kubelet 不做 per-pod ephemeral 驱逐），
+     只受节点阈值约束。此判定属规划期必做的后果链排查，不要留到执行期才发现
+   - 同节点 Pod 逐 Pod restartCount 基线必须先记录，并**显式锁定预存异常 Pod 的
+     基线态**（CrashLoopBackOff/长期 Pending/Terminating 窗口内按自身节奏继续自重
+     属基线内、非注入所致，计划点名供 verifier 勿误判）；恢复验证时逐 Pod 对照自身
+     基线，判据是 delta、非绝对态（无注入新增的驱逐/重启漂移即爆炸半径未失控，详见
+     SKILL.md「爆炸半径验证判据」）
 4. **容器工具探测（决定手段2 路径）**——有 fallocate 或 dd 即可走路径 A：
    ```bash
    kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
@@ -58,6 +84,19 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
    ```
    典型靶：fallocate/dd/truncate 全有 → 路径 A。都没有（distroless/scratch 镜像
    常态）→ 路径 B（节点侧写）
+   - **fallocate 在 overlayfs 上的可行性（无独立卷靶 = rootfs overlay，必核，定案
+     免推导）**：overlayfs 仅在 **kernel ≥ 4.16**（`ovl_fallocate`，commit
+     5248b7f8b8ec）时把 fallocate 转发到 upper fs；更老内核返回 `EOPNOTSUPP`、
+     fallocate 失败。这是**稳定内核版本事实**（非 per-run 偶发），核实方式是
+     **只读**查节点内核版本（切勿在 read-only 规划期试写 fallocate 探测）：
+     ```bash
+     kubectl get node <node-name> -o jsonpath='{.status.nodeInfo.kernelVersion}'
+     ```
+     kernel ≥ 4.16 → fallocate 可用（overlayfs 把新建文件的分配转发到 upper fs，
+     upper 落在 ext4/xfs 均支持）；kernel < 4.16 → 走路径 A 的 **dd 兜底**
+     （`dd if=/dev/zero`，同属路径 A 容器内填充、**不是**降级到手段1 ChaosBlade）。
+     无需为核实 backing fs 类型另起 debug pod（会给同节点 Pod 清单加一个临时 Pod、
+     污染爆炸半径交叉确认）——内核版本已足以定案 fallocate 可行性
 5. 确认目标目录当前用户可写（典型靶 uid=0、`/tmp` 1777，探测 `ls -ld <目标目录>` 即可）
 
 ## 演练步骤
@@ -93,8 +132,11 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
 
 **路径 A —— 容器内 fallocate/dd（适用形态）**
 
-前提条件：容器内有 fallocate（快，仅分配元数据）或 dd（慢，真实写入）；
-落点判定已完成（资源准备第 3 条），填充量已按爆炸半径上界算出。
+前提条件：容器内有 fallocate 或 dd。fallocate **分配真实磁盘块、但不写零**（故快；
+`df` 已用量与 `du` 都按填充量如实上涨——**非稀疏、不是"仅分配元数据"**，这正是
+效果主证 df 增量成立的物理基础），dd 则真实写零（慢，GB 级耗时明显）。overlayfs 上
+fallocate 需 kernel ≥ 4.16（可行性核实见资源准备第 4 条），不满足则用 dd 兜底。
+落点判定已完成（资源准备第 3 条，含两条驱逐路径），填充量已按爆炸半径上界算出。
 
 填充量计算（**按增量，不是按百分比**）：
 - 打满设计（仅独立卷）：填充量 = 文件系统总量 × 目标使用率 − 当前已用量
@@ -108,7 +150,7 @@ terway、csi-plugin 等系统/生产组件，甚至可能有演练通道自身�
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   '( sleep <recovery-seconds>; rm -f /tmp/fill_file; echo DISKFILL_RESTORED >> /tmp/diskfill.evd ) >/dev/null 2>&1 & \
    fallocate -l <填充量>G /tmp/fill_file && \
-   ls -l /tmp/fill_file >> /tmp/diskfill.evd && \
+   ls -l /tmp/fill_file > /tmp/diskfill.evd && \
    echo DISKFILL_INJECTED >> /tmp/diskfill.evd'
 ```
 - `dd` 替代（无 fallocate 时）：`dd if=/dev/zero of=/tmp/fill_file bs=1M count=<MB数>`
@@ -159,38 +201,60 @@ read-only 纪律天然放行，无探针形态冲突）：
    ```
    `ls` 见填充文件、字节数与填充量一致；证据文件含 `DISKFILL_INJECTED`
    （含 `DISKFILL_RESTORED` 即窗口已关，如实报告实际时长）
-3. **爆炸半径未失控交叉确认（无独立卷靶必做）**：
+3. **爆炸半径未失控交叉确认（无独立卷靶必做，两条驱逐路径都要看）**（节点路径判据 =
+   逐 Pod 对照自身基线的 delta、非绝对态，详见 SKILL.md「爆炸半径验证判据」）：
    ```bash
-   kubectl get node <node-name> -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}'
-   kubectl get pods -A -o wide --field-selector spec.nodeName=<node-name> --no-headers
+   kubectl get node <node-name> -o jsonpath='DiskPressure={.status.conditions[?(@.type=="DiskPressure")].status} Ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+   kubectl get pods -A --field-selector spec.nodeName=<node-name> -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}:{.status.phase}:{.status.containerStatuses[0].restartCount}{"\n"}{end}'
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.status.phase} {.status.reason}'
    ```
-   节点 DiskPressure 仍 False；同节点 Pod 与基线清单一致（无 Evicted、无异常重启）
+   ① 节点路径：DiskPressure 仍 False；同节点 Pod 逐 Pod 对照资源准备第 3 条记录的
+   自身 restartCount 基线，无注入新增的 Evicted/重启漂移（预存自重 Pod 的基线内漂移
+   排除归因）；
+   ② 单 Pod 路径：靶 Pod 自身仍 Running、`status.reason` 非 `Evicted`——若容器声明了
+   ephemeral-storage limit，填充超限时 kubelet 只驱逐靶 Pod 而节点 DiskPressure 仍 False，
+   只看节点条件会漏判，故必须单独确认靶 Pod 未被 ephemeral-storage 驱逐
+   （必要时 `kubectl describe pod` 查有无 `Evicted`/ephemeral-local-storage 超限事件）
 4. **预期阴性声明（小增量设计）**：以下现象**不出现且不作为失败证据**——
-   应用写入失败/ENOSPC（磁盘远未满）、Pod 事件出现磁盘异常、Pod 被驱逐。
+   应用写入失败/ENOSPC（磁盘远未满）、Pod 事件出现磁盘异常、相对基线新增的 Pod 驱逐。
    出现任一项 = 爆炸半径失控，立即按恢复命令处置并如实上报。
    （写入失败现象仅打满设计下可验证；且注意 verify 阶段 readonly 纪律拒绝
    一切写探针——打满设计须在注入载荷后立即做执行期写入探针，不可留到验证阶段）
-5. **持续性检查（必做）**——占用是状态型故障，填充文件存活即故障存活：
+5. **持续性检查**——占用是状态型故障，填充文件存活即故障存活：
    45s 后复查 `df -k` 已用量仍在高位（增量未消失）、`ls -l` 填充文件仍存在
 
 ## 注入恢复
 1. 手段1：`blade destroy <experiment_uid>`，填充文件随实验销毁自动清理；
    使用了 `--retain-handle` 且空间未释放时重启目标 Pod
 2. 手段2：定时器到期自动 `rm -f` + 写 `DISKFILL_RESTORED`（主恢复路径）；
-   提前恢复（幂等：文件不存在时 rm -f 空触发无害）：
+   提前恢复（幂等：文件不存在时 rm -f 空触发无害）——**必须拆成两次 exec：先停
+   定时器，再删文件写标记**：
    ```bash
+   # (a) 停定时器：单独一次 exec，命令行内只有 pkill 模式串、无字面文件名
    kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
-     'pkill -f "sleep.*; rm -f /tmp/fill_fil[e]" 2>/dev/null; \
-      rm -f /tmp/fill_file; echo DISKFILL_RESTORED >> /tmp/diskfill.evd; true'
+     'pkill -f "sleep.*; rm -f /tmp/fill_fil[e]" 2>/dev/null; true'
+   # (b) 删文件 + 写还原标记：另一次 exec
+   kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
+     'rm -f /tmp/fill_file; echo DISKFILL_RESTORED >> /tmp/diskfill.evd; true'
    ```
+   **禁止把 (a)(b) 合并进同一条 sh -c**：合并后执行恢复的 shell 自身命令行同时含
+   “sleep”（pkill 模式串里）与字面的 `/tmp/fill_file`（rm 目标），
+   `pkill -f "sleep.*; rm -f /tmp/fill_fil[e]"` 会匹配到这个 shell 自己——末字符
+   `[e]` 的防自杀只挡得住模式串自身的 `fill_fil[e]`，挡不住同一命令行里第二个
+   字面 `fill_file`；pkill 先把自己 SIGTERM（退出码 143），后续 `rm` 与还原标记都不
+   执行，故障文件残留、提前恢复失效。拆开后 (a) 的命令行无字面文件名，`[e]`
+   守卫成立（与「武装后修复」处停旧定时器的 standalone pkill 同形态）。停定时器只杀
+   subshell，其 `sleep` 子进程成孤儿但无害：父 subshell 已死，到期不再触发 `rm`，
+   孤儿 `sleep` 自行退出。
 
 ## 恢复验证
 1. **空间定量回落（主证）**：`df -k <目标目录>` 已用 KB 回落到基线水平
    （±少量日志写入噪声，通常 < 几百 MB），Use% 回到基线值
 2. 填充文件不存在：`ls /tmp/fill_file` 报 No such file；证据文件含
    `DISKFILL_RESTORED`（双标记齐备 = 注入与还原全程自证）
-3. 节点健康：DiskPressure 仍 False；同节点 Pod 与基线清单一致（对照资源准备
-   第 3 条记录，无 Evicted/重启漂移——爆炸半径全程受控的最终证据）
+3. 节点健康：DiskPressure 仍 False；同节点 Pod 逐 Pod 对照资源准备第 3 条记录的
+   自身基线，无注入新增的 Evicted/重启漂移（预存自重 Pod 的基线内漂移排除归因——
+   爆炸半径全程受控的最终证据）
 4. Pod 状态 Running、RESTARTS 与基线一致
 
 ## 基准事实
@@ -252,7 +316,7 @@ read-only 纪律天然放行，无探针形态冲突）：
        systemd-run --on-active=<recovery-seconds>s --unit=blade-rmfill-<PodUID前8位> \
          "sh -c \"truncate -s 0 <步骤2确认的路径>/fill_file; echo DISKFILL_RESTORED >> <步骤2确认的路径>/diskfill.evd\"" &&
        fallocate -l <按路径A同式算出的填充量>G <步骤2确认的路径>/fill_file &&
-       ls -l <步骤2确认的路径>/fill_file >> <步骤2确认的路径>/diskfill.evd &&
+       ls -l <步骤2确认的路径>/fill_file > <步骤2确认的路径>/diskfill.evd &&
        echo DISKFILL_INJECTED >> <步骤2确认的路径>/diskfill.evd
      '
    ```

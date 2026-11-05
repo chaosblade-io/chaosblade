@@ -93,7 +93,7 @@ action 的一次性形态已被本用例废除。
 2. 确认容器发生过重建：优先从 `kubectl get pod <pod-name> -n <namespace> -o json` 读取 containerID 变化与 Last State（terminated 时间戳）——**故障生效期间容器正在崩溃，exec 大概率失败（unable to upgrade connection），不要把 exec 作为首选**；exec `ps aux` 看 PID 变化仅作容器已稳定时的补充手段
 3. 执行 `kubectl describe pod <pod-name> -n <namespace>`，确认 Events 中有 `Back-off restarting failed container` 或 Last State 显示 terminated 且 reason 为 Error/Signal（第 1、3 步相互独立，应同批并行执行；只读探针一律单命令直发，不做 `sh -c 'a && b'` 串联——串联形态下一条失败会连坐整链）
 4. CrashLoopBackOff 由构造成立：RESTARTS 持续递增（第 1 步）+ 第 3 步**任一分支**（Back-off 事件，或 Last State terminated/Error）即证明已越过退避阈值、kubelet 已进入退避控制——状态标签是这些量的渲染，不等其文本出现；首检已观测到标签时如实记录即可
-5. **持续性检查（必做）**——判据是"无外部干预下杀进程仍在继续"。本步证明的是持续性（机制将运转到窗口结束），不是效果存在——效果已由第 1-3 步证明；对持续性命题，机制状态就是直接证据。三层按可得性取用，**任一层成立即完成本步，下层仅为上层不可查时的回退**：
+5. **持续性检查**——判据是"无外部干预下杀进程仍在继续"。本步证明的是持续性（机制将运转到窗口结束），不是效果存在——效果已由第 1-3 步证明；对持续性命题，机制状态就是直接证据。三层按可得性取用，**任一层成立即完成本步，下层仅为上层不可查时的回退**：
    - **白盒主证（即时，单独充分）**：故障机制本身仍存活——`systemctl is-active blade-stoploop-<pod-name>` 为 active（循环 unit）且终止 timer pending（`systemctl list-timers` 含 `blade-stoploop-term-<pod-name>.timer`；经 debug pod `chroot /host` 查询）。机制存活且循环指向目标容器时，"持续在杀"由构造成立——本步即完成，无需佐证窗口
    - **有界佐证（仅当白盒不可查时）**：静观一个短窗口（≤60 秒）后再次执行 `kubectl get pods`，RESTARTS 无干预递增即完成。CrashLoopBackOff 深期 kubelet 退避可达 60-90 秒，窗口内未见递增不等于机制已停——此情形如实记录退避歧义即可
    - **黑盒回退（仅当以上均不可查时）**：停止一切操作、静观 1-2 分钟后再查 RESTARTS

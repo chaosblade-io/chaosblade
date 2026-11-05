@@ -37,7 +37,7 @@
      LISTEN、内核照常完成 connect → CNI binary 发送请求后挂起等待响应直至超时（挂起
      超时路径）→ Pod 真卡 Terminating，FailedKillPod 事件周期性重试——此形态「卡
      Terminating」与 kubelet 日志 CNI DEL 失败**两判据同现**，仍以 CNI DEL 失败记录为主
-     证据、Terminating 停留为辅证（实测：600s 窗口内 FailedKillPod ×25）
+     证据、Terminating 停留为辅证（如 600s 窗口内 FailedKillPod 反复累积）
 2. 查看 kubelet 日志（`journalctl -u kubelet`），确认有 CNI DEL 调用失败或超时的记录（主证据，必做）。journalctl 不可达（节点无权限/验证载体不可 exec）时，目标 Pod 的 FailedKillPod 事件为等价同源通道——事件由 kubelet 自身产生写入 API，文本含 plugin type 与 eni.socket 报错原文，经 `kubectl describe pod` 读取即主证据成立（记 deviation）
 3. 确认 CNI 插件进程处于 T（Stopped）状态。liveness probe 是否导致窗口坍缩须先做
    **操作性判定**：`ss -lntp` 查 probe 端口持有者并核对其与被 STOP 的 daemon 的进程

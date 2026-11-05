@@ -141,7 +141,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
   'cp /etc/hosts /etc/hosts.bak &&
    { ( sleep <recovery-seconds>; cat /etc/hosts.bak > /etc/hosts; rm -f /etc/hosts.bak; echo DNS_HIJACK_RESTORED >> /etc/hosts.bak.evd ) >/dev/null 2>&1 & } &&
    echo "<错误IP> <target-domain>" >> /etc/hosts &&
-   echo DNS_HIJACK_INJECTED >> /etc/hosts.bak.evd'
+   echo DNS_HIJACK_INJECTED > /etc/hosts.bak.evd'
 ```
 链条是**自证的**：注入成功后的 `DNS_HIJACK_INJECTED` 与定时器还原后的 `DNS_HIJACK_RESTORED`
 写入证据文件 `/etc/hosts.bak.evd`，白盒主证在注入/还原时刻即被捕获，验证阶段读
@@ -169,11 +169,17 @@ busybox cp 向它覆盖写入必报 `can't create '/etc/hosts': File exists`；�
 
 提前恢复命令（幂等：备份不存在说明定时器已还原，整链空触发无害；
 兜底执行务必包 `test -f` 守卫，否则 `cat` 报错会污染退出码。同 D50 陷阱：
-`cp` 覆盖 /etc/hosts 必报 File exists，必须用 `cat >` 截断写）：
+`cp` 覆盖 /etc/hosts 必报 File exists，必须用 `cat >` 截断写）——**必须拆成两次
+exec：先停定时器，再还原**：
 ```bash
+# (a) 停定时器：单独一次 exec，命令行内只有 pkill 模式串、无字面 hosts.bak
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
-  'pkill -f hosts.ba[k]; test -f /etc/hosts.bak && { cat /etc/hosts.bak > /etc/hosts; rm -f /etc/hosts.bak; echo DNS_HIJACK_RESTORED >> /etc/hosts.bak.evd; }; true'
+  'pkill -f hosts.ba[k]; true'
+# (b) 还原 + 删备份 + 写标记：另一次 exec
+kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
+  'test -f /etc/hosts.bak && { cat /etc/hosts.bak > /etc/hosts; rm -f /etc/hosts.bak; echo DNS_HIJACK_RESTORED >> /etc/hosts.bak.evd; }; true'
 ```
+**禁止把 pkill 与还原块合并进同一条 sh -c**（如旧写法 `sh -c 'pkill -f hosts.ba[k]; test -f /etc/hosts.bak && {...}'`）：合并后执行恢复的 shell 自身命令行同时含字面 `/etc/hosts.bak`（test/cat/rm/evd 四处），`pkill -f hosts.ba[k]` 的正则匹配字面 `hosts.bak`——`[k]` 守卫只挡得住模式串自身的 `hosts.ba[k]`，挡不住同一命令行里那四处字面 `hosts.bak` → pkill 匹配到这个 shell 自己、先 SIGTERM（退出码 143），后续还原块全部不执行、劫持记录永久残留、提前恢复失效。拆开后 (a) 的命令行无字面 `hosts.bak`（与上文重武装处停旧定时器的 standalone pkill 同形态），`[k]` 守卫成立。停定时器只杀 subshell，其 `sleep` 子进程成孤儿但无害：父 subshell 已死，到期不再触发还原。
 
 ## 注入验证
 （两种手段共用——底层都是 /etc/hosts 劫持记录）：
@@ -204,7 +210,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c \
    kubectl exec <pod-name> -n <namespace> -c <container> -- ping -c 1 -W 3 <无关域名>
    ```
    解析应仍为正常 IP
-6. **持续性检查（必做）**——劫持记录是状态型故障，记录存活即故障存活：白盒主证为
+6. **持续性检查**——劫持记录是状态型故障，记录存活即故障存活：白盒主证为
    `cat /etc/hosts` 仍含劫持行（手段1 实验未 destroy 且未到 `--timeout`；手段2 定时器未走完）。
    路径 B 以证据文件为准：`DNS_HIJACK_INJECTED` 已现而 `DNS_HIJACK_RESTORED` 未现即窗口仍开
    （链条严格串行，标记先后顺序即注入/还原的确证）。有界佐证为静观短窗口后请求该域名

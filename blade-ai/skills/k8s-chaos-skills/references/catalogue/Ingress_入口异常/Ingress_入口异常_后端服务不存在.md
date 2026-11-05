@@ -1,10 +1,21 @@
 ---
+# 受害者作用域参考（route A，非强制 hint）：本用例受害者是 Ingress 自身——故障机制
+# patch 的就是该 Ingress 第一条 rule 的 backend service 名（受害者域内写，名字匹配
+# 放行），Service 与后端 Pod 全程健康。供 planner 填 finish_planning 的 fault_scope
+# 时参照，把它钉在 ingress 而非降级到 service：ingress 不在旧 scope 词表时 approved
+# 会被迫降级成 service，使 approved.scope=service ≠ effective.scope=ingress，被 drift
+# 守卫结构性拒绝（openspec register-config-object-fault-scopes 已把 ingress 注册进词表
+# 修复此链）。这是「参考」而非「边界」——代码不校验、不覆盖（无 enforcement），模型
+# 仍须理解真实语义后自行判断、不盲从本字段。
+fault_scope: ingress
 # 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
 # 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 Ingress backend service
 # 名），路由进程序化恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：
 # 建栈+验权+武装+注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点
 # 不容纳/RBAC 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
+# 载体由 faultdrill_assemble_carrier 程序化建栈、结构性自拆（fail-closed 路径 + 恢复句柄清理链 + 武装定时器自删 → apiserver ownerRef GC 级联）；降级路径不自建可自撤 RBAC 栈，正文无需传输载体自撤授权类知识。
+carrier_teardown: assembler-managed
 # 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
 # 自身（patch Ingress 的 backend service 名属受害者域内，名字匹配放行），无跨
 # 对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash>
@@ -26,7 +37,7 @@ backend 名即自动恢复。与既有 Service 层形态（Service_调用失败/
 是必填的故障窗口契约，未给定时先向用户确认。
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 backend service 名；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 backend service 名；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -49,8 +60,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 - 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。
 
 ## 故障现象
-1. 通过 Ingress 入口访问目标 host/path 返回 **503 Service Unavailable**（ingress-nginx 对无 Endpoints 后端的默认响应；其他 controller 实现可能返回 502/404，以实测为准）
-2. ingress controller 日志出现 backend 解析失败记录（ingress-nginx：`service drill-nonexistent-svc-<hash> not found` 或 endpoints 为空告警）
+1. 通过 Ingress 入口访问目标 host/path 返回 **503 Service Unavailable**（ingress-nginx 对无 Endpoints 后端的默认响应；其他 controller 实现可能返回 502/404，以当次探测为准）
+2. ingress controller 日志出现 backend 解析失败记录（ingress-nginx：`service drill-nonexistent-svc-<hash> not found` 或 endpoints 为空告警）。**采集方法（可达，必采）**：只读 `kubectl logs -n <ingress-ns> <controller-pod> --tail=50` 即可取到——只读观测在守卫放行范围内，即使 exec 进 controller 命名空间被拒（超出演练授权面），本条日志仍可采，是「故障只在转发层、后端 Endpoints 解析失败」的最强机制归因证据，勿因 exec 被拒而一并放弃
 3. **Service 与后端 Pod 全程健康**——`kubectl get svc,endpoints,pods` 均正常，故障只在 Ingress 转发层（与 Service 层故障的关键区别）
 4. 直接访问 Service ClusterIP 或 Pod IP 仍可达（绕过 Ingress 的路径不受影响）
 
@@ -59,11 +70,14 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```bash
    kubectl get ingress <ingress-name> -n <namespace> -o jsonpath='{.spec.rules[0].http.paths[0].backend.service.name}'
    ```
-2. 确认有可访问的入口地址（外部 LB 地址 / 节点端口 + Host 头）并记录基线响应：
-   ```bash
-   curl -s -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>
+2. 确认有可访问的入口地址并记录基线响应。**`<入口地址>` vantage 选型（hairpin + 跨 ns 纪律）**：外部 LB / 节点端口在 Agent 本机常不可达（hairpin 回环 → curl 000 假象），故 `<入口地址>` 取**集群内 vantage**——从靶命名空间内的一个 Pod（后端 Pod / 载体 Pod）发起 curl，打 ingress controller 的 Service DNS 名或 ClusterIP + Host 头；**勿打后端自身的 Service ClusterIP**（从后端 Pod curl 自身 Service 会因 kube-proxy hairpin 得到 000 假象）。**严禁 exec 进 controller 自身命名空间的 controller pod**——跨 ns exec 超出演练授权面、会被守卫拒绝（只读 `kubectl logs/get -n <ingress-ns>` 不在此列，仍放行）；controller 侧证据走只读日志（见故障现象第 2 条）。**入口探针首选框架内置只读工具 `http_probe`（配 `resolve` 打虚拟主机路由端点）**——Ingress 按 Host 头路由，把裸 controller ClusterIP 塞进 url 会因 Host 不匹配落到 default backend（404）而非目标 host/path，故必须用 `resolve` 把 ingress-host 这个 NAME 的 DNS 钉到 controller Service ClusterIP（url 里保留 NAME、curl 才会发对的 Host 头）：
    ```
-   预期 200（或业务正常码）——基线不可达时本 case 无法验证故障效果，先修基线或换靶
+   http_probe(origin_pod=<集群内独立非后端探测 Pod>, url=http://<ingress-host>/<path>, resolve=<ingress-host>:80:<controller-Service-ClusterIP>, namespace=<namespace>, max_time=10, capture=metadata)
+   ```
+   **`resolve` 是本 case 的关键参数、不可省**——格式 `host:port:IPv4`：`host` 与 url 里的 ingress-host 逐字一致、`port` 等于 url 有效端口（HTTP 入口＝80，否则 curl 忽略 override 直接 DNS 失败 `exit_code=6`）、`IPv4` 是 controller Service ClusterIP（先只读 `kubectl get svc -n <ingress-ns> <controller-svc> -o jsonpath='{.spec.clusterIP}'` 取）。`origin_pod` 即上面 vantage 纪律选定的集群内独立非后端 Pod（勿打后端自身 Service ClusterIP，hairpin 得 000 假象）。`capture` 用默认 `metadata`（本 case 只判状态码/退出码，`http_code` 即落 exact-key 进观测时间线供 Layer-2 cross-check）。预期 `http_code=200`（或业务正常码）——基线不可达时本 case 无法验证故障效果，先修基线或换靶。**降级形态（仅当 `http_probe` 不可用）＝手写 `-H 'Host:'` plain curl**（http_code 不进时间线、是 cross-check 盲区，故仅作降级；详见注意事项末条）：
+   ```bash
+   curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>
+   ```
 3. 确认 ingress controller 在位且健康：
    ```bash
    kubectl get pods -A -l app.kubernetes.io/name=ingress-nginx
@@ -76,13 +90,13 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 ## 演练步骤
 （主路径 = 基线捕获（步骤 1）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Ingress、patches=backend 名改错、restorePatches=活体捕获还原、duration_seconds=<duration>），注入+武装+readback 工具内同步完成；以下手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 
-> **爆炸半径分类（定案）**：`target-only`——写入集仅靶 Ingress 自身的一个 backend 字段（新 backend 名是字符串值，不创建任何新对象）；consequence 影响面 = 该 host/path 的全部外部入口流量，写入 `blast_radius_detail` 注明，勿因 consequence 抬档。
+> **爆炸半径分类（定案，defer recovery-carrier §9）**：声明 `blast_radius_scope=namespace-wide`——本 case 走 apiserver-write 四件套 carrier（Pod/SA/Role/RoleBinding），新增 namespaced RBAC 授权面，按 §9①「四件套 → namespace-wide」定案免推导，勿在 target-only↔namespace-wide 间重复仲裁。故障本体写入集仅靶 Ingress 自身的一个 backend 字段（target-only 语义，新 backend 名是字符串值、不创建任何新对象）；consequence 影响面 = 该 host/path 的全部外部入口流量，一并写入 `blast_radius_detail` 注明，勿因 consequence 抬到 cluster-wide（无跨 ns 持久资源写入）。
 
-1. **基线捕获**：记录 backend service 名基线与入口响应码基线（restorePatches 活体捕获的对照锚点，两条路径共用）：
+1. **基线捕获**：记录 backend service 名基线（白盒，restorePatches 活体捕获的对照锚点）与入口响应码基线（行为，两条路径共用）。白盒：
    ```bash
    kubectl get ingress <ingress-name> -n <namespace> -o jsonpath='{.spec.rules[0].http.paths[0].backend.service.name}'
-   curl -s -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>
    ```
+   行为基线**首选用资源准备第 2 条同款 `http_probe(resolve=...)` canonical 探针**（born-structured 落时间线，与注入后/恢复后探针同源、可直接对比 `http_code`）；降级形态＝手写 `-H 'Host:'` plain curl（同资源准备第 2 条降级块）。
 2. **先武装定时自恢复，再注入**（主路径 = 装配器一次调用内完成武装+注入；降级路径 = 按 recovery-carrier.md 标准件自建载体栈，Role 动词集 `get,patch ingresses`，武装命令形态参照 ConfigMap 篡改 case 资源准备第 3 条——紧凑变量形态 merge-patch curl。恢复命令幂等：定时器到期还原为主，Agent 演练结束时主动执行同一条 patch 兜底，重复执行无副作用）
 3. **注入**（降级兜底形态——主路径下由装配器注入域承载）：
    ```bash
@@ -97,11 +111,14 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl get ingress <ingress-name> -n <namespace> -o jsonpath='{.spec.rules[0].http.paths[0].backend.service.name}'
    ```
    预期输出 `drill-nonexistent-svc-<hash>`
-2. 行为确认——入口访问返回 503（与基线响应码对照）：
-   ```bash
-   curl -s -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>
+2. 行为确认——入口访问返回 503（与基线响应码对照）。**首选 `http_probe(resolve=...)`**（同资源准备第 2 条 canonical 探针，`capture=metadata` 即落 `http_code` exact-key 进观测时间线供 Layer-2 cross-check）：
    ```
-   预期 503。**controller reload 有秒级传播窗**——注入后立即 curl 可能仍 200（旧配置未卸载），等 10s 再采；10s 后仍 200 则核对 controller 日志是否 reload 失败
+   http_probe(origin_pod=<集群内独立非后端探测 Pod>, url=http://<ingress-host>/<path>, resolve=<ingress-host>:80:<controller-Service-ClusterIP>, namespace=<namespace>, max_time=10, capture=metadata)
+   ```
+   预期 `http_code=503`。**controller reload 有秒级传播窗**——注入后立即探测可能仍 200（旧配置未卸载），等 10s 再采；10s 后仍 200 则只读核对 controller 日志（`kubectl logs -n <ingress-ns> <controller-pod>`，只读放行）是否 reload 失败。`origin_pod`/`resolve` 的 vantage 与取参同资源准备第 2 条（集群内独立非后端 Pod，勿 exec 进 controller ns）。**降级形态（仅当 `http_probe` 不可用）＝手写 `-H 'Host:'` plain curl**：
+   ```bash
+   curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>
+   ```
 3. 反证确认——Service 与后端 Pod 健康（故障只在入口层的关键判据）：
    ```bash
    kubectl get endpoints <backend-svc> -n <namespace> -o jsonpath='{.subsets[0].addresses[0].ip}'
@@ -113,10 +130,10 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 > - 直接访问 Service ClusterIP/Pod IP 仍可达是**预期**（绕过 Ingress），不是注入失败。
 > - 同一事实（backend 字段值）确认一次即可，不要重复查询。
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活（配置型故障：错误 backend 名在即故障在）：
-以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效），生效后一次 `time_wait 30`（间隔 = 2 × 传播上限：controller reload 秒级 → 30s 最小复测窗，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
+**持续性检查**——故障窗口内故障必须持续存活（配置型故障：错误 backend 名在即故障在）：
+以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效）——生效确认只证明某一刻故障已落地，不证明它在整个窗口持续存活；持续性复测要把「稳态故障」与「传播收敛窗内的瞬时态」分开：待传播收敛后再次观测仍见故障态才算坐实持续。本故障传播特性：controller reload 秒级。隔多久复测、复测几次由你依该传播特性与故障形态自行判断（无固定间隔、无固定探针数），到点**下发**复测探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
 1. 白盒复查：Ingress backend 字段仍为错误值（同注入验证第 1 条）
-2. 行为复查：入口访问仍 503（同注入验证第 2 条）
+2. 行为复查：入口访问仍 503（同注入验证第 2 条 `http_probe(resolve=...)` 探针）
 3. 稳定性复查：后端 Pod RESTARTS 无增长、Endpoints 仍有 IP（排除故障向 Service 层蔓延的误判）
 
 ## 注入恢复
@@ -134,11 +151,14 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl get ingress <ingress-name> -n <namespace> -o jsonpath='{.spec.rules[0].http.paths[0].backend.service.name}'
    ```
    预期与演练步骤 1 基线一致
-2. 行为确认——入口访问恢复基线响应码（reload 传播窗内立即 curl 可能仍 503，等 10s 再采）：
-   ```bash
-   curl -s -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>
+2. 行为确认——入口访问恢复基线响应码（reload 传播窗内立即探测可能仍 503，等 10s 再采）。**首选 `http_probe(resolve=...)`**（同资源准备第 2 条 / 注入验证第 2 条同一 canonical 探针，与当时记录的基线 `http_code` 直接对比）：
    ```
-   预期与基线一致（200 或业务正常码）
+   http_probe(origin_pod=<集群内独立非后端探测 Pod>, url=http://<ingress-host>/<path>, resolve=<ingress-host>:80:<controller-Service-ClusterIP>, namespace=<namespace>, max_time=10, capture=metadata)
+   ```
+   预期与基线一致（`http_code=200` 或业务正常码）。**降级形态（仅当 `http_probe` 不可用）＝手写 `-H 'Host:'` plain curl**：
+   ```bash
+   curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>
+   ```
 3. 确认载体 restore.log 取证（`kubectl exec drill-rc-<hash> -n <namespace> -- cat /tmp/restore.log`——定时器 fire 的直接证据，PATCH 响应回显）
 
 ## 基准事实
@@ -150,7 +170,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 ## 注意事项
 - chaosblade 无 Ingress/入口配置类故障靶点，本用例为 kubectl-native 专属注入
 - **非 ingress-nginx controller 的响应码差异**：traefik/haproxy-ingress/云厂商 ALB Ingress 对空后端可能返回 502/404 而非 503——判据以「响应码 ≠ 基线且为 5xx/4xx 错误族」为准，不硬编码 503
-- 云厂商托管 Ingress（ALB/GCE）的 controller reload 可能慢至分钟级——传播窗按实测放大，持续性采样间隔同步放大（2 × 实测窗）
+- 云厂商托管 Ingress（ALB/GCE）的 controller reload 可能慢至分钟级——传播窗按探测放大，持续性采样间隔同步放大（2 × 探测窗）
 - 注入的假 service 名带 `drill-` 前缀（任务侧资产归属登记依据）——本 case 不创建任何新对象，假名只是字符串值，无残留清理义务
-- 若 Ingress 带 TLS，curl 验证用 `https://` + `-k`（证书校验非本 case 判据；TLS 证书形态见同目录 TLS证书过期 case）
+- 若 Ingress 带 TLS，HTTPS 验证用**手写** `curl https:// -k`（证书校验非本 case 判据；TLS 证书形态见同目录 TLS证书过期 case）——**`http_probe` 无 `-k`/insecure flag，过期/自签证书会让 curl 先 `exit_code=60` 失败，故 `http_probe(resolve=...)` 只适用于 HTTP（80）明文入口探针；带 TLS 的 HTTPS 验证仍走手写 curl**（若确要用 `http_probe` 打 HTTPS 入口，`resolve` 端口改 443 且证书须 CA 可信，本 case 不依赖此路径）
 - 多 rule/多 path Ingress 只改一条 path 即构成有效故障（最小注入面纪律）——严禁为"效果明显"改全部 path（爆炸半径无谓扩大）
+- **入口 HTTP 探针首选框架内置只读工具 `http_probe`（配 `resolve` 打虚拟主机路由端点）**：资源准备第 2 条基线、演练步骤第 1 条基线捕获、注入验证第 2 条主证据、持续性检查第 2 条行为复查、恢复验证第 2 条这五处对入口 host/path 的状态码观测，**首选** `http_probe`（参数 `origin_pod`＝集群内独立非后端探测 Pod、`url`＝`http://<ingress-host>/<path>`、`resolve`＝`<ingress-host>:80:<controller-Service-ClusterIP>`、`namespace`、`max_time`、`capture` 用默认 `metadata`——本 case 只判状态码/退出码、无需 body/header）——它按名进只读分类器白名单（不经 `_judge_exec_script` 静态证明、不会被只读门误拒），框架自建 canonical `curl -w` 命令并解析出结构化 `http_code`/`time_connect`/`time_starttransfer`/`exit_code`/`size_download`，born-structured 落进观测时间线供 Layer-2 cross-check 消费（本 case 签名 `http_code=503`/`exit_code=0` 被如实报为 DATA 而非工具错误）；「连测 2-3 次」＝把同一次 `http_probe` 调用独立重复下发。**为什么必须带 `resolve`（W-70-5 教训）**：Ingress 按 Host 头路由，把裸 controller ClusterIP 塞进 url 会因 Host 不匹配落到 default backend（404）而非目标 host/path——`resolve` 把 ingress-host 这个 NAME 的 DNS 钉到 controller ClusterIP、url 里保留 NAME 使 curl 天然发对的 Host 头，二者合一才够得到虚拟主机路由端点。此前 `http_probe` 无 `resolve` → 整个 Ingress 族被推上手写 `-H 'Host:'` curl 逃生通道，而手写 curl 的 `http_code` 不进时间线 → cross-check 幻觉护栏对 Ingress 入口永久盲区（A/A 实测报 "absent from the observation timeline / cannot cross-check"）。`resolve` 的 port 必须等于 url 有效端口（HTTP＝80 / HTTPS＝443），否则 curl 忽略 override 直接 DNS 失败 `exit_code=6`；ClusterIP 先只读 `kubectl get svc -n <ingress-ns> <controller-svc> -o jsonpath='{.spec.clusterIP}'` 取；`resolve` 值经 fail-closed 白名单校验（RFC1123 host + port 1-65535 + dotted-quad，拒空白/引号/shell 元字符）。**降级形态（仅当 `http_probe` 不可用）＝手写 `-H 'Host:'` plain curl**（即正文各处 `curl -s --max-time 10 -o /dev/null -w '%{http_code}' -H 'Host: <ingress-host>' http://<入口地址>/<path>`）——**必须** plain 单条命令：勿套 `sh -c` wrapper、勿 `for` 循环、勿 `echo curl_exit=$?`，否则 verify 相位只读门对 wrapper/循环/命令替换无法静态证明只读 → fail-closed 拒绝（`readonly_phase_violation`/`unknown_syntax`）烧轮次。**带 TLS 的 HTTPS 入口不适用 `http_probe`**（无 `-k`、见上一条），仍走手写 `curl https:// -k`

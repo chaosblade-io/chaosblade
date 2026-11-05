@@ -16,7 +16,7 @@ recovery_channel: apiserver-write
 **用例名称** 拓扑约束过严 导致 Pod_Pending
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -70,7 +70,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl create sa drill-rc-<hash> -n <namespace>
    kubectl create role drill-rc-<hash> -n <namespace> --verb=get,patch --resource=deployments
    kubectl create rolebinding drill-rc-<hash> -n <namespace> --role=drill-rc-<hash> --serviceaccount=<namespace>:drill-rc-<hash>
-   kubectl run drill-rc-<hash> -n <namespace> --image=busybox:1.36 --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
+   kubectl run drill-rc-<hash> -n <namespace> --image=curlimages/curl:latest --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
    ```
    （镜像按标准件第九节判别法选定——受限网络（VPC 无法拉 docker.io）时选节点已缓存且含 curl/sh/sleep 工具链的镜像；**第九节「本集群实证档案」中精确 tag 匹配的镜像可直接引用免工具链探测**（探测需额外约 150s 的规划轮）；节点带 taint 时 overrides 需加 tolerations，见标准件第一节。SA/Role/RoleBinding 须先于载体 Pod 创建：overrides 挂接的 Pod 引用该 SA，SA 不存在时 Pod 卡 ContainerCreating。）
    载体创建后武装前**必须先做 SA 真实 token 验权**（禁 `can-i --as` 假放行，见标准件第三节，含写动词 SSAR 对账——Role verbs 以恢复脚本实际载荷动词为准，换恢复形态时按第二节形态无关总则重建）。定时器用载体内 SA token 直调 apiserver REST——本用例四个恢复动作，**必须用标准件第四节「紧凑变量形态」的 for 循环变体**（完整形态四 curl 约 1.6KB 超通道 1024B 上限不可派发；逐 curl 变量形态同参数约 1118B **仍超限**——勿用；for 循环变体约 657B 在限内。**禁止改写为 printf/heredoc 写脚本文件形态**——写入层把 `$T`/`$C` 空展开固化，恢复 curl 无认证静默失败，见标准件第四节形态纪律。恢复动作全部是对 deployment 主资源的 merge-patch——约束字段置 null 即删除（基线为空时）或写回基线值（基线非空时）、replicas 与 maxUnavailable 同 patch 还原，故 Role 只需 deployments 的 get/patch，无需 scale 子资源授权）：
@@ -151,8 +151,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 3. 执行 `kubectl describe pod <pending-pod>`，确认 Events 显示拓扑约束或反亲和相关的调度失败原因
    （**事件时间戳形态注**：部分集群 events 呈新式字段形态——lastTimestamp 为 null、count 为空，属 API 字段差异**非数据缺失**；判读以 eventTime 与 series.lastObservedTime 为准。直接解读即可，**无需为重建时间线做交叉推算**）
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活（约束是配置型故障，字段在 spec 即故障在）：
-以「注入生效确认」为时点锚（注入验证第 1-3 条通过 = 生效：滚动完成 + 扩容副本 Pending + Events 见调度失败），生效后一次 `time_wait 30`（间隔 = 2 × 传播上限：本案为规则/字段/进程型即时生效故障，无传播过程，30s 为最小复测窗，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
+**持续性检查**——故障窗口内故障必须持续存活（约束是配置型故障，字段在 spec 即故障在）：
+以「注入生效确认」为时点锚（注入验证第 1-3 条通过 = 生效：滚动完成 + 扩容副本 Pending + Events 见调度失败）——生效确认只证明某一刻故障已落地，不证明它在整个窗口持续存活；持续性复测要把「稳态故障」与「传播收敛窗内的瞬时态」分开：待传播收敛后再次观测仍见故障态才算坐实持续。本故障传播特性：本案为规则/字段/进程型即时生效故障，无传播过程。隔多久复测、复测几次由你依该传播特性与故障形态自行判断（无固定间隔、无固定探针数），到点**下发**复测探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
 1. 白盒复查：约束字段仍在 spec（`kubectl get deployment <deployment-name> -n <namespace> -o jsonpath='{.spec.template.spec.affinity}'` 输出非空，配置即状态）
 2. 行为复查：超节点数扩出的副本仍 Pending（`kubectl get pods -n <namespace> -l <app-label>` 中 Pending 数不变）
 3. 事件复查：FailedScheduling 事件 LAST SEEN 相比注入时有新增（调度器仍在周期性重试）

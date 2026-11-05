@@ -5,18 +5,51 @@
 # 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
 # 不可授/验权 403）时降级正文 SOP 路径。
 recovery_channel: apiserver-write
+# 载体由 faultdrill_assemble_carrier 程序化建栈、结构性自拆（fail-closed 路径 + 恢复句柄清理链 + 武装定时器自删 → apiserver ownerRef GC 级联）；降级路径不自建可自撤 RBAC 栈，正文无需传输载体自撤授权类知识。
+carrier_teardown: assembler-managed
 # 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
 # 自身（patch spec.replicas 属受害者域内，名字匹配放行），无跨对象写条目；
 # 装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash> 四件套）由
 # 工具内程序化构建——构造保证 + fail-closed 内嵌检查（RBAC 从 restorePatches
 # 同源推导禁通配、SA 真实 token 验权 403 中止+清理），不经 LLM kubectl 写面，
 # 无立法条目。
+#
+# 字段态确定性裁决绑定（openspec mechanism-invariant-trust-boundary，D2/D3）：本 case 是继
+# #77 StatefulSet partition 之后第二个接入确定性裁决层的「声明式数值字段态」故障族——注入 =
+# 把 workload 的 spec.replicas 缩到声明期望值，故障存活期该字段稳定停在期望值，恢复 = 逆
+# patch 扩回基线。deterministic_verdict 是 freeze 期由代码解析的正交作者声明键（不 override
+# LLM 现场三元组、不 override approved.scope），经 approved_target 快照 verbatim 透传给 verify
+# 收尾的确定性规则：target/action 是规则选择键（对齐 _verification_profiles 的 deployment
+# profile + _deterministic_rules 的 scale-down 规则），expected.Replicas 是本案**标准演练固定
+# 缩容到的副本数**（规范演练 = 3→1），规则据此判「spec.replicas 是否达
+# 声明期望值」。规则首发 PINNED（弃权 unknown，须攒够多案真实闭环才校准翻 passed，见 change
+# 5.5/6.3）；本 frontmatter 落地后系统对该案裁决与现状 byte-identical（无注册规则时回落
+# default profile → 空规则），只是每次真实演练都在攒校准数据。
+# target 取值硬约定：deterministic_verdict.target 必须是**具体
+# 已注册 scope kind**（本 Deployment 演练 = deployment；StatefulSet 缩容演练则改 statefulset），
+# 与 #77 的 target=statefulset 同源约定——**严禁填泛域名 workload**。根因：planner 读本 frontmatter
+# 后会把 target 镜像进 finish_planning 的 fault_scope 声明，而 workload 不在 fault_registry 任何
+# family 的 scopes 词表内（词表只有具体 kind：deployment/statefulset/daemonset…），非法 scope 经
+# extract_planning_metadata（只查 truthiness）+ safety_check（L266 只查 `if not spec.scope`）一路溜过
+# Phase 1 冻结，直到 Phase 2 resolve_profile_for_state 因 family_for_scope("workload")=None 返回
+# PROFILE_UNKNOWN → 能力门禁绑定空工具集 → 连 update_progress/request_replan 等控制面工具都被
+# target_guard REJECT_UNKNOWN 拒（且误导消息把非法 scope 归因成 kubeconfig/transport 配置问题）。
+# target=deployment 使该镜像落入合法 scope，conflation 无害。
+# 判据读回形态硬约束：验证/基线读 spec.replicas 一律用**带标签 jsonpath**（replicas={.spec.replicas}
+# 的 label=value 形态），使通用 labeled-jsonpath 提取器产出命名指标 Replicas 进 metric_observations
+# 时间线；裸 jsonpath（-o jsonpath={.spec.replicas}）无标签，会被提取器按禁列位纪律拒绝、指标永不
+# 进时间线（#77 引号门控教训同源）。
+deterministic_verdict:
+  target: deployment
+  action: scale-down
+  expected:
+    Replicas: 1
 ---
 
 **用例名称** 人为误操作 导致 workload_副本被缩容
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 扩回原始副本数；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 扩回原始副本数；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:
@@ -52,14 +85,15 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 1. 定位应用 A 的 Deployment/StatefulSet，记录当前副本数，并完成基线快照（每个 Pod 的名字/UID/nodeName——UID 对照是恢复后「重建而非复活」判据的前后参照）
 2. **恢复通道对称性定案（本 case 与 daemon 类故障的本质分野——降级路径论证）**：kubectl scale 是声明式 API mutation——注入与恢复是同一条命令的镜像（`--replicas=<较小值>` ↔ `--replicas=<基线值>`），恢复通道与注入通道同源同复杂度且幂等（<5s），**Agent 主动执行恢复即满足「30 秒内可恢复」红线，定时自恢复非必要**；timer 自恢复的必要性仅当恢复通道可能比注入通道更难达（daemon 故障/载体失联/宿主网络断）——声明式 mutation 稳态无失控恶化风险，不在其列。因此主路径下自治恢复由装配器载体 TTL 承载（载体配方），降级路径 = Agent 在演练结束时主动执行恢复、**无需建任何载体标准件**（对称性免 timer）。通用模板（载体 Pod 内 kubectl 定时器）在本集群三通道判死（降级路径如需 timer 时的既定事实）：①演练载体镜像（terway 等 CNI 组件镜像）无 kubectl 二进制；②宿主 systemd timer + `--kubeconfig=/etc/kubernetes/kubelet.conf` 仅放行节点自操作（uncordon 族），scale deployment 属跨资源写，Node authorizer 语义外必拒；③集群内无可复用的带 kubectl 常驻 Pod（第三方组件 Pod 不得征用）。降级路径手动序列：
    ```bash
-   # 基线捕获：Agent 读取输出并记录原始副本数（恢复命令使用）
-   kubectl get <workload-kind> <name> -n <namespace> -o jsonpath='{.spec.replicas}'
+   # 基线捕获：Agent 读取输出并记录原始副本数（恢复命令使用）——用带标签 jsonpath（label=value 形态），
+   # 使确定性裁决层通用提取器产出命名指标 Replicas/Ready 进 metric_observations 时间线（裸 jsonpath 无标签会被拒）
+   kubectl get <workload-kind> <name> -n <namespace> -o 'jsonpath=replicas={.spec.replicas}{"\n"}ready={.status.readyReplicas}{"\n"}updatedReplicas={.status.updatedReplicas}'
    # 缩容注入（误操作经典形态：脚本 bug 或打错数字直接归零）
    kubectl scale <workload-kind> <name> -n <namespace> --replicas=<较小值>
    # 恢复（幂等，迟到重复执行无副作用）
    kubectl scale <workload-kind> <name> -n <namespace> --replicas=<基线捕获的原始副本数>
    ```
-   若演练环境存在带 kubectl 且有 scale 权限的常驻工具 Pod，可按通用模板加注定时自恢复（`kubectl exec <载体Pod> -n <载体ns> -- sh -c '( sleep <duration>; kubectl scale ... --replicas=<基线> ) >/tmp/restore.log 2>&1 & echo armed'`）作为兜底——但须先按上述三通道逐一实证可达，不可默认在位；兜底 timer 在场时，武装后发生任何修复须先 `kubectl exec <同一载体Pod> -- sh -c 'pkill -f --replica[s]=; true'` 停旧定时器再全额重武装（SKILL.md 安全红线「故障窗口完整」）
+   若演练环境存在带 kubectl 且有 scale 权限的常驻工具 Pod，可按通用模板加注定时自恢复（`kubectl exec <载体Pod> -n <载体ns> -- sh -c '( sleep <duration>; kubectl scale ... --replicas=<基线> ) >/tmp/restore.log 2>&1 & echo armed'`）作为兜底——但须先按上述三通道逐一探测可达，不可默认在位；兜底 timer 在场时，武装后发生任何修复须先 `kubectl exec <同一载体Pod> -- sh -c 'pkill -f --replica[s]=; true'` 停旧定时器再全额重武装（SKILL.md 安全红线「故障窗口完整」）
 3. 观察 Pod 缩容过程和应用状态变化
 
 **标签选择器提示**：
@@ -69,7 +103,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 
 ## 注入验证
 1. 执行 `kubectl get pods`，确认 Pod 总数减少，部分 Pod 被终止（`--replicas=0` 形态下目标 selector 的 Pod 列表为空集）
-2. 执行 `kubectl get deployment/statefulset <name> -o jsonpath='{.spec.replicas}'`，确认 spec.replicas 等于注入值且小于缩容前的基线值；RS 的 desired/ready 同步收敛（`kubectl get rs -l <selector>`）
+2. 执行带标签 jsonpath 读回（label=value 形态，供确定性裁决层提取命名指标 Replicas）：`kubectl get deployment/statefulset <name> -n <namespace> -o 'jsonpath=replicas={.spec.replicas}{"\n"}ready={.status.readyReplicas}{"\n"}updatedReplicas={.status.updatedReplicas}'`，确认 `replicas=` 等于注入期望值且小于缩容前的基线值；RS 的 desired/ready 同步收敛（`kubectl get rs -l <selector>`）
 3. 缩容事件佐证：Deployment/RS 事件流出现 `ScalingReplicaSet` 缩容记录（Scaled down replica set ...），事件时间落在注入窗口内
 4. （可选，仅当演练方提供了应用访问入口时）确认请求延迟增大/超时或可用性下降；无入口时上述副本数证据成立即可判定
 
@@ -83,7 +117,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 
 ## 恢复验证
 1. 执行 `kubectl get pods`，确认 Pod 总数恢复到缩容前的值
-2. 执行 `kubectl get deployment/statefulset <name>`，确认 READY==DESIRED==基线副本数（注意 UID 对照：恢复后的 Pod 是新 UID 新 Pod 名——「重建而非复活」，旧 Pod UID 不得再现）
+2. 执行带标签 jsonpath 读回：`kubectl get deployment/statefulset <name> -n <namespace> -o 'jsonpath=replicas={.spec.replicas}{"\n"}ready={.status.readyReplicas}'`，确认 `replicas=`==`ready=`==基线副本数（注意 UID 对照：恢复后的 Pod 是新 UID 新 Pod 名——「重建而非复活」，旧 Pod UID 不得再现）
 3. （可选，有访问入口时）确认请求延迟与可用性恢复正常
 
 ## 基准事实

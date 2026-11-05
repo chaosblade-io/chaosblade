@@ -5,6 +5,8 @@
 # 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
 # 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
+# 载体由 faultdrill_assemble_carrier 程序化建栈、结构性自拆（fail-closed 路径 + 恢复句柄清理链 + 武装定时器自删 → apiserver ownerRef GC 级联）；降级路径不自建可自撤 RBAC 栈，正文无需传输载体自撤授权类知识。
+carrier_teardown: assembler-managed
 # 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
 # 自身（patch startupProbe/maxUnavailable 属受害者域内，名字匹配放行），无
 # 跨对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash>
@@ -16,7 +18,7 @@ recovery_channel: apiserver-write
 **用例名称** StartupProbe配置不足 导致 Pod_CrashLoopBackOff
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 startupProbe 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 startupProbe 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:
@@ -72,7 +74,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl get deployment <deployment-name> -n <namespace> \
      -o jsonpath='{.spec.template.spec.containers[0].startupProbe}'
    ```
-2. 记录 Deployment 当前 maxUnavailable 值，并临时设为 100%（确保滚动更新确定性完成。机制定案勿再推导：maxSurge 向上取整、maxUnavailable 向下取整，1 副本默认 25%/25% ⇒ 0 个旧 Pod 可先下线、滚动退化为纯 surge 必须等新 Pod Ready；本案新 Pod 在 startup 探针窗口耗尽前绝无可能 Ready（故障本身），默认参数即确定性死锁，连 race 都没有。100% ⇒ 1 个旧 Pod 可先下线，滚动确定性完成。详见 recovery-carrier.md 第九节「滚动更新容量语义」。**引号传输定案**：patch 命令的 `-p='[...]'` 单引号形态是传输契约——构造执行参数时原样保留计划冻结的引号，argv 层剥掉单引号会让内层 JSON 双引号被吞、服务端 400 拒绝（#44 实测：26.9s 自纠轮才重发成功））——**降级路径形态；主路径下写入 100% 由载体配方注入域承载（restorePatches 基线值来源 = 本步的读取部分，两条路径共用），无需单独执行**：
+2. 记录 Deployment 当前 maxUnavailable 值，并临时设为 100%（确保滚动更新确定性完成。机制定案勿再推导：maxSurge 向上取整、maxUnavailable 向下取整，1 副本默认 25%/25% ⇒ 0 个旧 Pod 可先下线、滚动退化为纯 surge 必须等新 Pod Ready；本案新 Pod 在 startup 探针窗口耗尽前绝无可能 Ready（故障本身），默认参数即确定性死锁，连 race 都没有。100% ⇒ 1 个旧 Pod 可先下线，滚动确定性完成。详见 recovery-carrier.md 第九节「滚动更新容量语义」。**引号传输定案**：patch 命令的 `-p='[...]'` 单引号形态是传输契约——构造执行参数时原样保留计划冻结的引号，argv 层剥掉单引号会让内层 JSON 双引号被吞、服务端 400 拒绝）——**降级路径形态；主路径下写入 100% 由载体配方注入域承载（restorePatches 基线值来源 = 本步的读取部分，两条路径共用），无需单独执行**：
    ```bash
    kubectl get deployment <deployment-name> -n <namespace> \
      -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}'
@@ -84,7 +86,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    `sh -c '…'` 作为顶层命令派发会被命令守卫拦截（unknown_binary: sh）；载体 Pod 为多副本
    时无法可靠终止定时器，故不设 pidfile。恢复含 json patch 引号嵌套，且整对象探针载荷 +
    kubectl 命令骨架天然逼近/超出通道 1024B 上限——**落盘形态按 recovery-carrier.md 第七节「四档定案表」按明文字节数查表选定（Phase 2 无 base64 生成器，勿在计划里留 `<restore-b64>` 占位符或手算 b64 长度——直接写明文+档位指令），严禁为压字节缩小 patch 字段域**（SMP 少写字段会使未写字段保留注入值，
-   B80 实证；对称律见注入恢复段——本案 remove 分支是键级对称）。`<duration>` 需覆盖滚动更新与观察窗口）。
+   对称律见注入恢复段——本案 remove 分支是键级对称）。`<duration>` 需覆盖滚动更新与观察窗口）。
    载体 Pod 选集群内带 kubectl 且有足够 RBAC 权限的常驻 Pod（如演练工具 Pod）：
    ```bash
    # 武装定时自恢复（"注入恢复"第 1 步命令按基线选定 replace/remove 定形后，按第七节四档表选形态落盘；
@@ -127,7 +129,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    resourceVersion 乐观锁问题，也不会像 apply 三方合并那样保留注入新增的字段。**对称律按基线形态二分**：
    **replace 分支**——注入是整对象 replace，恢复 value 必须携带步骤 1 基线的**全部字段**（字段域
    与注入对齐）；构造时预算字节，超 1024B 走 base64 两步法，**禁止删字段/换 SMP 缩域挤
-   字节**——SMP 未写字段保留的是注入值，failureThreshold 漏写即残留（B80 实证，见
+   字节**——SMP 未写字段保留的是注入值，failureThreshold 漏写即残留（见
    recovery-carrier.md 第七节三条铁律）。**remove 分支**（基线本无 startupProbe）——注入用
    json patch **add 整对象**、恢复用 **remove 整键**，键级对称：remove 后 template 回到无键
    基线态，任一字段残留都会阻断 RS hash 回基线；remove 二次触发报 path 不存在属无害噪音

@@ -7,7 +7,7 @@
 4. 集群调度器将工作负载从故障 AZ 迁移至健康 AZ
 
 ## 资源准备
-1. 确认目标可用区名称（AZ 标签值）。标签有新旧两版（新版 `topology.kubernetes.io/zone`、旧版 `failure-domain.beta.kubernetes.io/zone`），**两版都要查、以当次实测为准**（存在新版全空而旧版可用的集群——旧版已 deprecated 但部分托管集群仅打旧版；后续所有按 AZ 选节点的命令均沿用实测命中的那版标签）：
+1. 确认目标可用区名称（AZ 标签值）。标签有新旧两版（新版 `topology.kubernetes.io/zone`、旧版 `failure-domain.beta.kubernetes.io/zone`），**两版都要查、以当次探测为准**（存在新版全空而旧版可用的集群——旧版已 deprecated 但部分托管集群仅打旧版；后续所有按 AZ 选节点的命令均沿用探测命中的那版标签）：
    ```bash
    kubectl get nodes -L topology.kubernetes.io/zone
    kubectl get nodes -L failure-domain.beta.kubernetes.io/zone
@@ -88,10 +88,13 @@
    ```bash
    kubectl get pods -o wide -l app=<关键服务标签> 
    ```
-4. 检查事件：
+4. 检查事件（**短窗自恢复 + 逐轮延迟 ≫ 窗口时的权威行为判据**）：
    ```bash
-   kubectl get events --field-selector reason=NodeNotReady
+   kubectl get events --field-selector involvedObject.kind=Node,reason=NodeNotReady   # 逐节点「生效」
+   kubectl get events --field-selector involvedObject.kind=Node,reason=NodeReady       # 逐节点「恢复」
    ```
+   加 `involvedObject.kind=Node` 精确到 node-scoped 事件，滤掉被隔离节点上各 Pod 的 `NodeNotReady`（"Node is not ready"）级联噪声。
+   > ⚠️ **live 快照不可达时严禁重注入追 live NotReady（W-88-7）**：本故障窗口短（180–300s）而 LLM 逐轮编排延迟常达数分钟——当**每一次集群侧 live 快照都落在自恢复之后**（`get nodes` 反复显示全 Ready，且这是探针时机而非注入无效所致）时，上文「最终成功数取最近一次成功快照 NotReady 数」这条 live-snapshot 主判据在本 regime **物理不可达**。**不得**据此判「注入无效」而重新注入——重注入只会重复同一验证-恢复赛跑、倍增 debug 载体（每个持有 armed timer 的载体会被守卫锁 `recovery_armed` 而须新建）、进一步侵蚀窗口。正确做法：**每批注入后尽快（在 event TTL ~5–30min 内）**查上述 node-scoped 耐久事件，配 `Ready.lastTransitionTime` 双时序指纹（onset≈inject+40s grace、recovery≈inject+recovery_timer）逐节点坐实即可收敛结束执行段。**耐久事件 `NodeNotReady`/`NodeReady` + `lastTransitionTime` 是 staggered-batch + 短窗自恢复场景的权威行为判据**；live 快照不可达既不构成失败、也不构成重注入的理由。
 
 ## 注入恢复
 1. 销毁 ChaosBlade 实验：
@@ -100,6 +103,7 @@
    ```
    AZ 网络分区场景下，DaemonSet 通道的 blade destroy 大概率无法下达（API Server 不可达）。
    依赖 `--timeout` 自动恢复。SSH 通道可逐节点 SSH 登录恢复。
+   > ⚠️ **本故障族（屏蔽控制面端口 6443/10250）手段1 的恢复通道与故障自身共用同一条被切断的路径，故手段1 不作为本用例的恢复保障**：operator 的注入下发与 `--timeout` 到期销毁都要经 `apiserver → 目标节点 kubelet:10250 exec` 进 tool Pod 执行，而本故障恰恰 DROP 了 `--dport 10250`——注入生效后这条带内恢复通道即被故障自身切断，destroy 与 timeout 销毁都可能无法送达，最坏结果是整个 AZ 锁死、须逐台人工 SSH/控制台抢救。因此**即便 operator 健康、手段1 在"能否注入"维度成立，本用例仍必须走手段2（kubectl-native 方案A）**：其恢复由宿主机 PID1 持有的 `systemd-run` transient timer 在 DROP 之前登记、到点本机执行 `iptables -D`，不依赖 apiserver/kubelet/operator/debug Pod/agent 存活——这也正是 SKILL.md 安全红线「故障窗口完整」与「禁止使用无自恢复机制的方案」的要求。（Case #88-R2 实测：FaultSpec 曾误判"operator 未部署→手段1 判死"，实际 operator 在 `default` ns 健康运行，但 Agent 仍按上述恢复通道自洽性自主选了手段2 并 verified——手段选型的决定因素是"恢复通道是否被故障自身切断"，而非"operator 是否可用"。）
 2. 超时自动恢复后确认节点状态
 
 ## 恢复验证
@@ -143,7 +147,7 @@ for NODE in $TARGET_NODES; do
   #    DROP 会切断 10250/6443——本条 exec 依赖的通道，若恢复排在 DROP 后，exec 流会在闹钟登记前被切断 → 永不恢复。
   #    恢复链（systemd-run 载荷内的 iptables -D 系列）用 `;` 串联而非 `&&`——每条 -D 都被尝试，
   #    某条规则不存在也不中断后续删除；注入链（外层）用 `&&` 保证武装成功后才下 DROP。
-  #    ✅ 注入后本条 exec 会因 6443/10250 被切断而超时（如 timed out after 10s）——这是预期成功信号，**不要重试该 exec、不要换镜像**；继续下一个节点，并改用集群侧 `kubectl get nodes -l <实测命中的zone标签>=<az-name>` 验证。
+  #    ✅ 注入后本条 exec 会因 6443/10250 被切断而超时（如 timed out after 10s）——这是预期成功信号，**不要重试该 exec、不要换镜像**；继续下一个节点，并改用集群侧 `kubectl get nodes -l <探测命中的zone标签>=<az-name>` 验证。
   # <recovery-seconds> 取 prompt 下发的 recovery_timer_seconds（= duration + grace，见 SKILL.md 双数窗口契约）
   kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c '
     systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-az sh -c "
@@ -219,6 +223,7 @@ done
 - **默认选方案 A（端口级屏蔽，保住 SSH/观测通道）**；方案 B（全量断网）仅在已确认带外（SSH/systemd）恢复通道可靠时使用。
 - systemd-run --on-active 创建的 transient timer 由宿主机 systemd 管理，不依赖 debug Pod 存活
 - 建议超时设置 60-180 秒，避免长时间网络分区导致大量 Pod 重新调度后的状态混乱；窗口短于节点默认 NoExecute 容忍（not-ready/unreachable 300s）时，多数业务 Pod 只经历瞬时 NotReady 而不触发驱逐——恢复验证不应把"零驱逐"误判为注入失败（驱逐是否发生取决于窗口长度与各负载自定义容忍，与注入成功与否无关）
+- **分批编排下不会"真正同时齐断"，勿据此判失败**：手段2 kubectl-native 受"每批≤10 节点"通道约束须把大 AZ 拆多批顺序下发，且**每批的恢复 timer 从各自武装时刻起算**（`--on-active` 是相对延迟），叠加 LLM 逐轮编排延迟常达分钟级——当**整轮注入跨度超过单批恢复窗口**时，先注入的批次会在后注入批次还没打完前就到期自恢复，任意时刻都不会出现"全部目标节点同时 NotReady"，**峰值同时 NotReady 数只等于最大单批规模**（如 12 节点拆 2×6，峰值仅 6）。这是分批编排的固有保真度限制，**不是注入失败**：成功口径应以"**每个目标节点各自经历 NotReady→在自身 inject+recovery 秒恢复**"（靠耐久事件 `NodeNotReady`/`NodeReady` 与 `Ready.lastTransitionTime` 逐节点坐实）为准，不得因"从未同时齐断"报部分成功。"AZ 级同时分区"语义只在**注入跨度 ≪ 恢复窗口**、或用 **DaemonSet 通道 `--names` 一条命令合并全部节点**（operator 可用时）才真正成立；确需同时齐断又必须走 kubectl-native 时，只能把窗口拉长到覆盖整轮注入跨度（须按上条重新核算驱逐边界）
 - 集群存在外部节点自愈通道（云厂商 NodeRepair 类，NotReady 后分钟级介入）时，**timer fire 时刻必须设计为先于自愈介入**（如 120s fire vs 217-292s 介入下界——AZ 级多节点齐断时介入规模未知，fire 先行是唯一可控规避）；fire 被外部通道抢跑时注入效果时间窗不可控，报告须标注
 - 生产环境建议安装 ChaosBlade 后使用 DaemonSet 通道 + `--timeout` 执行 AZ 级网络分区（operator 可用时优先）
 - 禁止使用无自恢复机制的全量 DROP 方案（可能导致节点永久锁死）

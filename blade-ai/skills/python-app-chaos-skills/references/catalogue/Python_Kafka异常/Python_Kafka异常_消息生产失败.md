@@ -12,7 +12,7 @@
 1. 已生成 Agent hook:`blade prepare python --port <port> --python-path <解释器> --target-script <应用入口脚本>`(两参数均必填,hook 文件 `sitecustomize.py` 落在入口脚本所在目录;blade 自带 agent 库,无需 pip install;端口须空闲)
 2. 目标 Python 应用已以 `PYTHONPATH=<hook 目录>:$PYTHONPATH` **重启**,Agent 才在应用进程内监听;且应用使用 `kafka-python` 客户端
 3. 已记录注入前该 topic 的生产速率/成功率基线,以及下游消费位点
-4. 确认应用日志可见异常堆栈
+4. 确认应用会把被捕获的异常外显到某个可观测通道(日志堆栈 **或** 接口错误响应体 **或** trace)——`throwCustomException` 只保证在应用进程内抛出配置的异常,是否落日志由应用自身的 `except` 处理决定,不保证
 
 > prepare 返回 success 与 `blade status --type prepare` 显示 `Running` 都**不代表 Agent 已存活**,只是记录状态。真实状态由注入结果反推:报 `no running python preparation record found` 说明缺 prepare(可当场补做);报 `connect: connection refused` 说明 Agent 不在进程内(需重启应用,演练中无法补做,按前置条件不满足上报)。不要尝试用 curl 等命令探活——它们不在 Agent 可执行白名单内。
 
@@ -30,11 +30,11 @@
 3. 记录返回的实验 uid,用于后续恢复
 
 ## 注入验证
-1. **（主证据，必做）** 触发**与本次 `--operation` 匹配的那一侧调用**（`produce` → 生产一条消息；`consume` → 触发一次拉取），确认抛出配置的异常类型与消息：
+1. **（主证据，必做）** 触发**与本次 `--operation` 匹配的那一侧调用**（`produce` → 生产一条消息；`consume` → 触发一次拉取），经应用实际暴露的通道(日志堆栈行 **或** 接口错误响应体/降级响应内嵌的 type+message **或** trace,不预设异常一定落日志)确认抛出的正是配置的异常类型与消息：
    ```
    kafka.errors.KafkaTimeoutError: chaos drill: kafka produce failed
    ```
-   - 若日志中看到的是 `RuntimeError` 而非配置的类型,说明该异常类名**无法在应用进程内导入**,Agent 已静默降级为 `RuntimeError`。此时应用「按 Kafka 异常类型决定是否重投」的逻辑不会被真正验证,应改用应用确实能导入的类名重注
+   - 若看到的是 `RuntimeError` 而非配置的类型(无论在日志还是响应体),说明该异常类名**无法在应用进程内导入**,Agent 已静默降级为 `RuntimeError`。此时应用「按 Kafka 异常类型决定是否重投」的逻辑不会被真正验证,应改用应用确实能导入的类名重注
 2. **（只做与本次 `--operation` 匹配的分支）** 其余分支的现象在本次注入下**不可能出现**，直接标记为 `expected` 并跳过：
    - **`produce`**：a) Kafka 侧确认该 topic 消息量停止增长、下游消费位点不再推进——这是消息确实未发出的证据；b) 确认**消费侧仍正常**——这是 operation matcher 生效的证据
    - **`consume`**：a) 确认消费位点停滞、下游处理中断；b) 确认**生产侧仍正常写入，topic 消息量仍在增长**——这是 matcher 生效的证据，**不是失败**
@@ -61,7 +61,7 @@
 ## 恢复验证
 1. 再次触发消息生产,确认成功写入且下游可消费
 2. `blade status --uid <uid>` 状态为 Destroyed
-3. 确认应用日志不再出现注入的异常;**核对故障期间的消息是否有缺口**,如有则需业务侧补偿
+3. 确认应用外显通道(日志/响应体)不再出现注入的异常;**核对故障期间的消息是否有缺口**,如有则需业务侧补偿
 
 ## 基准事实
 - **根因**：Agent 在应用进程内拦截 `kafka.KafkaProducer.send`（`--operation produce`）或 `kafka.KafkaConsumer.poll`（`--operation consume`），命中 matcher 时**不执行真实操作**而直接抛出配置的异常（受控中断），因此 Kafka 集群从未收到该请求

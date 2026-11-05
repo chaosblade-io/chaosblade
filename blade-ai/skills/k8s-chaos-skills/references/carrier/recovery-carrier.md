@@ -31,31 +31,35 @@ kubectl create rolebinding drill-rc-<hash> -n <namespace> \
   --role=drill-rc-<hash> --serviceaccount=<namespace>:drill-rc-<hash>
 
 # 4) 载体 Pod：以 drill-rc SA 运行（overrides 挂接，见下文「SA 挂接」），
-#    sleep 骨架自过期（骨架时长 = 故障窗口 + 1800s 取证缓冲（2026-09-17 立法升级：#46/#48/#51 三现 restore.log 不可回读——600s 不够 fire 后带外取证节奏，1800s 覆盖「发现异常→诊断链→取证」全程），上限 86400）
+#    sleep 骨架自过期（骨架时长 = 故障窗口 + 1800s 取证缓冲（restore.log 不可回读时 600s 不够 fire 后带外取证节奏，1800s 覆盖「发现异常→诊断链→取证」全程），上限 86400）
 #    五条件缺一不可：drill-rc- 前缀 / --restart=Never / --command -- sleep N /
 #    镜像在允许集（配置默认集 busybox/curlimages-curl ∪ 任务启动自动发现集——
 #    健康 DaemonSet 镜像=全节点缓存，探测消息直接给出候选清单；VPC/受限网络
 #    集群优先从自动发现候选中选，零人工配置。人工入口
 #    BLADE_AI_RECOVERY_CARRIER_ALLOWED_IMAGES 仅兜底探测失败等少数场景）/
-#    镜像工具链硬要求：sh+sleep+curl（第四节武装命令全靠它们）/
+#    镜像工具链硬要求：sh+sleep+curl（第四节武装命令全靠它们——**busybox 系只有
+#    wget 无 curl，不满足本要求，严禁作本标准件载体镜像**〔fire 时 `curl: not found`
+#    静默吞进 restore.log、恢复动作从不发出、故障滞留〕；配置默认集里唯一 curl-capable
+#    的静态项是 curlimages/curl:latest，VPC/受限网络集群〔docker.io 不可达〕则从 §9 自动
+#    发现候选里选节点已缓存的 curl-capable 镜像，如 chaosblade-tool:1.8.0）/
 #    flag 白名单——只允许 -n/--namespace、--image、--restart、--command、
 #    --overrides（见「SA 挂接与调度容忍」），其余任何 flag（--serviceaccount/--env/
 #    --nodename/--labels/...）一律 fail-closed（SA 挂接只有 overrides 一条路）
-kubectl run drill-rc-<hash> -n <namespace> --image=busybox:1.36 \
+kubectl run drill-rc-<hash> -n <namespace> --image=curlimages/curl:latest \
   --restart=Never \
   --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>","tolerations":[{"key":"<taint-key>","operator":"Equal","value":"<taint-value>","effect":"NoSchedule"}]}}' \
   --command -- sleep <骨架时长>
 ```
 
-**Role 跨资源族构造立法（两步法，2026-09-18 实测定案）**：恢复动作跨多个资源族（如 apps/deployments + core/secrets）时，Role 必须收口**单 Role 多 rule**。构造路径按各族动词集是否相同二分——**均匀**（各族同一动词集）单命令天然干净（`--verb=get,patch --resource=configmaps,deployments` 即可，实测各 rule 恰好只携带该动词集）；**非均匀**（各族动词集不同——恢复场景的常态，如 deployments 要 patch 而 secrets 要 delete）单命令只有一条合法路径——两步法：
+**Role 跨资源族构造立法（两步法）**：恢复动作跨多个资源族（如 apps/deployments + core/secrets）时，Role 必须收口**单 Role 多 rule**。构造路径按各族动词集是否相同二分——**均匀**（各族同一动词集）单命令天然干净（`--verb=get,patch --resource=configmaps,deployments` 即可，各 rule 恰好只携带该动词集）；**非均匀**（各族动词集不同——恢复场景的常态，如 deployments 要 patch 而 secrets 要 delete）单命令只有一条合法路径——两步法：
 
 ```bash
 # 步骤 1：create 单对第一族（与建栈第 2 步同发）
 kubectl create role drill-rc-<hash> -n <namespace> \
   --verb=get,update --resource=deployments
 # 步骤 2：四件套建栈、载体 Pod 注册后（patch 在载体注册前被 patch 全局禁令拦，
-#        注册后合法——#51-R 实弹），逐族追加独立 rule（无交叉积）；
-#        多族可合一条 patch（JSON patch 数组多 op 顺序追加，实测三族一次成型）
+#        注册后合法），逐族追加独立 rule（无交叉积）；
+#        多族可合一条 patch（JSON patch 数组多 op 顺序追加，三族可一次成型）
 kubectl patch role drill-rc-<hash> -n <namespace> --type=json \
   -p '[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["secrets"],"verbs":["get","delete"]}}]'
 # 步骤 3：readback 硬门——逐 rule 动词集与设计精确一致（无并集外溢、恢复动词无缺漏；
@@ -63,8 +67,8 @@ kubectl patch role drill-rc-<hash> -n <namespace> --type=json \
 kubectl get role drill-rc-<hash> -n <namespace> -o jsonpath='{.rules}'
 ```
 
-- **为什么非均匀动词集禁止单命令**（实测：`--verb=get,patch --resource=deployments --verb=get,delete --resource=resourcequotas` → 两条 rule 均携带 [get,patch,delete]；三族 sts/pvc/pods 形态 → 全部 rule 均携带 [get,patch,delete,list]）：kubectl create role 对 `--verb`/`--resource` 无论逗号单 flag 还是多 flag 重复，都是 **verbs 全量并集广播进每条（按 API group 分组的）rule**——「配对」语义不存在，非均匀动词集必产超授权面（delete×deployments + patch×resourcequotas 等），最小权限立法被静默击穿。均匀动词集是实测例外（各 rule 恰好干净）——但恢复场景跨族动词集几乎必然非均匀，拿不准就走两步法。另注意单命令里**同 API group 多资源合并进一条 rule**（pvc+pods 同 core 组实测共一条）；两步法追加的 rule 各自独立成条。同机理判例：下方「自删规则两步建栈法」的 pflag 污染（resourceNames 锁名同样复制进每条 rule）。
-- **为什么禁止双 Role 分族**（#51-R 拦截 1 判例）：任务侧 rbac_family 只登记主注册 Role 的 verbs 并集，第二 Role 的动词层 1 对账看不见——武装载荷动词 ⊄ 主 Role verbs 即拒武装。单 Role 多 rule 恰好使全部恢复动词落在同一对账面。
+- **为什么非均匀动词集禁止单命令**（如 `--verb=get,patch --resource=deployments --verb=get,delete --resource=resourcequotas` → 两条 rule 均携带 [get,patch,delete]；三族 sts/pvc/pods 形态 → 全部 rule 均携带 [get,patch,delete,list]）：kubectl create role 对 `--verb`/`--resource` 无论逗号单 flag 还是多 flag 重复，都是 **verbs 全量并集广播进每条（按 API group 分组的）rule**——「配对」语义不存在，非均匀动词集必产超授权面（delete×deployments + patch×resourcequotas 等），最小权限立法被静默击穿。均匀动词集是例外（各 rule 恰好干净）——但恢复场景跨族动词集几乎必然非均匀，拿不准就走两步法。另注意单命令里**同 API group 多资源合并进一条 rule**（pvc+pods 同 core 组共一条）；两步法追加的 rule 各自独立成条。同机理：下方「自删规则两步建栈法」的 pflag 污染（resourceNames 锁名同样复制进每条 rule）。
+- **为什么禁止双 Role 分族**：任务侧 rbac_family 只登记主注册 Role 的 verbs 并集，第二 Role 的动词层 1 对账看不见——武装载荷动词 ⊄ 主 Role verbs 即拒武装。单 Role 多 rule 恰好使全部恢复动词落在同一对账面。
 - **为什么不用 manifest 一体法**：kubectl 工具的 `apply -f -` 白名单不收 RBAC kinds（命令式构造是守卫可见性硬要求，见上方「命令式构造」）。
 - **SSAR 验权无需补授**：selfsubjectaccessreviews 由 system:basic-user 全局授权，Role 不需要也不应携带 create 该资源（层 1 对 review 族 POST 已立法豁免）。
 
@@ -92,9 +96,24 @@ kubectl get role drill-rc-<hash> -n <namespace> -o jsonpath='{.rules}'
 
 推导原则：**Role 只含恢复动作 + 验权探测所需的最小 verb 集**；注入动作本身不进 Role（注入由 Agent 主通道执行，不借载体）。自断授权行的 delete verb 同样最小化：`resourceNames` 锁死自己 Binding 的名字，与「严禁 delete 目标资源」红线不同域——那条防的是载体能删故障目标（如 PV），本行删的是载体自己的 RBAC，对象域不交叠。
 
-**恢复形态无关总则（硬立法——#51 B85 判例：Agent 合法切换恢复形态后 RBAC 授权面未联动，timer fire 时 PATCH×2 403 静默失败 + Pod 假性恢复）**：Role verbs 以**恢复脚本载荷实际使用的全部写动词**为准，不以规划期钦定的形态为准——规划期钦定 PUT、执行期切换为 json-patch（2 PATCH + 1 DELETE）时，授权面必须按实际载荷动词重建。**REST 方法→RBAC 动词映射**：`PATCH→patch`、`PUT→update`、`DELETE→delete`、`POST→create`。武装前的判定铁律：**载荷写动词 ⊄ Role verbs 即不得武装**（例如载荷含 `-X PATCH` 而 Role 只有 `get,update` → 缺 `patch`，中止）。本表左列的 API 请求形态仅是示例推导——Agent 换形态（PATCH↔PUT、增加/减少动作步）时按实际载荷动词重新查表。
+**恢复形态无关总则（硬立法——Agent 合法切换恢复形态后 RBAC 授权面未联动，timer fire 时 PATCH×2 403 静默失败 + Pod 假性恢复）**：Role verbs 以**恢复脚本载荷实际使用的全部写动词**为准，不以规划期钦定的形态为准——规划期钦定 PUT、执行期切换为 json-patch（2 PATCH + 1 DELETE）时，授权面必须按实际载荷动词重建。**REST 方法→RBAC 动词映射**：`PATCH→patch`、`PUT→update`、`DELETE→delete`、`POST→create`。武装前的判定铁律：**载荷写动词 ⊄ Role verbs 即不得武装**（例如载荷含 `-X PATCH` 而 Role 只有 `get,update` → 缺 `patch`，中止）。本表左列的 API 请求形态仅是示例推导——Agent 换形态（PATCH↔PUT、增加/减少动作步）时按实际载荷动词重新查表。
 
-**自删规则两步建栈法（硬立法——pflag 合并污染判例，2026-09-17 真实 apiserver 实测）**：自删规则必须在建栈命令之后**独立追加**（**追加时机：武装之后、注入之前**——不可在建栈同期、武装前追加；armed-before-inject 门禁止武装前 patch 载体 Role，执行序见第九节「端到端建栈 SOP」），**严禁**把 `--verb=delete --resource=<bindings 类> --resource-name=<自己名>` 合并进主授权的 `kubectl create role/clusterrole`——`kubectl create` 对重复 flag 的语义是「同类 flag 各自求并集后**复制进每一条规则**」：合并形态下主恢复规则被 `resourceNames` 锁名污染（锁名规则对未点名资源一律 403——SA 真实 token GET 目标资源 403，第三节验权硬门必中止，case 不可执行）+ delete verb 泄漏进主恢复规则（授权面扩大）。两步形态（cluster 变体；namespaced 栈把 clusterrole/clusterrolebindings 相应换成 role/rolebindings 并带 `-n <ns>`）：
+**RBAC 绑定重建的提权前置（硬立法）**：当恢复动作是**创建一根 RoleBinding/ClusterRoleBinding**（注入 DELETE 绑定、恢复 POST 重建的一类），`create rolebindings` 动词是**必要但不充分**的。apiserver 的 **RBAC 提权防护（privilege-escalation guard）**要求创建者二者居其一：①已持有 `roleRef` 所指 Role/ClusterRole 授予的**全部**权限（holder 条款——恢复载体去持有目标 Role 的全部权限属过授，**禁用**）；②对被引用的 Role/ClusterRole 持 **`bind`** 动词。二者皆无时，即便 `create rolebindings` 已授、SSAR 回 `allowed:true`，POST 仍被 **403** 拒绝，报文 `... is attempting to grant RBAC permissions not currently held`。这是此类恢复集群侧自恢复在**构造上失败**的根因——动词层验权（第三节 GET/SSAR、层 1 对账）问的是「能 create rolebindings 吗」，看不见「能创建**这根指向该 `roleRef` 的**绑定吗」这一**内容相关**前置。
+
+构造修复 = 给恢复载体 Role **两步 json-patch 追加一条独立 `bind` 规则**（`resourceNames` 锁死被引用 Role 的名字，最小化——只能绑定这一根 Role，不能借 bind 提权到任意 Role）：
+
+```bash
+# 载体 Role 主授权照旧（get,create rolebindings），bind 规则独立追加（禁并入 create 命令——
+# pflag 并集复制会把 resourceNames 锁名污染进主恢复规则，同「自删规则两步建栈法」机理）
+kubectl patch role drill-rc-<hash> -n <namespace> --type=json \
+  -p '[{"op":"add","path":"/rules/-","value":{"apiGroups":["rbac.authorization.k8s.io"],"resources":["roles"],"resourceNames":["<roleRef.name>"],"verbs":["bind"]}}]'
+```
+
+- `resources` 是**被引用角色的类型**（namespaced 栈 `roles`、cluster 变体 `clusterroles`），`resourceNames` 是**被引用角色的名字**（即 `roleRef.name`，**不是**载体自己的 Role、也不是被创建的 Binding 名）。
+- **授权效果**：无 `bind` 时创建被 403 拒（提权防护）；追加 `bind`（resourceNames 锁名）后创建成功、被引用 Role 的权限即时授予 subject；对已存在的同名绑定重复创建得 409（幂等，恢复无副作用）。
+- **提权 403 先于 AlreadyExists 409**（apiserver 授权判定先于存储层存在性检查）：武装发生在注入之前、被删的 Binding 此刻仍在——创建请求命中的是 403（提权防护）而非 409（对象已存在），故第三节的 dry-run 武装门即使对「创建一根已存在的绑定」也能正确拦下提权失败，无需 fresh-name 技巧。
+
+**自删规则两步建栈法（硬立法——pflag 合并污染）**：自删规则必须在建栈命令之后**独立追加**（**追加时机：武装之后、注入之前**——不可在建栈同期、武装前追加（此为 §9 执行序约定、**非门强制**：armed-before-inject 门已**放行**「载体自身已登记 Role/ClusterRole〔rbac_family 精确同名成员〕的 add-only〔json-patch op:add〕追加动词 patch」，仅拒受害靶/未登记同名 role/replace-remove 收缩；主恢复族的武装前追加〔步骤 9〕正是靠此豁免过门，自删族排武装后是 fail-open 尾步约定，执行序见第九节「端到端建栈 SOP」），**严禁**把 `--verb=delete --resource=<bindings 类> --resource-name=<自己名>` 合并进主授权的 `kubectl create role/clusterrole`——`kubectl create` 对重复 flag 的语义是「同类 flag 各自求并集后**复制进每一条规则**」：合并形态下主恢复规则被 `resourceNames` 锁名污染（锁名规则对未点名资源一律 403——SA 真实 token GET 目标资源 403，第三节验权硬门必中止，case 不可执行）+ delete verb 泄漏进主恢复规则（授权面扩大）。两步形态（cluster 变体；namespaced 栈把 clusterrole/clusterrolebindings 相应换成 role/rolebindings 并带 `-n <ns>`）：
 
 ```bash
 # 1) 主授权照旧——只带恢复动作所需 flag，不带任何自删 flag
@@ -104,7 +123,27 @@ kubectl patch clusterrole drill-rc-<hash> --type=json \
   -p '[{"op":"add","path":"/rules/-","value":{"apiGroups":["rbac.authorization.k8s.io"],"resources":["clusterrolebindings"],"resourceNames":["drill-rc-<hash>"],"verbs":["delete"]}}]'
 ```
 
-产物读回为**双规则各干净**（第四节「验权读回」两条判据）：主授权规则**无锁名**（GET 真实资源 200 的前提）、自删规则独立成条。实测对照（同栈同探针）：合并形态 SA token GET 目标资源 **403**；两步形态 **200** + timer fire → 主恢复 → 自删 Binding 全链闭环。
+产物读回为**双规则各干净**（第四节「验权读回」两条判据）：主授权规则**无锁名**（GET 真实资源 200 的前提）、自删规则独立成条。对照：合并形态 SA token GET 目标资源 **403**；两步形态 **200** + timer fire → 主恢复 → 自删 Binding 全链闭环。
+
+**ownerRef 自终结构造前置（namespaced 四对象栈首选——W-83-3B 根治）**：namespaced 栈的自我终结不走「删自己 Binding」（那是 cluster 变体受跨 scope 限制的死锁退路），而走 **ownerReference GC 级联**——建栈后、武装前追加三步构造（程序化装配器在 §4.9 自动完成；LLM 手工装配 namespaced 栈时照此填）：
+
+```bash
+# 1) 取载体 Pod 的 UID（owner 必须先带 UID 存在，dependent 才能引用它）
+POD_UID=$(kubectl get pod drill-rc-<hash> -n <namespace> -o jsonpath='{.metadata.uid}')
+# 2) Role 独立追加 delete pods 自删规则（resourceNames 锁自己名——同「自删规则两步建栈法」，禁并入 create 广播）
+kubectl patch role drill-rc-<hash> -n <namespace> --type=json \
+  -p '[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["pods"],"resourceNames":["drill-rc-<hash>"],"verbs":["delete"]}}]'
+# 3) 给 SA/Role/RoleBinding 各打 ownerReferences→Pod（merge patch 替换空 ownerReferences 数组，纯 additive）
+for k in serviceaccount role rolebinding; do \
+  kubectl patch $k drill-rc-<hash> -n <namespace> --type=merge \
+    -p "{\"metadata\":{\"ownerReferences\":[{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"name\":\"drill-rc-<hash>\",\"uid\":\"$POD_UID\"}]}}"; \
+done
+```
+
+- **级联机理**：删 Pod 时 apiserver GC 用**自己的凭证**服务端级联删所有 `ownerReferences` 指向它的 dependent（SA/Role/RoleBinding）——无需载体 SA 对这三件持任何自删授权，从根上绕过「用自己授权删自己授权」死锁。跨 group 有效（v1 Pod 拥有 v1 SA + rbac/v1 Role/RoleBinding），已实弹坐实（实测 A/B，2026-10-20，K8s v1.24.6，GC 秒级完成）。
+- **fail-safe 全或无（严禁半装）**：三步（取 UID + 追加 delete pods 规则 + 打 ownerRef）必须**全部落地**才启用尾步删 Pod；任一步失败即**抑制尾步**、回退第六节 agent 四连删除。半装（打了 delete pods 却没打 ownerRef）会让尾步删掉 Pod 却**孤立三件 live RBAC**（比现状更糟——四连删除至少按名找得全四件），故绝不 fail-worse。
+- **SSAR 豁免**：delete pods 自删规则**不进第三节 SSAR 写动词对账**——SSAR 的 resourceAttributes 不带 resourceName，对 resourceNames 锁名的 delete pods 发无名 SSAR 会回 `allowed:false` 而 fail-close 击穿武装；它与「delete verb 无法用 GET 事前探测」同理，靠建栈后 Role 读回验证（第四节「验权读回」判据②：自删规则独立成条）。
+- **scope 边界（诚实）**：ownerRef 级联要求**同 scope owner**——namespaced 四对象栈✓完全覆盖；五/六对象栈的 ClusterRole/ClusterRoleBinding 是 cluster-scoped，namespaced Pod **不能**拥有（K8s 禁跨 scope ownerRef），级联够不着，那两件仍走「删自己 Binding」+ agent 六连删除兜底（见下「六对象栈的双自删形态」）。
 
 **六对象栈的双自删形态（五件套变体启用尾步时，级联检视 F-G2 补立法）**：六对象栈有 Role 与 ClusterRole 两条授权链、两个 Binding——第四节「六对象栈两个 Binding 都删」要求 **Role 与 ClusterRole 各追加一条自删规则**（Role 的规则删自己的 RoleBinding，ClusterRole 的规则删自己的 ClusterRoleBinding；两条授权链互不依赖对方的 Binding，先后删除互不锁死。cluster-only 四对象变体无 namespaced 链，只在 ClusterRole 追加一条——即上方 cluster 单栈形态）：
 
@@ -136,9 +175,9 @@ kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \
 
 - `200` → 读权限在，继续写动词对账
 - `403` → 权限缺失，**中止**（补 Role 前不得武装）
-- 非 200/403（超时/000）→ 通道不可达，见「降级路径」
+- 非 200/403（超时/000）→ 通道不可达，**先分诊根因**（见第八节）：若判明是**载体所在节点**的 pod→apiserver 局部路由断（同节点其他 hostNetwork Pod 正常、`nslookup kubernetes.default.svc` 超时、pod IP 落无路由网段）→ 属环境故障非载体缺陷，走第八节「节点局部网络故障 → 载体迁移」（同名 delete+重建换节点、至多一次、武装前）；若是**故障本身**集群级切断通道（拓扑死锁）或迁移后仍不可达 → 第八节如实失败收尾
 
-**写动词对账（SSAR，武装前必做——B85 判例立法：GET 200 只验读路径，恢复动作的写动词从未被验证，#51 实弹翻车 PATCH×2 403 静默）**：读探针 200 后，对**恢复脚本载荷的每个写动词**（按第二节映射表从载荷提取）发一次 SelfSubjectAccessReview。SSAR 是 K8s 原生的自我授权检查（无副作用、亚秒级），载体 SA 的授权链是我们自建的 Role→Binding→SA，SSAR 结果与 Role 定义精确一致——这里验的不是未知授权面，而是**「Role verbs 是否覆盖恢复脚本实际写动词」的对账**：
+**写动词对账（SSAR，武装前必做——GET 200 只验读路径，恢复动作的写动词从未被验证，漏验则 timer fire 时 PATCH×2 403 静默）**：读探针 200 后，对**恢复脚本载荷的每个写动词**（按第二节映射表从载荷提取）发一次 SelfSubjectAccessReview。SSAR 是 K8s 原生的自我授权检查（无副作用、亚秒级），载体 SA 的授权链是我们自建的 Role→Binding→SA，SSAR 结果与 Role 定义精确一致——这里验的不是未知授权面，而是**「Role verbs 是否覆盖恢复脚本实际写动词」的对账**：
 
 ```bash
 kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \
@@ -149,17 +188,42 @@ kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \
    -d "{\"apiVersion\":\"authorization.k8s.io/v1\",\"kind\":\"SelfSubjectAccessReview\",\"spec\":{\"resourceAttributes\":{\"namespace\":\"<namespace>\",\"verb\":\"patch\",\"group\":\"apps\",\"resource\":\"deployments\"}}}"'
 ```
 
-⚠️ 字段拼写与结构纪律（#51-R 实弹翻车：首版照抄 apiGroup 错拼，apiserver 静默丢弃未知字段返 allowed:false 假阴性，险些错误中止）：ResourceAttributes 用 `group`，不是 `apiGroup`——`apiGroups` 是上节 Role rule 的拼写，两个结构相似字段勿互串。`spec` 的值必须是**对象** `{"resourceAttributes":{...}}`——丢了 `spec` 后的 `{` 载荷即非法 JSON，apiserver 直接 400 硬错误（拼写错是假阴性、结构错是硬拒绝，两者都过不了对账）。子资源目标（如 `deployments/scale`）直接把 `资源/子资源` 整体填进 `resource` 字段即可——2026-09-18 实弹载体实测与 `resource`+`subresource` 两字段分离形态判定等价（均 allowed）。
+⚠️ 字段拼写与结构纪律（apiGroup 错拼会被 apiserver 静默丢弃、返 allowed:false 假阴性，险些错误中止）：ResourceAttributes 用 `group`，不是 `apiGroup`——`apiGroups` 是上节 Role rule 的拼写，两个结构相似字段勿互串。`spec` 的值必须是**对象** `{"resourceAttributes":{...}}`——丢了 `spec` 后的 `{` 载荷即非法 JSON，apiserver 直接 400 硬错误（拼写错是假阴性、结构错是硬拒绝，两者都过不了对账）。子资源目标（如 `deployments/scale`）直接把 `资源/子资源` 整体填进 `resource` 字段即可——与 `resource`+`subresource` 两字段分离形态判定等价（均 allowed）。
 
-**回执自证三态判定（2026-09-18 三探针实测定案：正确/错拼/破语法三形态回执均已实测锚定）**：拿到回执先核对 `spec.resourceAttributes` 回显的 namespace/verb/group/resource 四字段与请求意图逐项一致，再做权限判定——静默忽略式 API 丢字段不报错，但被丢字段同样不会出现在回显里（实测：apiGroup 错拼 → 回显只剩三字段、managedFields 无 f:group，问题已漂移成「无 group 的授权检查」，此时 allowed 值无意义）：
+**回执自证三态判定（正确/错拼/破语法三形态回执）**：拿到回执先核对 `spec.resourceAttributes` 回显的 namespace/verb/group/resource 四字段与请求意图逐项一致，再做权限判定——静默忽略式 API 丢字段不报错，但被丢字段同样不会出现在回显里（如 apiGroup 错拼 → 回显只剩三字段、managedFields 无 f:group，问题已漂移成「无 group 的授权检查」，此时 allowed 值无意义）：
 
-- **omitempty 契约（2026-09-21 #55 实弹补锚，先于漂移判定）**：`ResourceAttributes` 全字段是 Go `omitempty` 字符串——**请求里显式空串的字段，apiserver 回显时省略该键（而非回显 `""`）**。core group 靶（Service/ConfigMap/Pod 等）的 `"group": ""` 请求，回显**无 group 键是序列化契约、不是漂移**；对照时「键缺失」与「显式空串」按等价处理。反方向仍然 fail-closed：请求了**非空**值（如 `group: "apps"`）而回显缺失/异值，就是真漂移（实测翻车：装配器首版字节级对照把全部 core group 靶误判 form_error）
+- **omitempty 契约（先于漂移判定）**：`ResourceAttributes` 全字段是 Go `omitempty` 字符串——**请求里显式空串的字段，apiserver 回显时省略该键（而非回显 `""`）**。core group 靶（Service/ConfigMap/Pod 等）的 `"group": ""` 请求，回显**无 group 键是序列化契约、不是漂移**；对照时「键缺失」与「显式空串」按等价处理。反方向仍然 fail-closed：请求了**非空**值（如 `group: "apps"`）而回显缺失/异值，就是真漂移（字节级对照曾把全部 core group 靶误判 form_error）
 - 回显字段漂移（非空值对不上）→ **请求形态错误，不进权限判定**：对照上方模板查拼写，修正重发
 - 回显完整 + `"allowed": true` → 该动词已授权，验下一个
 - 回显完整 + `"allowed": false` → **中止武装**（缺动词：按第二节形态无关总则补 Role 后重验）
 - 通道层错误（超时/解析失败/HTTP 400 json parse error）→ 见「降级路径」
 
-判定铁律：**全部主恢复写动词 allowed 才可武装；任一 false 即中止**——宁可在武装前中止（可修可重试），不可在 timer fire 时 403 静默（载体自治段无人监听、curl -sf 吞错、部分恢复的假性恢复比不恢复更隐蔽）。写动词清单的提取源是**恢复脚本载荷本身**（grep `-X PATCH|-X PUT|-X DELETE|-X POST`），不是规划声明——Agent 无论怎么换形态，载荷是最终真相。**唯一例外——可选自断授权尾步的自删 verb（DELETE 自己的 Binding）不纳入武装前 SSAR 硬门**：①它 fail-open（fire 时 403 只是授权残留，交第六节四连删除兜底，不是 B85 判例要防的主恢复静默失败）；②它的 Role 规则按第九节执行序在**武装后**才 json-patch 追加（armed 门禁止武装前 patch 载体 Role），故武装前 SSAR 它必然 allowed:false——若纳入硬门则启用尾步的 case 永远无法武装。自删 verb 的授权改由「武装后 patch + fire 前规则就位」保证：fire 时 DELETE 自己 Binding 即 200。SSAR 硬门只覆盖主恢复动词。
+判定铁律：**全部主恢复写动词 allowed 才可武装；任一 false 即中止**——宁可在武装前中止（可修可重试），不可在 timer fire 时 403 静默（载体自治段无人监听、curl -sf 吞错、部分恢复的假性恢复比不恢复更隐蔽）。写动词清单的提取源是**恢复脚本载荷本身**（grep `-X PATCH|-X PUT|-X DELETE|-X POST`），不是规划声明——Agent 无论怎么换形态，载荷是最终真相。**唯一例外——可选自终结尾步的自删 verb 不纳入武装前 SSAR 硬门**（两形态各自的理由）：**（A）cluster 变体的 DELETE 自己 Binding**：①它 fail-open（fire 时 403 只是授权残留，交第六节四/六连删除兜底，不是纪律要防的主恢复静默失败）；②它的 Role 规则按第九节执行序在**武装后**才 json-patch 追加（§9 约定、非门强制——门已放行载体自身已登记 Role 的 add-only patch），故武装前 SSAR 它必然 allowed:false——若纳入硬门则启用尾步的 case 永远无法武装。**（B）namespaced ownerRef 形态的 DELETE 自己 Pod**（第二节「ownerRef 自终结构造前置」）：该规则 `resourceNames` 锁自己名，而 SSAR 的 resourceAttributes **不带 resourceName**——对锁名规则发无名 SSAR 恒回 allowed:false（与本节 GET 硬门同理，delete verb 无法用无名探测事前验证），故它与形态 A 一样**排除在 SSAR 迭代的 rules 之外**，靠建栈后 Role 读回验证（第四节「验权读回」判据②）；装配器把 delete pods 自删规则作为独立 `/rules/-` 追加、绝不并入 SSAR 对账的派生 rules（否则 fail-close 击穿武装）。自删 verb 的授权改由「fire 前规则就位」保证：fire 时 DELETE 自己 Binding/Pod 即 200。SSAR 硬门只覆盖主恢复动词。
+
+**内容感知 dry-run 武装门（step 3——硬立法；GET probe 与 SSAR 之后、武装之前）**：GET probe（step 1）与 SSAR（step 2）都是**动词+资源**级的回答（「这个载体能 `create`/`patch` `rolebindings`/… 吗」）。一个写请求能否被接受还可能取决于**请求体内容**，这是任何动词层门结构性看不见的。典型实例就是第二节「RBAC 绑定重建的提权前置」：创建一根 `roleRef` 指向本载体未持有且无 `bind` 的 Role 的 RoleBinding，即使 `create rolebindings` 已授（SSAR `allowed:true`）也被 403 拒——定时器照旧武装、fire 进 403、`curl -sf` 把错误吞成空 restore.log（创建绑定型恢复的静默失败）。admission webhook、ResourceQuota、不可变字段守卫同样以内容拒绝。
+
+**方法**：用载体 SA 的**真实 token** 对**与武装载荷逐字相同的恢复请求**加 `?dryRun=All` 发一次——服务端 dry-run 跑**完整 apiserver 管线**（authn → authz **含提权防护** → admission → validation）而**不落盘**，因此恰好暴露 live fire 会撞上的内容相关拒绝：
+
+```bash
+kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \
+  'C=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt; \
+   T=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token); \
+   echo "MAIN=$(curl -s -o /dev/null -w %{http_code} -X POST --cacert $C \
+     -H "Authorization: Bearer $T" -H "Content-Type: application/json" \
+     -d @/tmp/restore.json \
+     "https://kubernetes.default.svc/apis/rbac.authorization.k8s.io/v1/namespaces/<namespace>/rolebindings?dryRun=All")"'
+```
+
+（恢复体较大时先按第七节 base64 两步法落盘 `/tmp/restore.json` 再 `-d @` 引用，与武装载荷同源；多个写请求〔主 patch + extra_delete DELETE〕逐个发 dry-run、各回一行 `KEY=<code>`，任一被拒即中止。）
+
+**判决铁律（保守 fail-closed，只认授权拒绝）**：
+- `401`/`403` → **中止武装**（授权是**状态无关**的——dry-run 403 意味 live fire 必 403：提权防护/webhook 拒绝/quota）。这是唯一 fail-closed 的码。
+- `2xx`/`409`/`404` → 通过（成功或幂等：409 = 武装时对象已在〔创建一根已存在的绑定〕，fire 时的 create-on-existing 是 no-op、靶已正确）。
+- `400`/`422`/`5xx` → 通过（可能是 dry-run-vs-live 伪影：对注入才创建的路径做 json-patch `replace`，在武装时〔注入前的基线〕是 422、fire 时却正常应用——对它们 fail-closed 会误杀本可成功的恢复）。
+- **机制依据**：授权判定状态无关，故 dry-run 的 401/403 与 live fire 一致（dry-run 403 ⇒ live 必 403）；dry-run 全程不落盘（副作用-free，武装时跑安全）；apiserver 授权先于存储存在性检查，故对「创建一根已存在的绑定」dry-run 仍回提权 403 而非 409，此门对创建-重建型恢复同样生效。
+- **通道层错误**（超时/无法解析的回执/无 `KEY=<code>` 行）→ 记为「未确认」、**不中止**（传输伪影不得误杀本可成功的恢复）——区别于已确认的 401/403 拒绝。
+
+判定顺序：step 1 GET probe（200 硬门）→ step 2 SSAR（逐写动词 allowed）→ **step 3 dry-run（内容感知，401/403 fail-closed）**→ 第四节武装。三道门全过才武装。（程序化装配器路径已将 step 3 体现为 `build_dryrun_script`/`dryrun_verdict` + arm gate，在 SSAR 之后、arm exec 之前 fail-closed；本 SOP 路径与之同构。）
 
 ## 四、武装命令模板（定时器）
 
@@ -191,7 +255,7 @@ kubectl exec drill-rc-<hash> -n <namespace> -- sh -c '( sleep <duration>; C=/var
 
 **形态纪律（三禁一许）**：
 - ✅ **许**：上述两种内联形态原样套用（紧凑形态的变量在载体内展开，合法）
-- ❌ **禁**：**有空展开点的落盘**——未加引号定界符的 heredoc 或 printf 把恢复命令写入载体内脚本文件再执行，写入层会把 `$T`/`$C` 在**中间 shell 空展开固化**（curl 行变成 `--cacert (空) -H "Authorization: Bearer (空)"`，四 curl 无认证静默失败，定时器正常 fire 但集群未恢复）。**合法落盘形态两种**（写入层无展开点、脚本执行时才展开变量）：**base64 两步法**（第七节铁律 2）与**加引号定界符 heredoc**（`<<'EOF'` 或 `<<"EOF"`——POSIX：定界符任何形式的引用都使 heredoc 字面化，`$`/`$(...)` 不在写入层展开；#44 实证：`<<"RSEOF"` 直书明文 + E9 回显目检门全过）
+- ❌ **禁**：**有空展开点的落盘**——未加引号定界符的 heredoc 或 printf 把恢复命令写入载体内脚本文件再执行，写入层会把 `$T`/`$C` 在**中间 shell 空展开固化**（curl 行变成 `--cacert (空) -H "Authorization: Bearer (空)"`，四 curl 无认证静默失败，定时器正常 fire 但集群未恢复）。**合法落盘形态两种**（写入层无展开点、脚本执行时才展开变量）：**base64 两步法**（第七节铁律 2）与**加引号定界符 heredoc**（`<<'EOF'` 或 `<<"EOF"`——POSIX：定界符任何形式的引用都使 heredoc 字面化，`$`/`$(...)` 不在写入层展开；`<<"RSEOF"` 直书明文形态回显目检门可过）
 - ❌ **禁**：token 硬编码进任何脚本/变量（跨层转义不可控，且 token 泄漏进日志）
 - ❌ **禁**：把 `>/tmp/restore.log 2>&1` 改回 `>/dev/null 2>&1`——恢复失败必须留取证证据：fire 后带外 `kubectl exec <载体Pod> -- cat /tmp/restore.log` 可确认每个恢复 curl 的实际执行情况（静默吞错 = 恢复失败不可见）
 
@@ -199,11 +263,28 @@ kubectl exec drill-rc-<hash> -n <namespace> -- sh -c '( sleep <duration>; C=/var
 - **必须以 `sh -c` 作为 exec 载荷**：顶层裸 `( sleep … ) &` 语法 exec-form 通道不解释，直接派发 `sh -c '…'` 顶层命令会被命令守卫拦截（unknown_binary）
 - 走 `https://kubernetes.default.svc`（集群内 DNS 直达 apiserver；恢复通道不依赖被攻击的集群 DNS 的场景才适用本标准件）
 - **倒计时从武装时刻起算**：武装与注入必须是紧邻步骤（间隔 ≤ 60 秒）；武装前必须先过第三节 SA 真实 token 验权（同一 T 的 GET 200 硬门）——内联模板已验证免 `sh -n`，**禁止为「校验」目的把载荷落成脚本文件**（即上列第一禁）
-- **多步注入序列的武装点（定案免仲裁）**：载体建栈与 token 验权属 setup，可前置完成；**武装推迟至第一个故障生效动作紧邻前**。用例步骤常把武装模板写在建栈步（如「步骤 2」）而真正的故障注入动作在后文（滚动等待、多步变更隔在中间）——此时武装点 = 最后一个 setup 步骤完成后、第一个真正引入故障的变更（taint/删 Pod/patch 生效动作等）执行前；勿按模板出现位置机械执行，也勿花推导权衡摆放
+- **多步注入序列的武装点（定案免仲裁）**：载体建栈与 token 验权属 setup，可前置完成；**武装推迟至第一个故障生效动作紧邻前**。用例步骤常把武装模板写在建栈步（如「步骤 2」）而真正的故障注入动作在后文（滚动等待、多步变更隔在中间）——此时武装点 = 最后一个 setup 步骤完成后、第一个真正引入故障的变更（taint/删 Pod/patch/**`apply`·`create -f` 创建道具对象**等生效动作）执行前；勿按模板出现位置机械执行，也勿花推导权衡摆放
+- **create 域道具对象是故障生效动作、绝非 setup（硬立法——armed-before-inject 门覆盖 apply-native object-write，#12/#46 实证根治）**：凡用例 frontmatter `mechanism_writes` 声明的 **create 域**道具对象（引用不存在 StorageClass 的道具 PVC、道具 Secret/ConfigMap/NetworkPolicy/LimitRange 等瞬态故障对象），若以 `kubectl apply -f`/`create -f` 传入 **inline manifest**（`stdin_data`）创建、且 kind ∈ 持久故障对象族（`PERSISTENT_FAULT_MANIFEST_KINDS`：persistentvolumeclaim/configmap/secret/networkpolicy/limitrange/poddisruptionbudget/priorityclass/... 全集见 `k8s_native/classifier.py`），则该 create **本身就是一次 object-write 注入**——无 UID、无 `activeDeadlineSeconds`、无 self-timeout，活得和对象一样久，其逆操作（DELETE）是唯一有界恢复，与 mutation 动词（patch/delete）同受 armed-before-inject 门约束（判据 `_is_object_write_injection` 双覆盖 = mutation 动词 ∪ apply-native 持久故障对象 `is_apply_native_fault_injection`）。**两条硬序**：① 道具对象**必须排在载体武装之后创建**——武装前创建 = 无恢复载体的无界对象写，门判 `REJECT_BANNED armed-before-inject`（主路径下装配器一次调用同步完成「武装 + patch 域注入」，故道具 create 排在装配器调用**之后**）；② 调装配器时把道具对象登记进 **`extra_delete`**（`[{"kind","name","namespace"}]`），使载体 TTL 自治恢复 + `blade-ai recover` 台账重放都删除它，闭合非 patch 域 residue（否则道具产物无自动删除执行者、退化为人工 sweep）。**勿把道具 create 误分类为「setup」而排在武装前**——这是 case 文档演练步骤的历史性顺序缺陷（#12 PVC未绑定 / #46 STS_PVC未绑定 实证：道具 PVC `apply` 排在装配器前被门拦，逼 agent 执行期自纠 inverted 为「装配器优先 → 道具后建 → 注册 extra_delete」，每 run 复现该递推代价 + 覆写自己 approved plan）。**benign 间隙**：道具 create 域在装配器之外由 execute 计划创建（固有属性——闭合靠编排顺序、不靠给装配器加 create 能力，见决策记录），故「靶先被 patch 引用、道具后到位」的 ~1s 间隙是 benign（K8s 允许 volume 引用不存在的 PVC，Pod 照样 Pending，稳态收敛到预期 `unbound immediate PersistentVolumeClaims` 签名；事件史多一条 transient `... not found` 属预期，非缺陷）。注：命令式 `kubectl create quota --hard=...`/`create cm --from-literal=...`（无 `stdin_data` inline manifest）不落 apply-native 判据、不被该门约束，但仍是无界道具对象，恢复归属同样走 `extra_delete`/收尾清理步
 - 多个恢复动作用 `;` 串联在同一个定时器里，一个 duration 统一控制；**curl 顺序即执行顺序**——有顺序安全要求（如「约束移除先于 maxUnavailable 还原」）时按序排列
-- **`-sf` 吞 body 排障律（2026-09-17 实测立法）**：`-f` 在 4xx/5xx 时丢弃响应体、只回非零退出码——fire 失败时 restore.log 里没有 apiserver 错误详情（t4 死因链在 8.14.1 逐字复现：恢复请求被拒、日志零 body，一度误诊「定时器死了」白查一小时）。**restore.log 近空 ≠ 定时器未跑**。排障顺序：先看日志有无取证包裹输出（尾步「取证包裹律」满档的错误 body / 轻档的 `FAIL rc=22` 标记——`FAIL rc=22` 即证明定时器跑了且被 HTTP 层拒绝，与「没跑」立判）；无包裹形态才带外重放定死因：重放同一条恢复 curl **去掉 `-f`**（或加 `-v`）拿完整错误 body。**勿反向修法**：把模板里的 `-sf` 去掉 = fail-open 挂接律失灵（4xx 静默转 0、恢复失败照样自删授权）；`--fail-with-body` 理论两全但**不进模板**——允许集镜像 curl 版本不齐（实测 terway 8.5.0 / 本地 chaosblade-tool 8.14.1 支持，npd 7.61.1 不识别该 flag，遇之 curl 立即退出、恢复链整条挂），仅诊断重放可用且须先验版本
+- **`-sf` 吞 body 排障律**：`-f` 在 4xx/5xx 时丢弃响应体、只回非零退出码——fire 失败时 restore.log 里没有 apiserver 错误详情（恢复请求被拒时日志零 body，易误诊「定时器死了」）。**restore.log 近空 ≠ 定时器未跑**。排障顺序：先看日志有无取证包裹输出（尾步「取证包裹律」满档的错误 body / 轻档的 `FAIL rc=22` 标记——`FAIL rc=22` 即证明定时器跑了且被 HTTP 层拒绝，与「没跑」立判）；无包裹形态才带外重放定死因：重放同一条恢复 curl **去掉 `-f`**（或加 `-v`）拿完整错误 body。**勿反向修法**：把模板里的 `-sf` 去掉 = fail-open 挂接律失灵（4xx 静默转 0、恢复失败照样自删授权）；`--fail-with-body` 理论两全但**不进模板**——允许集镜像 curl 版本不齐（如 terway 8.5.0 / chaosblade-tool 8.14.1 支持，npd 7.61.1 不识别该 flag，遇之 curl 立即退出、恢复链整条挂），仅诊断重放可用且须先验版本
 
-**自断授权尾步（可选优化步，#36 inject-dfee9d3d 立法）**：恢复全链确认成功后，定时器顺带 DELETE 自己栈里的 Binding（namespaced 栈删 `rolebindings/<自己名>`，cluster 变体删 `clusterrolebindings/<自己名>`；六对象栈两个 Binding 都在字节预算内时都删），把「授权残留窗口」从骨架时长压到 fire 时刻（六对象栈两个 Binding 都删的自删规则构造见第二节「六对象栈的双自删形态」）。挂接形态——**最后一个恢复动作**升级为 `curl -sf` 并以 `&&` 链接自删：
+**自终结尾步（可选优化步）**：恢复全链确认成功后，定时器顺带触发整栈自我终结，把「授权残留窗口」从骨架时长压到 fire 时刻。**两种形态按栈 scope 分**：
+
+- **namespaced 四对象栈（首选，装配器编程形态）**：尾步 DELETE **自己的 Pod**（`?gracePeriodSeconds=0`），建栈期打的 `ownerReferences→Pod`（第二节「ownerRef 自终结构造前置」）让 apiserver GC 服务端级联删 SA/Role/RoleBinding——整栈一次清空、**无空壳残留**（死锁根治见本节「自删对象」条）。
+- **cluster 变体（五/六对象栈）**：ClusterRole/ClusterRoleBinding 是 cluster-scoped、namespaced Pod 无法 ownerRef 拥有，级联够不着——尾步退回 DELETE 自己的 Binding（`clusterrolebindings/<自己名>`；六对象栈两个 Binding 都在字节预算内时都删，构造见第二节「六对象栈的双自删形态」），残留惰性 ClusterRole 交收车路径清。
+
+**namespaced 尾步挂接形态（RC 门控 + 取证 hold + 立即 grace）**——删 Pod 会连带摧毁 `/tmp/restore.log` 取证通道，故与 cluster 变体的 `&&` 链不同：先**捕获**主恢复的 HTTP 码、只在 **2xx** 才自删、且删前 `sleep` 一段**取证 hold**：
+
+```bash
+( sleep <duration>; C=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt; T=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token); U=https://kubernetes.default.svc/apis/<group>/<v>/namespaces/<namespace>/<plural>/<name>; RC=$(curl -s -o /tmp/rr.body -w '%{http_code}' -X PATCH --cacert $C -H "Authorization: Bearer $T" -H "Content-Type: application/json-patch+json" -H "User-Agent: blade-ai-recovery/drill-rc-<hash>" -d '<恢复patch>' $U); echo "RESTORE_HTTP=$RC"; cat /tmp/rr.body; case "$RC" in 2*) sleep <hold>; curl -sf -X DELETE --cacert $C -H "Authorization: Bearer $T" -H "User-Agent: blade-ai-recovery/drill-rc-<hash>" "https://kubernetes.default.svc/api/v1/namespaces/<namespace>/pods/drill-rc-<hash>?gracePeriodSeconds=0" ;; esac ) >/tmp/restore.log 2>&1 & echo armed
+```
+
+三条纪律（与下方 cluster 变体五条纪律并行、namespaced 形态专属）：
+- **fail-open RC 门控律**：`RC=$(curl -w '%{http_code}')` 捕获主恢复码 + `case "$RC" in 2*)` 只在 2xx 才自删——主恢复未确认成功（非 2xx）则**保留载体供取证与带外 `blade-ai recover` 重试**，绝不删掉一个未恢复故障的授权/证据（等价 cluster 变体 `&&` 的 fail-open，但用捕获码而非退出码链，因删 Pod 会杀掉读退出码的进程）。捕获 `$RC` 时把 PATCH body 重定向到 `/tmp/rr.body` 再 `cat` 回，故 restore.log 取证（body + 显式 `RESTORE_HTTP=` 行）**完整保留**、不退化成一个码。
+- **取证 hold 律**：`sleep <hold>` 在恢复之后、删 Pod 之前——`hold = 骨架 buffer − lead`（默认 1800−300=1500s），既保住 fire 后带外 `cat /tmp/restore.log` 的取证窗口，又保证删 Pod 的 curl 在**容器仍存活**时执行（后台定时器在骨架主 `sleep` 退出瞬间即被杀，lead 让自删严格落在 Pod 生命期内、不与骨架边界竞态）。
+- **立即 grace 律**：删 Pod URL 带 `?gracePeriodSeconds=0`——骨架是无状态 `sleep`（无待刷数据，同第六节 `--force` 理据），Pod 立即消失、GC 级联即刻完成，不等 30s 默认 grace（实测 B：默认 grace 会把整栈在 Terminating 挂约 30s）。
+
+**cluster 变体挂接形态——最后一个恢复动作升级为 `curl -sf` 并以 `&&` 链接自删 Binding**：
 
 ```bash
      curl -sf -X PATCH \
@@ -218,12 +299,14 @@ kubectl exec drill-rc-<hash> -n <namespace> -- sh -c '( sleep <duration>; C=/var
        https://kubernetes.default.svc/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/drill-rc-<hash>
 ```
 
-（紧凑变量形态挂接——R13 检视修正：原「同构」措辞未验证循环退出码语义，实际不构成 fail-open。正确形态**两环 `-f` 缺一不可**：① for 循环内每个恢复 curl 升级为 `curl -sf`；② 自删 DELETE 以 `done && curl -sf -X DELETE --cacert $C -H "Authorization: Bearer $T" https://…/clusterrolebindings/<自己名>` 挂在循环之后，复用 `$C`/`$T` 变量。退出码链条：for 循环的退出码是**最后执行的命令**的退出码——循环内 curl 不带 `-f` 则 4xx/5xx 静默转 0，`done` 恒 0，`&&` 恒真，主恢复失败照样自删、fail-open 形同虚设。）五条纪律：
+（紧凑变量形态挂接——正确形态**两环 `-f` 缺一不可**：① for 循环内每个恢复 curl 升级为 `curl -sf`；② 自删 DELETE 以 `done && curl -sf -X DELETE --cacert $C -H "Authorization: Bearer $T" https://…/clusterrolebindings/<自己名>` 挂在循环之后，复用 `$C`/`$T` 变量。退出码链条：for 循环的退出码是**最后执行的命令**的退出码——循环内 curl 不带 `-f` 则 4xx/5xx 静默转 0，`done` 恒 0，`&&` 恒真，主恢复失败照样自删、fail-open 形同虚设。）五条纪律：
 - **fail-open 挂接律**：`curl -sf` + `&&` 成对出现——`-f` 让 4xx/5xx 转非零退出（DELETE 403/404 不再静默成功），`&&` 保证主恢复未确认成功则授权保留（人工兜底恢复路径完整）。**边界诚实（`&&` 只门末动作）**：`&&` 链感知的只是**最后一个**恢复动作的退出码——前序动作用 `;` 串联且不带 `-f` 时（完整形态），前序失败（4xx 转退出 0）而末动作成功则自删照样执行：授权已删、恢复残缺，载体无法补做，此角落**不在 fail-open 保护内**（不是「授权多活」的反向；紧凑形态 for 循环同此——循环退出码是最后执行命令的退出码），兜底是带外 `blade-ai recover`（Layer1 补恢复幂等重执行残缺动作，finalize 四连删除清残壳）
 - **字节预算从属律**：自删 DELETE 计入 1024B 预算；挤不下就不带（恢复完整性优先——第七节铁律 1 禁止缩字段域挤字节，自删同样不得反向侵蚀），授权清退交给收车路径
-- **自删对象 = 自己的 Binding，非 Role/SA**：删 Binding 授权链即断（残留惰性 Role/SA 零权限，第六节空壳中间态）；先删 Role 会留悬空 Binding（指向不存在 Role 的迷惑形态）；先删 SA 则 token 立即失效一件都删不成——**自删上限就是一件（或每类 Binding 一件），这是「用自己授权删自己授权」的结构性死锁，非实现妥协**
-- **验权读回（双规则各自干净）**：启用尾步时，建栈后 `kubectl get clusterrole drill-rc-<hash> -o jsonpath='{.rules}'`（namespaced 栈读 role、cluster 变体读 clusterrole、**六对象栈 Role 与 ClusterRole 各读一次**——各自适用判据①②）读回 rules，目检**两条判据**：① 主授权规则**无 `resourceNames` 锁名**——锁名在场 = 两步建栈法被违反（自删 flag 被合并进 create 命令），主恢复 GET 目标资源将 403、case 不可执行，中止并按两步建栈法重建栈；② 自删规则独立成条（delete verb + `resourceNames` 锁名在场）。Role 是刚建的、rules 显式，读回即确定性证明（delete verb 无法用 GET 事前实测）
-- **取证包裹律（2026-09-17 立法，实测依据同要点区排障律）**：主恢复 curl 可包裹失败取证，两档——**满档**（同参数去 `-f` 重放、错误 body 落 restore.log）：`curl -sf <参数> $U || { curl -s <同参数> $U; false; }`（同参数含 Content-Type，缺了重放变 415、诊断的是另一个错）；**轻档**（贴限保底）：`|| { echo "FAIL rc=$? $d"; false; }`——定位失败动作与错误类别（rc=22 HTTP 层拒绝 / rc=6,7 连接层 / rc=28 超时；紧凑形态 +37B/处，完整形态无 `$d` 变体 33B/处）。**包裹对象 = 带 `-sf` 的 curl**（K1 检视收口：`-f` 才吞 body——裸 `-s` curl 失败时 body 本来就落 restore.log，包裹它纯属浪费字节；完整形态即升 `-sf` 的末动作一处，紧凑 for 形态循环体一处覆盖全部循环内 curl，前序裸 `-s` curl 勿包裹）。**两档的 `false` 都是承重件**：`||` 右侧回 0 会掩掉失败（无 `-f` 的取证 curl 4xx 也回 0、echo 回 0）→ `&&` 链恒真、fail-open 失灵——与上方 R13 修正同病，实测反证：`curl -sf … || echo …` 后链退出码为 0；包裹与 `&&` 链接续语义已验（POSIX `||`/`&&` 等优先级左结合，`A || { …; false; } && C` 中 A 败则 C 不执行）。**字节从属**：包裹计入第七节预算校验，挤不下先降档（满档→轻档）再弃包裹（裸 `-sf`）——满档紧凑形态整载荷 +134B（循环体只写一处、curl 全变量引用故增量与取值无关；四动作 657B 口径 +满档 ≈ 791B 限内；J1 定案用例 ~938B +满档 1072B 超限、+轻档 975B 限内），完整形态逐 curl +342B（`$(cat token)` 直书膨胀，基本只配轻档）；与自删二选一时**自删优先**（自删成功路径每跑兑现、取证只在失败路径兑现且有带外重放兜底）；恢复完整性仍居首（同字节预算从属律）。**自删 DELETE 不包**：其失败属授权残留（收车六连删除兜底）非恢复路径诊断重点。边界诚实：只覆盖「跑了但失败无证据」半边；定时器根本没跑（载体 Pod 死/驱逐）仍靠带外核实载体进程
+- **自删对象 —— namespaced 栈删 Pod（ownerRef GC 级联，W-83-3B 根治）；cluster 变体删 Binding（死锁仅存于此）**：
+  - **namespaced 四对象栈**：删**自己的 Pod**（非 Role/SA/Binding）——建栈期打的 `ownerReferences→Pod` 让 apiserver GC 用**自己的凭证**服务端级联删 SA/Role/RoleBinding，载体 SA 无需对这三件持任何自删授权，故**不受下方死锁约束**、整栈一次清空无空壳。这是本节尾步从「删 Binding」升级为「删 Pod」的根因（构造前置见第二节「ownerRef 自终结构造前置」，实弹坐实见该节）。
+  - **cluster 变体的 ClusterRole/ClusterRoleBinding**：namespaced Pod **不能** ownerRef 拥有 cluster-scoped 对象（K8s 禁跨 scope ownerRef），GC 级联够不着，只能退回「删自己的 Binding」：删 Binding 授权链即断（残留惰性 ClusterRole 零权限，第六节空壳中间态）；先删 ClusterRole 会留悬空 Binding（指向不存在 Role 的迷惑形态）；先删 SA 则 token 立即失效一件都删不成——**cluster-scoped 自删上限就是每类 Binding 一件，这是「用自己授权删自己授权」的结构性死锁，非实现妥协；ownerRef 级联只对 namespaced 栈解此死锁，cluster-scoped 残留仍靠第六节 agent 六连删除兜底**
+- **验权读回（双规则各自干净）**：启用尾步时，建栈后 `kubectl get clusterrole drill-rc-<hash> -o jsonpath='{.rules}'`（namespaced 栈读 role、cluster 变体读 clusterrole、**六对象栈 Role 与 ClusterRole 各读一次**——各自适用判据①②）读回 rules，目检**两条判据**：① 主授权规则**无 `resourceNames` 锁名**——锁名在场 = 两步建栈法被违反（自删 flag 被合并进 create 命令），主恢复 GET 目标资源将 403、case 不可执行，中止并按两步建栈法重建栈；② 自删规则独立成条（delete verb + `resourceNames` 锁名在场）。Role 是刚建的、rules 显式，读回即确定性证明（delete verb 无法用 GET 事前探测）
+- **取证包裹律（依据同要点区排障律）**：主恢复 curl 可包裹失败取证，两档——**满档**（同参数去 `-f` 重放、错误 body 落 restore.log）：`curl -sf <参数> $U || { curl -s <同参数> $U; false; }`（同参数含 Content-Type，缺了重放变 415、诊断的是另一个错）；**轻档**（贴限保底）：`|| { echo "FAIL rc=$? $d"; false; }`——定位失败动作与错误类别（rc=22 HTTP 层拒绝 / rc=6,7 连接层 / rc=28 超时；紧凑形态 +37B/处，完整形态无 `$d` 变体 33B/处）。**包裹对象 = 带 `-sf` 的 curl**（`-f` 才吞 body——裸 `-s` curl 失败时 body 本来就落 restore.log，包裹它纯属浪费字节；完整形态即升 `-sf` 的末动作一处，紧凑 for 形态循环体一处覆盖全部循环内 curl，前序裸 `-s` curl 勿包裹）。**两档的 `false` 都是承重件**：`||` 右侧回 0 会掩掉失败（无 `-f` 的取证 curl 4xx 也回 0、echo 回 0）→ `&&` 链恒真、fail-open 失灵——与上方紧凑形态挂接同病，如 `curl -sf … || echo …` 后链退出码为 0；包裹与 `&&` 链接续语义（POSIX `||`/`&&` 等优先级左结合，`A || { …; false; } && C` 中 A 败则 C 不执行）。**字节从属**：包裹计入第七节预算校验，挤不下先降档（满档→轻档）再弃包裹（裸 `-sf`）——满档紧凑形态整载荷 +134B（循环体只写一处、curl 全变量引用故增量与取值无关；四动作 657B 口径 +满档 ≈ 791B 限内；~938B 的载荷 +满档 1072B 超限、+轻档 975B 限内），完整形态逐 curl +342B（`$(cat token)` 直书膨胀，基本只配轻档）；与自删二选一时**自删优先**（自删成功路径每跑兑现、取证只在失败路径兑现且有带外重放兜底）；恢复完整性仍居首（同字节预算从属律）。**自删 DELETE 不包**：其失败属授权残留（收车六连删除兜底）非恢复路径诊断重点。边界诚实：只覆盖「跑了但失败无证据」半边；定时器根本没跑（载体 Pod 死/驱逐）仍靠带外核实载体进程
 
 ## 五、重武装纪律
 
@@ -258,9 +341,9 @@ kubectl get pods,sa,role,rolebinding -n <namespace> | grep drill-rc
 # 期望：无输出
 ```
 
-兜底事实：即使全清命令未落地（通道被故障切断），载体 Pod 的 sleep 骨架到时自过期；未挂 binding 的 Role/SA 是惰性对象（无授权效力）。任务内清理链会在武装到期后的清理轮（verify 收尾反复重入）自动执行同一组四连删除；但任务终态时窗口仍在倒计时的载体，系统侧不再有到期触发点——其收尾依赖骨架自过期（Pod）+ 上方带外核实兜底，RBAC 三件的清理由本节四连删除命令承担。
+兜底事实：即使全清命令未落地（通道被故障切断），载体 Pod 的 sleep 骨架到时自过期；未挂 binding 的 Role/SA 是惰性对象（无授权效力）。任务内清理链会在武装到期后的清理轮（verify 收尾反复重入）自动执行同一组四连删除。**W-83-3B 根治（namespaced 栈）**：启用自终结尾步的 namespaced 四对象栈，其 armed 定时器的自删尾步（第四节）在 TTL 删自己的 Pod，ownerRef GC 级联清 SA/Role/RoleBinding——这是一条**集群侧、与 agent 进程无关**的到期触发点，覆盖 agent timeout/crash/kill 及 recover 从未跑到 finalize 的场景（正是此前「任务终态时窗口仍在倒计时的载体，系统侧不再有到期触发点」漏洞的根治）。**边界诚实**：该 in-cluster 触发点仅在 ① 尾步实际启用（fail-safe 未抑制）且 ② 主恢复 2xx（fail-open RC 门控放行）时兑现；尾步被抑制、主恢复非 2xx、或 cluster-scoped 对象（ownerRef 够不着）时，仍回退骨架自过期（Pod）+ 上方带外核实兜底，RBAC 清理由本节四/六连删除命令承担。
 
-**空壳中间态（自断授权尾步执行后的合法残留形态）**：尾步（第四节）执行后，栈中 Binding 已死，SA + Role/ClusterRole 成为零授权惰性对象，载体 Pod 骨架自过期——**授权残留为零，对象残留为空壳**。空壳是**中间态**而非终态：收尾首选 `blade-ai recover --task-id <task_id>`（finalize 四连删除幂等清壳，`--ignore-not-found` 对已删 Binding 静默跳过）；批量积累碍眼时前缀一把扫（演练集群低频卫生操作）：
+**空壳中间态（cluster 变体尾步执行后的合法残留形态）**：namespaced 栈的自终结尾步删 Pod → GC 级联清**整栈**（SA/Role/RoleBinding 全消，**无空壳**）。空壳中间态仅存于 **cluster 变体**：尾步（第四节）删自己的 Binding 后，ClusterRole 成为零授权惰性对象（namespaced Pod 无法 ownerRef 拥有 cluster-scoped 对象，级联够不着）——**授权残留为零，对象残留为空壳**。空壳是**中间态**而非终态：收尾首选 `blade-ai recover --task-id <task_id>`（finalize 四/六连删除幂等清壳，`--ignore-not-found` 对已删 Binding 静默跳过）；批量积累碍眼时前缀一把扫（演练集群低频卫生操作）：
 
 ```bash
 kubectl delete $(kubectl get sa,role,clusterrole -A -o name | grep drill-rc-) --ignore-not-found
@@ -272,10 +355,10 @@ kubectl delete $(kubectl get sa,role,clusterrole -A -o name | grep drill-rc-) --
 
 部分命令通道单条载荷有 **1024 字节级上限**。武装命令天然较长（token 路径 + 双 HTTP 头 + URL），长 patch payload（如整段 ConfigMap 还原内容）会超限。
 
-**恢复 patch 三条铁律（B58/B80 家族立法——先于一切字节优化）**：
-1. **同语义对称律**：恢复 patch 与注入 patch **同类型、同字段域**，值取基线快照。换 patch 类型 = 换覆盖语义——merge/SMP 的「未写字段保留现值」在恢复场景下是「未写字段保留**注入值**」，部分字段恢复 = 语义级残留（B58：merge-patch 数组整组替换 → 422 原子拒绝、恢复死锁；B80：SMP 两字段恢复 json-patch 整对象注入 → failureThreshold 残留静默存活、恢复代 RS hash 不回基线）。**禁止以「某字段注入值恰等于基线值」为由缩小恢复字段域**——同值巧合不可靠（B80 中 timeoutSeconds 恰同值掩盖了另一半漂移）。
-2. **字节预算与逃生通道**：恢复命令规划期构造时预算字节（1024B 硬上限，安全线 ~900B 留引号转义余量）。超限处置按优先级：紧凑变量形态（第四节）→ 拆多个短 patch 串联（同一 `sh -c` 内顺序执行，不拆定时器）→ **base64 两步法**（恢复命令 base64 编码落盘为自包含脚本 + 定时器 fire 时 `sh` 执行；编码后仍超限时分段落盘拼接——多次 exec 各落一段再 cat 合并，同一形态的多段变体。合法前提：编码内容不含中间展开点，脚本内 `$(...)` 在执行时才展开——与第四节第一禁「printf/heredoc 落盘」的区别就在写入层有无变量展开点）。**唯一非法降级 = 缩小 patch 字段域挤字节**（删字段/少写字段/换更短类型但缩域）——字段域被铁律 1 锁定，字节压力不得侵蚀语义完整性（B80 即 1067B 超限后删两字段挤进限制的直接后果）。
-3. **恢复验证锚基线律**：恢复验证判据从**基线快照**派生，不从「恢复命令写了什么」派生——注入涉及的**整个子树** jsonpath 读回逐字段比对基线（勿只挑恢复命令涉及的字段）；Deployment template 被改过的 case 加 **RS hash 回基线值**判据（RS hash 是 pod template 全字段相等性的免费校验和：template 逐字段回基线 ⇒ Deployment controller 复用基线 RS ⇒ hash 必然回基线值；hash 不回 = 有残留，不必猜哪个字段）。判据跟着恢复命令字段域走 = 判据域同源窄化、恢复写窄验证跟着窄（B80 的验证层失效机制）。
+**恢复 patch 三条铁律（先于一切字节优化）**：
+1. **同语义对称律**：恢复 patch 与注入 patch **同类型、同字段域**，值取基线快照。换 patch 类型 = 换覆盖语义——merge/SMP 的「未写字段保留现值」在恢复场景下是「未写字段保留**注入值**」，部分字段恢复 = 语义级残留（如 merge-patch 对数组整组替换 → 422 原子拒绝、恢复死锁；SMP 两字段恢复而注入为 json-patch 整对象 → failureThreshold 残留静默存活、恢复代 RS hash 不回基线）。**禁止以「某字段注入值恰等于基线值」为由缩小恢复字段域**——同值巧合不可靠（如 timeoutSeconds 恰同值掩盖了另一半漂移）。
+2. **字节预算与逃生通道**：恢复命令规划期构造时预算字节（1024B 硬上限，安全线 ~900B 留引号转义余量）。超限处置按优先级：紧凑变量形态（第四节）→ 拆多个短 patch 串联（同一 `sh -c` 内顺序执行，不拆定时器）→ **base64 两步法**（恢复命令 base64 编码落盘为自包含脚本 + 定时器 fire 时 `sh` 执行；编码后仍超限时分段落盘拼接——多次 exec 各落一段再 cat 合并，同一形态的多段变体。合法前提：编码内容不含中间展开点，脚本内 `$(...)` 在执行时才展开——与第四节第一禁「printf/heredoc 落盘」的区别就在写入层有无变量展开点）。**唯一非法降级 = 缩小 patch 字段域挤字节**（删字段/少写字段/换更短类型但缩域）——字段域被铁律 1 锁定，字节压力不得侵蚀语义完整性（1067B 超限后删两字段挤进限制即此类直接后果）。
+3. **恢复验证锚基线律**：恢复验证判据从**基线快照**派生，不从「恢复命令写了什么」派生——注入涉及的**整个子树** jsonpath 读回逐字段比对基线（勿只挑恢复命令涉及的字段）；Deployment template 被改过的 case 加 **RS hash 回基线值**判据（RS hash 是 pod template 全字段相等性的免费校验和：template 逐字段回基线 ⇒ Deployment controller 复用基线 RS ⇒ hash 必然回基线值；hash 不回 = 有残留，不必猜哪个字段）。判据跟着恢复命令字段域走 = 判据域同源窄化、恢复写窄验证跟着窄（验证层同源窄化的失效机制）。
 
 处置（按优先级）：
 - **首选换第四节「紧凑变量形态」**（C/T/U 载荷内赋值，消除逐 curl 重复的 auth 头字节——多动作恢复的主要超限来源）
@@ -285,27 +368,29 @@ kubectl delete $(kubectl get sa,role,clusterrole -A -o name | grep drill-rc-) --
 
 **恢复脚本落盘形态（四档定案——按明文字节数查表，免现场重推导）**：
 
-Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**不手算 base64 长度、不写字节预估**——Phase 1 无 base64 生成器可绑定，`<restore-b64>` 类占位符无法填充（#44 判例：Phase 1 三轮手算 b64 字节数全数作废，Phase 2 现场重设计落盘形态又耗 126s 巨轮——占位符契约缺陷）；档位判断以**明文字节数**为唯一输入，Phase 2 落盘后按回显目检验证实际形态：
+Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**不手算 base64 长度、不写字节预估**——Phase 1 无 base64 生成器可绑定，`<restore-b64>` 类占位符无法填充（Phase 1 手算 b64 字节数易全数作废、Phase 2 现场重设计落盘形态又耗巨轮——占位符契约缺陷）；档位判断以**明文字节数**为唯一输入，Phase 2 落盘后按回显目检验证实际形态：
 
 | 档 | 明文字节数 | 形态 | 判据 |
 |---|---|---|---|
 | ① | ≤ ~400B 且无引号嵌套冲突 | 内联 `sh -c` 直书（第四节紧凑变量形态原样套用） | 单条载荷 ≤ 900B 安全线 |
-| ② | ≤ ~600B | 加引号定界符 heredoc 直书（`sh -c 'cat > /tmp/blade-restore-<名>.sh <<"EOF"\n<明文>\nEOF'`——**外层单引号**包裹、内层 `<<"EOF"` 字面保留；定界符加引号即字面化，无展开点。#44/#45 实证形态；外层双引号+反斜杠转义形态经 2026-09-16 方案 A 分词器修复后亦可安全使用（真实集群四形态实测），但单引号形态仍是首推——更简、无转义心智负担，见下引号保真律） | 落盘后 `cat` 回显目检 |
-| ③ | 更长或引号复杂 | 载体内 base64 编码（#43-R 实证形态：明文经引号安全形态传入载体内 → 载体内 `base64 -w0` 编码落盘 → 解码回显目检；编码产物不出载体，不受 exec 通道 1024B cap 约束） | 载体内编码 + 回显目检 |
-| ④ | ②仍超限（明文 > ~700B） | 分块并行写入（#43-R2 第五跑实证：明文分段独立文件并行落盘 → 载体内 `cat` 拼接 → 回显目检；mid-token-split 边界对空白裁剪免疫） | 拼接后回显目检 |
+| ② | ≤ ~600B | 加引号定界符 heredoc 直书（`sh -c 'cat > /tmp/blade-restore-<名>.sh <<"EOF"\n<明文>\nEOF'`——**外层单引号**包裹、内层 `<<"EOF"` 字面保留；定界符加引号即字面化，无展开点。外层双引号+反斜杠转义形态经分词器修复后亦可安全使用，但单引号形态仍是首推——更简、无转义心智负担，见下引号保真律） | 落盘后 `cat` 回显目检 |
+| ③ | 更长或引号复杂 | 载体内 base64 编码（明文经引号安全形态传入载体内 → 载体内 `base64 -w0` 编码落盘 → 解码回显目检；编码产物不出载体，不受 exec 通道 1024B cap 约束） | 载体内编码 + 回显目检 |
+| ④ | ②仍超限（明文 > ~700B） | 分块并行写入（明文分段独立文件并行落盘 → 载体内 `cat` 拼接 → 回显目检；mid-token-split 边界对空白裁剪免疫） | 拼接后回显目检 |
 
 各档目检门不变（第四节「先校验后武装」）：回显全文中键路径/字段域/Content-Type/`$` 变量字面量逐项核对才武装；档位边界处（如 550B）取更保守档不违法。
 
-**exec 载荷引号保真律（#45 实证立法；2026-09-16 二轮归因修正：根因在本地分词器，非 wiz 通道；同日方案 A 修复落地）**：引号损毁的第一现场在**本地 kubectl 分词器 `_split_args`**（tools/kubectl_cli.py：plain quoted region 逐字符扫描遇同类引号即闭合，**不识别双引号区内的反斜杠转义**）——外层双引号+转义形态（`\"`/`\$`）的 exec payload 被静默碎片化成多 token（`\"` 剥引号留反斜杠、token 在 `\Authorization:` 处截断、`Bearer` 沦为容器 shell `$0`），碎片经 wiz 通道（shlex.quote 逐词重组）**忠实**传输、容器 shell 再把残骸解析出错（残留 `\`+换行成行续接吞行——#45 corrupt file 209B≠正确 206B 三特征经四形态矩阵探针（.codex_work/probe_splitargs_45.py）逐字复现）；「外层单引号保真」的真因 = 分词器 verbatim-until-`'` 恰是 shell 单引号精确语义（无转义概念、无假闭合点），**wiz 通道对两种形态均无损**（同文件同型归因失误判例 d9117d36：从远端回显反推平台行为的坑两次——归因纪律：从 guard 派发最早的本地证据起比对）。**2026-09-16 方案 A 修复（用户裁决保留，实测四层验证）**：`_split_args` 双引号区已按 POSIX 解转义（`\"` `\\` `\$` `\`` → 字面字符、`\<newline>` 行续接、其他 `\x` 字面保留）——转义形态经真实集群 live-path 四形态实测 INTACT（修复前同 payload 11 token 碎片化 + 容器静默零输出；修复后 7 token 与单引号形态逐字节等价）；真实 /bin/sh oracle 9/9 一致；8351 项回归零破坏。**当前防御纪律**（修复后从硬律降为形态建议）：①落盘命令外层**首推单引号**（更简、无转义心智负担；转义形态已可用但两形态 token 等价，无收益）；②**单引号外层形态 payload 零单引号字符——此洞方案 A 不修**：外层 `'` 在 payload 首个 `'` 处假闭合，其后 JSON 双引号被**静默剥除**（`{"op":"replace"}` → `{op:replace}`，产物「看似合法裸文本」，比可见残骸更难目检）——payload 需要单引号时（如 awk 脚本）改走③或转义形态；③payload 含双引号/引号嵌套冲突时用 quoted heredoc 直书或 `-d @file` 分离（脚本与 payload 分两个文件各自 heredoc 落盘，curl `-d @/tmp/patch.json` 引用——payload 字节原样落盘，字段域零缩窄，#45 实证形态）；④载体内 base64 编码（档③）天然免疫。
+**exec 载荷引号保真律（根因在本地分词器，非 wiz 通道）**：引号损毁的第一现场在**本地 kubectl 分词器 `_split_args`**（tools/kubectl_cli.py：plain quoted region 逐字符扫描遇同类引号即闭合，**不识别双引号区内的反斜杠转义**）——外层双引号+转义形态（`\"`/`\$`）的 exec payload 被静默碎片化成多 token（`\"` 剥引号留反斜杠、token 在 `\Authorization:` 处截断、`Bearer` 沦为容器 shell `$0`），碎片经 wiz 通道（shlex.quote 逐词重组）**忠实**传输、容器 shell 再把残骸解析出错（残留 `\`+换行成行续接吞行——corrupt file 209B≠正确 206B 三特征可逐字复现）；「外层单引号保真」的真因 = 分词器 verbatim-until-`'` 恰是 shell 单引号精确语义（无转义概念、无假闭合点），**wiz 通道对两种形态均无损**（归因纪律：从 guard 派发最早的本地证据起比对，勿从远端回显反推平台行为）。**分词器修复后**：`_split_args` 双引号区已按 POSIX 解转义（`\"` `\\` `\$` `\`` → 字面字符、`\<newline>` 行续接、其他 `\x` 字面保留）——转义形态 live-path INTACT（修复前同 payload 11 token 碎片化 + 容器静默零输出；修复后 7 token 与单引号形态逐字节等价）。**当前防御纪律**（修复后从硬律降为形态建议）：①落盘命令外层**首推单引号**（更简、无转义心智负担；转义形态已可用但两形态 token 等价，无收益）；②**单引号外层形态 payload 零单引号字符——此洞不修**：外层 `'` 在 payload 首个 `'` 处假闭合，其后 JSON 双引号被**静默剥除**（`{"op":"replace"}` → `{op:replace}`，产物「看似合法裸文本」，比可见残骸更难目检）——payload 需要单引号时（如 awk 脚本）改走③或转义形态；③payload 含双引号/引号嵌套冲突时用 quoted heredoc 直书或 `-d @file` 分离（脚本与 payload 分两个文件各自 heredoc 落盘，curl `-d @/tmp/patch.json` 引用——payload 字节原样落盘，字段域零缩窄）；④载体内 base64 编码（档③）天然免疫。
 
 ## 八、降级路径
 
 本节治理**本标准件自身**的建栈失败。本标准件一~十节全流程是程序化装配器 `faultdrill_assemble_carrier` 不可用时的降级目标，也是结构性无法程序化的 case 的主路径。
 
 载体自建失败（镜像不可拉取 / 验权 403 / 通道不可达）时：
-1. **不得**反复重试绕行（换名重建、换命名空间、改清单路径均属绕行）
+1. **不得**反复重试绕行（换名重建、换命名空间、改清单路径均属绕行）——**绕行与迁移的分界（实测坐实，勿混）**：绕行是**载体本身有缺陷**（形态/RBAC/镜像不合法）却靠改名/改 ns/改清单去规避门的拒绝，属掩盖缺陷、禁止；**迁移**是载体本身完全合法（形态过门、RBAC 齐、镜像可用），只是它**被调度到的那个节点有局部网络故障**（pod→service CIDR 路由断：第三节 GET 探针回超时/000 而非 403，`nslookup` 超时、apiserver ClusterIP 不可达、pod IP 落到无路由网段），集群与其余节点健康——此时**同名 delete + 重建让调度器换节点**不是绕行，是修复与载体正确性正交的环境故障，允许（见下方「节点局部网络故障 → 载体迁移」）
 2. 如实报告失败原因，**任务如实失败收尾——恢复定时器未武装即不得注入**（「武装与注入紧邻」时序立法的硬序面：无定时器注入 = 故障窗口期内无任何自动恢复保障）。**不存在「Agent 在线保活」降级形态**——Agent 会话不承担恢复执行，在线段职责恒定（武装 → 注入 → 生效确认 → 窗口内采样 → 提交结论即收尾，见第九节「任务生命周期契约」）
 3. 故障已落地后才发现载体不可用 / 定时器丢失的，恢复移交带外段：`blade-ai recover --task-id`（第六节三层：补恢复/确认 + 恢复效果核实 + 程序化四连删除）——结果报告如实记录降级原因与移交状态
+
+**节点局部网络故障 → 载体迁移（武装前唯一合法重试，有界）**：第三节 GET 探针/SSAR 回**超时/000/无路由**（非 403）且判明是**载体所在节点**的 pod→apiserver 路径断（同节点其他 hostNetwork Pod 正常、载体 pod IP 落无路由网段、`nslookup kubernetes.default.svc` 超时）时——验权门已 fail-closed 抓住（武装前中止正确✓），但这是**环境故障非载体缺陷**，处置 = **同名 `kubectl delete pod drill-rc-<hash> -n <namespace>` + 按第一节形态原样重建**，让调度器把它甩到另一节点，再重跑第三节三道验权门。纪律：①**同名同形态**（换名/换 ns/改清单即落入绕行，禁止）；②**有界**——至多一次迁移重试（对齐装配器「至多一次 pre-arming fail-closed 重试」预算），迁移后仍通道不可达即按本节 2 如实失败收尾，不得无限重摇节点；③迁移的 delete+重建**发生在武装前**（武装后载体 `recovery_armed` 锁定，删载体即 disarm，见第五节重武装纪律）；④overrides 白名单不含 nodeSelector/nodeName，迁移靠调度器随机换节点、不能钉节点（钉节点的 merge/strategic overrides 会被形态门拒）。**注意与拓扑死锁的区别**：若通道是被**故障本身**集群级切断（如集群 DNS 故障使 `kubernetes.default.svc` 全域不可解析）则迁移无用——见下方拓扑死锁段。
 
 恢复通道被故障本身切断的场景（如集群 DNS 故障使 `kubernetes.default.svc` 不可解析）：**先备好带外恢复手段才可注入**（直连 kubeconfig 走 API server IP，或控制台手动）——此为拓扑死锁，载体定时器与带外恢复双双不可达，忙等无意义。
 
@@ -325,12 +410,12 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 1. **verify 不等窗口到期**：恢复由载体定时器单点负责，不是本任务的验证对象——效果证据在窗口存活期采集，计划里不设 post-window 恢复等待轮
 2. **全清触发是条件式的**：窗口在任务存活期内到期 → 任务内清理链自动四连删除；任务先于窗口到期收尾（常态，见结论 1）→ 系统侧无到期触发点，全清依赖带外收尾（首选 `blade-ai recover --task-id`，第六节）+ Pod 骨架自过期 + RBAC 惰性对象兜底（第六节兜底事实）
 3. **Agent 的收尾义务 = 如实报告**：结果报告 cleanup 清单列出载体资产即可；不在线等恢复、不等骨架自过期
-4. **Agent 在线段不设计 early recovery（#52 实测立法，2026-09-18）**：载体武装 timer 后即处于 `recovery_armed` 锁定态，fire 前 target_guard 拒绝对该载体的第二次 mutation（含提前执行恢复动作），新建第二载体绕锁违反安全设计意图，勿走此路。daemon 挂起类故障按批准 duration **全窗设计**：提前恢复会使 verify 失去故障态采样（T 态进程、事件累积计数都在窗口存活期取得），且窗口尾部与 verify 报告生成本就天然重叠（#52 实测：fire 落在终报告生成中途，fire 后 35s 收尾，全窗零浪费）——计划里出现「T0+N 提前恢复」步骤即为立法违背，规划期删除
-5. **窗口预算自武装时刻起算（2026-09-21 NXDOMAIN 实测立法，inject-2340dac9）**：载体 TTL 时钟在武装瞬间启动，execute 武装后的一切消耗——生效等待（reload/rollout）、readback 复核、中段复查的 time_wait——都吃同一扇窗口；行为证据（故障态探针输出）只能在故障存活期内采集，窗口耗尽即永久丢失、不可事后补采（结论 1 的硬边界反面：不是 verify 不等窗口，而是窗口等不起 execute 的内部消耗）。规划期 duration 取值须预留内部消耗余量（装配含至多一次 pre-arming fail-closed 重试 + 生效等待 + 采样轮）；execute 期发现剩余窗口走不完中段复查时，优先保行为证据采集（白盒+行为+对照一轮同发）。实测教训：TTL 300s 被 execute 内部 431s 消耗（装配事故重试 118s + readback 侦查 60s + reload 等待 93s + 收尾）耗尽，行为证据零采集，verdict 封顶 partial
+4. **Agent 在线段不设计 early recovery**：载体武装 timer 后即处于 `recovery_armed` 锁定态，fire 前 target_guard 拒绝对该载体的第二次 mutation（含提前执行恢复动作），新建第二载体绕锁违反安全设计意图，勿走此路。daemon 挂起类故障按批准 duration **全窗设计**：提前恢复会使 verify 失去故障态采样（T 态进程、事件累积计数都在窗口存活期取得），且窗口尾部与 verify 报告生成本就天然重叠（fire 常落在终报告生成中途、fire 后即收尾，全窗零浪费）——计划里出现「T0+N 提前恢复」步骤即为立法违背，规划期删除
+5. **窗口预算自武装时刻起算**：载体 TTL 时钟在武装瞬间启动，execute 武装后的一切消耗——生效等待（reload/rollout）、readback 复核、中段复查的 time_wait——都吃同一扇窗口；行为证据（故障态探针输出）只能在故障存活期内采集，窗口耗尽即永久丢失、不可事后补采（结论 1 的硬边界反面：不是 verify 不等窗口，而是窗口等不起 execute 的内部消耗）。规划期 duration 取值须预留内部消耗余量（装配含至多一次 pre-arming fail-closed 重试 + 生效等待 + 采样轮）；execute 期发现剩余窗口走不完中段复查时，优先保行为证据采集（白盒+行为+对照一轮同发）。如 TTL 窗口被 execute 内部消耗（装配重试 + readback 侦查 + reload 等待 + 收尾）耗尽，则行为证据零采集、verdict 封顶 partial
 
 （降级路径见第八节——载体建不起来即任务失败收尾，不改变本契约三段边界：Agent 段从不承担恢复执行。）
 
-**端到端建栈 SOP 填空模板（执行序一次拼装，免逐节跳转重排——planner 照此序填空成文，#51-R3 实测定案）**：标准件全生命周期的执行顺序骨架如下，每步右侧引用细节立法所在节（判据正文以各节为准，本模板不复制判据防双源漂移）——计划按此序成文，勿在规划期重新推导步骤间的次序与拼装：
+**端到端建栈 SOP 填空模板（执行序一次拼装，免逐节跳转重排——planner 照此序填空成文）**：标准件全生命周期的执行顺序骨架如下，每步右侧引用细节立法所在节（判据正文以各节为准，本模板不复制判据防双源漂移）——计划按此序成文，勿在规划期重新推导步骤间的次序与拼装：
 
 | # | 步骤 | 形态 | 立法出处 |
 |---|---|---|---|
@@ -342,25 +427,26 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 | 6 | Role（单族直建 / 跨族两步法步骤 1） | `kubectl create role --verb --resource`（verbs 以恢复载荷实际写动词为准，第二节映射表） | 第一节 + 第二节形态无关总则 |
 | 7 | RoleBinding | `kubectl create rolebinding --role --serviceaccount` | 第一节步骤 3 |
 | 8 | 载体 Pod | `kubectl run` + overrides（SA 挂接 + tolerations）+ `--command -- sleep <骨架>` | 第一节步骤 4 |
-| 9 | Role 两步法步骤 2+3（跨族非均匀动词集时） | 载体注册后 json-patch 逐族追加 `/rules/-` + readback 逐 rule EXACT | 第一节「Role 跨资源族构造立法」 |
+| 9 | Role 两步法追加（跨族非均匀动词集 / 恢复动作为创建 RoleBinding 时的 `bind` 规则） | 载体注册后 json-patch 逐族追加 `/rules/-`（bind 规则 `resourceNames` 锁被引用 Role 名）+ readback 逐 rule EXACT | 第一节「Role 跨资源族构造立法」+ 第二节「RBAC 绑定重建的提权前置」 |
 | 10 | SA 真实 token 验权（GET 硬门） | exec curl GET 目标资源 → 200 继续 / 403 中止 | 第三节 |
 | 11 | SSAR 写动词对账（逐写动词） | exec curl POST selfsubjectaccessreviews + 回执自证三态判定 | 第三节 |
-| 12 | 武装（推迟至第一个故障生效动作紧邻前） | exec `sh -c '( sleep N; <恢复动作> ) >/tmp/restore.log 2>&1 & echo armed'` | 第四节（形态/时序/字节预算三查） |
+| 12 | 内容感知 dry-run 武装门（逐写请求） | exec curl 对武装载荷同源的恢复请求加 `?dryRun=All` → 401/403 中止 / 其余通过 | 第三节「内容感知 dry-run 武装门」 |
+| 13 | 武装（推迟至第一个故障生效动作紧邻前） | exec `sh -c '( sleep N; <恢复动作> ) >/tmp/restore.log 2>&1 & echo armed'` | 第四节（形态/时序/字节预算三查） |
 
-顺序硬约束三条（其余顺序即表序）：**SA(5) 先于载体 Pod(8)**；**Role 追加(9) 须在载体注册(8) 之后**（patch 全局禁令在载体注册前生效）；**武装(12) 紧邻第一个故障生效动作之前**（勿按命令模板在计划文本中的出现位置机械摆放，见第四节「多步注入序列的武装点」）。可选变体注记：启用自断授权尾步时，自删规则的两步追加（json-patch `/rules/-` + resourceNames 锁名）**排在武装(12)之后、注入之前**——不可与主授权建栈同期（步骤 6/9）追加（第二节「自删规则两步建栈法」）。原因：自删规则只在定时器 **fire 时**才被消费（删自己的 Binding），而 armed-before-inject 门要求 object-write patch 在载体武装后才放行，故把这条 patch 放到武装之后既过门、又赶在 fire 前就位（隔着整个故障窗口，完全来得及）。启用尾步时的执行序：建主授权 Role(6) → SSAR 主恢复动词(10/11) → 武装(12，载荷末已含自删 DELETE) → **patch Role 追加自删规则** → 注入（这条 patch 是秒级 setup，不破坏「武装紧邻注入」）。尾步 DELETE 的 `curl -sf &&` 仍挂接在步骤 12 载荷末（第四节五条纪律）；五件套/六对象栈的集群级链同步。收尾侧（verify/全清/带外）不进本表——见本节顶部任务生命周期契约三段表。
+顺序硬约束三条（其余顺序即表序）：**SA(5) 先于载体 Pod(8)**；**Role 追加(9) 须在载体注册(8) 之后**（patch 全局禁令在载体注册前生效）；**武装(13) 紧邻第一个故障生效动作之前**（勿按命令模板在计划文本中的出现位置机械摆放，见第四节「多步注入序列的武装点」）；**dry-run 武装门(12) 在 SSAR(11) 之后、武装(13) 之前**（内容感知门，动词层 SSAR 通过后仍需过它）。可选变体注记：启用自断授权尾步时，自删规则的两步追加（json-patch `/rules/-` + resourceNames 锁名）**排在武装(13)之后、注入之前**——不可与主授权建栈同期（步骤 6/9）追加（第二节「自删规则两步建栈法」）。原因：自删规则只在定时器 **fire 时**才被消费（删自己的 Binding），按 §9 执行序约定排在武装后追加（**非门强制**——armed-before-inject 门已放行载体自身已登记 Role 的 add-only 追加动词 patch，主恢复族〔步骤 9〕的武装前追加正是靠此豁免过门），放武装后既顺延 fail-open 尾步序、又赶在 fire 前就位（隔着整个故障窗口，完全来得及）。启用尾步时的执行序：建主授权 Role(6) → SSAR 主恢复动词(10/11) → dry-run 门(12) → 武装(13，载荷末已含自删 DELETE) → **patch Role 追加自删规则** → 注入（这条 patch 是秒级 setup，不破坏「武装紧邻注入」）。尾步 DELETE 的 `curl -sf &&` 仍挂接在步骤 13 载荷末（第四节五条纪律）；五件套/六对象栈的集群级链同步。**namespaced 栈启用 ownerRef 自终结时的执行序（W-83-3B 根治形态，与 cluster 变体的「武装后追加」相反）**：建主授权 Role(6) → 载体 Pod Running(8) → SSAR 主恢复动词(10/11) → dry-run 门(12) → **ownerRef 自终结构造（取 Pod UID + patch Role 追加 `delete pods` 自删规则 + patch SA/Role/RoleBinding 打 `ownerReferences→Pod`，第二节「ownerRef 自终结构造前置」）** → 武装(13，载荷末含 RC 门控的删 Pod 尾步) → 注入。**为何排武装前而非武装后**：删 Pod 尾步是否写入武装载荷，取决于 ownerRef 构造三步是否**全部落地**（fail-safe 全或无——半装会删 Pod 却孤立三件 live RBAC，比不装更糟），故构造须先于武装载荷定型；这与 cluster 变体「自删规则只 fire 时消费、可排武装后」不同。ownerRef 构造需 Pod 已 Running(8) 才有 UID。**⚠️ 门放行边界（实测坐实，勿再假设 ownerRef patch 全放行）**：armed-before-inject 门只放行**载体自身已登记 Role 的 add-only json-patch（`/rules/-` 追加动词）**；对 SA/Role/RoleBinding 打 `ownerReferences` 的 **merge-patch 被判 object-write injection、要求先武装而 REJECT**（`--type=json` 的 Role 追加放行、`--type=merge` 的 ownerReferences 被拒，实测三条 merge-patch 全打回、原子批未跑任何一条）。而武装(13)后载体进入 `recovery_armed` 锁定态、不得再 mutation——故 **namespaced ownerRef 自终结尾步在 LLM kubectl 路径上结构性不可构造**（武装前门拒、武装后锁死），第二节 fail-safe 全或无**必然触发**：抑制尾步、整栈退回第六节 agent 四连删除兜底（这是本路径的实际清理形态，非异常）。ownerRef 尾步只在**装配器路径**有效（装配器走 exec 内部派发不经该门）。收尾侧（verify/全清/带外）不进本表——见本节顶部任务生命周期契约三段表。
 
 **镜像选型（覆盖优先——无法钉节点）**：overrides 白名单不含 nodeSelector/nodeName，载体可能调度到**任意可调度节点**，镜像必须「任意节点都拿得到」。**主路径是零配置自动发现**：任务启动探测（preplan_probe）枚举健康 DaemonSet（desired==ready>0）的镜像——全节点缓存、无需网络拉取——自动并入载体允许集并在探测消息中给出候选清单，规划期直接选用（按第 3 条确认工具链即可）。探测消息不含候选或需自行核实时，按以下判别法：
 1. 权威缓存清单：`kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.images[*].names}{"\n"}{end}'`（kubelet 上报的每节点镜像缓存）；**DaemonSet 全节点覆盖（每个节点都有 Running 副本）的镜像 = 全节点缓存**，是天然候选
 2. 或选集群可达 registry 的镜像——可达性判据：有运行中 Pod 正在使用该 registry 前缀（未缓存也可拉取）
-3. 工具链预检属尽力而为：批准靶标自身若正在使用候选镜像，可对它 exec `command -v sh curl sleep`（域外 Pod 的 exec 会被身份漂移守卫拒绝）；预检不了也无妨——第三节验权 exec 本身就是硬门（curl 缺失 → 无 200 → 中止，故障尚未注入）
+3. 工具链预检属尽力而为：批准靶标自身若正在使用候选镜像，可对它 exec `command -v sh curl sleep`（域外 Pod 的 exec 会被身份漂移守卫拒绝）；预检不了也无妨——第三节验权 exec 本身就是硬门（curl 缺失 → 无 200 → 中止，故障尚未注入）。**两条路径的相对成本（事实，供权衡、非强制顺序）**：exec 批准靶验工具链守卫安全、零额外规划轮（唯批准靶可走此路）；`kubectl debug node/<node> --image=<候选>` 则多花约 150s 规划轮、有 debug Pod 60s 存活竞态。**批准靶自身镜像是否落在候选允许集，是一条 `get pod <靶> -o jsonpath '{.spec.containers[*].image}'` 即可确定的事实**——命中即可走前者、免 debug 探测
 4. 允许集语义（硬门）：配置默认集（busybox/curl；`BLADE_AI_RECOVERY_CARRIER_ALLOWED_IMAGES` 可覆盖——人工兜底入口，仅探测失败等少数场景需要）∪ 自动发现集（每任务重探、进程内合并、不持久化）；任务运行中不可改。不在允许集的镜像进不了标准件形态——SHAPE 拒绝消息会透传「镜像 X 不在允许集 + 当次发现集 + 人工入口」，失败可诊断
 5. **既往实证可引用（免工具链探测）**：镜像内容不可变——精确 tag 匹配的既往实证（载体定时器真实 fire 过，非仅 command -v 探测）是工具链的充分证据，规划期直接选用无需 debug 探测（探测需额外约 150s 的规划轮，且有 debug Pod 60s 存活期竞态）。注意实证只证工具链：当次探测候选清单仍是可用性的唯一权威——实证 tag 不在候选清单说明 DS 已滚动，实证失效需重探。**候选清单 ∩ 实证档案非空时取第一个命中项即定案**——多候选同命中时不做优劣对比（DS 健康度已由探测保证），档案命中但不在候选清单的镜像按失效论
 
-**载体 tolerations 取舍（定案免推导）**：探得集群 taint 形态后，**资源池隔离类 NoSchedule taint（如 sigma.ali/*）加对应 tolerations**（带此 taint 的节点是正常工作节点，DS 覆盖即可证健康）；**运维窗口类 taint（如 ops-maintenance）不加容忍**——被标记维护的节点不是好载体宿主，容忍它反而扩大落点风险。无 taint 可调度节点充裕（>10）时零容忍也可（默认调度面足够）。**未列举类别（如 dedicated 专用硬件类）按语义就近归类，归不了类取零容忍**——漏容忍的失败模式是载体 Pending → 第八节降级中止（fail-closed），错加容忍的失败模式是载体落上不该落的节点（fail-open），fail-closed 恒优于 fail-open；取舍权衡勿再展开三轮论证（#44 判例：全容忍/零容忍/子集容忍三轮自我辩论 ~50s，定案后免）。
+**载体 tolerations 取舍（定案免推导）**：探得集群 taint 形态后，**资源池隔离类 NoSchedule taint（如 sigma.ali/*）加对应 tolerations**（带此 taint 的节点是正常工作节点，DS 覆盖即可证健康）；**运维窗口类 taint（如 ops-maintenance）不加容忍**——被标记维护的节点不是好载体宿主，容忍它反而扩大落点风险。无 taint 可调度节点充裕（>10）时零容忍也可（默认调度面足够）。**未列举类别（如 dedicated 专用硬件类）按语义就近归类，归不了类取零容忍**——漏容忍的失败模式是载体 Pending → 第八节降级中止（fail-closed），错加容忍的失败模式是载体落上不该落的节点（fail-open），fail-closed 恒优于 fail-open；取舍权衡勿再展开反复论证（全容忍/零容忍/子集容忍自我辩论耗时，定案后免）。
 
-**载体建栈的 blast_radius_scope 定性（定案免推导，按栈形态分流）**：以**新增授权对象的写入集**为判据——①**四件套**（Pod/SA/Role/RoleBinding 全在靶 ns、Role 授予 namespaced get/patch）→ **namespace-wide**（故障本体仅变更靶资源，但 namespaced 新增 RBAC grant 保守声明；additive scaffolding 不算 mutation 但授权面属实）；②**五件套变体**（含 ClusterRole/ClusterRoleBinding 集群级两件）与**第十节跨 ns 变体**（role/rolebinding 落靶 ns 之外的恢复 ns）→ 按 SKILL.md 安全红线「爆炸半径 scope 枚举映射」规则③声明 **cluster-wide**（跨命名空间持久资源写入；#15 五件套实测定案同此）。此定性一次定案，勿在 planning 与 finish_planning 两轮反复辩论（#44 判例：两轮辩论两次结论不同 target-only→namespace-wide，~110s，定案后免）。
+**载体建栈的 blast_radius_scope 定性（定案免推导，按栈形态分流）**：以**新增授权对象的写入集**为判据——①**四件套**（Pod/SA/Role/RoleBinding 全在靶 ns、Role 授予 namespaced get/patch）→ **namespace-wide**（故障本体仅变更靶资源，但 namespaced 新增 RBAC grant 保守声明；additive scaffolding 不算 mutation 但授权面属实）；②**五件套变体**（含 ClusterRole/ClusterRoleBinding 集群级两件）与**第十节跨 ns 变体**（role/rolebinding 落靶 ns 之外的恢复 ns）→ 按 SKILL.md 安全红线「爆炸半径 scope 枚举映射」规则③声明 **cluster-wide**（跨命名空间持久资源写入；五件套变体同此）。此定性一次定案，勿在 planning 与 finish_planning 两轮反复辩论（易两次结论不同 target-only↔namespace-wide，定案后免）。
 
-**task_id 命名（定案免推导）**：save_fault_plan 的 task_id 用 **ASCII 连字符短名**，推荐「<域目录小写>-<case 短名>」形态（如 pod-terminating-finalizers）——task_id 会成为任务文件名与台账检索键，非 ASCII/中文有文件名兼容风险；按此式一次定案，勿起多候选轮转纠结（#48 实测：Iter 8 内三个候选方案轮转 ~100s，无立法指引时 LLM 自行权衡描述性/安全性/简洁性）。载体名沿用 drill-rc-<短名> 独立命名，两者不需一致性仲裁。
+**task_id 命名（定案免推导）**：save_fault_plan 的 task_id 用 **ASCII 连字符短名**，推荐「<域目录小写>-<case 短名>」形态（如 pod-terminating-finalizers）——task_id 会成为任务文件名与台账检索键，非 ASCII/中文有文件名兼容风险；按此式一次定案，勿起多候选轮转纠结（无立法指引时易在多候选方案间轮转、自行权衡描述性/安全性/简洁性）。载体名沿用 drill-rc-<短名> 独立命名，两者不需一致性仲裁。
 
 **本集群实证档案（环境特定记忆，随台账更新——新实证在 CASE_实测记录.md 归档后追加到此）**：
 
@@ -384,11 +470,11 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 
 **遗留同名资产处置预案（预检撞到即拆旧建新——定案免推导）**：冲突预检**有输出**（同名遗留存在：上一任务的载体 Pod 已 Succeeded/Completed 自过期 + RBAC 三件常驻——「常驻无害」指惰性对象无风险，不等于可复用；常驻必然使下次同名演练再撞冲突）时，处置定案 = **按第六节全清序先拆遗留（Pod → RoleBinding → Role → SA，五件套含集群级两件），再按第一节标准流程新建同名栈**，不得复用遗留资产。这是 execute 计划的 setup 步骤义务（载体建栈前执行——动作措辞显式声明执行者与阶段），理由两条：
 - Completed 态 Pod 的 exec 通道不可用（第三节验权与第四节武装载荷都走 exec）——复用等于跳过验权盲武装
-- 任务侧归属完整性：任务收尾的自动清理链按本任务 execution artifacts 名册执行——继承的遗留资产不在名册，本任务收尾清不掉，下次同 hash 演练再撞同一冲突；新建资产进名册，收尾自动清理完整覆盖（#43-R 实证：拆旧建新后零残留）
+- 任务侧归属完整性：任务收尾的自动清理链按本任务 execution artifacts 名册执行——继承的遗留资产不在名册，本任务收尾清不掉，下次同 hash 演练再撞同一冲突；新建资产进名册，收尾自动清理完整覆盖（拆旧建新后零残留）
 
 拆除回执预期：delete 正常 exit 0；预检与拆除之间被并发清理（NotFound）时按「确认不存在」预检的 POSIX 通过语义解读，继续新建。
 
-**执行凭证预检（一轮发全）**：规划期对当前凭证一次并行 `kubectl auth can-i` 发全**本任务全部写动词**——建栈集（`create serviceaccounts/roles/rolebindings/pods`，五件套变体加 `create clusterroles/clusterrolebindings`；启用自断授权尾步时**加两步建栈第二步动词**——namespaced 栈 `patch roles`、cluster 变体与六对象栈的 cluster 链 `patch clusterroles`：create 有而 patch 无则自删规则追加不上、timer 自删 DELETE 必 403）∪ 注入动作集（按用例演练步骤：`patch deployments`、`patch/label nodes`、`delete pods` 等）∪ 验权只读集（`get` 目标资源）。can-i 亚秒级且可并行，**一次发全、勿分批**——漏发任何一条都会导致后续轮次补探。
+**执行凭证预检（一轮发全）**：规划期对当前凭证一次并行 `kubectl auth can-i` 发全**本任务全部写动词**——建栈集（`create serviceaccounts/roles/rolebindings/pods`，五件套变体加 `create clusterroles/clusterrolebindings`；启用自终结尾步时**加两步建栈第二步动词**——cluster 变体与六对象栈的 cluster 链 `patch clusterroles`（自删规则追加）；namespaced ownerRef 形态 `patch roles`（delete pods 自删规则）+ `patch serviceaccounts/rolebindings`（打 ownerReferences→Pod，第二节「ownerRef 自终结构造前置」）：create 有而 patch 无则自删规则/ownerRef 追加不上——cluster 变体 timer 自删 DELETE 必 403，namespaced 形态 fail-safe 抑制尾步、整栈退回 agent 四连删除兜底）∪ 注入动作集（按用例演练步骤：`patch deployments`、`patch/label nodes`、`delete pods` 等）∪ 验权只读集（`get` 目标资源）。`can-i` 的位置参数恒为**两个**：`<verb> <resource>[.<group>][/<name>]`——资源与可选资源名以 `/` 连为**单个** token（`patch configmaps/coredns`）；资源名作独立第三位置参数（`can-i patch configmap coredns`）会被 kubectl 拒（`you must specify two arguments: verb resource or verb resource/resourceName`）。调用方自身权限通常不按资源名收窄，故预检探到**资源级**（`can-i patch configmaps -n <ns>`）即足；`/<name>` 形态仅用于核实某 `resourceNames` 锁名规则。can-i 亚秒级且可并行，**一次发全、勿分批**——漏发任何一条都会导致后续轮次补探。
 
 **verify 期卫生项边界**：注入机制卫生（如滚动更新参数 maxUnavailable 的还原）**不是故障效果判据**——效果检查表只对效果主张取证；卫生项有执行期证据即在 warnings 注记，不为它追加采样
 
@@ -418,7 +504,7 @@ kubectl create rolebinding drill-rc-<hash> -n <恢复ns> \
   --role=drill-rc-<hash> --serviceaccount=<靶ns>:drill-rc-<hash>
 # 4) 载体 Pod（靶 ns；overrides = SA 挂接 + tolerations，结构白名单见第一节；
 #    受限网络按第九节判别法选定全节点可达镜像后替换 --image）
-kubectl run drill-rc-<hash> -n <靶ns> --image=busybox:1.36 \
+kubectl run drill-rc-<hash> -n <靶ns> --image=curlimages/curl:latest \
   --restart=Never \
   --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>","tolerations":[{"key":"<taint-key>","operator":"Equal","value":"<taint-value>","effect":"NoSchedule"}]}}' \
   --command -- sleep <骨架时长>
@@ -426,7 +512,7 @@ kubectl run drill-rc-<hash> -n <靶ns> --image=busybox:1.36 \
 
 **立法前置（硬门）**：恢复 ns 的 role/rolebinding 写超出了靶 ns secondary 覆盖——用例 frontmatter 的 `mechanism_writes` 必须含 `role`/`rolebinding` @ 恢复 ns + `name_prefix: "drill-rc-"` 两条，否则守卫按 scope drift 拒绝（fail-closed）。SA/载体 Pod 仍在靶 ns，无需立法。
 
-**执行凭证前提**：当前凭证须在恢复 ns 有 `create roles/rolebindings` 权限（`kubectl auth can-i create roles -n <恢复ns>` 探测；启用自断授权尾步时另查 `can-i patch roles -n <恢复ns>`——两步建栈第二步）；无权限时不可强建——走第八节降级路径。
+**执行凭证前提**：当前凭证须在恢复 ns 有 `create roles/rolebindings` 权限（`kubectl auth can-i create roles -n <恢复ns>` 探测；启用自终结尾步时另查 `can-i patch roles -n <恢复ns>`——两步建栈第二步；namespaced ownerRef 形态还需 `can-i patch serviceaccounts/rolebindings -n <恢复ns>`——打 ownerReferences→Pod）；无权限时不可强建——走第八节降级路径。
 
 **全清变体**：四连删除顺序不变，role/rolebinding 改在恢复 ns 删（清理侧按成员各自记录的 ns 删除，任务侧已支持）：
 

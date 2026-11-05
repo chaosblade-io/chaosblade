@@ -5,6 +5,8 @@
 # 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
 # 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
+# 载体由 faultdrill_assemble_carrier 程序化建栈、结构性自拆（fail-closed 路径 + 恢复句柄清理链 + 武装定时器自删 → apiserver ownerRef GC 级联）；降级路径不自建可自撤 RBAC 栈，正文无需传输载体自撤授权类知识。
+carrier_teardown: assembler-managed
 # 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
 # 自身（patch readinessProbe/maxUnavailable 属受害者域内，名字匹配放行），无
 # 跨对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash>
@@ -16,7 +18,7 @@ recovery_channel: apiserver-write
 **用例名称** ReadinessProbe配置不一致 导致 Service_调用失败
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 readinessProbe 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 readinessProbe 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:
@@ -55,8 +57,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 ## 资源准备
 1. 确认应用 A 已正常运行，对外暴露 Service
 2. 确认应用 A 实际监听的端口和健康检查路径
-3. **靶须在探针 path:port 上真实返回 HTTP 200（httpGet readinessProbe 基线 PASS 前提）**：本 case 演示「探针配置一致→不一致」的翻转，要求注入前探针 PASS（Pod Ready、在 Endpoints 内）、注入后 FAIL（Pod Not Ready、移出 Endpoints）。裸 `sleep`／无 HTTP 服务的靶，httpGet 探针基线即恒失败（Pod 恒 Not Ready），无法演示翻转，**不可用作本 case 靶**。用专用演练靶（非真实业务应用）时，须让靶容器起最小 HTTP 服务（用靶镜像既有工具，工具链以当次实测为准），使基线探针能 PASS。
-   > 用 socat 类工具起最小 HTTP 服务时注意：其地址解析器会把响应串里的 `\r\n` 转义成真实换行，致响应命令被拆行失败（实测 `sh: N: Content-Length:: not found`）；稳妥形态是先把 HTTP 响应写进文件、再由服务进程 `cat` 该文件（响应体无反斜杠即零转义风险）。
+3. **靶须在探针 path:port 上真实返回 HTTP 200（httpGet readinessProbe 基线 PASS 前提）**：本 case 演示「探针配置一致→不一致」的翻转，要求注入前探针 PASS（Pod Ready、在 Endpoints 内）、注入后 FAIL（Pod Not Ready、移出 Endpoints）。裸 `sleep`／无 HTTP 服务的靶，httpGet 探针基线即恒失败（Pod 恒 Not Ready），无法演示翻转，**不可用作本 case 靶**。用专用演练靶（非真实业务应用）时，须让靶容器起最小 HTTP 服务（用靶镜像既有工具，工具链以当次探测为准），使基线探针能 PASS。
+   > 用 socat 类工具起最小 HTTP 服务时注意：其地址解析器会把响应串里的 `\r\n` 转义成真实换行，致响应命令被拆行失败（如 `sh: N: Content-Length:: not found`）；稳妥形态是先把 HTTP 响应写进文件、再由服务进程 `cat` 该文件（响应体无反斜杠即零转义风险）。
 
 ## 演练步骤
 （主路径 = 步骤 1 基线捕获（readinessProbe 配置 JSON——restorePatches 基线值来源，两条路径共用）→ 调 faultdrill_assemble_carrier（参数取自载体配方：target_kind=deployment、target_name=<deployment-name>、target_namespace=<namespace>、patches=…（含 MU 100% 注入域）、restorePatches=…、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 MU 100% 由配方注入域承载，无需单独执行 → 步骤 5 等待滚动更新完成（两路径共用）→ 步骤 6 的 MU 还原随 restorePatches 由载体 TTL 承载，无需手动执行。步骤 3 的手动定时器序列与步骤 4 的 strategic patch 仅当装配器 fail-closed 报告不可用时作降级兜底——降级路径下步骤 2/4/6 手动序列照常）：
@@ -98,7 +100,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
    （本用例的故障机制就是探针指向错误端点：注入前必须先探测目标应用实际监听端口与健康检查路径，再选一个确定未监听/不存在的值；不得照抄示例值，若示例端口恰被应用监听则故障不生效）
 
-   > ⚠️ **path 错配 vs port 错配的触发可靠性（实测坐实）**：若靶用**静态 HTTP 响应器**（对任意路径都返回 200，如「socat cat 固定响应文件」形态），则 **path 错配不触发探针失败**（响应器不解析请求路径，错误路径仍 200）——此时必须用 **port 错配**（探针端口指向未监听端口 → connection refused → 探针失败）作可靠触发器。若靶用**按路径响应的真实 HTTP 服务**（错误路径返回 404），path 错配亦可触发。选错配值前须实测靶对该 path/port 的响应行为，确认「基线 PASS + 错配 FAIL」两态都可达，再定注入用 path 还是 port 错配。
+   > ⚠️ **path 错配 vs port 错配的触发可靠性**：若靶用**静态 HTTP 响应器**（对任意路径都返回 200，如「socat cat 固定响应文件」形态），则 **path 错配不触发探针失败**（响应器不解析请求路径，错误路径仍 200）——此时必须用 **port 错配**（探针端口指向未监听端口 → connection refused → 探针失败）作可靠触发器。若靶用**按路径响应的真实 HTTP 服务**（错误路径返回 404），path 错配亦可触发。选错配值前须探测靶对该 path/port 的响应行为，确认「基线 PASS + 错配 FAIL」两态都可达，再定注入用 path 还是 port 错配。
 5. 等待 Pod 滚动更新完成，确认所有旧 Pod 已被替换
 6. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段；跳过此步会导致 100% 泄漏到故障恢复之后，始终要在注入验证完成后第一时间还原）——**降级路径形态；主路径下此项随载体配方 restorePatches 由载体 TTL 还原，无需手动执行**
 7. 观察 Pod Ready 状态和 Service Endpoints 变化
@@ -112,11 +114,11 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    `successfully rolled out`，可作恢复完成判据
 2. 执行 `kubectl get pods`，确认**所有** Pod 状态为 Running 但 READY 列显示 0/1（不是仅一个新 Pod 0/1，而是全部副本都 0/1）
 3. 执行 `kubectl get endpoints <service-name>`，确认 Endpoints **无 ready 后端**（`kubectl get endpoints` 的 ENDPOINTS 列渲染为空），而非仅新 Pod 不在列表中
-   > ⚠️ 精确语义（实测坐实）：判据是「`subsets[].addresses`（可路由就绪后端）为空」，**不是字面「无 subsets 对象」**。NotReady 的 Pod 通常仍留在 `subsets[].notReadyAddresses`（kube-proxy 不路由 notReadyAddresses，对「Service 无可路由后端」语义等价），故 subsets 可能存在但 addresses 空——此时 `kubectl get endpoints` 的 ENDPOINTS 列仍渲染为空，判据成立。若误按字面「无 subsets」判定，会把正常故障态（subsets 含 notReadyAddresses）误判为「注入未生效」。
+   > ⚠️ 精确语义：判据是「`subsets[].addresses`（可路由就绪后端）为空」，**不是字面「无 subsets 对象」**。NotReady 的 Pod 通常仍留在 `subsets[].notReadyAddresses`（kube-proxy 不路由 notReadyAddresses，对「Service 无可路由后端」语义等价），故 subsets 可能存在但 addresses 空——此时 `kubectl get endpoints` 的 ENDPOINTS 列仍渲染为空，判据成立。若误按字面「无 subsets」判定，会把正常故障态（subsets 含 notReadyAddresses）误判为「注入未生效」。
 4. 执行 `kubectl describe pod <pod-name>`，确认 Events 显示 `Readiness probe failed`
 5. 向 Service 发送请求，确认返回 connection refused 或超时。注意：connection reset by peer 可能是应用自身行为而非故障效果，不可作为故障生效的充分证据；ipvs 模式无后端时为 Connection refused（kube-proxy 对无 Endpoints 的 ClusterIP 直接 reject）
 
-   > ⚠️ **对照选择陷阱（实测坐实）**：验证「Service 调用失败」应以**同一靶 Service 注入前/后的翻转**为判据（基线 curl 靶 ClusterIP/DNS = 200 → 注入后 = 000/refused → 恢复后 = 200），此即充分判别证据。**勿引入集群内其它 Service 作「健康对照」**：若对照 Service 的后端靶不提供被测协议（如 `sleep` 类靶——Endpoints 虽已填充、Pod 虽 Ready，但后端零 HTTP 监听），其 curl 恒返回 connection refused(000)，会被误读成「pod→ClusterIP egress 全环境断裂」，进而把本已成立的 Service-调用-失败判据错误降级为 partial。「Endpoints 已填充」仅证明后端 Ready，**不证明后端监听被测端口**。有效对照必须先用 direct pod-IP curl 确认后端真实返回 200；否则直接省略对照、只用靶自身前后翻转（配合 Endpoints ready 后端 2→0 + 探针失败事件原文即可完整归因）。
+   > ⚠️ **对照选择陷阱**：验证「Service 调用失败」应以**同一靶 Service 注入前/后的翻转**为判据（基线 curl 靶 ClusterIP/DNS = 200 → 注入后 = 000/refused → 恢复后 = 200），此即充分判别证据。**勿引入集群内其它 Service 作「健康对照」**：若对照 Service 的后端靶不提供被测协议（如 `sleep` 类靶——Endpoints 虽已填充、Pod 虽 Ready，但后端零 HTTP 监听），其 curl 恒返回 connection refused(000)，会被误读成「pod→ClusterIP egress 全环境断裂」，进而把本已成立的 Service-调用-失败判据错误降级为 partial。「Endpoints 已填充」仅证明后端 Ready，**不证明后端监听被测端口**。有效对照必须先用 direct pod-IP curl 确认后端真实返回 200；否则直接省略对照、只用靶自身前后翻转（配合 Endpoints ready 后端 2→0 + 探针失败事件原文即可完整归因）。
 
 ## 注入恢复
 （主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原（restorePatches 的探针 replace + MU 基线 replace 由载体内 timer 到点执行，恢复自动触发回滚滚动；fire 证据落载体 /tmp/restore.log + 任务台账 recovery_handle）；演练提前结束时 blade-ai recover 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：

@@ -1,5 +1,8 @@
 **用例名称** 缓存占用过大 导致 Host_内存使用率过高
 
+## 故障定位
+持续型故障——Page Cache 被填充并占用，缓存占用进程（blade `mem load --mode cache`）存活即故障存活，被 pin 的缓存贯穿整个故障窗口；窗口结束（`--timeout` 到期或实验销毁）即自动释放。**手段1（ChaosBlade）**与**手段2（原生命令）**是并列的注入手段，按环境能力选用：主机装有 ChaosBlade（`blade version` 可用）→ 手段1（实验 UID 统一生命周期管理）；否则手段2。**两手段的观测面不等价**：手段1（`--mode cache`）填充 Page Cache，本用例主判据（`free -m` buff/cache 升高、`/proc/meminfo` Cached 升高）**可达**；手段2（stress-ng `--vm`）占用的是匿名内存，仅从「可用内存减少」的应用视角等效，buff/cache 判据**不可达**（详见文末手段2 说明）。`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
+
 ## 故障现象
 1. 主机 Page Cache 持续增长
 2. 可用内存（free）减少，但 buff/cache 指标异常偏高
@@ -11,7 +14,7 @@
 
 ## 演练步骤
 1. 记录当前内存基线：`free -m`（关注 buff/cache 列）
-2. 使用 ChaosBlade 注入缓存内存压力
+2. 注入缓存内存压力 —— **手段1（ChaosBlade）**（主机无 blade 时改用文末**手段2（原生命令）**）
 
 ```bash
 blade create mem load --mode cache --mem-percent <percent> --timeout <duration>
@@ -22,17 +25,28 @@ blade create mem load --mode cache --mem-percent <percent> --timeout <duration>
 - `--mem-percent`：内存使用率百分比（如 70、80）
 - `--timeout`：超时自动恢复（秒）
 
+> **定案（实测坐实，勿重推）——`--mode cache` 填充机制与判据可达性**：
+> - **承载形态**：ChaosBlade 1.8.2 的 `--mode cache` 以 **tmpfs/Shmem** 承载填充（实测 Shmem 708kB→2946756kB）。Shmem 属页面缓存，内核计入 `/proc/meminfo` 的 `Cached`、`free -m` 计入 buff/cache 列——故本用例主判据（buff/cache 与 Cached 升高）在手段1 路径下确实**可达**。
+> - **`--mem-percent` 必须显著高于现有基线 Cached**：目标是把内存抬到 N% × MemTotal，若主机基线 Cached 已接近或超过 N%（如基线 Cached ≈30% MemTotal 时探 20%/30%），则无需填充、观测不到变化——这是**假阴性**，不代表 `--mode cache` 失效。选型时先读基线 Cached 占比，`--mem-percent` 取值须明显超过它。
+> - **填充需数十秒成型**：注入后立即采样会采到未成型的中间态，须在故障窗内等待填充稳定后再核实（实测 Cached 在 +142s 与 +359s 仅 Δ+128kB，已属稳定驻留）。
+> - **进程 RSS 不反映占用**：cache 模式的内存落在 Shmem/tmpfs，**不在压测进程（chaos_os）的 RSS**——查进程 RSS 会误判「没占内存」。判据一律看 `free -m` buff/cache 与 `/proc/meminfo` 的 Cached/Shmem，而非 `ps`/`top` 的进程内存列。
+> - **buff/cache 恒等式（判读用）**：`free -m` 的 buff/cache = `Buffers + Cached + SReclaimable`（**不减 Shmem**）；实测精确复现基线 2785.9MB 与注入后 5667.4MB。AnonPages 基本不动（噪声级），可据此与手段2（stress-ng `--vm` 填匿名内存、AnonPages 大涨）区分。
+
 3. 观察 buff/cache 增长及系统性能变化
 
 ## 注入验证
+> 以下判据针对**手段1（ChaosBlade `--mode cache`）**——填充 Page Cache 后 buff/cache 与 Cached 升高可达。**手段2（stress-ng `--vm`）填匿名内存、buff/cache 判据不可达**，改看 `free -m` used 列增长（见文末手段2 说明）。
+
 1. `free -m` 确认 buff/cache 列显著增长
 2. `cat /proc/meminfo | grep -i cache` 确认 Cached 值升高
 3. 观察是否触发内存回收（`vmstat 1` 关注 si/so 列）
 
 ## 注入恢复
+**手段1（ChaosBlade）**——销毁实验即恢复（`--timeout` 到期亦自动恢复）：
 ```bash
 blade destroy <experiment-uid>
 ```
+**手段2（原生命令）**——见文末「手段2（原生命令）」块的恢复命令（stress-ng `--timeout` 自停 / `truncate` 清空填充文件）
 
 ## 恢复验证
 1. `free -m` 确认内存恢复正常
@@ -44,9 +58,9 @@ blade destroy <experiment-uid>
 
 ---
 
-## 降级方案（原生命令）
+**手段2（原生命令）**
 
-> 当 ChaosBlade 不可用时，可使用以下原生命令实现等效故障注入。
+> 与手段1（ChaosBlade）并列的注入手段；主机未装 ChaosBlade 时选用本手段。本手段属 **Branch B（自停型手段2）**——stress-ng 自带 `--timeout` 前台跑满窗口后自行退出即恢复、无需外挂载体；发射经 host_inject 前台直发，本地等待超时返回 outcome UNKNOWN 即预期且完整的发射回执（命令在主机续跑），随后**一条只读探针对账**即为权威回执，**严禁** setsid/systemd-run/nohup/`&` 包裹故障命令追同步返回；发射语义详见 `references/carrier/recovery-carrier.md` §〇 Branch B。**注意观测面差异**：stress-ng `--vm` 占用匿名内存，从「可用内存减少」的应用视角与手段1 等效，但本用例主判据 buff/cache **不可达**（下方注入命令注释详述）；若监控告警钉在 buff/cache 指标上，须用手段1，或按 `disk` 族另行立项走人工 `dd` 填充 Page Cache。
 
 前提条件：主机需具备 `stress-ng`（`dd` 方案见下方说明，受故障族限制）
 

@@ -5,6 +5,8 @@
 # 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
 # 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
+# 载体由 faultdrill_assemble_carrier 程序化建栈、结构性自拆（fail-closed 路径 + 恢复句柄清理链 + 武装定时器自删 → apiserver ownerRef GC 级联）；降级路径不自建可自撤 RBAC 栈，正文无需传输载体自撤授权类知识。
+carrier_teardown: assembler-managed
 # 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
 # 自身（patch Deployment 模板的 resources/maxUnavailable 属受害者域内，名字
 # 匹配放行），无跨对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名
@@ -16,7 +18,7 @@ recovery_channel: apiserver-write
 **用例名称** limit单位写错 导致 Pod_OOM内存异常
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 memory limits 与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 memory limits 与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -84,10 +86,10 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    PATCH 的 Content-Type 用 application/json-patch+json——resources 位于 containers 数组
    元素内部（merge-patch 对数组是整组替换语义会抹掉容器），json patch 精确路径 replace 整对象
    与注入同型满足铁律 1 对称律；resources+MU 双 op 可并入单条 json-patch 数组一条 curl 完成
-   （#45 实证））：
+   ）：
    ```bash
    # 武装定时自恢复（"注入恢复"第 1 步命令按第七节四档表选定落盘形态；标准件 REST 路径下恢复明文
-   # （紧凑变量形态一条 json-patch 双 op PATCH，含 token/CA 变量赋值）~450-570B ⇒ 档②；#45 实测
+   # （紧凑变量形态一条 json-patch 双 op PATCH，含 token/CA 变量赋值）~450-570B ⇒ 档②；常见
    # 形态=双文件分离——脚本 ~250B + patch.json 206B 各自 quoted heredoc 落盘、curl `-d @/tmp/patch.json`
    # 引用 payload（零反斜杠转义、payload 文件内容零单引号字符——载荷引号保真律免疫；下行为旧契约历史形态示例，勿套用）
    kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-oom.sh; ( sleep <duration>; sh /tmp/blade-restore-oom.sh ) >/tmp/restore.log 2>&1 & echo armed'
@@ -107,10 +109,10 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    注入值选型判型：进程实际内存超限才会触发形态 A（OOMKilled）——轻量骨架靶（sleep 类，实际
    内存 ~1MB）取 10Mi 不会 OOM，必须取 **100m 走形态 B**（CRI 取整 0 字节 → cgroup
    memory.max=0 → 容器创建失败，故障在 cgroup 配置层与进程内存无关，注入验证第 3 条形态 B）；
-   有真实内存负载的应用取 10Mi 可走形态 A（lastState OOMKilled 判据更直）；形态预判以注入后实测为准
-   ——容器内 `/sys/fs/cgroup` 视图不可靠（#45：容器内探测显示 v1 布局，节点实际行为是 v2 语义
+   有真实内存负载的应用取 10Mi 可走形态 A（lastState OOMKilled 判据更直）；形态预判以注入后探测为准
+   ——容器内 `/sys/fs/cgroup` 视图不可靠（容器内探测显示 v1 布局，节点实际行为是 v2 语义
    memory.max=0 → 形态 B 兑现；bind-mount 视角与节点运行时 cgroup 语义可不一致），勿据容器内探测改判型
-   注意：在 Kubernetes 中，`m` 表示 milli（千分之一），`100m` = 0.1 字节；正确应为 `Mi`（Mebibyte）。patch 提交时 API server 在响应头携带 `Warning: fractional byte value "100m" is invalid, must be an integer`（不影响 patch 生效）——但 **kubectl CLI 不渲染 Warning 响应头**（#45 实证：Warning 未在输出中出现），勿以「未见 Warning」判失败；单位错误的权威确认信号是 **spec 持久化值**（Deployment 模板与各 Pod spec 中 `100m` 原样落地、无 LimitRange/ResourceQuota 改写即注入生效）
+   注意：在 Kubernetes 中，`m` 表示 milli（千分之一），`100m` = 0.1 字节；正确应为 `Mi`（Mebibyte）。patch 提交时 API server 在响应头携带 `Warning: fractional byte value "100m" is invalid, must be an integer`（不影响 patch 生效）——但 **kubectl CLI 不渲染 Warning 响应头**（Warning 未在输出中出现），勿以「未见 Warning」判失败；单位错误的权威确认信号是 **spec 持久化值**（Deployment 模板与各 Pod spec 中 `100m` 原样落地、无 LimitRange/ResourceQuota 改写即注入生效）
 5. 等待 Pod 滚动更新完成，确认所有旧 Pod 已被替换
 6. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段；置 100% 的数学必要性：2 副本 × 25% ⇒ floor(0.5)=0 个不可用，永不 Ready 的新 Pod 下滚动死锁——注入期新 Pod 本就永不 Ready，默认 MU 下 K8s 不会终止旧 Pod。主路径下此项随载体配方 restorePatches 由载体 TTL 还原，无需手动执行）
 7. 观察 Pod 启动行为

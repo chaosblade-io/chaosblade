@@ -9,7 +9,7 @@
 1. 已生成 Agent hook:`blade prepare python --port <port> --python-path <解释器> --target-script <应用入口脚本>`(两参数均必填,hook 文件 `sitecustomize.py` 落在入口脚本所在目录;blade 自带 agent 库,无需 pip install;端口须空闲)
 2. 目标 Python 应用已以 `PYTHONPATH=<hook 目录>:$PYTHONPATH` **重启**,Agent 才在应用进程内监听;且应用使用 `requests` 客户端库
 3. 已记录注入前该接口的成功率/错误率基线
-4. 确认应用日志可见异常堆栈,且可观测下游调用的重试次数
+4. 确认应用会把被捕获的异常外显到某个可观测通道(日志堆栈 **或** 接口错误响应体 **或** trace),且可观测下游调用的重试次数——`throwCustomException` 只保证在应用进程内抛出配置的异常,是否落日志由应用自身的 `except` 处理决定,不保证
 
 > prepare 返回 success 与 `blade status --type prepare` 显示 `Running` 都**不代表 Agent 已存活**,只是记录状态。真实状态由注入结果反推:报 `no running python preparation record found` 说明缺 prepare(可当场补做);报 `connect: connection refused` 说明 Agent 不在进程内(需重启应用,演练中无法补做,按前置条件不满足上报)。不要尝试用 curl 等命令探活——它们不在 Agent 可执行白名单内。
 
@@ -27,11 +27,11 @@
 
 ## 注入验证
 1. **（主证据，必做）** 调用依赖该下游的接口,确认返回错误或降级响应而非正常结果
-2. 查看应用日志确认抛出的正是配置的异常类型与消息:
+2. 确认应用外显的异常类型与消息正是配置值——经应用实际暴露的通道核实(日志堆栈行 **或** 接口错误响应体/降级响应内嵌的 type+message **或** trace),不预设异常一定落日志:
    ```
    requests.exceptions.ConnectionError: chaos drill: downstream unreachable
    ```
-   - 若日志中看到的是 `RuntimeError` 而非配置的类型,说明该异常类名**无法在应用进程内导入**,Agent 已静默降级为 `RuntimeError`。故障仍然生效,但应用的按异常类型分支的逻辑不会被真正验证——应改用应用确实能导入的类名重注
+   - 若看到的是 `RuntimeError` 而非配置的类型(无论在日志还是响应体),说明该异常类名**无法在应用进程内导入**,Agent 已静默降级为 `RuntimeError`。故障仍然生效,但应用的按异常类型分支的逻辑不会被真正验证——应改用应用确实能导入的类名重注
 3. **（诊断，仅当上述效果未出现时执行）**查询实验状态——机制回执为机制代言不为结果代言，实验在册仅证明拦截规则已注册（用于区分「实验未在册」与「在册但应用未命中拦截点」），不构成效果证据:
    ```bash
    blade status --uid <uid>
@@ -49,7 +49,7 @@
 ## 恢复验证
 1. 再次调用接口,确认恢复正常返回
 2. `blade status --uid <uid>` 状态为 Destroyed
-3. 确认应用日志不再出现注入的异常,熔断器(若有)回到闭合状态
+3. 确认应用外显通道(日志/响应体)不再出现注入的异常,熔断器(若有)回到闭合状态
 
 ## 基准事实
 - **根因**：Agent 在应用进程内拦截 `requests.adapters.HTTPAdapter.send`，命中 matcher 时**不发出真实请求**而直接抛出配置的异常（受控中断），因此下游服务从未收到该请求

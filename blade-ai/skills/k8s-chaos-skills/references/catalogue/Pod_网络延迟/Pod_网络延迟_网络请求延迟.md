@@ -46,16 +46,36 @@
    - 输出 `BusyBox v<版本> ...` 或命令不存在 → 走路径 B
      （BusyBox 版执行 `tc qdisc add ... root netem` 会报 `invalid argument 'root' to 'command'`）
    同时取**延迟判据的对照锚点**（在目标 Pod 内对集群内稳定 HTTPS 服务测连接耗时基线；示例用
-   集群 `kubernetes` Service，地址以当次实测为准）：
+   集群 `kubernetes` Service，地址以当次探测为准）。**探针地址必须抗 DNS 搜索域放大**：延迟故障
+   会拖慢每一次 DNS 查询，而 K8s 默认 `ndots:5` 对相对名（点数 <5）逐个追加搜索域
+   （`<svc>.<ns>.svc.cluster.local` → `<svc>.svc.cluster.local` → … → 绝对名），把一次解析放大成
+   ~8 次串联查询；注入 2s 延迟时仅 DNS 就可耗尽 ~16s，远超探针 `--max-time`，令其 exit 28 超时、
+   `time_total=0`，把「数据面延迟」误测成「完全不通」（task-821d4bb4 误判 failed 的直接来源）。
+   抗放大写法有两种，**延迟故障首选「零 DNS」的预解析 IP**（一次 DNS 都不发，`time_connect` 即纯
+   数据面握手延迟）；尾点 FQDN 次之（把 ~8 次查询收敛为 1 次，但那 1 次仍被延迟拖慢、会混入
+   `time_connect`）。**基线 / 注入验证 / 恢复验证三处必须同口径**：
+   - **预解析 ClusterIP（首选，零 DNS）**：`kubectl get svc <svc> -n <ns> -o jsonpath='{.spec.clusterIP}'`
+     取 IP，探针用 `--resolve <host>:<port>:<clusterIP>` 保留 Host/SNI（或直接打 IP）；
+   - **绝对名 + 尾点（次选，1 次 DNS）**：`https://<svc>.<ns>.svc.cluster.local./`（尾点标记 FQDN，
+     resolv.conf 不再追加搜索域）。
+   用框架首选的 `http_probe` 工具时同一纪律照搬——`url` 填尾点 FQDN 或直接 IP，或传
+   `resolve=<host>:<port>:<clusterIP>`（工具已内建 `--resolve` 且校验放行这三种形态）；task-821d4bb4
+   正是 `http_probe` 打了无尾点的 `drill-readiness-svc.default.svc.cluster.local` 才被放大烧穿窗口。
+   并让 curl 输出**分段时间**以区分 DNS 段与数据面：
    ```bash
    kubectl exec <pod-name> -n <namespace> -- curl -s -o /dev/null \
-     -w 'connect=%{time_connect} total=%{time_total}\n' --connect-timeout 3 -k https://<集群内稳定 HTTPS 服务地址>/
+     -w 'namelookup=%{time_namelookup} connect=%{time_connect} total=%{time_total}\n' \
+     --connect-timeout 3 --max-time 15 -k https://<抗放大的服务地址>/
    ```
-   记下基线值（集群内通常 <10ms）；注入后同一命令的 `time_connect` 应增加约注入的延迟值
+   记下基线值（集群内通常 namelookup/connect <10ms）；注入后**同一命令**的 `time_connect`
+   （或 `time_total - time_namelookup`）应增加约注入的延迟值。判据读 `connect` 段或
+   `time_total - time_namelookup`，不读被 DNS 污染的裸 `total`。`namelookup` 段是抗放大的自检：
+   预解析 IP 应 ≈0；尾点 FQDN 至多 ≈单次延迟；若 ≈延迟×多次，说明仍在用被 `ndots:5` 放大的相对名，
+   先修正探针地址再取证，不要把 DNS 放大当成注入延迟。
 2. 判定注入手段——手段1 的可用性是三个串联前置的与（按序短路，前面死了后面不用再查）：
    **前置1（operator 活性）**：ChaosBlade operator 未就绪（0 副本 / Init 失败 / 长期非 Running）
    → CRD 注入通道整体不可用，手段1 即判死——此状态下创建的实验 CR 无人调谐、静默失效
-   （实测形态：operator 宕机集群中 15 个历史 CR 遗留 48–109 天未被 finalizer 清理），
+   （常见形态：operator 宕机集群中历史 CR 长期遗留、数十天未被 finalizer 清理），
    此时 `blade -h` 命令家族再全也不改变结论。
    **前置2（目标节点 tool pod）**：operator 就绪时才看——blade 的实际执行经由节点侧
    tool pod，目标节点无存活 tool pod 时实验无法落地。
@@ -176,29 +196,37 @@
    `ping: permission denied (are you root?)`；更糟的是若接了管道（如 `| tail`），退出码来自
    管道末端，会**看起来成功**。NET_RAW 属容器默认集（runtime/default）**含**的
    capability——spec 侧 `securityContext.capabilities` 为空不代表运行时缺失（默认集
-   注入不体现在该字段），运行时是否持有只有 `CapEff` 能回答（实测形态：spec 侧空但
-   CapEff bit13=1，ping 本可用——把 API 侧空误读为运行时缺位是实测发生过的误判）。改用
-   TCP 层的探测：
+   注入不体现在该字段），运行时是否持有只有 `CapEff` 能回答（常见形态：spec 侧空但
+   CapEff bit13=1，ping 本可用——把 API 侧空误读为运行时缺位是易发生的误判）。改用
+   TCP 层的探测——**探测地址必须抗 DNS 搜索域放大**（绝对名尾点或预解析 ClusterIP，见演练步骤 1），
+   否则超时预算会被放大的 DNS 查询吃掉，「成功→超时」翻转无法归因到数据面延迟：
    ```bash
    # 把探测超时设在「基线耗时」与「基线耗时+注入延迟」之间，用「成功→超时」的翻转作为判据。
    # 例：基线 <100ms、注入 1000ms 时，--timeout=1 的探测会由成功转为超时：
-   kubectl exec <pod-name> -n <namespace> -- wget -qO- --timeout=<探测超时秒数> --tries=1 <依赖服务地址>
+   kubectl exec <pod-name> -n <namespace> -- wget -qO- --timeout=<探测超时秒数> --tries=1 <抗放大的依赖服务地址>
    # 无 wget 的镜像（含 iproute2 tc 的 CNI 镜像常无 wget 但有 curl）用 curl 形态，
    # 同样把连接超时设在「基线」与「基线+注入延迟」之间：
-   kubectl exec <pod-name> -n <namespace> -- curl -s -o /dev/null --connect-timeout <探测超时秒数> <依赖服务地址>
+   kubectl exec <pod-name> -n <namespace> -- curl -s -o /dev/null --connect-timeout <探测超时秒数> <抗放大的依赖服务地址>
    # 目标容器内没有探测工具时，可在共享 netns 的调试容器内执行（-c <debugger-name>）
    ```
    注入生效的判据：该命令由「正常返回」变为「超时失败」。把超时放宽到远大于注入延迟值应仍能成功，
-   以此区分「延迟」和「完全不通」。
-3. 量化延迟毫秒数（比步骤 2 的超时翻转更精确）：
+   以此区分「延迟」和「完全不通」。翻转必须落在数据面（connect/total 段）——放宽超时后仍失败且
+   `namelookup` 段异常放大，是 DNS 搜索域放大而非注入延迟，先修探针地址再取证。
+3. 量化延迟毫秒数（比步骤 2 的超时翻转更精确）——**必须与演练步骤 1 的基线探针同口径、同样抗
+   DNS 搜索域放大**（绝对名尾点或预解析 ClusterIP，见演练步骤 1）：
    ```bash
-   # 输出丢进 /dev/null 只取耗时；两条命令按容器内可用的那个选
+   # 输出丢进 /dev/null 只取分段时间；两条命令按容器内可用的那个选
    kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- \
-     curl -s -o /dev/null -w '%{time_total}' --max-time 10 <依赖服务地址>
+     curl -s -o /dev/null -w 'namelookup=%{time_namelookup} connect=%{time_connect} total=%{time_total}' \
+     --max-time 15 <抗放大的依赖服务地址>
    kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- \
-     wget -O /dev/null --timeout=10 <依赖服务地址>
+     wget -O /dev/null --timeout=15 <抗放大的依赖服务地址>
    ```
-   `time_total` 应比基线高出约注入的延迟值。**不要接管道或重定向**
+   判据读 `time_connect`（TCP 握手落在数据面，直接反映注入延迟）或 `time_total - time_namelookup`，
+   应比基线高出约注入的延迟值。**不要直接读裸 `time_total` 归因**：它含 DNS 解析段，相对名在
+   `ndots:5` 下被放大成 延迟×查询次数，令 `time_total` 远超实际注入延迟、甚至撞 `--max-time` 超时得 0，
+   把「延迟」误判成「不通」——这正是 task-821d4bb4 触发诊断循环、烧穿故障窗口的机制-效果矛盾来源。
+   若 `namelookup` 段随注入上涨，是探针地址未抗放大的信号，先修地址再取证。**不要接管道或重定向**
    （`| head`、`2>&1`）——只读探针会拒绝 shell 操作符，且 exec-form 下它们会被
    当成字面参数传给命令。响应头用 `wget -S` 直接看即可，无需 `2>&1`。
 4. 检查应用日志是否出现 timeout 或 slow response 相关错误
@@ -242,26 +270,29 @@
    ```bash
    kubectl logs <pod-name> -n <namespace> -c <注入 ephemeral 容器名>
    ```
-2. 在 Pod 内验证延迟恢复正常（用演练步骤 1 的**同一探针**，与当时记录的基线直接对比）：
+2. 在 Pod 内验证延迟恢复正常（用演练步骤 1 的**同一探针、同一抗放大地址**，与当时记录的基线直接对比）：
    ```bash
    # 同样避开 ping（需 CAP_NET_RAW）——用 TCP 探测，超时取接近基线耗时的短值
-   kubectl exec <pod-name> -n <namespace> -- wget -qO- --timeout=<探测超时秒数> --tries=1 <依赖服务地址>
-   # 无 wget 的镜像用 curl 形态（与演练步骤 1 的基线探针同口径，直接对比 time_connect）
+   kubectl exec <pod-name> -n <namespace> -- wget -qO- --timeout=<探测超时秒数> --tries=1 <抗放大的依赖服务地址>
+   # 无 wget 的镜像用 curl 形态（与演练步骤 1 的基线探针同口径，直接对比分段耗时）
    kubectl exec <pod-name> -n <namespace> -- curl -s -o /dev/null \
-     -w 'connect=%{time_connect} total=%{time_total}\n' --connect-timeout 3 -k https://<集群内稳定 HTTPS 服务地址>/
+     -w 'namelookup=%{time_namelookup} connect=%{time_connect} total=%{time_total}\n' \
+     --connect-timeout 3 --max-time 15 -k https://<抗放大的服务地址>/
    ```
-   确认耗时/`time_connect` 恢复回**演练步骤第 1 步记录的基线水平**（不再是「基线 + 注入延迟」的量级）
+   确认 `time_connect`（或 `time_total - time_namelookup`）恢复回**演练步骤第 1 步记录的基线水平**
+   （不再是「基线 + 注入延迟」的量级）
 3. 确认应用日志不再出现超时错误
 
 ## 基准事实
 - **根因**：通过 tc netem 在 Pod 网卡注入出方向固定延迟，模拟弱网/跨地域网络环境
 - **必现现象**：Pod 内对外 TCP 请求耗时增加约注入的延迟值（短超时探测由成功转为超时）；`tc qdisc show` 显示 netem delay 规则；应用对外请求响应时间显著增加
+- **延迟探针必须抗 DNS 搜索域放大**：延迟故障拖慢每次 DNS 查询，K8s 默认 `ndots:5` 把相对名（如 4 点的 `<svc>.<ns>.svc.cluster.local`）解析放大成 ~8 次串联查询（搜索域逐个追加）；注入 2s 时仅 DNS 就可达 ~16s，撞穿探针 `--max-time` 得 exit 28 / `time_total=0`，把数据面「延迟」误测成「不通」。**首选预解析 ClusterIP / `--resolve`（零 DNS）**，尾点 FQDN（`<svc>.<ns>.svc.cluster.local.`，1 次 DNS）次之；用 `http_probe` 工具时把尾点 FQDN 或 IP 填 `url`、或传 `resolve=<host>:<port>:<clusterIP>`（工具已内建并校验放行）。判据读 `connect`（数据面）不读裸 `total`（含 DNS），`namelookup` 段作抗放大自检。基线 / 注入验证 / 恢复验证三处同口径。这是 task-821d4bb4 误判 failed 的机制-效果矛盾根源，不是可选优化
 - **blade 可用性因构建而异**：`pod-network delay` 并非所有 blade 发行版都提供（官方发行含
   delay/loss/corrupt/reorder 等 netem 全家桶；存在仅提供 dns/drop/occupy 的定制发行）——
   以**执行环境内** `blade create k8s pod-network -h` 的 Available Commands 为准，没有 delay 就用手段2
 - **集群 Pod 遗迹是环境形态的历史证据**：`kubectl get pods -A`（或 `-o jsonpath='{{..image}}'`）
   一次扫描同时回答多个环境问题——哪些调试镜像已在集群内验证可拉取、历史演练留下了哪些
-  载体/CR 遗迹、同类工具 pod 的存活比例。存活比例须按计数陈述（实测形态：36/41 失效
+  载体/CR 遗迹、同类工具 pod 的存活比例。存活比例须按计数陈述（如 36/41 失效
   + 5 Running）；「全部失效」式的全称判断与部分存活的事实结论不同，直接影响载体可用性判定
 - **netem 可用性以功能探测为准**：`/proc/modules` 与 `/sys/module` 查不到 sch_netem 痕迹，
   不等于内核不支持——模块可能内建或首次使用时按需加载，必须用 dummy 接口功能探测定论

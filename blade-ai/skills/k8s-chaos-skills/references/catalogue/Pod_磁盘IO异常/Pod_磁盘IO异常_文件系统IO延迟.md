@@ -1,6 +1,6 @@
 **⚠️ 注意：此场景为 kubectl-native 方案。选用前提是 ChaosBlade 没有 pod-IO target（以 `blade create k8s --help` 探测为准；若本地版本提供 `pod-IO delay`，优先用它），需通过 kubectl exec + tc（块设备级）或 blade pod-disk burn（IO 饱和）实现近似效果。**
 
-**2026-09-22 实测注记（#63）：本环境本地 blade CLI 无 pod-IO target；且目标集群 ChaosBlade Operator 不可用（chaosblade namespace 零资源、operator Pod 长期 Init:ImagePullBackOff）——k8s scope 的 blade 手段（含 pod-disk burn）均不可用，实测走手段2 kubectl-native。**
+**若目标集群 ChaosBlade Operator 不可用（chaosblade namespace 零资源、operator Pod 长期非就绪），则 k8s scope 的 blade 手段（含 pod-disk burn）均不可用，须走手段2 kubectl-native（以当次探测为准）。**
 
 **用例名称** 文件系统IO延迟 导致 Pod_磁盘IO异常
 
@@ -12,15 +12,15 @@
 
 ## 资源准备
 1. 确认应用 A 已正常运行，且有活跃的磁盘读写操作
-2. 确认目标 Pod 内的写入路径可写（`<data-path>` = 靶的专属数据盘挂载路径，本靶实测 `/var/lib/data`，优先使用——爆炸半径零外部；无专属盘时用空串即容器根 `/`——注意根盘 IO 与同节点其他 Pod 共享底层设备）：`kubectl exec <pod-name> -n <namespace> -- df -h / <data-path>`
+2. 确认目标 Pod 内的写入路径可写（`<data-path>` = 靶的专属数据盘挂载路径（典型如 `/var/lib/data`，须先 `ls -ld` 确认存在），优先使用——爆炸半径零外部；无专属盘时用空串即容器根 `/`——注意根盘 IO 与同节点其他 Pod 共享底层设备）：`kubectl exec <pod-name> -n <namespace> -- df -h / <data-path>`
 3. 确认监控系统可观测应用延迟指标
-4. 确认容器内有 `dd` 工具并探测其实现（用于验证 IO 性能）：`kubectl exec <pod-name> -n <namespace> -- dd --version 2>&1 | head -1`——`oflag=direct` 型载荷仅 coreutils dd 支持（本靶 coreutils 8.32 实测支持）；busybox dd 仅支持 `conv=fsync`
+4. 确认容器内有 `dd` 工具并探测其实现（用于验证 IO 性能）：`kubectl exec <pod-name> -n <namespace> -- dd --version 2>&1 | head -1`——`oflag=direct` 型载荷仅 coreutils dd 支持（如 coreutils 8.32）；busybox dd 仅支持 `conv=fsync`
 
 ## 演练步骤
 1. 定位应用 A 的 Pod，确认根文件系统可写（&& 必须包在 sh -c 载荷内——命令是 argv 直传无 shell，
    裸 touch 形态下 `&&`/`rm`/`-f` 会沦为 touch 的字面参数，在 / 下创建同名垃圾文件且 rm 永不执行）：
    ```bash
-   # 写入路径优先用数据盘（本靶 /var/lib/data）；无数据盘时把路径换成 /
+   # 写入路径优先用数据盘（如 /var/lib/data）；无数据盘时把路径换成 /
    kubectl exec <pod-name> -n <namespace> -- sh -c 'touch /.iobench.tmp && rm -f /.iobench.tmp'
    ```
 2. 使用 `blade create k8s pod-disk burn` 对目标 Pod 注入持续高 IO 负载，间接制造 IO 延迟：
@@ -44,10 +44,10 @@
 1. 在 Pod 内执行写入操作，确认耗时明显增加（`conv=fsync` 写完强制落盘，busybox 与 coreutils 公共可用；
    不要用 `oflag=dsync`——busybox dd 不支持任何 oflag，会报 `unrecognized option`）：
    ```bash
-   # 与注入载荷同盘（本靶 /var/lib/data）；至少采样 3 次——IO 竞争延迟非确定性波动
+   # 与注入载荷同盘（如 /var/lib/data）；至少采样 3 次——IO 竞争延迟非确定性波动
    kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=<data-path>/.iolatency.tmp bs=1M count=10 conv=fsync
    ```
-2. 对比注入前后写入耗时（注入后因 IO 队列饱和，写入吞吐显著下降）。2026-09-22 实测锚点（靶 drill-sts-pvc-target-0 的 /var/lib/data，ext4 云盘）：基线 10MB fsync 写 ≈ 0.010s（约 1GB/s）；单路文档载荷运行 8s 后判据耗时 0.098s → 0.098s → 0.330s（10x–33x 上升，非确定性），判定阈值建议 ≥5x
+2. 对比注入前后写入耗时（注入后因 IO 队列饱和，写入吞吐显著下降）。常见形态（ext4 云盘 /var/lib/data）：基线 10MB fsync 写约 0.010s（约 1GB/s）；单路文档载荷运行数秒后判据耗时约 0.098s → 0.330s（约 10x–33x 上升，非确定性），判定阈值建议 ≥5x
 3. 查看应用日志，确认出现 slow query 或 timeout 相关告警
 4. 确认应用请求延迟 P99 显著上升
 5. 查看 Pod 内 IO 等待情况：
@@ -72,7 +72,7 @@
 - **根因**：通过 pod-disk burn 使磁盘 IO 队列饱和，应用的正常 IO 请求需排队等待，表现为 IO 操作延迟显著增加
 - **必现现象**：Pod 内文件读写耗时显著增加；磁盘 IO 利用率接近 100%；应用出现慢查询或超时；请求延迟 P99 升高
 - **方案说明**：此为 blade pod-disk burn 近似方案（选用前提：无 pod-IO target，以 `--help` 探测为准）。与精确 IO 延迟注入（每次 IO 固定增加 Nms）不同，burn 方案通过 IO 竞争间接制造延迟，效果为非确定性延迟增加而非固定值注入
-- **2026-09-22 实测（#63）**：靶 drill-sts-pvc-target-0（/var/lib/data，ext4 云盘，coreutils dd 8.32）：基线 10MB fsync 写 ≈ 10ms；单路载荷（bs=1M count=100 oflag=direct 写读交替）8s 后判据 98ms→330ms（10x–33x）；$! PID 落盘 + 定时 kill 恢复幂等、kill 后零残留
+- **典型形态**（ext4 云盘 /var/lib/data，coreutils dd 8.32）：基线 10MB fsync 写约 10ms；单路载荷（bs=1M count=100 oflag=direct 写读交替）数秒后判据约 98ms→330ms（约 10x–33x）；$! PID 落盘 + 定时 kill 恢复幂等、kill 后零残留
 
 ---
 
@@ -86,8 +86,8 @@
 ```bash
 # 通过 kubectl exec 在 Pod 内持续制造 IO 负载（读写同时）
 # 关键点：子 shell 后台 + 重定向（否则 exec 挂到 10s 超时）；PID 落盘 + 定时自动 kill。
-# 路径：优先靶的专属数据盘（本靶实测 /var/lib/data，爆炸半径零外部）；无数据盘时用 /（与同节点 Pod 共享底层设备）
-# $! 机理已实测（2026-09-22）：$! 捕获真实 PID、kill 精确可达、kill 后零残留（进程树核实）
+# 路径：优先靶的专属数据盘（如 /var/lib/data，爆炸半径零外部）；无数据盘时用 /（与同节点 Pod 共享底层设备）
+# $! 机理：$! 捕获真实 PID、kill 精确可达、kill 后零残留（进程树核实）
 kubectl exec <pod-name> -n <namespace> -- sh -c '
   ( while :; do dd if=/dev/zero of=<data-path>/.iocache.dat bs=1M count=100 oflag=direct 2>/dev/null; dd if=<data-path>/.iocache.dat of=/dev/null bs=1M 2>/dev/null; done ) >/dev/null 2>&1 &
   echo $! > /tmp/iostat-sampler.pid
@@ -107,7 +107,7 @@ kubectl exec <pod-name> -n <namespace> -- sh -c '
 kubectl exec <pod-name> -n <namespace> -- sh -c \
   'kill $(cat /tmp/iostat-sampler.pid) 2>/dev/null; rm -f /tmp/iostat-sampler.pid /.iocache.dat'
 # 兜底：ps+kill（比 pkill 通用）——清理动作必须拆为独立 exec：若与 grep 同载荷，rm 行的裸文件名
-# 会被主进程 sh -c 的 cmdline 携带、被 grep 正则命中导致自杀（实测同族证据）
+# 会被主进程 sh -c 的 cmdline 携带、被 grep 正则命中导致自杀
 kubectl exec <pod-name> -n <namespace> -- sh -c \
   "ps -o pid,args 2>/dev/null | grep '[i]ocache.dat' | awk '{print \$1}' | xargs -r kill -9"
 kubectl exec <pod-name> -n <namespace> -- sh -c 'rm -f /.iocache.dat /tmp/iostat-sampler.pid'

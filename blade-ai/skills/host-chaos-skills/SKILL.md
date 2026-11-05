@@ -3,7 +3,7 @@ name: host-chaos-skills
 description: |
   主机级故障演练与混沌工程专家。当用户需要对物理机、虚拟机、ECS 等主机环境进行故障注入测试、混沌工程演练、系统韧性验证时，立即使用此 skill。
 
-  内置多个标准化故障注入用例，覆盖 CPU（满载）、内存（RAM/Cache 压力）、磁盘（空间填充、IO 读写高负载）、网络（DNS 劫持、丢包隔离、端口占用）、进程（杀死、挂起假死、进程数飙升）、文件系统（句柄耗尽、文件篡改、文件删除）、时间（系统时钟偏移）、系统服务（Systemd 服务停止）、系统调用（syscall 延迟、返回值篡改）九个层级。
+  内置多个标准化故障注入用例，覆盖 CPU（满载）、内存（RAM/Cache 压力）、磁盘（空间填充、IO 读写高负载）、网络（DNS 劫持、DNS 不可用、丢包隔离、丢包率、网络延迟、带宽受限、报文损坏、报文乱序、报文重复、端口占用）、进程（杀死、挂起假死、进程数飙升）、文件系统（句柄耗尽、文件篡改、文件删除）、时间（系统时钟偏移）、系统服务（Systemd 服务停止）、系统调用（syscall 延迟、返回值篡改）九个层级。
 
   通过「意图识别 → 用例选择 → 意图提交」的决策树流程精确匹配用户需求。注入通道（本地执行 / SSH 远程）与目标主机由运行时配置自动决定，无需在对话中向用户询问。
 
@@ -29,7 +29,7 @@ scripts:
 - **隔离**：在测试环境或隔离主机上演练，严禁在生产核心主机上注入
 - **最小影响**：精确指定故障目标（进程名、路径、端口），范围尽可能小
 - **可回滚**：注入前明确回滚方案，所有实验必须设置 `--timeout` 确保自动恢复
-- **故障窗口完整 / 恢复定时器值单源（双数窗口契约）**：自恢复定时器倒计时从**武装时刻**起算，武装与注入必须紧邻（间隔 ≤ 60 秒），武装后发生任何修复必须重新武装。窗口有两个数——**观察窗 `D` = `duration_seconds`**（框架在场义务，严禁被调试/计划变更侵蚀，同样严禁擅自延长）与**安全网窗 `D+G` = `recovery_timer_seconds`**（故障自身定时器的武装值，G 为程序立法的恢复宽限）。blade 面的 `--timeout` 由引擎按 `recovery_timer_seconds` 程序钉定；**原生（blade 不可用）fallback 形态**里一切**故障自治恢复点**的武装值——`systemd-run --on-active=<recovery-seconds>s` 的 `<recovery-seconds>`、自停 kill 循环的墙钟寿命——**一律取执行 prompt 下发的 `recovery_timer_seconds=<N>s` 整数值**（`structured_params_hint` 已渲染），**禁止自算缓冲**（"recovery-seconds 取 duration"、裸取 `duration_seconds` 等自推导形一律废止）。这**不是"擅自延长"**：`recovery_timer_seconds` 是程序单源计算、精确相等可守门的立法值——让框架在观察窗终点（onset+D）主动派发的恢复先于故障自治恢复（onset+D+G）落地
+- **故障窗口完整 / 恢复定时器值单源（双数窗口契约）**：自恢复定时器倒计时从**武装时刻**起算，武装与注入必须紧邻（间隔 ≤ 60 秒），武装后发生任何修复必须重新武装。窗口有两个数——**观察窗 `D` = `duration_seconds`**（框架在场义务，严禁被调试/计划变更侵蚀，同样严禁擅自延长）与**安全网窗 `D+G` = `recovery_timer_seconds`**（故障自身定时器的武装值，G 为程序立法的恢复宽限）。blade 面的 `--timeout` 由引擎按 `recovery_timer_seconds` 程序钉定；**原生（blade 不可用）fallback 形态**里一切**故障自治恢复点**的武装值——**分层自恢复载体**（Tier-1 主机有 systemd 时 `systemd-run --on-active=<recovery-seconds>s`、Tier-2 主机无 systemd 时 `setsid --fork sh -c 'exec >/dev/null 2>&1; sleep <recovery-seconds> && <幂等逆命令>'`）的 `<recovery-seconds>`、自停 kill 循环的墙钟寿命——**一律取执行 prompt 下发的 `recovery_timer_seconds=<N>s` 整数值**（`structured_params_hint` 已渲染），**禁止自算缓冲**（"recovery-seconds 取 duration"、裸取 `duration_seconds` 等自推导形一律废止）。这**不是"擅自延长"**：`recovery_timer_seconds` 是程序单源计算、精确相等可守门的立法值——让框架在观察窗终点（onset+D）主动派发的恢复先于故障自治恢复（onset+D+G）落地。原生 fallback 载体的**分层选型（systemd 只读探测门 → Tier-1/Tier-2）、武装与重武装纪律、payload 文法、fail-closed 边界、Tier-2 取证约束**见 `references/carrier/recovery-carrier.md`（host 域自恢复单一权威：Branch A 分层载体 + Branch B 自停手段2 发射，各 case 只引用不内嵌）
 - **有监控**：无监控不演练
 - **仅限已有用例**：只能执行 `references/catalogue/` 中已有的故障注入用例，严禁自行编造、拼凑或即兴发挥用例中未涉及的故障注入操作。无法匹配时必须明确告知用户「当前不支持该场景」并停止
 - **禁止**：对系统关键进程（init/systemd/sshd）注入 kill / 对根分区注入 disk fill 且不设 reserve / 对生产数据库主机注入
@@ -56,7 +56,7 @@ scripts:
 | 内存、memory、OOM、swap | 内存 |
 | 磁盘空间、df、磁盘满、存储 | 磁盘空间 |
 | 磁盘IO、iowait、读写慢、iostat | 磁盘IO |
-| 网络、dns、丢包、端口占用、隔离、drop | 网络 |
+| 网络、dns、dns_down、丢包、丢包率、loss、隔离、drop、延迟、delay、带宽、限速、bandwidth、乱序、reorder、损坏、corrupt、重复、duplicate、端口占用 | 网络 |
 | 进程、kill、假死、挂起、zombie、fork | 进程 |
 | 文件、权限、fd、句柄、日志、删除 | 文件系统 |
 | 时间、时钟、ntp、偏移 | 时间 |
@@ -139,3 +139,5 @@ ls references/catalogue/<匹配的目录>/
 5. 所有实验都会带 `--timeout` 自动恢复（安全红线，由引擎保证）
 
 > 用例文件中的「演练步骤 / 注入验证 / 注入恢复 / 恢复验证」是给**执行引擎**的模板（需要时可查阅 `references/chaosblade-host-commands.md` 获取完整参数），本阶段只需理解 WHAT，**不要在提交前自己执行它们**。
+>
+> 其中「注入验证」的判据 authoring 遵循 `references/criterion-reachability.md`（判据可达性单一权威）：判据须在靶机运行时实际可达，不可达有两条正交成因轴——① 被本文档注入手段自身运行时封锁（M2，如 ptrace 排他下的 `strace -T -p`）；② 承重探针依赖的工具在靶机可能缺失或语义读不到故障观测面（M3，如 dnsutils `nslookup`/`dig` 非最小镜像默认装、且绕过 `/etc/hosts`，DNS 解析类承重判据须走应用同款 glibc NSS 路径 `getent hosts`/`ping`）。两轴下不可达的判据均须降级并带「判据可达性」caveat，不得列为无条件主判据。

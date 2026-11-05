@@ -1,4 +1,11 @@
 ---
+# 受害者作用域参考（route A，非强制 hint）：本用例受害者是 ConfigMap 自身——故障
+# 机制 patch 的是该 ConfigMap 的 data 键值（受害者域内写，名字匹配放行）。供 planner
+# 填 finish_planning 的 fault_scope 时参照，把它钉在 configmap 而非降级到
+# workload/service：降级会使 approved.scope ≠ effective.scope=configmap，被 drift
+# 守卫结构性拒绝（openspec register-config-object-fault-scopes 已把 configmap 注册
+# 进词表修复此链）。这是「参考」而非「边界」——代码不校验、不覆盖（无 enforcement）。
+fault_scope: configmap
 # 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
 # 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 ConfigMap 配置值），路由进程序化
 # 恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+
@@ -16,7 +23,7 @@ recovery_channel: apiserver-write
 **用例名称** 关键配置被篡改 导致 ConfigMap_内容错误
 
 ## 载体配方
-（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 ConfigMap 配置值；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（通道横跳三测三撞三拒历史教训后退役），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
+（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 ConfigMap 配置值；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；通道仲裁预立法：faultdrill_assemble_carrier 即 apiserver-write 恢复通道的程序化实现定案——CR 通道已退役（不再作为恢复通道），faultdrills CRD 在位/Established 不构成启用 CR 通道的理由，CR 通道仅当配方显式声明时使用；装配不可用时降级正文 SOP 形态——计划写作纪律：降级路径在计划中只落差异点（载体命名前缀/RBAC 动词集/恢复载荷体/镜像选型/落盘档位），四件套标准形态与武装序列不逐字抄录进计划——正文降级兜底段与 recovery-carrier.md 标准件是权威源；降级执行时按计划引用回读权威源、照差异点执行——标准件形态以权威源为准不自创；遇环境与预期不符时允许临场应变，应变连同依据如实记录）：
 
 ```yaml
 targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
@@ -55,7 +62,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    kubectl create serviceaccount drill-rc-<hash> -n <namespace>
    kubectl create role drill-rc-<hash> -n <namespace> --verb=get,patch --resource=configmaps,deployments
    kubectl create rolebinding drill-rc-<hash> -n <namespace> --role=drill-rc-<hash> --serviceaccount=<namespace>:drill-rc-<hash>
-   kubectl run drill-rc-<hash> -n <namespace> --image=busybox:1.36 --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
+   kubectl run drill-rc-<hash> -n <namespace> --image=curlimages/curl:latest --restart=Never --overrides='{"spec":{"serviceAccountName":"drill-rc-<hash>"}}' --command -- sleep <duration+1800>
    ```
    （镜像按标准件第九节判别法选定——受限网络（VPC 无法拉 docker.io）时选节点已缓存且含 curl/sh/sleep 工具链的镜像：候选清单 ∩ 实证档案非空取第一个命中即定案；SA/Role/RoleBinding 须先于载体 Pod 创建：overrides 挂接的 Pod 引用该 SA，SA 不存在时 Pod 卡 ContainerCreating。定名后按标准件第九节做精确同名冲突预检：`kubectl get sa,role,rolebinding,pod drill-rc-<hash> -n <namespace> -o name`——NotFound 即无冲突。）
    载体创建后武装前**必须先做 SA 真实 token 验权**（禁 `can-i --as` 假放行，见标准件第三节，含写动词 SSAR 对账——Role verbs 以恢复脚本实际载荷动词为准；验权清单覆盖**两类对象**——configmap GET 200 且 deployment GET 200，任一 403 即中止）。定时器用载体内 SA token 直调 apiserver REST。**curl 顺序即执行顺序**：先 configmap data 还原（数据），后 deployment 注解 patch（触发滚动）——先还原数据再触发滚动，顺序颠倒会让滚动加载到未还原的错误值。两条 curl 对象不同，用**紧凑变量形态的逐 curl 变体**（变量赋值 C/T/S/M/D 后逐条引用，约 ~700B 在通道 1024B 限内）；恢复滚动触发用 kubectl 原生注解 `kubectl.kubernetes.io/restartedAt`（与 `kubectl rollout restart` 等价且是 kubectl 生态常规注解，非演练标记）：
@@ -74,7 +81,7 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
 ## 演练步骤
 （主路径 = 基线捕获（步骤 1）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=ConfigMap、patches=data 键篡改、restorePatches=基线还原、duration_seconds=<duration>），CM 注入+武装+readback 工具内同步完成 → rollout restart 使新值生效（步骤 3 后半，execute 计划普通步骤，两条路径共用）；步骤 2-3 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 
-> **爆炸半径分类（定案）**：`target-only`——被修改的既有资源仅靶 ConfigMap 自身（env 接线、载体四件套均为演练新建资产，不触及任何既有非靶资源；新建资产不构成"影响其他资源"，与既有节点 taint 的 cluster-wide 场景不同），勿纠结是否升格。
+> **爆炸半径分类（定案，defer recovery-carrier §9）**：声明 `blast_radius_scope=namespace-wide`——本 case 走 apiserver-write 四件套 carrier（Pod/SA/Role/RoleBinding），新增 namespaced RBAC 授权面，按 §9①「四件套 → namespace-wide」定案免推导，勿纠结是否升格或在 target-only↔namespace-wide 间重复仲裁。故障本体写入集仅靶 ConfigMap 自身（target-only 语义，env 接线为演练新建资产、不触及既有非靶资源，与既有节点 taint 的 cluster-wide 场景不同），此事实写进 `blast_radius_detail`。
 
 1. **基线捕获**：记录 ConfigMap 原始键值与当前生效值（restorePatches 的基线值来源，两条路径共用）
    ```bash
@@ -101,8 +108,8 @@ durationSeconds: <duration>               # TTL 从武装时刻起算，取正�
    ```
 3. （可选，仅当演练方提供了应用访问入口时）确认依赖该配置的业务功能出现预期异常
 
-**持续性检查（必做）**——故障窗口内故障必须持续存活（配置型故障：CM data 里错误值在即故障在，与 taint/nodeSelector 类故障同型）：
-以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效：CM data 为错误值 + 新 Pod printenv 为错误值），生效后一次 `time_wait 30`（间隔 = 2 × 传播上限：本案为规则/字段/进程型即时生效故障，无传播过程，30s 为最小复测窗，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
+**持续性检查**——故障窗口内故障必须持续存活（配置型故障：CM data 里错误值在即故障在，与 taint/nodeSelector 类故障同型）：
+以「注入生效确认」为时点锚（注入验证第 1-2 条通过 = 生效：CM data 为错误值 + 新 Pod printenv 为错误值）——生效确认只证明某一刻故障已落地，不证明它在整个窗口持续存活；持续性复测要把「稳态故障」与「传播收敛窗内的瞬时态」分开：待传播收敛后再次观测仍见故障态才算坐实持续。本故障传播特性：本案为规则/字段/进程型即时生效故障，无传播过程。隔多久复测、复测几次由你依该传播特性与故障形态自行判断（无固定间隔、无固定探针数），到点**下发**复测探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
 1. 白盒复查：CM data.<KEY> 仍为错误值（`kubectl get cm <cm-name> -n <namespace> -o jsonpath={.data.<KEY>}`）
 2. 行为复查：Pod 内 `printenv <KEY>` 仍为错误值（env 在 Pod 启动时固化，存量 Pod 不会自行重载）
 3. 稳定性复查：目标 Pod RESTARTS 计数无增长（排除应用侧 crash 自愈路径；本故障为配置型，无调度类周期事件可查——白盒字段在位即故障在位，事件探针不适用）
