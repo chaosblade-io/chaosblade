@@ -3,13 +3,21 @@ from unittest.mock import patch
 
 import pytest
 
+from chaos_agent.config.settings import blade_ai_context
 from chaos_agent.tools.guard import CommandResult
 from chaos_agent.tools.kubectl_cli import (
+    _build_kubectl_global_args,
     build_kubectl_cmd,
     exec_kubectl_raw,
 )
 from chaos_agent.transports.base import TransportTarget
-from chaos_agent.transports.channels import KubewizK8sChannel
+from chaos_agent.transports.channels import (
+    KubeconfigChannel,
+    KubewizHostChannel,
+    KubewizK8sChannel,
+    SSHChannel,
+    strip_local_connection_flags,
+)
 from chaos_agent.transports.protocol import parse_wiz_output
 
 
@@ -116,16 +124,182 @@ class TestKubewizK8sChannelWrapCommand:
 
     @patch("chaos_agent.tools.kubectl_cli.settings")
     def test_kubeconfig_mode_no_wiz(self, mock_settings):
-        """In kubeconfig mode, build_kubectl_cmd should NOT use wiz wrapper."""
-        mock_settings.kube_connection_mode = "kubeconfig"
+        """In kubeconfig mode, build_kubectl_cmd should NOT use wiz wrapper.
+
+        The builder reads local connection identity (--kubeconfig/--context)
+        from the resolved ``target`` — state > settings via
+        ``resolve_transport_target`` — never bare from ``kubectl_cli.settings``.
+        So the identity is supplied through an explicit target (matching how
+        every real caller invokes it) instead of the patched module settings,
+        which now only back ``kubectl_path``. This keeps the assertion
+        independent of whatever the ambient process-global settings hold.
+        """
         mock_settings.kubectl_path = "kubectl"
-        mock_settings.kubeconfig_path = "/home/user/.kube/config"
-        mock_settings.kube_context = ""
-        cmd = build_kubectl_cmd("get", ["pods", "-n", "default"])
+        target = TransportTarget(
+            scope="k8s",
+            kubeconfig="/home/user/.kube/config",
+            kube_context="",
+        )
+        cmd = build_kubectl_cmd("get", ["pods", "-n", "default"], target=target)
         assert cmd[0] == "kubectl"
         assert "wiz" not in cmd
         assert "task" not in cmd
         assert "--kubeconfig" in cmd
+
+
+class TestLocalConnectionFlagStripping:
+    """--kubeconfig / --context are LOCAL connection-identity flags. The build
+    side (``_build_kubectl_global_args``) is CHANNEL-AGNOSTIC and always emits
+    them at the command head; the AUTHORITATIVE transport channel — resolved
+    from the target, the same resolution that picks ``wrap_command`` — decides
+    survival: remote channels (kubewiz_k8s / kubewiz_host / ssh) strip them, the
+    local ``kubeconfig`` channel keeps them.
+
+    This is the by-construction cure for the settings-vs-target divergence. The
+    former fix gated emission on a SETTINGS-ONLY ``resolve_channel_name()``
+    lookup, but the LLM ``kubectl`` tool (and every graph node) executes against
+    ``resolve_transport_target(state)``; the SDK HTTP inject route stores a
+    per-call ``kube_connection_mode`` on the graph state WITHOUT syncing it back
+    to settings, so the two authorities diverged — Dir A leaked --kubeconfig
+    into a remote payload, Dir B dropped it from a local subprocess. Stripping in
+    the target-resolved channel makes build and execution incapable of
+    disagreeing.
+
+    Regression for the ai-testing-platform resilience-discovery bug: resource
+    discovery over a KubeWiz cluster (SPE) returned ``available=false`` because
+    the built command carried the operator's local ``--kubeconfig`` into the
+    remote payload (``stat <local-path>: no such file or directory``).
+    """
+
+    # ── build side is channel-agnostic (no settings-only gate) ──────
+    def test_build_emits_local_identity_even_under_remote_mode(self):
+        """The builder no longer gates on a settings-only channel lookup: even
+        under a remote mode it emits the local identity, leaving stripping to the
+        authoritative channel. Gating here WAS the settings-vs-target bug."""
+        with blade_ai_context(
+            kube_connection_mode="kubewiz_k8s",
+            kubewiz_cluster_uuid="uuid-1",
+            kubewiz_profile="p",
+            kubeconfig_path="/local/settings.yaml",
+            kube_context="ctx",
+        ):
+            assert _build_kubectl_global_args() == [
+                "--kubeconfig", "/local/settings.yaml", "--context", "ctx",
+            ]
+            # explicit param overrides the settings fallback
+            assert _build_kubectl_global_args(kubeconfig="/explicit.yaml") == [
+                "--kubeconfig", "/explicit.yaml", "--context", "ctx",
+            ]
+
+    # ── strip helper: precise, leading-run only ─────────────────────
+    def test_strip_removes_leading_flags_space_and_equals_forms(self):
+        assert strip_local_connection_flags(
+            ["kubectl", "--kubeconfig", "/x", "--context", "c", "get", "pods"]
+        ) == ["kubectl", "get", "pods"]
+        assert strip_local_connection_flags(
+            ["kubectl", "--kubeconfig=/x", "--context=c", "get", "pods"]
+        ) == ["kubectl", "get", "pods"]
+
+    def test_strip_stops_at_subcommand_preserving_exec_payload(self):
+        """A --context past the ``--`` separator is exec payload (script text for
+        the container shell), never a kubectl global flag — it must survive. The
+        scan stops at the subcommand, so the payload region is never reached."""
+        cmd = ["kubectl", "--kubeconfig", "/x", "exec", "pod", "--",
+               "sh", "-c", "echo --context keep"]
+        assert strip_local_connection_flags(cmd) == [
+            "kubectl", "exec", "pod", "--", "sh", "-c", "echo --context keep",
+        ]
+
+    def test_strip_noop_for_non_kubectl_command(self):
+        """A non-kubectl command's own --context must not be stripped."""
+        cmd = ["somecli", "--context", "x", "do"]
+        assert strip_local_connection_flags(cmd) == cmd
+
+    def test_strip_noop_when_no_leading_flags(self):
+        cmd = ["kubectl", "get", "pods"]
+        assert strip_local_connection_flags(cmd) is cmd  # identity, no copy
+
+    # ── remote channels strip in wrap_command ───────────────────────
+    @pytest.mark.parametrize("channel,target", [
+        (KubewizK8sChannel(),
+         TransportTarget(scope="k8s", kubewiz_cluster_uuid="u", kubewiz_profile="p")),
+        (KubewizHostChannel(),
+         TransportTarget(scope="host", host_name="h", kubewiz_profile="p")),
+        (SSHChannel(),
+         TransportTarget(scope="host", ssh_host="h", ssh_user="u")),
+    ])
+    def test_remote_wrap_command_strips_local_flags(self, channel, target):
+        raw = ["kubectl", "--kubeconfig", "/leak/local.yaml",
+               "--context", "leak-ctx", "get", "pods"]
+        blob = " ".join(channel.wrap_command(raw, target))
+        assert "--kubeconfig" not in blob
+        assert "/leak/local.yaml" not in blob
+        assert "--context" not in blob
+        assert "leak-ctx" not in blob
+        # the semantic command still rides the payload
+        assert "get" in blob and "pods" in blob
+
+    # ── remote channels strip in display_command ────────────────────
+    @pytest.mark.parametrize("channel,target", [
+        (KubewizK8sChannel(),
+         TransportTarget(scope="k8s", kubewiz_cluster_uuid="u", kubewiz_profile="p")),
+        (KubewizHostChannel(),
+         TransportTarget(scope="host", host_name="h", kubewiz_profile="p")),
+        (SSHChannel(),
+         TransportTarget(scope="host", ssh_host="h", ssh_user="u")),
+    ])
+    def test_remote_display_command_strips_local_flags(self, channel, target):
+        raw = ["kubectl", "--kubeconfig", "/leak/local.yaml", "get", "pods"]
+        shown = channel.display_command(raw, target)
+        assert "--kubeconfig" not in shown
+        assert "/leak/local.yaml" not in shown
+        assert shown.startswith("kubectl get pods")
+
+    # ── local channel keeps the flags ───────────────────────────────
+    def test_local_channel_keeps_local_flags(self):
+        ch = KubeconfigChannel()
+        target = TransportTarget(scope="k8s", kubeconfig="/local/settings.yaml")
+        raw = ["kubectl", "--kubeconfig", "/local/settings.yaml",
+               "--context", "ctx", "get", "pods"]
+        assert ch.wrap_command(raw, target) == raw  # passthrough, flags intact
+        shown = ch.display_command(raw, target)
+        assert "--kubeconfig" in shown and "/local/settings.yaml" in shown
+
+    # ── divergence regression: the target-resolved channel wins ─────
+    def test_dir_a_remote_target_strips_even_when_settings_local(self):
+        """Dir A: settings say local (kubeconfig_path set) but the per-call target
+        is remote. The old settings-only gate leaked --kubeconfig into the remote
+        payload; the target-resolved channel now strips it."""
+        with blade_ai_context(
+            kube_connection_mode="kubeconfig",
+            kubeconfig_path="/leak/local.yaml",
+            kube_context="leak-ctx",
+        ):
+            cmd = build_kubectl_cmd("get", ["pods", "-n", "default"])
+            assert "--kubeconfig" in cmd  # build is channel-agnostic
+            remote_target = TransportTarget(
+                scope="k8s", kubewiz_cluster_uuid="u", kubewiz_profile="p",
+            )
+            blob = " ".join(KubewizK8sChannel().wrap_command(cmd, remote_target))
+            assert "--kubeconfig" not in blob
+            assert "/leak/local.yaml" not in blob
+
+    def test_dir_b_local_target_keeps_even_when_settings_remote(self):
+        """Dir B: settings say remote but the per-call target is local. The old
+        settings-only gate stripped --kubeconfig at build, so the local subprocess
+        lost it; the target-resolved local channel now keeps it."""
+        with blade_ai_context(
+            kube_connection_mode="kubewiz_k8s",
+            kubewiz_cluster_uuid="u",
+            kubewiz_profile="p",
+            kubeconfig_path="/local/settings.yaml",
+        ):
+            cmd = build_kubectl_cmd("get", ["pods", "-n", "default"])
+            assert "--kubeconfig" in cmd  # build no longer gates on settings
+            local_target = TransportTarget(
+                scope="k8s", kubeconfig="/local/settings.yaml",
+            )
+            assert KubeconfigChannel().wrap_command(cmd, local_target) == cmd
 
 
 class TestExecKubectlRaw:

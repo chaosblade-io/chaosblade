@@ -2,6 +2,7 @@
 
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -1692,6 +1693,225 @@ class TestSystemdRunTimerGuard:
         assert "not allowed" in reason
 
 
+class TestSetsidDetachedTimerGuard:
+    """``setsid`` — admitted ONLY as a Tier-2 (no-systemd) self-recovery
+    detached-timer carrier: ``setsid --fork sh -c 'sleep <N> && <inverse>'``.
+
+    The no-systemd twin of ``TestSystemdRunTimerGuard``: on a host without
+    systemd the drill arms a detached child that sleeps the recovery window
+    then runs the idempotent inverse, so a native fault self-reverses even if
+    the session dies. ``--fork`` is CONSTITUTIVE (setsid does not fork by
+    default, so a bare form blocks the caller for the whole window — verified
+    out-of-band: bare ``setsid sh -c 'sleep 3; …'`` blocks 3013ms, ``--fork``
+    returns in 3ms with PPID=1 and a new SID). The payload reuses the SAME
+    readmission grammar as the systemd-run timer — no invariant is relaxed.
+    """
+
+    def setup_method(self):
+        self.guard = ToolGuard()
+
+    # ── the documented detached-timer forms must pass ───────────────────
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # 磁盘被填满: detached child reclaims the fill file at the deadline
+            # (``&&`` separator — ``; rm`` would trip the ``;\s*rm`` hard floor,
+            # which fires symmetrically on the Tier-1 systemd-run carrier too).
+            [
+                "setsid",
+                "--fork",
+                "sh",
+                "-c",
+                "sleep 300 && rm -f /drill-disk/app-archive.dat",
+            ],
+            # truncate inverse (non-rm: ``;`` would also pass, ``&&`` is the
+            # single canonical separator)
+            ["setsid", "--fork", "sh", "-c", "sleep 420 && truncate -s 0 /x"],
+            # 进程假死挂起: PID-probe ``$(pgrep …)`` inside the payload is a
+            # TARGET-shell expansion at the deadline — the same exemption the
+            # systemd-run timer payload gets.
+            [
+                "setsid",
+                "--fork",
+                "sh",
+                "-c",
+                "sleep 60 && kill -CONT $(pgrep -f nginx)",
+            ],
+            # -f short form is setsid's own --fork alias
+            ["setsid", "-f", "sh", "-c", "sleep 300 && rm -f /x"],
+            # ── stdio sever (D8): the canonical over-pipe-transport form ──
+            # ``--fork`` severs the process tree (PPID=1) but the child still
+            # inherits the SSH channel's fd1/fd2, so sshd never sees EOF and
+            # the arm blocks the whole sleep window (transport-faithful probe:
+            # 8112ms). The payload's FIRST statement ``exec >/dev/null 2>&1``
+            # is the stdio twin of ``--fork``: it rebinds the child's fds so
+            # the channel sees EOF and the arm returns at once (69-96ms), while
+            # the detached child survives to fire. MUST live INSIDE the sh -c
+            # script — at the setsid argv layer wrap_command's per-token
+            # shlex.quote literalises it into a dead arg (8074ms, still blocks).
+            [
+                "setsid",
+                "--fork",
+                "sh",
+                "-c",
+                "exec >/dev/null 2>&1; sleep 300 && rm -f /drill-disk/app-archive.dat",
+            ],
+            # fd-sever with the truncate inverse + a payload-internal fd-dup
+            # (``2>&1``): the fd number is NOT a path, so it is a discard sink
+            # (bug C regression anchor — the old startswith test misread ``1``
+            # as a path and rejected EVERY fd-dup).
+            [
+                "setsid",
+                "--fork",
+                "sh",
+                "-c",
+                "exec >/dev/null 2>&1; sleep 420 && truncate -s 0 /x 2>&1",
+            ],
+        ],
+    )
+    def test_documented_detached_timer_forms_allowed(self, cmd):
+        allowed, reason = self.guard.check(cmd)
+        assert allowed is True, reason
+
+    # ── stdio sever: bare ``exec`` fd-sever is the ONLY exec exemption ───
+
+    def test_bare_exec_fd_sever_is_admitted(self):
+        """``exec >/dev/null 2>&1`` (bare exec, discard-sink redirects only) is
+        the stdio twin of ``--fork`` — admitted as the canonical fd-sever."""
+        allowed, reason = self.guard.check(
+            ["setsid", "--fork", "sh", "-c", "exec >/dev/null 2>&1; sleep 300 && rm -f /x"]
+        )
+        assert allowed is True, reason
+
+    def test_exec_with_program_is_hard_floor(self):
+        """``exec <program>`` replaces the shell with an arbitrary program —
+        arbitrary execution escape, hard floor (the bare-exec exemption does
+        NOT extend to exec-with-args)."""
+        fb = self.guard.evaluate(
+            ["setsid", "--fork", "sh", "-c", "exec /bin/sh; sleep 300 && rm -f /x"]
+        )
+        assert fb.allowed is False
+        assert fb.is_hard_floor is True
+        assert fb.offending == "exec"
+
+    def test_exec_fd_sever_to_real_file_rejected(self):
+        """A bare ``exec`` whose redirect targets a REAL file is not a discard
+        sink — the fd-sever exemption requires every redirect to be a sink."""
+        fb = self.guard.evaluate(
+            ["setsid", "--fork", "sh", "-c", "exec >/tmp/x.log 2>&1; sleep 300 && rm -f /y"]
+        )
+        assert fb.allowed is False
+        assert "non-sink" in fb.reason
+
+    def test_payload_fd_dup_is_a_sink_not_a_path(self):
+        """bug C regression anchor: a payload-internal ``2>&1`` (fd-dup, target
+        is the FD number ``1``, not a path) writes no file and MUST pass. The
+        former inline ``target.value.startswith(sinks)`` test misread ``1`` as
+        a path and rejected every fd-dup."""
+        allowed, reason = self.guard.check(
+            ["setsid", "--fork", "sh", "-c", "sleep 300 && rm -f /x 2>&1"]
+        )
+        assert allowed is True, reason
+
+    # ── non-detached / non-timer forms: rejected ────────────────────────
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # bare setsid runs the payload NOW — arbitrary execution wearing a
+            # whitelisted name (the systemd-run ``nginx`` analogue)
+            ["setsid", "nginx"],
+            # --fork missing: setsid does NOT fork by default → the caller
+            # blocks for the whole sleep window, arm-then-inject never proceeds
+            ["setsid", "sh", "-c", "sleep 300 && rm -f /x"],
+            # --wait / -w wait for the child — the opposite of fire-and-forget
+            ["setsid", "--wait", "sh", "-c", "sleep 300 && rm -f /x"],
+            ["setsid", "-w", "sh", "-c", "sleep 300 && rm -f /x"],
+        ],
+    )
+    def test_non_detached_form_rejected(self, cmd):
+        allowed, reason = self.guard.check(cmd)
+        assert allowed is False
+        assert "detached self-recovery" in reason or "--wait" in reason
+
+    def test_missing_fork_rejection_is_reshapeable_not_a_dead_end(self):
+        fb = self.guard.evaluate(["setsid", "sh", "-c", "sleep 300 && rm -f /x"])
+        assert fb.is_hard_floor is False
+        assert "setsid --fork sh -c" in fb.compliant_form
+
+    def test_bare_setsid_rejection_names_the_carrier_form(self):
+        fb = self.guard.evaluate(["setsid", "nginx"])
+        assert fb.allowed is False
+        assert fb.is_hard_floor is False
+        assert "setsid --fork sh -c" in fb.compliant_form
+
+    def test_wait_rejection_echoes_the_offending_flag(self):
+        fb = self.guard.evaluate(["setsid", "--wait", "sh", "-c", "sleep 1 && rm -f /x"])
+        assert fb.allowed is False
+        assert fb.offending == "--wait"
+
+    # ── the payload region reuses the SAME grammar (zero relaxation) ─────
+
+    def test_bare_script_file_rejected(self):
+        """A script FILE the guard cannot see is refused — interpreter form is
+        only ``sh -c '<script>'`` (mirrors the timer payload readmission)."""
+        allowed, reason = self.guard.check(["setsid", "--fork", "sh", "/tmp/x.sh"])
+        assert allowed is False
+        assert "sh -c" in reason
+
+    @pytest.mark.parametrize(
+        "script,fragment",
+        [
+            ("sleep 300 && rm -f /x &", "background"),
+            ("( sleep 300 && rm -f /x )", "subshell"),
+            ("sleep 300 && rm -f /x >/tmp/restore.log 2>&1", "non-sink"),
+            ('sh -c "rm -f /x"', "nests an interpreter"),
+            ("systemd-run --on-active=1s rm -f /x", "nests carrier"),
+        ],
+    )
+    def test_payload_grammar_invariants_still_fire(self, script, fragment):
+        """Every payload invariant the systemd-run timer enforces is enforced
+        here identically — the setsid carrier relaxes NONE of them."""
+        fb = self.guard.evaluate(["setsid", "--fork", "sh", "-c", script])
+        assert fb.allowed is False
+        assert fragment in fb.reason
+
+    def test_payload_non_whitelist_binary_is_hard_floor(self):
+        fb = self.guard.evaluate(
+            ["setsid", "--fork", "sh", "-c", "sleep 300 && python /tmp/x.py"]
+        )
+        assert fb.allowed is False
+        assert fb.is_hard_floor is True
+        assert "not allowed" in fb.reason
+
+    def test_payload_recursive_rm_rejected(self):
+        fb = self.guard.evaluate(["setsid", "--fork", "sh", "-c", "rm -rf /"])
+        assert fb.allowed is False
+        assert "rm -f <single-file>" in fb.reason
+
+    def test_semicolon_rm_chain_hits_symmetric_hard_floor(self):
+        """``; rm`` is a Gate-② hard floor that fires on the whole quoted
+        script token — symmetric with the Tier-1 systemd-run carrier (both
+        denied). The canonical separator is ``&&``; this floor is NOT relaxed
+        by the setsid carrier."""
+        fb = self.guard.evaluate(
+            ["setsid", "--fork", "sh", "-c", "sleep 300; rm -f /x"]
+        )
+        assert fb.allowed is False
+        assert fb.is_hard_floor is True
+        assert "chained shell deletion" in fb.reason
+
+    def test_systemd_run_semicolon_rm_is_denied_too(self):
+        """Symmetry anchor: the Tier-1 carrier is denied the SAME ``; rm``
+        chain — proving the floor predates and is independent of setsid."""
+        fb = self.guard.evaluate(
+            ["systemd-run", "--on-active=5s", "--unit=x", "sh", "-c", "sleep 5; rm -f /x"]
+        )
+        assert fb.allowed is False
+        assert "chained shell deletion" in fb.reason
+
+
 class TestTimerPayloadReadmission:
     """Payload-region readmission: the command riding in a carrier's argv
     meets the SAME Gate ① whitelist and Gate ③ per-binary checkers a
@@ -2380,6 +2600,20 @@ class TestKubectlKustomizeGuard:
         assert allowed is True, cmd
 
 
+def _sanctioned_carrier_image() -> str:
+    """A curl-capable carrier image drawn from the authoritative allowlist.
+
+    Single source: the same ``_recovery_carrier_allowed_images`` the shape
+    predicate consults at dispatch — never a second hardcoded copy, so the
+    carrier tests track the sanctioned set instead of pinning a literal.
+    """
+    from chaos_agent.agent.providers.k8s_native.classifier import (
+        _recovery_carrier_allowed_images,
+    )
+
+    return sorted(_recovery_carrier_allowed_images())[0]
+
+
 class TestKubectlReplaceRestoreVerb:
     """``kubectl replace`` — the only exactly-restoring verb the PVC /
     limits / topology cases teach for their baseline restore."""
@@ -2424,11 +2658,16 @@ class TestKubectlReplaceRestoreVerb:
         drift gate by construction. The shape predicate is delegated to
         the canonical classifier, so this gate and the screener's carrier
         branch can never disagree.
+
+        The admitted image is drawn from the SAME allowlist the predicate
+        consults (single source), so this tracks the sanctioned set rather
+        than pinning a literal that drifts when the allowlist changes.
         """
+        image = _sanctioned_carrier_image()
         allowed, reason = self.guard.check(
             [
                 "kubectl", "run", "drill-rc-a1b2c3", "-n", "prod",
-                "--image=busybox:1.36", "--restart=Never",
+                f"--image={image}", "--restart=Never",
                 "--command", "--", "sleep", "7200",
             ],
         )
@@ -2436,15 +2675,48 @@ class TestKubectlReplaceRestoreVerb:
 
     def test_run_verb_admitted_with_sa_overrides(self):
         # The one documented overrides use: SA attachment.
+        image = _sanctioned_carrier_image()
         allowed, reason = self.guard.check(
             [
                 "kubectl", "run", "drill-rc-a1b2c3", "-n", "prod",
-                "--image=busybox:1.36", "--restart=Never",
+                f"--image={image}", "--restart=Never",
                 '--overrides={"spec":{"serviceAccountName":"drill-rc-a1b2c3"}}',
                 "--command", "--", "sleep", "7200",
             ],
         )
         assert allowed is True, reason
+
+    def test_run_verb_refused_curl_less_carrier_image(self):
+        """A curl-less image is refused EVEN in a perfect carrier shape.
+
+        Root invariant (W-87-2): the carrier's §4 recovery payload is
+        ``curl ... DELETE``. An image without curl arms fine, then at
+        timer-fire time the subshell hits ``curl: not found``, the error is
+        swallowed into restore.log, the DELETE never issues, and the fault
+        silently persists past its window. busybox (wget, no curl) is thus
+        NOT in the allowlist, and the shape predicate's image condition (#4)
+        refuses it at dispatch — the guarantee is mechanism, not doc
+        discipline. Reverse assertion: pins the bug itself and fails loud if
+        busybox ever re-enters the allowlist.
+        """
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _recovery_carrier_allowed_images,
+        )
+
+        assert "busybox:1.36" not in _recovery_carrier_allowed_images(), (
+            "busybox re-entered the carrier allowlist — it ships wget but NOT "
+            "curl, so a busybox carrier silently fails the §4 DELETE at fire "
+            "time (W-87-2). Keep the configured default curl-only."
+        )
+        allowed, reason = self.guard.check(
+            [
+                "kubectl", "run", "drill-rc-a1b2c3", "-n", "prod",
+                "--image=busybox:1.36", "--restart=Never",
+                "--command", "--", "sleep", "7200",
+            ],
+        )
+        assert allowed is False
+        assert "allowlist" in reason
 
     def test_run_verb_refused_outside_carrier_shape(self):
         # An unrestricted run is an arbitrary pod spawner the identity
@@ -2462,9 +2734,11 @@ class TestKubectlReplaceRestoreVerb:
 
     def test_run_verb_refused_partial_carrier_shape(self):
         # Prefix + image alone are NOT the shape: no --restart=Never and
-        # no sleep skeleton. Fail closed.
+        # no sleep skeleton. Fail closed. Uses a SANCTIONED image so the
+        # refusal isolates the missing shape, not an allowlist miss.
         allowed, reason = self.guard.check(
-            ["kubectl", "run", "drill-rc-x", "--image=busybox:1.36"],
+            ["kubectl", "run", "drill-rc-x",
+             f"--image={_sanctioned_carrier_image()}"],
         )
         assert allowed is False
         assert "recovery-carrier" in reason
@@ -3089,3 +3363,88 @@ class TestKubectlFlagArityAtDispatch:
         )
         assert allowed is False
         assert "imperative 'kubectl create deployment'" in reason
+
+
+class TestUnknownBinaryCompliantFormDispatch:
+    """The Gate-① correction text is dispatched on the binary, not one constant.
+
+    Measured cost of the constant (host Case #13, timeoffset, 2227s): the model
+    tried ``sh -c 'echo PROBE_A PROBE_B'`` to test whether an ALREADY-ARMED
+    carrier payload had arrived intact, and got back a runnable-binary list plus
+    a pointer at ``host_read``. Both halves miss — the list answers "what CAN I
+    run" (not the question asked) and ``host_read`` is a read-only diagnostic
+    tool, not a payload prober. It then did the only thing that text left open:
+    ``systemctl stop`` a carrier that had armed successfully and re-arm it in a
+    form whose ``ExecStart`` readback is unambiguous — ~331s (14.9% of the run)
+    and one ``failed`` transient unit later, for information the transport
+    already held.
+
+    An interpreter is a different situation and must say so: inadmissible at top
+    level BY DESIGN (it is required inside a carrier payload region), and the
+    probe is neither dispatchable nor needed.
+    """
+
+    def setup_method(self):
+        self.guard = ToolGuard()
+
+    @pytest.mark.parametrize("cmd", [
+        ["sh", "-c", "echo PROBE_A PROBE_B"],   # the exact Case #13 dispatch
+        ["bash", "-c", "echo A B"],
+        ["/bin/bash", "-c", "systemctl restart nginx"],
+    ])
+    def test_interpreter_gets_the_interpreter_specific_text(self, cmd):
+        fb = self.guard.evaluate(cmd)
+        assert fb.allowed is False
+        assert fb.constraint is ViolatedConstraint.UNKNOWN_BINARY
+        # The name the model actually typed is echoed back (``Path().name``
+        # normalises /bin/bash -> bash, so the text cannot name a path that
+        # isn't the binary the guard judged).
+        assert f"`{Path(cmd[0]).name}` is never admissible as a TOP-LEVEL command" in (
+            fb.compliant_form
+        )
+        assert "not an omission from the list below" in fb.compliant_form
+        # It must name the reachable path (a carrier payload region) and the
+        # fact that closes the loop (the transport already quoted it).
+        assert "carrier's payload region" in fb.compliant_form
+        assert "shlex.quote" in fb.compliant_form
+        # And it must forbid the workaround the constant text drove the model
+        # to: re-arming so the readback becomes unambiguous.
+        assert "Do not re-arm to make a payload verifiable" in fb.compliant_form
+        assert "space-joined WITHOUT quotes" in fb.compliant_form
+        # The authoritative allow-list still rides along — it is the only
+        # source that cannot be stale.
+        assert "Runnable binaries: " in fb.compliant_form
+
+    @pytest.mark.parametrize("binary", ["nginx", "python", "losetup", "foo"])
+    def test_every_other_binary_is_byte_identical_to_before(self, binary):
+        """The dispatch must not disturb the generic text: it is the pre-existing
+        ReAct feedback for every other rejected binary, and it is pinned here so
+        a future edit to the interpreter branch cannot silently rewrite it."""
+        fb = self.guard.evaluate([binary, "-x"])
+        assert fb.allowed is False
+        assert fb.constraint is ViolatedConstraint.UNKNOWN_BINARY
+        assert fb.compliant_form == (
+            "Runnable binaries: "
+            + ", ".join(sorted(self.guard.allowed_commands))
+            + ". Read-only host diagnostics (df/ps/ss/cat/...) are NOT "
+            "here on purpose — reach them through the host_read tool, "
+            "not this binary whitelist."
+        )
+        assert "TOP-LEVEL" not in fb.compliant_form
+
+    def test_the_branch_is_keyed_on_the_gate_that_fired(self):
+        """``sh`` gets the interpreter text because Gate ① refused it — not
+        because of its name. Binaries that ARE on the whitelist never reach this
+        function at all, so they keep their own verdicts: ``chronyc`` is admitted
+        outright on every form (which is exactly why the readonly classifier's
+        allow-list is the load-bearing gate for it), and ``rm -x`` is refused by
+        the drill-artifact cleanup gate with a text about recursive forms.
+        Neither may be rewritten by the interpreter branch."""
+        assert self.guard.evaluate(["chronyc", "makestep"]).allowed is True
+        assert self.guard.evaluate(["chronyc", "-x"]).allowed is True
+
+        rm = self.guard.evaluate(["rm", "-x"])
+        assert rm.allowed is False
+        assert rm.constraint is ViolatedConstraint.UNSUPPORTED_FORM
+        assert "Runnable binaries:" not in rm.compliant_form
+        assert "TOP-LEVEL" not in rm.compliant_form

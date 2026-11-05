@@ -22,6 +22,8 @@ Symbols:
 
 import logging
 
+from chaos_agent.transports import TransportTarget, resolve_transport_target
+
 logger = logging.getLogger(__name__)
 
 # Label selector for ChaosBlade tool pods
@@ -99,6 +101,7 @@ def parse_tool_pod_rows(output: str) -> list[tuple[str, str, str]]:
 
 async def discover_tool_pod_state_on_node(
     node_name: str, kubeconfig: str, task_id: str = "",
+    target: TransportTarget | None = None,
 ) -> tuple[str, tuple[str, str] | None]:
     """Three-state tool-pod presence on ``node_name`` (single authority).
 
@@ -126,16 +129,15 @@ async def discover_tool_pod_state_on_node(
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import (
         PROFILE_K8S,
-        TransportTarget,
         execute_via_transport,
     )
 
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
     any_query_ok = False
     for label in TOOL_POD_LABEL_CANDIDATES:
         cmd = build_kubectl_cmd("get", [
             "pods", "-A", "-l", label, "--no-headers", "-o", TOOL_POD_JSONPATH,
-        ], kubeconfig=kubeconfig)
+        ], kubeconfig=kubeconfig, target=_target)
         try:
             result = await execute_via_transport(
                 cmd, _target,
@@ -169,6 +171,7 @@ async def discover_tool_pod_state_on_node(
 
 async def discover_tool_pod_on_node(
     node_name: str, kubeconfig: str, task_id: str = "",
+    target: TransportTarget | None = None,
 ) -> tuple[str, str] | None:
     """Find a Running ChaosBlade tool pod on the specified node (cluster-wide).
 
@@ -178,13 +181,14 @@ async def discover_tool_pod_on_node(
     for the distinction, it simply cannot proceed without a carrier).
     """
     _state, found = await discover_tool_pod_state_on_node(
-        node_name, kubeconfig, task_id,
+        node_name, kubeconfig, task_id, target=target,
     )
     return found
 
 
 async def discover_tool_pods_cluster_wide(
     kubeconfig: str, task_id: str = "",
+    target: TransportTarget | None = None,
 ) -> list[tuple[str, str]]:
     """Discover ChaosBlade tool pods across all namespaces.
 
@@ -198,15 +202,14 @@ async def discover_tool_pods_cluster_wide(
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import (
         PROFILE_K8S,
-        TransportTarget,
         execute_via_transport,
     )
 
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
     for label in TOOL_POD_LABEL_CANDIDATES:
         cmd = build_kubectl_cmd("get", [
             "pods", "-A", "-l", label, "--no-headers",
-        ], kubeconfig=kubeconfig)
+        ], kubeconfig=kubeconfig, target=_target)
         result = await execute_via_transport(
             cmd, _target,
             timeout=settings.timeout_kubectl,
@@ -222,6 +225,7 @@ async def discover_tool_pods_cluster_wide(
 
 async def discover_tool_pods_cluster_wide_with_nodes(
     kubeconfig: str, task_id: str = "",
+    target: TransportTarget | None = None,
 ) -> list[tuple[str, str, str]]:
     """Discover ChaosBlade tool pods across all namespaces with node info.
 
@@ -236,15 +240,14 @@ async def discover_tool_pods_cluster_wide_with_nodes(
     from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import (
         PROFILE_K8S,
-        TransportTarget,
         execute_via_transport,
     )
 
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
     for label in TOOL_POD_LABEL_CANDIDATES:
         cmd = build_kubectl_cmd("get", [
             "pods", "-A", "-l", label, "--no-headers", "-o", TOOL_POD_JSONPATH,
-        ], kubeconfig=kubeconfig)
+        ], kubeconfig=kubeconfig, target=_target)
         try:
             result = await execute_via_transport(
                 cmd, _target,

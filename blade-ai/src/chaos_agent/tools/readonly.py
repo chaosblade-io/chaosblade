@@ -73,6 +73,22 @@ _INTERNAL_ERROR_REASON = (
 )
 
 
+# The unregistered-binary terminal verdict of ``_classify_argv``, held as a
+# SUFFIX so one constant both BUILDS the message and IDENTIFIES it downstream
+# (see ``is_unregistered_binary_reason``). This verdict is the one a caller
+# must be able to tell apart from every other refusal, because its fix path is
+# the opposite of the others': a shape refusal is fixed by reshaping the
+# command, while this one says the binary has NO registered read-only form at
+# all, so no shape of it can ever be admitted. Measured cost of not telling
+# them apart — host Case #13 (timeoffset, 2227s run): ``chronyc tracking`` was
+# refused here, the caller's generic fix text offered "check whether the
+# binary exists", and the model spent a turn on ``command -v chronyc`` which
+# answered ``/usr/bin/chronyc`` — installed, and irrelevant to the verdict.
+# A caller that substring-matched the prose instead of importing this constant
+# would silently stop dispatching the moment the wording was edited.
+_UNREGISTERED_BINARY_SUFFIX = " is not a known read-only diagnostic command"
+
+
 def _facts_verdict(thunk, *, on_error):
     """Run a facts-engine verdict behind the 4.5 internal-error net."""
     try:
@@ -220,6 +236,14 @@ _READONLY_BINARIES = frozenset(
         "numastat",
         "dmidecode",
         "lshw",
+        # Virtualisation detection: reads /proc, /sys, DMI and CPUID and prints
+        # what hypervisor/container the caller is under. Its whole option set is
+        # detection scopes (--vm/--container/--private-users), reporting
+        # (-q/--quiet) and metadata (-v/-h) — there is no write face to guard
+        # (systemd-detect-virt(1)), so it needs no argument-level handler.
+        # A clock-drift drill needs this first: whether the guest clock is
+        # host-corrected decides which restore mechanism can be trusted.
+        "systemd-detect-virt",
         "whereis",
     }
 )
@@ -775,8 +799,92 @@ _DMSETUP_READONLY_VERBS = frozenset(
         "help",
     }
 )
-# openssl is a crypto toolkit — only the ``version`` subcommand is a probe;
-# every other subcommand computes / writes / connects. java RUNS bytecode by
+# chronyc — chrony's control client. ALLOW-LIST of its monitoring verbs, not a
+# deny-list of its mutating ones, and the reason is the dispatch that sits on
+# top of this classifier: ``host_inject`` runs a command it classifies as
+# read-only with ``skip_guard=True``, i.e. WITHOUT ToolGuard. ``chronyc
+# makestep`` is this project's own Tier-1 time-control injection (it is on the
+# host_inject binary whitelist precisely to step the clock), so a deny-list
+# that missed one mutating verb would not be a wrong verdict — it would be an
+# UNGUARDED clock write. Fail closed instead: an unlisted verb costs a refusal
+# the model can work around, a mis-listed one costs an unreviewed fault.
+# Same asymmetry as ``_DMSETUP_READONLY_VERBS`` above.
+#
+# The set is chrony's documented monitoring family — every verb here queries
+# chronyd and prints, mutating nothing (the read/write boundary this module
+# applies is injection impact, not command form). Deliberately NOT included:
+# ``manual`` (``manual on|off|reset`` mutates and the read face is only
+# ``manual list``), ``waitsync`` (mutates nothing but blocks unboundedly, which
+# is not a diagnostic shape), and the control verbs (makestep, burst, reselect,
+# reload, refresh, reset, shutdown, dns). Flags that consume a value
+# (``-h <host>`` / ``-f <conf>`` / ``-k <keyfile>``) make the value the first
+# non-flag token, so those forms are refused rather than mis-read — again fail
+# closed, and the reason names the allow-list so the model can reshape.
+_CHRONYC_READONLY_VERBS = frozenset(
+    {
+        "activity",
+        "authdata",
+        "clients",
+        "commandstats",
+        "ntpdata",
+        "selectdata",
+        "serverstats",
+        "smoothing",
+        "sources",
+        "sourcestats",
+        "tracking",
+    }
+)
+# hostnamectl — bare or ``status`` prints the system identity; every other verb
+# is a ``set-*`` that rewrites it (hostname / icon-name / chassis / deployment /
+# location). Allow-list for the same fail-closed reason as chronyc: a verb this
+# module does not recognise must not become an unguarded write.
+_HOSTNAMECTL_READONLY_VERBS = frozenset({"status"})
+# hwclock — reads the RTC unless it copies a clock INTO something. Allow-list
+# of the read/interpretation faces; the writers (``-w``/``--systohc``,
+# ``-s``/``--hctosys``, ``--systz``, ``-a``/``--adjust``, ``--set``,
+# ``--setepoch``, ``--update-drift``) are not merely excluded but refused, and
+# ``-s``/``--hctosys`` sets the SYSTEM clock — that is the clock-drift fault,
+# so it must never pass as a probe (the same note ``_h_date`` carries).
+# ``--date`` is neutral because it is the VALUE operand of both ``--set``
+# (refused) and ``--predict`` (a pure calculation); with ``--set`` gone it
+# cannot reach a writer. ``--adjfile`` is deliberately absent: the drift file is
+# a state artifact and ``--noadjfile`` covers the read that must not touch it.
+_HWCLOCK_READONLY_LONG = ("--show", "--get", "--predict", "--getepoch")
+_HWCLOCK_READONLY_SHORT_CHARS = frozenset("r")
+_HWCLOCK_NEUTRAL_LONG = ("--utc", "--localtime", "--noadjfile", "--rtc", "--date")
+_HWCLOCK_NEUTRAL_SHORT_CHARS = frozenset("ul")
+_HWCLOCK_VALUE_SHORT_FLAGS = frozenset({"-f"})
+_HWCLOCK_VALUE_LONG_FLAGS = ("--rtc", "--date")
+# openssl is a crypto toolkit. Read vs write is judged by INJECTION IMPACT, not
+# command form (the classifier's own philosophy): a decode that reads a cert and
+# prints fields to stdout mutates nothing, and an ``s_client`` handshake only
+# READS the served cert (same class as curl/nc); but ``ca``/``req``/``gen*``
+# SIGN or GENERATE and any ``-out``/``-signkey``/``-sess_out`` WRITES a file —
+# those are the fault-payload generators and stay refused. The allowed faces and
+# their fail-closed write/sign denylists are enumerated in _h_openssl.
+# Regression anchor: r9 inject-6450ed4d's verify hand-decoded the base64→DER
+# cert across two 360-470s reasoning rounds because ``openssl x509 -noout
+# -enddate`` and the ``s_client`` served-cert probe were both refused.
+_OPENSSL_X509_WRITE_FLAGS = frozenset(
+    {
+        "-out",
+        "-signkey",
+        "-key",
+        "-keyout",
+        "-req",
+        "-force_pubkey",
+        "-set_serial",
+        "-CA",
+        "-CAkey",
+        "-CAserial",
+        "-CAcreateserial",
+        "-x509toreq",
+        "-clrext",
+    }
+)
+_OPENSSL_S_CLIENT_WRITE_FLAGS = frozenset({"-sess_out", "-keyout"})
+# java RUNS bytecode by
 # default; only its version banner is a safe probe (note the single-dash
 # ``-version``, not covered by the ``--version`` metadata rule).
 _JAVA_READONLY_PROBES = frozenset(
@@ -1324,6 +1432,148 @@ _RUNTIME_VALUE_FLAGS = frozenset(
         "--debug-dir",
     }
 )
+# redis-cli — the first member of the DUAL-USE APPLICATION-PROTOCOL CLIENT
+# family (mysql/psql/etcdctl are future members; mysql/psql need a SQL-string
+# classifier, a different mechanism — see the openspec change
+# ``redis-cli-readonly-admission`` design D7). The read/write split is DERIVED
+# FROM REDIS'S OWN AUTHORITATIVE METADATA — ``COMMAND INFO <cmd>`` returns a
+# ``readonly`` flag per command (verified live on redis 6.0.16): the commands
+# below all report ``readonly`` (or are mutate-nothing reads such as
+# info/ping/command). Everything NOT listed is refused (fail-closed), so a
+# future redis command never fails open.
+_REDIS_CLI_READONLY_COMMANDS = frozenset(
+    {
+        # server / connection reads (mutate-nothing; info/ping are the
+        # corroboration probes — commandstats proves an intercepted command
+        # never reached the server).
+        "info",
+        "ping",
+        "echo",
+        "time",
+        "dbsize",
+        "command",
+        "role",
+        "lolwut",
+        # keyspace / string reads (COMMAND INFO: readonly)
+        "type",
+        "ttl",
+        "pttl",
+        "exists",
+        "strlen",
+        "get",
+        "mget",
+        "getrange",
+        "keys",
+        "scan",
+        "randomkey",
+        "dump",
+        # hash reads
+        "hget",
+        "hgetall",
+        "hkeys",
+        "hvals",
+        "hlen",
+        "hexists",
+        "hmget",
+        "hstrlen",
+        "hscan",
+        # list reads
+        "llen",
+        "lindex",
+        "lrange",
+        "lpos",
+        # set reads
+        "scard",
+        "sismember",
+        "smembers",
+        "srandmember",
+        "sinter",
+        "sdiff",
+        "sunion",
+        "sscan",
+        # sorted-set reads
+        "zcard",
+        "zscore",
+        "zcount",
+        "zrank",
+        "zrevrank",
+        "zrange",
+        "zrevrange",
+        "zrangebyscore",
+        "zrangebylex",
+        "zlexcount",
+        "zscan",
+        # bitmap / stream / geo reads
+        "bitcount",
+        "bitpos",
+        "xlen",
+        "xinfo",
+        "xrange",
+        "xrevrange",
+        "geohash",
+        "geopos",
+        "geodist",
+    }
+)
+# Parent commands redis flags as ``admin`` whose read/write split lives in the
+# SUB-VERB (like ``ip OBJECT VERB``): ``config get`` reads, ``config set``
+# writes. Only the listed read sub-verbs pass; anything else under these
+# parents is refused (fail-closed).
+_REDIS_CLI_GROUP_READ_SUBVERBS: dict[str, frozenset[str]] = {
+    "config": frozenset({"get"}),
+    "client": frozenset({"list", "info", "getname", "id"}),
+    "cluster": frozenset(
+        {"info", "nodes", "myid", "slots", "shards", "links", "countkeysinslot", "getkeysinslot"}
+    ),
+    "acl": frozenset({"list", "getuser", "whoami", "cat", "genpass", "users", "log"}),
+    "slowlog": frozenset({"get", "len", "help"}),
+    "memory": frozenset({"stats", "usage", "doctor", "help"}),
+    "object": frozenset({"encoding", "refcount", "idletime", "freq", "help"}),
+    "latency": frozenset({"latest", "history", "doctor", "help"}),
+}
+# Client-level MODE flags that change what redis-cli does regardless of the
+# subcommand that follows — running Lua, bulk-loading from stdin, sampling the
+# whole keyspace, streaming stats/latency, cluster management, pubsub. Refused
+# BEFORE the subcommand is even located. Long flags are matched with
+# ``_long_flag_hit`` (unique-prefix) — redis-cli itself does NOT abbreviate
+# long options (whole-token strcmp), so prefix matching here is extra-cautious
+# and errs toward refusal (fail-closed, the safe direction).
+_REDIS_CLI_DENY_LONG_FLAGS = (
+    "--eval",
+    "--ldb",
+    "--pipe",
+    "--pipe-timeout",
+    "--stat",
+    "--latency",
+    "--latency-history",
+    "--latency-dist",
+    "--intrinsic-latency",
+    "--bigkeys",
+    "--memkeys",
+    "--memkeys-samples",
+    "--hotkeys",
+    "--scan",
+    "--pattern",
+    "--cluster",
+    "--rdb",
+    "--aof",
+    "--replicas",
+    "--masters",
+    "--sentinel",
+    "--subscribe",
+    "--psubscribe",
+    "--publish",
+)
+# Short mode flags (exact-token; redis-cli does not bundle short options).
+_REDIS_CLI_DENY_SHORT_FLAGS = frozenset({"-x", "-r", "-i"})
+# Connection flags that CONSUME a separate value; skipping only the flag would
+# leave its value to be mistaken for the subcommand (``redis-cli -h host info``
+# must locate ``info``, not ``host``). EXACT match only, and only flags PROVEN
+# value-carrying from ``redis-cli --help`` — a wrong-present entry here would
+# eat the real subcommand and fail OPEN (see the value-flag asymmetry note).
+# NOTE ``-h`` is HOSTNAME, not help (``--help`` is help, and is already covered
+# by the all-metadata exemption upstream).
+_REDIS_CLI_VALUE_FLAGS = frozenset({"-h", "-p", "-a", "-n", "-u", "--user", "--pass"})
 # Wrappers that prefix a real command; the wrapped command decides the verdict.
 _COMMAND_WRAPPERS = ("timeout", "stdbuf", "nice", "ionice", "env", "watch")
 # Wrapper flags consuming a separate value — skipping only the flag would leave
@@ -2309,6 +2559,77 @@ def _build_binary_handlers() -> dict[str, "_HandlerFn"]:
             "and grouped verbs with sub-verbs such as image/config, all mutate)"
         )
 
+    # redis-cli — a DUAL-USE APPLICATION-PROTOCOL CLIENT (first member of a
+    # family; see _REDIS_CLI_READONLY_COMMANDS): the same binary runs
+    # mutate-nothing reads (``info``/``get``/``dbsize``/``config get``) and real
+    # mutations (``set``/``del``/``flushall``/``config set``/``shutdown``/``eval``).
+    # Judged by SUBCOMMAND against an allowlist derived from redis's own
+    # ``COMMAND INFO`` ``readonly`` flag, fail-closed on anything unknown. Order
+    # matters: (1) client-level MODE flags are refused FIRST whatever subcommand
+    # follows; (2) connection value flags are skipped to locate the subcommand —
+    # ``-h`` is HOSTNAME, not help (redis-cli does not bundle/abbreviate options,
+    # so exact short-token matching matches its parser); (3) single-token read;
+    # (4) two-level parent whose read/write split lives in the sub-verb; (5) deny.
+    def _h_redis_cli(binary, args, _depth):
+        for a in args:
+            if a in _REDIS_CLI_DENY_SHORT_FLAGS:
+                return False, (
+                    f"'redis-cli' {a} is a client mode flag (stdin / repeat / interval),"
+                    " not a read-only diagnostic form"
+                )
+            hit = _long_flag_hit(a, _REDIS_CLI_DENY_LONG_FLAGS)
+            if hit is not None:
+                return False, (
+                    f"'redis-cli' {hit} runs Lua / bulk-loads from stdin / samples the whole"
+                    " keyspace / streams stats or latency / manages the cluster / does pubsub"
+                    " — not read-only"
+                )
+        i = 0
+        cmd = ""
+        cmd_i = -1
+        while i < len(args):
+            tok = args[i]
+            if not tok.startswith("-"):
+                cmd = tok
+                cmd_i = i
+                break
+            i += 2 if tok in _REDIS_CLI_VALUE_FLAGS else 1
+        if not cmd:
+            return False, (
+                "'redis-cli' with no subcommand enters interactive mode reading stdin,"
+                " which is not a read-only diagnostic"
+            )
+        # Redis COMMAND NAMES are case-insensitive by protocol (GET == get == GeT;
+        # ``COMMAND INFO get`` is the same command as ``COMMAND INFO GET``), and the
+        # canonical casing in redis docs / LLM output is UPPERCASE. The allowlist is
+        # keyed by COMMAND INFO's lowercase canonical name, so fold the command token
+        # to lowercase before lookup to stay faithful to the very protocol metadata
+        # this table is derived from (spec: read/write boundary SHALL be derived from
+        # COMMAND INFO). ONLY the command tokens are folded — redis-cli's own getopt
+        # FLAGS (--eval/-x/-h/...) are case-SENSITIVE, so the deny/value-flag scans
+        # above stay on the raw tokens (faithful to the real parser; a wrong-cased
+        # flag is simply invalid to redis-cli and never runs). Folding cannot
+        # fail-open: it maps each token to the exact canonical name redis itself uses,
+        # and the allowlist is precisely the readonly set (an uppercase write like SET
+        # folds to 'set', which is still absent from the allowlist → denied).
+        cmd_l = cmd.lower()
+        if cmd_l in _REDIS_CLI_READONLY_COMMANDS:
+            return True, None
+        group = _REDIS_CLI_GROUP_READ_SUBVERBS.get(cmd_l)
+        if group is not None:
+            sub = args[cmd_i + 1] if cmd_i + 1 < len(args) else ""
+            if sub.lower() in group:
+                return True, None
+            return False, (
+                f"'redis-cli {cmd}' is read-only only for its read sub-verbs"
+                f" (got '{sub or 'none'}'; the others mutate)"
+            )
+        return False, (
+            f"'redis-cli {cmd}' is not a read-only command (redis COMMAND INFO does not flag"
+            " it readonly; set/del/expire/flushall/shutdown/save/debug/eval/subscribe mutate"
+            " or block)"
+        )
+
     # find — read-only only WITHOUT its action primitives. ``-exec``/``-ok``
     # run an arbitrary command per match (the ``+`` terminator carries no
     # shell metacharacter, so the string-level screens cannot see it),
@@ -3039,6 +3360,88 @@ def _build_binary_handlers() -> dict[str, "_HandlerFn"]:
             )
         return True, None
 
+    # chronyc — chrony's control client: monitoring verbs query chronyd and
+    # print, everything else changes its state or steps the clock. Allow-list,
+    # so an unrecognised verb fails CLOSED (see _CHRONYC_READONLY_VERBS: a
+    # deny-list here would be an unguarded write, not merely a wrong verdict,
+    # because host_inject skips ToolGuard for what this classifier clears).
+    # Bare chronyc enters interactive mode reading stdin — the same call the
+    # redis-cli bare form gets.
+    def _h_chronyc(binary, args, _depth):
+        verb = next((a for a in args if not a.startswith("-")), "")
+        if not verb:
+            return (
+                False,
+                "'chronyc' with no subcommand enters interactive mode reading stdin,"
+                " which is not a read-only diagnostic",
+            )
+        if verb in _CHRONYC_READONLY_VERBS:
+            return True, None
+        return (
+            False,
+            f"'chronyc {verb}' is not one of chrony's monitoring verbs — its control"
+            " verbs (makestep/burst/reselect/reload/manual on|off|reset) change"
+            " chronyd's state or step the clock, which is a fault, not a probe",
+        )
+
+    # hostnamectl — bare or ``status`` prints the system identity; every other
+    # verb is a ``set-*`` that rewrites it.
+    def _h_hostnamectl(binary, args, _depth):
+        verb = next((a for a in args if not a.startswith("-")), "")
+        if not verb or verb in _HOSTNAMECTL_READONLY_VERBS:
+            return True, None
+        return (
+            False,
+            f"'hostnamectl {verb}' rewrites the system identity (only bare"
+            " `hostnamectl` / `hostnamectl status` is read-only)",
+        )
+
+    # hwclock — reads the RTC unless it copies a clock INTO something.
+    # Flag-level allow-list; the writers are refused, and ``-s``/``--hctosys``
+    # sets the SYSTEM clock, which is the clock-drift fault itself (the same
+    # note ``_h_date`` carries for ``date -s``). Long flags ride getopt_long's
+    # prefix rule via ``_long_flag_hit``; an ambiguous abbreviation
+    # (``hwclock --s``, reachable by ``--show``) is fail-closed in practice
+    # because getopt_long rejects it before any action — verified against
+    # hwclock(8)'s option set: no writer flag prefix-matches into the read or
+    # neutral tables below.
+    def _h_hwclock(binary, args, _depth):
+        if not args:
+            return True, None  # bare hwclock IS --show
+        allow_short = _HWCLOCK_READONLY_SHORT_CHARS | _HWCLOCK_NEUTRAL_SHORT_CHARS
+        i = 0
+        while i < len(args):
+            a = args[i]
+            # A value option consumes its value in the separate spelling
+            # (``-f /dev/rtc0`` / ``--rtc /dev/rtc0``) and carries it in the
+            # attached one (``--rtc=/dev/rtc0``), which skips NOTHING — the
+            # rule ``_h_date`` applies, so the value is never mis-read as a
+            # positional.
+            if a in _HWCLOCK_VALUE_SHORT_FLAGS or (
+                _long_flag_hit(a, _HWCLOCK_VALUE_LONG_FLAGS) is not None
+            ):
+                i += 2 if "=" not in a else 1
+                continue
+            if (
+                _long_flag_hit(a, _HWCLOCK_READONLY_LONG) is not None
+                or _long_flag_hit(a, _HWCLOCK_NEUTRAL_LONG) is not None
+            ):
+                i += 1
+                continue
+            if a.startswith("-") and not a.startswith("--"):
+                cluster = _reachable_cluster(a, allow_short)
+                if cluster and all(ch in allow_short for ch in cluster):
+                    i += 1
+                    continue
+            return (
+                False,
+                f"'hwclock' {a} is not a read form — hwclock copies a clock with"
+                " -s/--hctosys, -w/--systohc, --systz, -a/--adjust, --set or"
+                " --update-drift, and setting the SYSTEM clock is the clock-drift"
+                " fault, not a probe (read the RTC with -r/--show)",
+            )
+        return True, None
+
     # taskset / chrt — query one pid with -p; a second positional is the value
     # being SET, and without -p they RUN a command. chrt -m lists limits.
     def _h_taskset(binary, args, _depth):
@@ -3160,14 +3563,57 @@ def _build_binary_handlers() -> dict[str, "_HandlerFn"]:
             )
         return True, None
 
-    # openssl — only the 'version' subcommand is a probe.
+    # openssl — read vs write judged by INJECTION IMPACT, not command form (see
+    # the module-level _OPENSSL_* denylists). Read-only faces:
+    #   (1) any '-help'/'--help': the opt parser prints usage and exit(0)s BEFORE
+    #       the subcommand runs, so ``openssl ca -help`` signs nothing (the same
+    #       metadata-probe exemption wget/iptables/nft/blade/java grant). Bare
+    #       '-h' is excluded — a real option for some subcommands. Regression
+    #       anchor: inject-9ca80c95's phantom window (a read-only ``openssl ca
+    #       -help`` probe misjudged as mutating).
+    #   (2) the 'version' subcommand.
+    #   (3) 'x509' decode WITH '-noout' and NO write/sign flag: reads a cert,
+    #       prints -enddate/-subject/-issuer/-text to stdout, mutates nothing.
+    #   (4) 's_client' observational connect with NO file-write flag: a TLS
+    #       handshake READS the served cert, changes no target state (same class
+    #       as curl/nc packet probes).
+    # Everything else SIGNS / GENERATES / WRITES (ca, req -x509, genrsa, x509
+    # -out/-signkey, s_client -sess_out, …) = fault-payload generators, refused.
+    # Regression anchor (3)(4): r9 inject-6450ed4d verify hand-decoded the
+    # base64→DER cert across two 360-470s reasoning rounds because both the
+    # ``x509 -noout -enddate`` decode and the ``s_client`` probe were refused.
     def _h_openssl(binary, args, _depth):
+        if any(a in ("-help", "--help") for a in args):
+            return True, None
         verb = next((a for a in args if not a.startswith("-")), "")
         if verb == "version":
             return True, None
+        argset = set(args)
+        if verb == "x509":
+            # decode probe: -noout present, no write/sign flag
+            if "-noout" in argset and not (argset & _OPENSSL_X509_WRITE_FLAGS):
+                return True, None
+            return (
+                False,
+                "'openssl x509' is read-only only as a '-noout' field decode "
+                "(-enddate/-subject/-issuer/-text); -out/-signkey/-CA*/-req "
+                "sign or write a file",
+            )
+        if verb == "s_client":
+            # observational TLS connect reads the served cert; refuse only the
+            # file-write faces
+            if not (argset & _OPENSSL_S_CLIENT_WRITE_FLAGS):
+                return True, None
+            return (
+                False,
+                "'openssl s_client' is read-only as an observational connect; "
+                "-sess_out/-keyout write a file",
+            )
         return (
             False,
-            "'openssl' is read-only only for the 'version' subcommand (other subcommands compute/write/connect)",
+            "'openssl' is read-only only for the 'version' subcommand, a '-help' "
+            "probe, an 'x509 -noout' field decode, or an observational 's_client' "
+            "connect (other subcommands sign/generate/write)",
         )
 
     # java — runs bytecode; only its version banner is a safe probe.
@@ -3247,6 +3693,7 @@ def _build_binary_handlers() -> dict[str, "_HandlerFn"]:
         "nerdctl": _h_runtime_clis,
         "podman": _h_runtime_clis,
         "ctr": _h_runtime_clis,
+        "redis-cli": _h_redis_cli,
         "find": _h_find,
         "awk": _h_awk,
         "curl": _h_curl,
@@ -3269,6 +3716,17 @@ def _build_binary_handlers() -> dict[str, "_HandlerFn"]:
         "ipvsadm": _h_ipvsadm,
         "crontab": _h_crontab,
         "timedatectl": _h_timedatectl,
+        # The other two faces of the same clock/system-identity family, and the
+        # three a clock-drift drill actually needs to OBSERVE with: chronyd's
+        # own view (tracking/sources), the RTC (hwclock), and the machine
+        # identity (hostnamectl). ``chronyc`` in particular was a registration
+        # asymmetry — host_inject's whitelist admits ``chronyc makestep`` to
+        # STEP the clock while this face refused ``chronyc tracking`` to READ
+        # it (host Case #13 burned a reconnaissance round on that, plus a
+        # ``command -v chronyc`` existence probe the refusal text invited).
+        "chronyc": _h_chronyc,
+        "hwclock": _h_hwclock,
+        "hostnamectl": _h_hostnamectl,
         "resolvectl": _h_resolvectl,
         "systemd-resolve": _h_resolvectl,
         "taskset": _h_taskset,
@@ -3352,7 +3810,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
     if binary in _READONLY_BINARIES:
         return True, None
-    return False, f"'{binary}' is not a known read-only diagnostic command"
+    return False, f"'{binary}'{_UNREGISTERED_BINARY_SUFFIX}"
 
 
 def _classify_inner(inner: list[str], _depth: int = 0) -> tuple[bool, str | None]:
@@ -3515,6 +3973,35 @@ READONLY_PROBE_FIX_HINT = (
     "iostat -xd 1 2` (chained probes: one debug pod instead of several). "
     "If the command is genuinely a fault INJECTION, it belongs to Phase 2 "
     "(execution), not to a read-only phase."
+)
+
+
+# The compliant-shape guidance paired with a ``host_inject`` refusal whose
+# command was NOT admitted as a read-only diagnostic — i.e. a mutating shape, or
+# a banned verb that left the fault family empty (the ``python3 -c`` probe of
+# O-C2-1). Single source of truth, isomorphic to READONLY_PROBE_FIX_HINT: the
+# host classifier (``_classify_host_inject``) attaches THIS SAME hint as the
+# ``reject_suggestion`` paired with its ``reject_detail`` cause, so a model
+# refused on a host carrier gets the identical read-only capability fact the
+# ``host_inject`` docstring states — never a private per-binary copy free to
+# drift from the judge (a2f0cce7).
+#
+# Binary-agnostic by design (O-C2-1 root cause): it states the SHAPE rule the
+# authority (``is_readonly_host_command``) applies, not a static allow/deny
+# binary list — curl/wget appear only as the named example the docstring also
+# names, hot-tracked against the authority by regression. Framed as "this
+# refusal covers the command you ISSUED, not read-only observation" so it can
+# never be misread as a NEW admission rule (8207f9f1 item 8): the drift guard's
+# admit/deny decision is untouched, and a genuine second fault on a drifted
+# target stays refused.
+HOST_READONLY_PROBE_HINT = (
+    "This refusal covers the mutating/banned command you ISSUED, not read-only "
+    "observation. host_inject ALSO admits a single read-only diagnostic (no "
+    "pipe/redirect) by command SHAPE, not by binary — including a dual-use "
+    "network probe on a read verb (an HTTP GET via curl/wget), the only "
+    "app-level probe for an in-process (python) target. Re-issue that shape to "
+    "observe the fault's live effect; a genuine second fault on a drifted "
+    "target stays refused."
 )
 
 
@@ -3743,15 +4230,36 @@ def host_command_rejection_reason(command: str) -> str | None:
     )
 
 
+def is_unregistered_binary_reason(reason: str | None) -> bool:
+    """True when a refusal reason is the UNREGISTERED-BINARY terminal verdict.
+
+    Lets a caller render the fix path that verdict actually needs. It is the
+    only refusal whose fix is NOT "reshape the command": the binary has no
+    registered read-only form, so no shape of it can be admitted here, and
+    whether the binary is installed on the host is a different question that
+    answers nothing. Every other refusal (a pipe, a redirect, a write flag, a
+    mutating binary) IS fixable by reshaping, so pairing this verdict with
+    generic reshape advice sends the model looking for a shape that does not
+    exist — see ``_UNREGISTERED_BINARY_SUFFIX`` for the measured cost.
+
+    Tests the shared suffix constant rather than the prose, so wording edits
+    cannot silently break the dispatch. ``None`` (an ADMITTED command) and the
+    internal-error reason both return False: neither is this verdict.
+    """
+    return reason is not None and reason.endswith(_UNREGISTERED_BINARY_SUFFIX)
+
+
 __all__ = [
     "is_readonly_argv",
     "is_readonly_inner_tokens",
     "readonly_inner_tokens_reason",
     "READONLY_PROBE_FIX_HINT",
+    "HOST_READONLY_PROBE_HINT",
     "is_readonly_kubectl_exec",
     "kubectl_exec_rejection_reason",
     "kubectl_exec_target_form_reason",
     "is_readonly_host_command",
     "contains_shell_metachar",
     "host_command_rejection_reason",
+    "is_unregistered_binary_reason",
 ]

@@ -1697,8 +1697,34 @@ class TestExtendedDualUseGuards:
         (["parted", "-l"], False),
         (["parted", "/dev/sda", "mkpart"], False),
         (["openssl", "version"], True),
+        # '-help' prints usage and exit(0)s before the subcommand runs, so it
+        # is a read-only metadata probe like wget/iptables/nft help. Regression
+        # anchor: inject-9ca80c95's phantom window was stamped by a misjudged
+        # ``openssl ca -help`` capability probe.
+        (["openssl", "ca", "-help"], True),
+        (["openssl", "req", "-help"], True),
+        (["openssl", "x509", "--help"], True),
+        # Read-only decode/observe faces (no injection impact): x509 -noout field
+        # decode reads a cert and prints to stdout; s_client observational connect
+        # READS the served cert (like curl/nc). r9 inject-6450ed4d: both refused,
+        # forcing a 360-470s hand base64→DER decode in verify.
+        (["openssl", "x509", "-in", "/tmp/c.pem", "-noout", "-enddate"], True),
+        (["openssl", "x509", "-noout", "-subject", "-issuer", "-dates"], True),
+        (["openssl", "s_client", "-connect", "x:443"], True),
+        (["openssl", "s_client", "-connect", "x:443", "-servername", "y"], True),
+        # The real signing/generating/file-writing forms stay refused (the
+        # decode/observe exemption must not leak to an actual mutation).
+        (["openssl", "ca"], False),
+        (["openssl", "ca", "-infiles", "/tmp/x"], False),
         (["openssl", "genrsa", "-out", "/tmp/k", "2048"], False),
-        (["openssl", "s_client", "-connect", "x:443"], False),
+        (["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", "/tmp/k"], False),
+        # x509 decode carrying a write/sign flag is refused even with -noout.
+        (["openssl", "x509", "-in", "/tmp/c.pem", "-noout", "-out", "/tmp/o.pem"], False),
+        (["openssl", "x509", "-req", "-signkey", "/tmp/k", "-noout"], False),
+        # x509 WITHOUT -noout is not the narrow decode probe (fail-closed).
+        (["openssl", "x509", "-in", "/tmp/c.pem", "-enddate"], False),
+        # s_client with a file-write face is refused.
+        (["openssl", "s_client", "-connect", "x:443", "-sess_out", "/tmp/s"], False),
         (["java", "-version"], True),
         (["java", "-jar", "/tmp/app.jar"], False),
         (["java", "-cp", "/tmp", "Main"], False),
@@ -2463,3 +2489,342 @@ class TestBenignStreamRedirects:
         structure AT ALL?" — orthogonal to read-only-ness; a benign stream
         op is still structure and must still screen True."""
         assert readonly.contains_shell_metachar(cmd), cmd
+
+
+class TestRedisCliDualUseClient:
+    """``redis-cli`` is the first member of the DUAL-USE APPLICATION-PROTOCOL
+    CLIENT family (openspec change ``redis-cli-readonly-admission``). The same
+    binary runs mutate-nothing reads (``info``/``get``/``config get``) and real
+    mutations (``set``/``flushall``/``config set``/``shutdown``/``eval``). The
+    read/write split is derived from redis's own ``COMMAND INFO`` ``readonly``
+    flag and is an ALLOWLIST (fail-closed): anything unknown is refused, so a
+    future redis command never fails open. Both surfaces are pinned — the host
+    face (``host_read``) and the argv face must share the verdict.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # single-token reads (redis COMMAND INFO: readonly)
+            "redis-cli info commandstats",     # the corroboration probe that surfaced this
+            "redis-cli ping",
+            "redis-cli get foo",
+            "redis-cli dbsize",
+            "redis-cli scan",
+            "redis-cli hgetall h",
+            "redis-cli zrange k 0 -1",
+            "redis-cli time",
+            # connection value flags skipped to locate the subcommand (-h is HOST)
+            "redis-cli -h somehost -p 6379 info",
+            "redis-cli -u redis://host:6379 get foo",
+            # two-level parents on their READ sub-verb
+            "redis-cli config get maxmemory",
+            "redis-cli client list",
+            "redis-cli slowlog get",
+            "redis-cli memory stats",
+            "redis-cli cluster info",
+            "redis-cli acl list",
+            "redis-cli object encoding k",
+            "redis-cli latency latest",
+        ],
+    )
+    def test_read_forms_allowed_both_surfaces(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+        assert is_readonly_argv(shlex.split(cmd)), cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # mutating subcommands (redis COMMAND INFO: write/admin/dangerous)
+            "redis-cli set foo bar",
+            "redis-cli del foo",
+            "redis-cli expire foo 10",
+            "redis-cli flushall",
+            "redis-cli shutdown",
+            "redis-cli save",
+            "redis-cli debug sleep",
+            "redis-cli eval 'return 1'",
+            "redis-cli subscribe ch",
+            "redis-cli publish ch msg",
+            "redis-cli sort k STORE d",
+            # two-level parents on their WRITE sub-verb
+            "redis-cli config set maxmemory 1",
+            "redis-cli config resetstat",
+            "redis-cli client kill id 1",
+            "redis-cli cluster failover",
+            "redis-cli slowlog reset",
+            "redis-cli memory purge",
+            "redis-cli acl setuser u on",
+        ],
+    )
+    def test_mutating_subcommands_refused_both_surfaces(self, cmd):
+        assert not is_readonly_host_command(cmd), cmd
+        assert not is_readonly_argv(shlex.split(cmd)), cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "redis-cli --eval script.lua",       # runs arbitrary Lua
+            "redis-cli --ev script.lua",         # unique-prefix abbrev still caught
+            "redis-cli -x set foo",              # last arg from stdin
+            "redis-cli -x info",                 # -x is the sole guard here (info reads):
+                                                 # stdin-injection mode must override the read
+            "redis-cli --pipe",                  # bulk-load raw protocol from stdin
+            "redis-cli --pip",                   # abbrev of --pipe
+            "redis-cli --scan",                  # whole-keyspace listing (load)
+            "redis-cli --bigkeys",               # keyspace sampling (load)
+            "redis-cli --hotkeys",
+            "redis-cli -r 100 -i 1 info",        # repeat/interval mode overrides the read
+            "redis-cli --cluster check node",    # cluster management
+            "redis-cli --stat",                  # rolling stats loop
+            "redis-cli --latency",               # continuous latency sampling
+            "redis-cli --subscribe ch",
+        ],
+    )
+    def test_dangerous_client_mode_flags_refused(self, cmd):
+        assert not is_readonly_host_command(cmd), cmd
+        assert not is_readonly_argv(shlex.split(cmd)), cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "redis-cli somefuturecommand",       # unknown -> fail-closed, NOT fail-open
+            "redis-cli config",                  # parent with no sub-verb
+            "redis-cli",                         # bare -> interactive mode reads stdin
+        ],
+    )
+    def test_unknown_and_bare_fail_closed(self, cmd):
+        assert not is_readonly_host_command(cmd), cmd
+        assert not is_readonly_argv(shlex.split(cmd)), cmd
+
+    def test_dash_h_is_host_not_help_and_cannot_mask_a_write(self):
+        """The ``_h_blade`` "any -h/--help passes" shortcut MUST NOT transfer:
+        redis-cli's ``-h`` is HOSTNAME. A value-flag table that wrongly skipped
+        ``-h`` as help (or ate the wrong token) would let ``config set`` through
+        — the fail-open direction. -h consumes its value, then config set is
+        located and refused."""
+        assert not is_readonly_host_command("redis-cli -h somehost config set x y")
+        assert not is_readonly_argv(shlex.split("redis-cli -h somehost config set x y"))
+        # ... while the same connection prefix on a read still passes.
+        assert is_readonly_host_command("redis-cli -h somehost config get x")
+
+    def test_registered_in_the_single_source_handler_table(self):
+        """The verdict must come from the authoritative ``_BINARY_HANDLERS``
+        table (memory: no private vocabulary副本), not a bolt-on private list."""
+        assert "redis-cli" in readonly._BINARY_HANDLERS
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # The EXACT form the live Case #5 run reached for and was refused:
+            # redis command names are canonically UPPERCASE in docs / LLM output.
+            "redis-cli GET drill-key",
+            "redis-cli INFO commandstats",
+            "redis-cli PING",
+            "redis-cli DBSIZE",
+            "redis-cli CONFIG GET maxmemory",   # uppercase parent + uppercase read sub-verb
+            "redis-cli CLIENT LIST",
+            "redis-cli GeT foo",                # mixed case
+            "redis-cli -h somehost GET k",      # uppercase read after a value flag
+        ],
+    )
+    def test_command_names_case_insensitive_allowed_both_surfaces(self, cmd):
+        """Redis COMMAND NAMES are case-insensitive by protocol (GET == get ==
+        GeT; ``COMMAND INFO get`` IS ``COMMAND INFO GET``). The allowlist is keyed
+        by COMMAND INFO's lowercase canonical name, so the command token MUST be
+        folded before lookup — otherwise the canonical UPPERCASE casing redis
+        docs and LLMs actually emit (``redis-cli GET drill-key``) is over-denied,
+        contradicting the spec clause that the read/write boundary is *derived
+        from* COMMAND INFO. Surfaced live: Case #5 verify reached for
+        ``host_read redis-cli GET drill-key`` and was refused (fail-closed, safe
+        direction, but a fidelity hole in the root-fix)."""
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+        assert is_readonly_argv(shlex.split(cmd)), cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # Folding the command MUST NOT fail-open: an uppercase write folds to
+            # its lowercase canonical name, which is still absent from the
+            # readonly allowlist -> denied.
+            "redis-cli SET foo bar",
+            "redis-cli DEL foo",
+            "redis-cli FLUSHALL",
+            "redis-cli CONFIG SET maxmemory 1",
+            "redis-cli SHUTDOWN",
+            "redis-cli CONFIG RESETSTAT",       # uppercase WRITE sub-verb of a group parent
+            # redis-cli's own getopt FLAGS are case-SENSITIVE and are scanned on
+            # the raw token — command folding must not touch the deny-flag path.
+            "redis-cli --eval script.lua",
+            "redis-cli -x GET foo",             # -x (stdin mode) denied even though GET reads
+            "redis-cli --scan --pattern *",
+        ],
+    )
+    def test_command_folding_does_not_fail_open_writes_or_flags(self, cmd):
+        assert not is_readonly_host_command(cmd), cmd
+        assert not is_readonly_argv(shlex.split(cmd)), cmd
+
+
+class TestClockAndIdentityFamilyReadVerbs:
+    """Clock-drift drills need four binaries to OBSERVE the fault, and three of
+    them had their MUTATING face admitted while their read face was refused.
+
+    The asymmetry, measured before the fix: ``ToolGuard.evaluate`` returns
+    ``allowed=True`` for ``chronyc makestep`` and ``chronyc -a makestep`` (this
+    project's own Tier-1 clock injection — chronyc is on the injection whitelist
+    on EVERY form), while the readonly classifier refused ``chronyc tracking`` /
+    ``sources`` as an unregistered binary — the only way to read back the offset
+    that injection just created. ``hwclock --show``, ``hostnamectl`` and
+    ``systemd-detect-virt`` were refused on both faces. Live cost in Case #13: a
+    wasted reconnaissance round, then a refusal message that invited an existence
+    probe (``command -v chronyc`` -> ``/usr/bin/chronyc``) whose answer cannot
+    change the verdict.
+
+    chronyc / hwclock / hostnamectl are judged by an ALLOWLIST, not a deny-list,
+    because of what sits above this classifier: a readonly verdict makes
+    ``host_inject`` dispatch with ``skip_guard=True`` (host_cmd.py) and
+    ``host_read`` reach the host directly. A deny-list that missed one verb
+    would therefore be an UNGUARDED clock write, not merely a wrong verdict —
+    ``chronyc makestep`` and ``hwclock -s`` are the fault itself.
+    ``systemd-detect-virt`` has no write face at all (systemd-detect-virt(1):
+    detection scopes, reporting, metadata), so it is a name-only entry in
+    ``_READONLY_BINARIES`` with no handler.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # chronyc monitoring family (every verb prints state, none steers)
+            "chronyc tracking",            # the offset readback the drill needs
+            "chronyc sources",
+            "chronyc sourcestats",
+            "chronyc clients",
+            "chronyc serverstats",
+            "chronyc smoothing",
+            "chronyc ntpdata",
+            "chronyc activity",
+            "chronyc authdata",
+            "chronyc selectdata",
+            "chronyc commandstats",
+            # valueless reporting/scope flags in front of a read verb
+            "chronyc -n sources",
+            "chronyc -4 tracking",
+            "chronyc -a tracking",
+            "chronyc -c sources",
+            # hwclock read forms (bare hwclock IS --show)
+            "hwclock",
+            "hwclock -r",
+            "hwclock --show",
+            "hwclock --show -u",
+            "hwclock -ul",
+            "hwclock -r -f /dev/rtc0",
+            "hwclock --rtc=/dev/rtc0 --show",
+            "hwclock --rtc /dev/rtc0 -r",
+            "hwclock --get",
+            "hwclock --predict --date 2026-10-29",
+            "hwclock --getepoch",
+            # hostnamectl: bare and explicit status both dump state
+            "hostnamectl",
+            "hostnamectl status",
+            # virtualisation detection: no write face exists
+            "systemd-detect-virt",
+            "systemd-detect-virt --vm",
+            "systemd-detect-virt --container",
+            "systemd-detect-virt -q",
+            "systemd-detect-virt --private-users",
+        ],
+    )
+    def test_read_forms_allowed_both_surfaces(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+        assert is_readonly_argv(shlex.split(cmd)), cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # chronyc control verbs. ``makestep`` is the injection itself: it
+            # steps the clock immediately, so admitting it here would let a
+            # read-only phase (or a guard-skipping host_inject) mutate time.
+            "chronyc makestep",
+            "chronyc -a makestep",
+            "chronyc burst 4/4",
+            "chronyc reselect",
+            "chronyc reload sources",
+            "chronyc manual on",
+            "chronyc manual off",
+            "chronyc manual reset",
+            "chronyc manual list",       # reads, but shares the mutating parent
+            "chronyc waitsync",          # unbounded block, not a diagnostic form
+            "chronyc shutdown",
+            "chronyc dns",               # on|off|reset
+            "chronyc bogusverb",
+            # bare chronyc drops into an interactive prompt (redis-cli同型)
+            "chronyc",
+            # a VALUE flag makes its value the first non-flag token, so the verb
+            # is no longer locatable -> fail closed rather than guess
+            "chronyc -h localhost tracking",
+            # hwclock write forms: -s/--hctosys IS the clock-drift fault body
+            "hwclock -s",
+            "hwclock --hctosys",
+            "hwclock -w",
+            "hwclock --systohc",
+            "hwclock --systz",
+            "hwclock -a",
+            "hwclock --adjust",
+            "hwclock --set --date 2020-01-01",
+            "hwclock --update-drift",
+            "hwclock --setepoch --epoch 2000",
+            "hwclock --epoch 2000",
+            "hwclock /dev/rtc0",         # bare positional: not a read form
+            # hostnamectl setters
+            "hostnamectl set-hostname evil",
+            "hostnamectl set-chassis vm",
+            "hostnamectl set-icon-name x",
+            "hostnamectl set-deployment prod",
+            "hostnamectl set-location dc1",
+        ],
+    )
+    def test_mutating_forms_refused_both_surfaces(self, cmd):
+        assert not is_readonly_host_command(cmd), cmd
+        assert not is_readonly_argv(shlex.split(cmd)), cmd
+
+    def test_registered_in_the_single_source_tables(self):
+        """The verdict must come from the authoritative tables (memory: no
+        private vocabulary副本), not a bolt-on private list. The three dual-use
+        binaries need argument-level handlers; the write-faceless one must be a
+        name-only entry and must NOT grow a handler."""
+        for binary in ("chronyc", "hwclock", "hostnamectl"):
+            assert binary in readonly._BINARY_HANDLERS, binary
+        assert "systemd-detect-virt" in readonly._READONLY_BINARIES
+        assert "systemd-detect-virt" not in readonly._BINARY_HANDLERS
+
+    def test_injection_face_admission_does_not_leak_into_the_read_face(self):
+        """The specific tooth for this family: ``chronyc makestep`` is ADMITTED
+        by ToolGuard as an injection (that is the drill). Admitting it there
+        must never make it read-only here — the two faces answer different
+        questions, and this classifier's verdict is what disables the guard."""
+        assert not is_readonly_host_command("chronyc makestep")
+        assert is_readonly_host_command("chronyc tracking"), (
+            host_command_rejection_reason("chronyc tracking")
+        )
+
+    def test_unregistered_binary_verdict_is_machine_identifiable(self):
+        """``host_read`` renders a different refusal for "this binary is not in
+        my registered vocabulary" than for "this shape is not read-only", so the
+        verdict itself must be identifiable without substring-matching prose
+        that can drift. The predicate and the message are built from one
+        constant."""
+        from chaos_agent.tools.readonly import is_unregistered_binary_reason
+
+        reason = host_command_rejection_reason("losetup -a")
+        assert reason is not None
+        assert is_unregistered_binary_reason(reason), reason
+        # A registered binary's refusal is NOT the unregistered verdict —
+        # otherwise the two branches would collapse back into one message.
+        assert not is_unregistered_binary_reason(
+            host_command_rejection_reason("chronyc makestep")
+        )
+        assert not is_unregistered_binary_reason(
+            host_command_rejection_reason("df -h | grep vda")
+        )
+        assert not is_unregistered_binary_reason(None)
+

@@ -2163,7 +2163,7 @@ class TestReviewFindings:
                 return CommandResult(0, "pod deleted", "", 1.0)
             return CommandResult(0, pod_json, "", 1.0)
 
-        async def fake_namespace(_kubeconfig):
+        async def fake_namespace(_kubeconfig, *, target=None):
             return "test-ns"
 
         kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]

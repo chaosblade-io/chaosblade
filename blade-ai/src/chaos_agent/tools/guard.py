@@ -56,7 +56,7 @@ import shlex
 from dataclasses import asdict
 from pathlib import Path
 
-from chaos_agent.bashfacts.facts import CommandFacts, ScriptFacts
+from chaos_agent.bashfacts.facts import CommandFacts, RedirectFacts, ScriptFacts
 from chaos_agent.bashfacts.parser import parse_script
 from chaos_agent.models.command_result import CommandResult
 from chaos_agent.tools.guard_feedback import (
@@ -278,6 +278,72 @@ def _systemd_run_payload_tokens(cmd: list[str]) -> frozenset[str]:
     return frozenset(cmd[_systemd_run_payload_start(cmd) :])
 
 
+# setsid(1) own options — everything from the first non-option token on is
+# argv for the detached child (``sh -c '<script>'``), never re-parsed as a
+# setsid flag. ``-c`` is deliberately NOT here: in the canonical carrier the
+# ``-c`` belongs to ``sh`` (``setsid --fork sh -c …``) and the scan already
+# stopped at the ``sh`` positional, so it is never seen as a setsid option.
+_SETSID_OPTIONS = frozenset({"--fork", "-f", "--wait", "-w", "--ctty"})
+
+
+def _setsid_payload_start(cmd: list[str]) -> int:
+    """Index of the first positional token — where the setsid payload starts.
+
+    The Tier-2 (no-systemd) self-recovery carrier is
+    ``setsid --fork sh -c '<script>'``: ``--fork`` is setsid's own flag, and
+    from ``sh`` on everything is the argv the detached child runs.
+    """
+    i = 1
+    while i < len(cmd) and cmd[i] in _SETSID_OPTIONS:
+        i += 1
+    return i
+
+
+def _setsid_payload_tokens(cmd: list[str]) -> frozenset[str]:
+    """The detached-payload tokens of a ``setsid`` argv.
+
+    ``setsid --fork sh -c '<script>'``: from the first positional token on,
+    everything IS the command the detached child runs at its deadline —
+    including a quoted ``sh -c '…$(…)…'`` script that only the TARGET's shell
+    will ever expand (the host twin of :func:`_systemd_run_payload_tokens`).
+    """
+    return frozenset(cmd[_setsid_payload_start(cmd) :])
+
+
+def is_setsid_detached_timer(cmd: list[str]) -> bool:
+    """True when a ``setsid`` argv is in its Tier-2 self-recovery TIMER form.
+
+    The no-systemd twin of :func:`is_systemd_run_timer`, and SINGLE SOURCE for
+    the same two consumers that must never drift:
+
+    - ToolGuard admission (:meth:`_check_setsid`): ``setsid`` is admitted ONLY
+      in this form — ``--fork`` detaches the child into a new session so the
+      payload fires at its DEADLINE (after ``sleep <N>``), letting a native
+      fault self-reverse even if the session dies; without ``--fork`` setsid
+      runs the payload synchronously in the caller's session (blocking the
+      whole window), and a bare ``setsid <cmd>`` is arbitrary execution wearing
+      a whitelisted name.
+    - machinery≠mutation attribution (execution_artifacts' HOST face): a call
+      in this admitted form is a timer REGISTRATION, never an injection — the
+      payload executes at the deadline, not at issue time, so the issue-time
+      attributor must not count it (the Tier-2 twin of the R23/G-7 seam).
+      Because the guard rejects every other setsid shape BEFORE the tool runs,
+      this form verdict is also the machinery verdict by construction.
+
+    ``--fork`` (or ``-f``) must sit in the OPTION region (before the payload
+    start) and ``--wait``/``-w`` must be absent — ``--wait`` re-blocks the
+    caller, the opposite of a fire-and-forget arm, so it is never a timer even
+    when ``--fork`` is also present.
+    """
+    if not cmd or cmd[0] != "setsid":
+        return False
+    payload_start = _setsid_payload_start(cmd)
+    options = cmd[1:payload_start]
+    if any(arg in ("--wait", "-w") for arg in options):
+        return False
+    return any(arg in ("--fork", "-f") for arg in options)
+
+
 def _wiz_command_values(cmd: list[str]) -> list[str]:
     """The ``--command`` values of a ``wiz`` argv (both flag spellings).
 
@@ -317,14 +383,113 @@ _PAYLOAD_INTERPRETERS = frozenset({"sh", "bash"})
 _NESTED_CARRIERS = frozenset({"systemd-run", "wiz"})
 # Redirect targets a payload script may write to: discard sinks only. The
 # one redirect the skills teach is ``2>/dev/null``; writing a payload's
-# output to a real file is no recovery step any skill prescribes.
+# output to a real file is no recovery step any skill prescribes. This is
+# the PATH-target vocabulary — fd duplication (``2>&1``) and heredocs are
+# classified by operator in :func:`_redirect_is_discard_sink`, the single
+# source for "what may a payload redirect to".
 _PAYLOAD_REDIRECT_SINKS = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/fd/")
+# fd-duplication operators: ``>&N`` / ``<&N`` point one descriptor at
+# ANOTHER — the target is an FD NUMBER, not a path, and no file is written.
+_FD_DUP_REDIRECT_OPS = frozenset({">&", "<&"})
+# heredoc / here-string operators: a body, never a discard sink. No recovery
+# payload feeds one, so they fail closed.
+_HEREDOC_REDIRECT_OPS = frozenset({"<<", "<<-", "<<<"})
 # Heads allowed INSIDE a ``$(...)`` body of a payload script. The skills'
 # one use of substitution in payloads is resolving PIDs (``kill -CONT
 # $(pidof x)``); anything wider would let a probe's OUTPUT smuggle flags —
 # ``chmod $(echo -R) 777 /etc`` is a recursive chmod the static replay
 # cannot see. Fail closed to the PID probes.
 _PAYLOAD_SUBST_PROBES = frozenset({"pidof", "pgrep"})
+
+
+def _unknown_binary_compliant_form(binary: str, allowed: set[str]) -> str:
+    """Correction text for a Gate-① rejection, dispatched on the binary.
+
+    This used to be ONE constant string for every rejected binary, which is
+    wrong in a way that costs a turn rather than merely being vague. Measured
+    on host Case #13 (timeoffset, 2227s): the model tried to dispatch
+    ``sh -c 'echo PROBE_A PROBE_B'`` to test whether an already-armed carrier
+    payload had arrived intact, and got back "Runnable binaries: blade, chmod,
+    chronyc, … Read-only host diagnostics (df/ps/ss/cat/…) are NOT here on
+    purpose — reach them through the host_read tool." Both halves miss: the
+    list answers a question it did not ask (what CAN I run), and the host_read
+    pointer sends a payload-probe at a read-only diagnostic tool. It then did
+    the only thing the text left open — ``systemctl stop`` a carrier that had
+    armed successfully and re-arm it in a form whose ``ExecStart`` readback is
+    unambiguous, ~331s (14.9% of the run) and a ``failed`` transient unit
+    later.
+
+    An interpreter is a different situation from an unknown binary, and says
+    so: it is not missing from the list by oversight, it is inadmissible at
+    top level by design while being REQUIRED inside a carrier payload region —
+    and the probe it was reaching for is both impossible and unnecessary,
+    because the transport applies the quoting and therefore already knows the
+    answer (see ``host_cmd.payload_fidelity_receipt``, which states it on the
+    success receipt). Naming that closes the loop instead of leaving the model
+    to invent a workaround.
+
+    Every other binary keeps the authoritative allow-list: the guard is the
+    only source that cannot be stale.
+    """
+    if binary in _PAYLOAD_INTERPRETERS:
+        return (
+            f"`{binary}` is never admissible as a TOP-LEVEL command — not an "
+            "omission from the list below. It is admissible only inside a "
+            "carrier's payload region, which is where a script belongs: "
+            "`systemd-run --on-active=<N>s --unit=<name> sh -c '<script>'`. "
+            "If the intent was to probe whether an ALREADY-ARMED payload "
+            "arrived intact, that probe is neither dispatchable nor needed: "
+            "the transport shlex.quotes each argv element individually, so "
+            "the payload cannot have been split en route, and host_inject's "
+            "success receipt states that as a fact (element index, byte "
+            "length, sha256). Do not re-arm to make a payload verifiable — an "
+            "`ExecStart=` / `argv[]=` readback renders elements space-joined "
+            "WITHOUT quotes, so it cannot distinguish an intact script from a "
+            "split one either way. Runnable binaries: "
+            + ", ".join(sorted(allowed))
+        )
+    return (
+        "Runnable binaries: "
+        + ", ".join(sorted(allowed))
+        + ". Read-only host diagnostics (df/ps/ss/cat/...) are NOT "
+        "here on purpose — reach them through the host_read tool, "
+        "not this binary whitelist."
+    )
+
+
+def _redirect_is_discard_sink(redirect: RedirectFacts) -> bool:
+    """True when a payload redirect writes nothing durable — a discard sink.
+
+    SINGLE SOURCE for "what may a payload redirect to", shared by every
+    payload-script redirect check AND the bare-``exec`` fd-sever exemption, so
+    admission and the fd-sever can never drift on the sink vocabulary (the
+    D7 "one verdict" discipline applied to redirects).
+
+    Three operator classes:
+
+    - fd duplication (``>&N`` / ``<&N``): the target is an FD NUMBER, not a
+      path — it points one descriptor at another and writes no file, so it is
+      always a sink. ``2>&1`` follows stdout to whatever sink the sibling
+      ``>/dev/null`` chose; even a lone ``2>&1`` writes nothing new. The former
+      ``target.value.startswith(sinks)`` test misread the fd number ``1`` as a
+      path and rejected EVERY fd-dup — the canonical Tier-2 fd-sever
+      ``exec >/dev/null 2>&1`` could never pass (bug fixed here).
+    - heredoc / here-string (``<<`` / ``<<-`` / ``<<<``): a body, not a
+      discard sink — no recovery payload feeds one; rejected.
+    - every other operator opens/writes ``target``: it must name a discard
+      pseudo-device (``/dev/null`` & co). ``<>`` is write-capable (it CREATES
+      the target), so it can only pass by naming a sink — harmless — and a
+      real-file target fails here exactly as ``>`` does.
+    """
+    if redirect.operator in _FD_DUP_REDIRECT_OPS:
+        return True
+    if redirect.operator in _HEREDOC_REDIRECT_OPS:
+        return False
+    target = redirect.target
+    if target is None:
+        return False
+    value = target.value
+    return value is not None and value.startswith(_PAYLOAD_REDIRECT_SINKS)
 
 
 class ToolGuard:
@@ -390,6 +555,13 @@ class ToolGuard:
         # ``systemd-run <cmd>`` would be a synchronous arbitrary-execution
         # bypass of this whitelist.
         "systemd-run",
+        # Self-recovery detached-timer carrier (Tier 2, host_shell) for hosts
+        # WITHOUT systemd: admitted only as ``setsid --fork sh -c '<script>'``
+        # by ``_check_setsid`` below — the no-systemd twin of ``systemd-run``.
+        # ``--fork`` is constitutive (setsid does not fork by default, so a
+        # bare form would block the caller for the whole recovery window);
+        # a bare ``setsid <cmd>`` is a synchronous arbitrary-execution bypass.
+        "setsid",
         # Single-resource fault primitives (Tier 2, host_shell): each is the only
         # single-command way to express its fault, and each is narrowed to that
         # form by its own guard (_check_nc listen-only, _check_fuser
@@ -586,6 +758,7 @@ class ToolGuard:
             "fuser": self._check_fuser,
             "strace": self._check_strace,
             "systemd-run": self._check_systemd_run,
+            "setsid": self._check_setsid,
             "rm": self._check_rm,
             "wiz": self._check_wiz,
         }
@@ -660,13 +833,12 @@ class ToolGuard:
                 is_hard_floor=True,
                 # The guard KNOWS the allow-list; withholding it forces the
                 # model to guess from a tool docstring that may be stale. Cheap
-                # to state, and it is the only authoritative source.
-                compliant_form=(
-                    "Runnable binaries: "
-                    + ", ".join(sorted(self.allowed_commands))
-                    + ". Read-only host diagnostics (df/ps/ss/cat/...) are NOT "
-                    "here on purpose — reach them through the host_read tool, "
-                    "not this binary whitelist."
+                # to state, and it is the only authoritative source. Dispatched
+                # on the binary because an interpreter is a different situation
+                # from an unknown binary and the generic text misdirects it
+                # (see the helper's docstring for the measured cost).
+                compliant_form=_unknown_binary_compliant_form(
+                    binary, self.allowed_commands
                 ),
             )
 
@@ -763,6 +935,14 @@ class ToolGuard:
         if binary == "systemd-run":
             carrier_payload_tokens = _systemd_run_payload_tokens(cmd)
             carrier_option_tokens = frozenset(cmd[1 : _systemd_run_payload_start(cmd)])
+        elif binary == "setsid":
+            # The no-systemd twin of systemd-run: ``setsid --fork sh -c '…'``
+            # carries the same ``sh -c '<script>'`` payload region, already
+            # re-admitted by ``_check_setsid`` above — a quoted
+            # ``$(pgrep -f x)`` there is a TARGET-shell expansion, not a host
+            # injection. ``--fork``/``-w`` are the option region.
+            carrier_payload_tokens = _setsid_payload_tokens(cmd)
+            carrier_option_tokens = frozenset(cmd[1 : _setsid_payload_start(cmd)])
         elif binary == "wiz":
             carrier_payload_tokens = frozenset(_wiz_command_values(cmd))
             carrier_option_tokens = frozenset(
@@ -952,7 +1132,8 @@ class ToolGuard:
             # NOT a hard floor: reshaping the call to the carrier skeleton
             # makes the same intent legal.
             compliant_form=(
-                "kubectl run <drill-rc-<hash>> -n <ns> --image=busybox:1.36 "
+                "kubectl run <drill-rc-<hash>> -n <ns> "
+                "--image=curlimages/curl:latest "
                 "--restart=Never --command -- sleep <N> (see "
                 "references/carrier/recovery-carrier.md; --overrides admits "
                 "spec.serviceAccountName only; any healthy-DaemonSet image "
@@ -1236,6 +1417,95 @@ class ToolGuard:
             )
         return self._admit_command_region(cmd[payload_start:], "timer")
 
+    def _check_setsid(self, cmd: list[str]) -> GuardFeedback | None:
+        """Admit ``setsid`` ONLY as a Tier-2 (no-systemd) self-recovery
+        detached-timer carrier:
+        ``setsid --fork sh -c 'exec >/dev/null 2>&1; sleep <N> && <inverse>'``.
+
+        The no-systemd twin of ``systemd-run --on-active=<N>s``: on a host with
+        no systemd (minimal container / non-systemd init / wiz executor) the
+        drill arms a detached child that sleeps the recovery window then runs
+        the idempotent inverse — so a native fault self-reverses even if the
+        session dies ("先武装定时恢复，再注入").
+
+        ``--fork`` is CONSTITUTIVE, exactly as ``--on-active`` is for
+        systemd-run: setsid(1) does NOT fork by default (only when it is
+        already a process-group leader), so a bare ``setsid sh -c 'sleep N; …'``
+        BLOCKS the caller for the whole window — the arm step never returns and
+        arm-then-inject fails structurally. ``--fork`` forces the detach (parent
+        exits at once; the child enters a new session — new SID, PPID=1 — so it
+        survives the SSH/transport session's SIGHUP and fires at its deadline).
+        ``--wait``/``-w`` is the opposite (waits for the child) and is refused.
+
+        ``--fork`` severs the PROCESS TREE, but over a pipe transport (SSH /
+        exec channel) the detached child still inherits the channel's fd1/fd2,
+        so the transport server waits for EOF on its output pipe for the WHOLE
+        sleep window and the arm call blocks anyway (measured live: 8112ms).
+        The script's leading ``exec >/dev/null 2>&1`` is the STDIO twin of
+        ``--fork``: it closes those inherited fds so the server sees EOF at
+        once (69ms) while the child lives on to fire. It MUST sit INSIDE the
+        ``sh -c`` script — the transport ``shlex.quote``s every argv token, so
+        a redirect at the setsid argv level is literalized into a dead argument
+        (measured live: 8074ms, still blocks). ``_admit_script_facts`` admits
+        that bare-``exec`` fd-sever (and only it: ``exec <program>`` stays a
+        hard floor); the setsid argv SHAPE is unchanged, so
+        :func:`is_setsid_detached_timer` — the single source shared with the
+        machinery≠mutation attributor — still recognises it.
+
+        Once the detached form is confirmed, the payload region
+        (``sh -c '<script>'``) is RE-ADMITTED through
+        :meth:`_admit_command_region` — the child executing the script at its
+        deadline is still that script EXECUTING, so it must meet the same Gate ①
+        whitelist and Gate ③ checkers a directly-run command meets (no ``&``, no
+        subshell, no nested interpreter/carrier, discard-sink redirects only).
+        """
+        args = cmd[1:]
+        # --wait / -w waits for the child to exit — synchronous, the opposite
+        # of a fire-and-forget arm. Never admitted.
+        if any(a in ("--wait", "-w") for a in args):
+            return GuardFeedback(
+                allowed=False,
+                constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+                reason="setsid --wait blocks the caller until the child exits",
+                offending=next(a for a in args if a in ("--wait", "-w")),
+                compliant_form=(
+                    "Arm a detached self-recovery timer: `setsid --fork sh -c "
+                    "'exec >/dev/null 2>&1; sleep <N> && <inverse-cmd>'` — "
+                    "--fork returns immediately, the leading exec severs the "
+                    "inherited channel stdio so the arm does not block, and the "
+                    "child fires at its deadline. --wait/-w waits for the child, "
+                    "which defeats the fire-and-forget arm."
+                ),
+            )
+        # --fork (or its -f short form) is what makes the carrier detached;
+        # without it setsid runs the payload synchronously in the caller's
+        # session — an arbitrary-execution bypass wearing a whitelisted name.
+        # This armed check is shared with the machinery≠mutation attributor via
+        # the module-level single source ``is_setsid_detached_timer`` (the
+        # Tier-2 twin of is_systemd_run_timer, R23/G-7) — admission here and
+        # exemption there are ONE verdict.
+        if not any(a in ("--fork", "-f") for a in args):
+            return GuardFeedback(
+                allowed=False,
+                constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+                reason=(
+                    "setsid is admitted only as a detached self-recovery "
+                    "timer (--fork)"
+                ),
+                offending="setsid",
+                compliant_form=(
+                    "Arm the detached timer: `setsid --fork sh -c "
+                    "'exec >/dev/null 2>&1; sleep <N> && <inverse-cmd>'`. "
+                    "setsid does NOT fork by default, so without --fork the "
+                    "caller blocks for the whole sleep window (arm-then-inject "
+                    "never proceeds); --fork detaches the child into a new "
+                    "session that survives the session's death and fires at the "
+                    "deadline."
+                ),
+            )
+        payload_start = _setsid_payload_start(cmd)
+        return self._admit_command_region(cmd[payload_start:], "setsid")
+
     def _check_wiz(self, cmd: list[str]) -> GuardFeedback | None:
         """Re-admit the ``--command`` value of an LLM-authored ``wiz`` argv.
 
@@ -1286,15 +1556,17 @@ class ToolGuard:
 
         Gate ① (binary whitelist) and Gate ③ (per-binary checkers) both key
         on ``cmd[0]`` alone, so a second command riding INSIDE a whitelisted
-        carrier's argv — the timer payload of ``systemd-run``, the
-        ``--command`` value of ``wiz task exec`` — reached execution meeting
-        neither. This is the hole-class fix: the region passes the SAME
-        admission judgment a directly-executed command would.
+        carrier's argv — the timer payload of ``systemd-run``, the detached
+        payload of ``setsid --fork``, the ``--command`` value of ``wiz task
+        exec`` — reached execution meeting neither. This is the hole-class fix:
+        the region passes the SAME admission judgment a directly-executed
+        command would.
 
-        Coverage is exactly those two carriers, by design: both payload
-        regions execute OUTSIDE the k8s target model — on the host (timer)
-        or on a remote host (``wiz`` task exec) — where ``approved_target``
-        has no jurisdiction and this grammar is the only line of defence.
+        Coverage is exactly those three carriers, by design: their payload
+        regions execute OUTSIDE the k8s target model — on the host (the
+        ``systemd-run`` timer, the no-systemd ``setsid`` detached-timer) or on
+        a remote host (``wiz`` task exec) — where ``approved_target`` has no
+        jurisdiction and this grammar is the only line of defence.
         ``kubectl exec … -- sh -c '<script>'`` is deliberately NOT in this
         hole class: its payload lands inside a k8s object (the target
         container) — ``target_guard``'s jurisdiction — and exec into a
@@ -1475,6 +1747,77 @@ class ToolGuard:
                         "directly in the payload."
                     ),
                 )
+            # A BARE ``exec`` (no command args) carrying only discard-sink
+            # redirects is a pure fd reassignment — the Tier-2 detached-timer
+            # carrier's STDIO SEVER, the twin of setsid's ``--fork``.
+            # ``setsid --fork`` detaches the child from the caller's process
+            # session (new SID, PPID=1) so it survives the session's death;
+            # but over a pipe transport (SSH / exec channel) the forked child
+            # ALSO inherits the channel's fd1/fd2, so the transport server
+            # waits for EOF on its output pipe for the WHOLE ``sleep`` window
+            # and the arm call blocks (or hits the tool timeout — measured
+            # live: 8112ms block vs 69ms with the sever). ``exec >/dev/null
+            # 2>&1`` as the script's FIRST act closes those inherited fds, so
+            # the server sees EOF at once while the detached child lives on to
+            # fire at its deadline. It must sit INSIDE the ``sh -c`` script —
+            # the transport ``shlex.quote``s every argv token, so a redirect at
+            # the setsid argv level (``setsid … sh -c '…' >/dev/null``) is
+            # literalized into a dead argument and never reaches the remote
+            # shell (measured live: 8074ms, still blocks). ``exec <program>``
+            # (any arg) is NOT exempt — it replaces the shell with an
+            # arbitrary binary, a hard floor. Redirect targets are validated
+            # by the SAME discard-sink classifier every payload redirect uses.
+            if head == "exec" and not subst_probe:
+                if seg.command.args:
+                    return GuardFeedback(
+                        allowed=False,
+                        constraint=ViolatedConstraint.UNKNOWN_BINARY,
+                        reason=(
+                            f"{carrier} payload uses `exec <command>` — replacing "
+                            "the shell with an arbitrary program"
+                        ),
+                        offending="exec",
+                        is_hard_floor=True,
+                        compliant_form=(
+                            "A payload `exec` may ONLY reassign fds to a discard "
+                            "sink (`exec >/dev/null 2>&1`, the detached-timer "
+                            "stdio sever); it must not name a program. Run the "
+                            "recovery steps as ordinary whitelisted commands."
+                        ),
+                    )
+                if not seg.command.redirects:
+                    return GuardFeedback(
+                        allowed=False,
+                        constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+                        reason=(f"{carrier} payload has a bare `exec` with no redirect"),
+                        offending="exec",
+                        compliant_form=(
+                            "A payload `exec` exists only to sever the detached "
+                            "child's inherited stdio: `exec >/dev/null 2>&1`."
+                        ),
+                    )
+                for redirect in seg.command.redirects:
+                    if not _redirect_is_discard_sink(redirect):
+                        shown = (
+                            redirect.target.value
+                            if redirect.target is not None
+                            and redirect.target.value is not None
+                            else redirect.operator
+                        )
+                        return GuardFeedback(
+                            allowed=False,
+                            constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+                            reason=(
+                                f"{carrier} payload `exec` fd-sever redirects to "
+                                f"non-sink target: {shown}"
+                            ),
+                            offending=shown,
+                            compliant_form=(
+                                "The stdio sever discards output only: "
+                                "`exec >/dev/null 2>&1`."
+                            ),
+                        )
+                continue  # fd-only exec admitted; no binary checker to replay
             if subst_probe:
                 head_ok = head in _PAYLOAD_SUBST_PROBES
             else:
@@ -1502,9 +1845,13 @@ class ToolGuard:
                     ),
                 )
             for redirect in seg.command.redirects:
-                target = redirect.target.value if redirect.target is not None else None
-                if target is None or not target.startswith(_PAYLOAD_REDIRECT_SINKS):
-                    shown = target if target is not None else "?"
+                if not _redirect_is_discard_sink(redirect):
+                    shown = (
+                        redirect.target.value
+                        if redirect.target is not None
+                        and redirect.target.value is not None
+                        else redirect.operator
+                    )
                     return GuardFeedback(
                         allowed=False,
                         constraint=ViolatedConstraint.UNSUPPORTED_FORM,
@@ -1729,7 +2076,9 @@ class ToolGuard:
                 compliant_form=(
                     "Add `-l` (e.g. `nc -l -p <port> -k`). Client mode opens an "
                     "outbound connection to an arbitrary host, which no target "
-                    "approval bounds; to CHECK a port, use host_read."
+                    "approval bounds; to CHECK a port, run a single read-only "
+                    "command through host_inject (e.g. `ss -ltn`) — host_read is "
+                    "not bound in this phase."
                 ),
             )
         return None

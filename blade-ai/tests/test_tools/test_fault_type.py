@@ -76,6 +76,48 @@ class TestEnsureMinDuration:
             assert ensure_min_duration("60", "node", "network", "delay") == 60
         assert "below the recommended" in caplog.text
 
+    def test_bottom_layer_suppresses_explicit_floor_warning(self, caplog):
+        """The BOTTOM injection layer passes ``warn_explicit_below_floor=False``.
+
+        Its ``--timeout`` is the engine-pinned RECOVERY TIMER (D+G), not the
+        observation window D the floor is empirically derived from, and the
+        D-owning layer (inject.py / extract_planning_metadata / l4 adapter)
+        has already warned. The value must still pass through verbatim — only
+        the redundant, wrong-number second warning is suppressed. Locks the
+        fix for the double "Explicit timeout ... below the recommended floor"
+        lines (one on D at the contract layer, one on D+G at the bottom layer)
+        seen in a single host-corrupt run.
+        """
+        with caplog.at_level(logging.WARNING, logger="chaos_agent.utils.fault_type"):
+            assert ensure_min_duration(
+                240, "host", "network", "corrupt",
+                warn_explicit_below_floor=False,
+            ) == 240
+        assert "below the recommended" not in caplog.text
+
+    def test_bottom_layer_flag_does_not_suppress_configured_default_warning(
+        self, caplog
+    ):
+        """``warn_explicit_below_floor=False`` gates ONLY the explicit branch.
+
+        The absent-value branch injects the operator-configured default and
+        must still surface its own below-floor warning — that is a distinct
+        operator-config signal, not the redundant recovery-timer one.
+        """
+        from chaos_agent.config.settings import blade_ai_context
+
+        with blade_ai_context(experiment_timeout=60):
+            with caplog.at_level(
+                logging.WARNING, logger="chaos_agent.utils.fault_type"
+            ):
+                assert ensure_min_duration(
+                    None, "host", "network", "corrupt",
+                    warn_explicit_below_floor=False,
+                ) == 60
+        assert "Configured experiment_timeout 60s is below the recommended" in (
+            caplog.text
+        )
+
     def test_sufficient_timeout_not_reduced(self):
         assert ensure_min_duration(800, "pod", "cpu", "fullload") == 800
 

@@ -17,6 +17,8 @@ from chaos_agent.tools.file_reader import safe_read_file
 from chaos_agent.tools.file_search import safe_search_files
 from chaos_agent.tools.file_writer import safe_write_file
 from chaos_agent.tools.host_cmd import host_inject, host_read
+from chaos_agent.tools.host_http_probe_cli import host_http_probe
+from chaos_agent.tools.http_probe_cli import http_probe
 from chaos_agent.tools.knowledge_reader import read_knowledge_resource
 from chaos_agent.tools.kubectl_cli import kubectl, kubectl_read
 from chaos_agent.tools.web_search_tool import web_search
@@ -24,6 +26,8 @@ from chaos_agent.tools.web_search_tool import web_search
 __all__ = [
     "host_inject",
     "host_read",
+    "host_http_probe",
+    "http_probe",
     "kubectl",
     "kubectl_read",
     "safe_read_file",

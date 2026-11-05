@@ -9,16 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Annotated
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
-from langgraph.prebuilt import InjectedState
-
-from chaos_agent.tools.progress import (
-    REDLINE_REMINDER_MARK,
-    behavioral_reminder_due,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +66,6 @@ def check_and_reset_wait_guard(messages: list) -> None:
 @tool
 async def time_wait(
     seconds: int = 10,
-    *,
-    state: Annotated[dict | None, InjectedState] = None,
 ) -> str:
     """Pause execution for the given seconds.
 
@@ -93,7 +84,6 @@ async def time_wait(
       - seconds: Wait length (1-60, default 10). Clamped to 60.
 
     Output: Confirmation of how long was waited. Side effects: None.
-    A missing behavioral probe appends one RED-LINE REMINDER per injection window.
     """
     global _last_tool_was_wait, _call_count
 
@@ -118,21 +108,9 @@ async def time_wait(
     await asyncio.sleep(clamped)
     _last_tool_was_wait = True
     _call_count += 1
-    receipt = f"Waited {clamped} seconds. Proceed with your next action."
-    # o10 (r68 review): the red line bans WAITING on missing behavioral
-    # evidence too — finish_execution already guards the third banned
-    # move; this guards the first. Soft like the finish gate: the wait
-    # itself proceeds, the receipt carries the reminder (one-shot per
-    # injection window — behavioral_reminder_due's latch).
-    try:
-        if behavioral_reminder_due(state):
-            receipt += (
-                f" {REDLINE_REMINDER_MARK} (soft gate): no behavioral evidence of "
-                "the fault's user-visible effect yet — only mechanism "
-                "readbacks. Waiting consumes the fault window in which "
-                "effect evidence can still be collected: probe once (logs "
-                "/ events / top / an exec probe) before waiting further."
-            )
-    except Exception:  # noqa: BLE001 — a reminder must never break the wait
-        logger.debug("behavioral reminder check failed", exc_info=True)
-    return receipt
+    # Arm-then-handoff (task-821d4bb4): waiting here no longer carries a
+    # "go probe the effect" red-line reminder. Effect evidence is the
+    # verifier's to collect — the router hands it the whole remaining fault
+    # window the moment the last mutation lands, so nudging the executor to
+    # probe (or to fret about a missing probe) only burns that window.
+    return f"Waited {clamped} seconds. Proceed with your next action."

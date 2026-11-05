@@ -26,9 +26,10 @@ import shlex
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolArg, tool
+from langgraph.prebuilt import InjectedState
 
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
@@ -39,6 +40,7 @@ from chaos_agent.transports import (
     TransportTarget,
     display_via_transport,
     execute_via_transport,
+    resolve_transport_target,
 )
 from chaos_agent.utils.truncation import (
     TOOL_OUTPUT_SAFETY_VALVE_BYTES,
@@ -462,6 +464,8 @@ async def _ephemeral_spec_names(
     target_pod: str,
     namespace: str,
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> set[str] | None:
     """Ephemeral container names present on the pod BEFORE dispatch.
 
@@ -472,12 +476,13 @@ async def _ephemeral_spec_names(
     fetch FAILED (not "the pod has none") — the caller must then treat every
     candidate as unconfirmed rather than as freshly created.
     """
+    if target is None:
+        target = resolve_transport_target(None)
     cmd = build_kubectl_cmd(
         "get", ["pod", target_pod, "-n", namespace, "-o", "json"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     try:
-        target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, target, timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
         )
@@ -519,6 +524,8 @@ def _extract_debug_profile(v_args: str) -> str:
 
 async def _resolve_effective_namespace(
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> str:
     """Resolve the namespace selected by the active transport context.
 
@@ -526,13 +533,14 @@ async def _resolve_effective_namespace(
     transport that will create the debug pod.  Falling back to ``default`` is
     Kubernetes-compatible, but only after the live context produced no value.
     """
+    if target is None:
+        target = resolve_transport_target(None)
     cmd = build_kubectl_cmd(
         "config",
         ["view", "--minify", "-o", "jsonpath={..namespace}"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     try:
-        target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, target, timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
         )
@@ -549,14 +557,17 @@ async def _debug_pod_metadata(
     pod_name: str,
     namespace: str,
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[dict, str]:
     """Read the authoritative identity and status of a created debug pod."""
+    if target is None:
+        target = resolve_transport_target(None)
     cmd = build_kubectl_cmd(
         "get", ["pod", pod_name, "-n", namespace, "-o", "json"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     try:
-        target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, target, timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
         )
@@ -624,9 +635,13 @@ async def _wait_for_created_debug_pod(
     pod_name: str,
     namespace: str,
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[bool, dict, str]:
     """Wait until a created debug pod is executable and return its identity."""
     wait_seconds = min(60, max(1, int(settings.timeout_kubectl_exec)))
+    if target is None:
+        target = resolve_transport_target(None)
     wait_cmd = build_kubectl_cmd(
         "wait",
         [
@@ -635,10 +650,9 @@ async def _wait_for_created_debug_pod(
             "-n", namespace,
             f"--timeout={wait_seconds}s",
         ],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     try:
-        target = TransportTarget.from_state({})
         wait_result = await execute_via_transport(
             wait_cmd, target, timeout=wait_seconds + 10, expect_profile=PROFILE_K8S,
         )
@@ -650,7 +664,7 @@ async def _wait_for_created_debug_pod(
         wait_error = str(exc)
 
     metadata, metadata_error = await _debug_pod_metadata(
-        pod_name, namespace, kubeconfig,
+        pod_name, namespace, kubeconfig, target=target,
     )
     if metadata_error:
         return False, {}, metadata_error
@@ -738,6 +752,8 @@ async def _wait_for_debug_pod_terminal(
     pod_name: str,
     namespace: str,
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[bool, dict, str]:
     """Poll a one-shot debug pod until its phase is terminal.
 
@@ -753,7 +769,7 @@ async def _wait_for_debug_pod_terminal(
     metadata: dict = {}
     while True:
         metadata, meta_error = await _debug_pod_metadata(
-            pod_name, namespace, kubeconfig,
+            pod_name, namespace, kubeconfig, target=target,
         )
         if meta_error:
             return False, {}, meta_error
@@ -774,14 +790,17 @@ async def _debug_pod_logs_tail(
     namespace: str,
     kubeconfig: str,
     tail: int = 20,
+    *,
+    target: TransportTarget | None = None,
 ) -> str:
     """Best-effort last ``tail`` log lines of a terminated debug pod."""
+    if target is None:
+        target = resolve_transport_target(None)
     cmd = build_kubectl_cmd(
         "logs", [pod_name, "-n", namespace, f"--tail={tail}"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     try:
-        target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, target, timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
         )
@@ -835,6 +854,8 @@ async def _wait_for_ephemeral_container(
     kubeconfig: str,
     pre_existing: set[str] | None = None,
     dispatch_ts: float = 0.0,
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[str, str, dict, str]:
     """Resolve + await the ephemeral container a Pod-scoped debug just created.
 
@@ -860,13 +881,14 @@ async def _wait_for_ephemeral_container(
     deadline = asyncio.get_running_loop().time() + wait_seconds
     last_error = ""
     container_name = ""
+    if target is None:
+        target = resolve_transport_target(None)
     while True:
         cmd = build_kubectl_cmd(
             "get", ["pod", target_pod, "-n", namespace, "-o", "json"],
-            kubeconfig,
+            kubeconfig, target=target,
         )
         try:
-            target = TransportTarget.from_state({})
             result = await execute_via_transport(
                 cmd, target, timeout=settings.timeout_kubectl,
                 expect_profile=PROFILE_K8S,
@@ -947,15 +969,18 @@ async def _delete_created_debug_pod(
     pod_name: str,
     namespace: str,
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> bool:
     """Best-effort removal for a debug pod that never became executable."""
+    if target is None:
+        target = resolve_transport_target(None)
     cmd = build_kubectl_cmd(
         "delete",
         ["pod", pod_name, "-n", namespace, "--ignore-not-found"],
-        kubeconfig,
+        kubeconfig, target=target,
     )
     try:
-        target = TransportTarget.from_state({})
         result = await execute_via_transport(
             cmd, target, timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
         )
@@ -972,27 +997,64 @@ async def _delete_created_debug_pod(
 
 def _build_kubectl_global_args(
     kubeconfig: str = "",
+    target: "TransportTarget | None" = None,
 ) -> list[str]:
-    """Build kubectl global flags list.
+    """Build kubectl global flags list — the LOCAL connection identity.
 
-    --kubeconfig: explicit parameter > settings (includes KUBECONFIG env via
-    AliasChoices). --context: runtime-channel authority (settings) ONLY —
-    never a caller parameter. --cluster is NOT emitted at all: under the
-    kubewiz/single-cluster lock the connection identity belongs to the
-    transport channel, and an LLM-supplied cluster name is always wrong
-    (K7: it caused exit-1 "cluster does not exist" detours, #51-R3).
+    This builder is CHANNEL-AGNOSTIC: it always emits the local connection
+    identity at the HEAD of the command (before the subcommand) —
+    ``--kubeconfig`` from param > target, and ``--context`` from the target.
+
+    CONNECTION IDENTITY HAS ONE SOURCE: the ``TransportTarget``.  Both flags
+    are read from the SAME authoritative target the transport layer resolves
+    the channel from — NEVER from the process-global ``settings``.  A target
+    hydrates from graph state > settings (``TransportTarget._from_state``), so
+    a per-task identity flows from the PERSISTED STATE: it survives the
+    inject→confirm→recover checkpoint boundary (those later requests carry no
+    connection fields — the state is their only source) and is inherently
+    concurrency-isolated (each task owns its own state, so two concurrent
+    injects can never stomp a shared global).  Reading ``settings.kube_context``
+    directly here — the pre-cure behaviour — made the process-global the carrier
+    of per-task identity: concurrent injects overwrote each other's ``--context``,
+    and a confirm/recover resume (a fresh request with no scope) fell back to the
+    server default and hit the WRONG cluster.  ``target=None`` resolves to
+    ``resolve_transport_target(None)`` (empty state → settings defaults), so a
+    standalone/CLI caller with no per-task state is byte-identical to before.
+
+    Whether those flags SURVIVE to execution is decided by the AUTHORITATIVE
+    transport channel — ``TransportRegistry.resolve(target)``, the same
+    resolution that picks the channel's ``wrap_command``:
+
+    - local ``kubeconfig`` channel: kubectl runs as a local subprocess against a
+      local kubeconfig file, so the flags are meaningful and kept verbatim.
+    - remote ``kubewiz_k8s`` / ``kubewiz_host`` / ``ssh`` channels: kubectl runs
+      on a remote node where a local kubeconfig path does not exist (leaking it
+      makes the remote kubectl fail with ``stat <local-path>: no such file or
+      directory``). Each remote channel strips the leading flags in its
+      ``wrap_command`` / ``display_command`` via ``strip_local_connection_flags``.
+
+    Because BOTH the flag values here AND the strip/keep decision ride the SAME
+    target-resolved channel, build and execution cannot disagree. The strip lives
+    on every remote channel, so a newly added remote channel suppresses the flags
+    by default rather than silently leaking a local path.
+
+    --cluster is never emitted for any channel: under the kubewiz/single-cluster
+    lock an LLM-supplied cluster name is always wrong (K7: it caused exit-1
+    "cluster does not exist" detours, #51-R3).
     """
+    t = target if target is not None else resolve_transport_target(None)
     args: list[str] = []
 
-    # --kubeconfig: tool param > settings fallback
-    kc = kubeconfig or settings.kubeconfig_path
+    # --kubeconfig: explicit tool param > target (target already folds in the
+    # state > settings fallback via TransportTarget._from_state).
+    kc = kubeconfig or t.kubeconfig
     if kc:
         kc = os.path.expanduser(kc)
         args.extend(["--kubeconfig", kc])
 
-    # --context: settings only (runtime channel owns connection identity)
-    if settings.kube_context:
-        args.extend(["--context", settings.kube_context])
+    # --context: the target only (state > settings) — never the process-global.
+    if t.kube_context:
+        args.extend(["--context", t.kube_context])
 
     return args
 
@@ -1002,11 +1064,18 @@ def build_kubectl_cmd(
     v_args: "list[str] | str" = "",
     kubeconfig: str = "",
     settings=None,
+    target: "TransportTarget | None" = None,
 ) -> list[str]:
     """Build a raw kubectl command (no transport wrapper).
 
     Returns ``[kubectl, --kubeconfig, ..., subcommand, ...args]``.
     Transport wrapping (wiz/ssh) is handled by the transport layer.
+
+    ``target`` is the authoritative source of the local connection identity
+    (``--kubeconfig`` / ``--context``); see ``_build_kubectl_global_args``. Call
+    sites that already resolve a ``TransportTarget`` for ``execute_via_transport``
+    MUST pass that same target here so the built command and the executing
+    channel agree. ``None`` falls back to settings defaults (standalone/CLI).
     """
     if isinstance(v_args, str) and v_args:
         args_list = _split_args(v_args)
@@ -1018,7 +1087,7 @@ def build_kubectl_cmd(
     runtime_settings = settings or globals()["settings"]
 
     cmd = [runtime_settings.kubectl_path]
-    cmd.extend(_build_kubectl_global_args(kubeconfig))
+    cmd.extend(_build_kubectl_global_args(kubeconfig, target=target))
     cmd.append(subcommand)
     cmd.extend(args_list)
     return cmd
@@ -1030,6 +1099,8 @@ async def exec_kubectl_raw(
     kubeconfig: str = "",
     timeout: float = 30.0,
     stdin_data: str = "",
+    *,
+    target: TransportTarget | None = None,
 ) -> CommandResult:
     """Execute kubectl via transport layer (lightweight internal checks).
 
@@ -1043,8 +1114,9 @@ async def exec_kubectl_raw(
     template — deliberately NOT whitelisted on the LLM face, design D2
     of openspec change ``faultdrill-cr-channel``).
     """
-    cmd = build_kubectl_cmd(subcommand, v_args, kubeconfig)
-    target = TransportTarget.from_state({})
+    if target is None:
+        target = resolve_transport_target(None)
+    cmd = build_kubectl_cmd(subcommand, v_args, kubeconfig, target=target)
     try:
         return await execute_via_transport(
             cmd, target, timeout=timeout, stdin_data=stdin_data,
@@ -1060,13 +1132,14 @@ async def exec_kubectl_raw(
         return CommandResult(exit_code=-1, stdout="", stderr=str(exc))
 
 
-def display_cmd(cmd: list[str]) -> str:
+def display_cmd(cmd: list[str], target: TransportTarget | None = None) -> str:
     """Return a human/LLM-facing command string.
 
     Delegates to the transport layer to strip any transport wrapper
     (wiz/ssh) and show only the inner semantic command.
     """
-    target = TransportTarget.from_state({})
+    if target is None:
+        target = resolve_transport_target(None)
     return display_via_transport(cmd, target)
 
 
@@ -1106,6 +1179,7 @@ async def query_kubectl(
     kubeconfig: str = "",
     *,
     log_name: str = "kubectl query",
+    target: TransportTarget | None = None,
 ) -> QueryOutcome:
     """Run ONE kubectl ``get`` through the transport; never raises (B81).
 
@@ -1123,12 +1197,13 @@ async def query_kubectl(
     """
     from chaos_agent.transports import (
         PROFILE_K8S,
-        TransportTarget,
         execute_via_transport,
+        resolve_transport_target,
     )
 
-    cmd = build_kubectl_cmd("get", args, kubeconfig=kubeconfig)
-    target = TransportTarget.from_state({})
+    if target is None:
+        target = resolve_transport_target(None)
+    cmd = build_kubectl_cmd("get", args, kubeconfig=kubeconfig, target=target)
     try:
         result = await execute_via_transport(
             cmd, target, timeout=settings.timeout_kubectl,
@@ -1175,7 +1250,9 @@ async def kubectl(
     subcommand: str,
     v_args: str = "",
     stdin_data: str = "",
-    kubeconfig: str = "",
+    kubeconfig: Annotated[str, InjectedToolArg] = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
 ) -> str:
     """Phase 2 (execution): full kubectl incl. mutation. Pick `subcommand`,
     pass remaining CLI args as `v_args`. NOT Phase 1 — use ``kubectl_read``.
@@ -1197,9 +1274,10 @@ async def kubectl(
         quote any arg with spaces or double quotes (jsonpath, `-p` JSON):
         `-o 'jsonpath={range...}'`, `-p '{"spec":...}'`.
       - stdin_data: YAML for ``apply -f -`` (not via v_args/exec heredoc).
-      - kubeconfig: path override; never --kubeconfig/--context/--cluster
-        in v_args (auto-stripped). Connection identity is owned by the
-        runtime channel — passing a cluster name cannot work.
+      - Connection identity is runtime-owned (kubeconfig is framework-
+        injected, never an LLM parameter): do NOT put --kubeconfig/
+        --context/--cluster in v_args (auto-stripped); a cluster name
+        cannot work.
 
     Output: stdout, or "Error: ..." on non-zero exit.
 
@@ -1231,7 +1309,10 @@ async def kubectl(
         knowledge `recovery-carrier-arming.md`).
       - Unknown-flag error → `--help`; do NOT guess and retry.
     """
-    return await _kubectl_impl(subcommand, v_args, kubeconfig, stdin_data=stdin_data)
+    return await _kubectl_impl(
+        subcommand, v_args, kubeconfig, stdin_data=stdin_data,
+        target=resolve_transport_target(state or {}),
+    )
 
 
 #: Appended to an empty ``get`` result that carried a label selector.
@@ -1254,13 +1335,26 @@ async def _kubectl_impl(
     v_args: str = "",
     kubeconfig: str = "",
     stdin_data: str = "",
+    *,
+    probe_mode: bool = False,
+    target: TransportTarget | None = None,
 ) -> str:
-    """Shared kubectl execution logic used by both kubectl and kubectl_read."""
+    """Shared kubectl execution logic used by both kubectl and kubectl_read.
+
+    ``probe_mode`` (opt-in, default False ⇒ byte-identical behaviour for the
+    LLM-facing ``kubectl`` / ``kubectl_read`` tools) is for typed probe tools
+    (``http_probe``) whose exec'd command SPEAKS IN EXIT CODES: a non-zero
+    exit is the probe's own answer (curl exit 7 = connection refused, 28 =
+    timeout — i.e. the fault LANDED), not a channel failure. When the command
+    really ran and produced stdout, probe_mode returns that stdout verbatim
+    instead of the ``Error:`` wrapper, so the caller parses the structured
+    observation. See the ``result.exit_code != 0`` branch below.
+    """
     # Transport target drives channel selection downstream; stdin_data rides
     # along via execute_via_transport, which folds it into the command on
     # channels without a native stdin pipe (wiz) — no channel-specific
     # rejection here any more (task-349ccf5d deadlock).
-    _target = TransportTarget.from_state({})
+    _target = target if target is not None else resolve_transport_target(None)
 
     processed_args: list[str] = []
 
@@ -1353,7 +1447,7 @@ async def _kubectl_impl(
         debug_namespace = _namespace_from_args(processed_args)
         if not debug_namespace:
             debug_namespace = await _resolve_effective_namespace(
-                kubeconfig,
+                kubeconfig, target=_target,
             )
             # R45: inject before the TRUE separator — the same value-slot
             # rule as the hygiene boundary above (a ``--`` in a flag's
@@ -1374,7 +1468,7 @@ async def _kubectl_impl(
         _pre_target_pod = _debug_target_pod_name(processed_args)
         if _pre_target_pod:
             _pre_ec_names = await _ephemeral_spec_names(
-                _pre_target_pod, debug_namespace, kubeconfig,
+                _pre_target_pod, debug_namespace, kubeconfig, target=_target,
             )
 
     # Auto-inject/normalize --timeout for kubectl exec blade create commands.
@@ -1406,7 +1500,14 @@ async def _kubectl_impl(
                 _current_int = int(_timeout_value)
             except (ValueError, TypeError):
                 _current_int = 0
-            _effective = ensure_min_duration(_timeout_value, _scope, _fault_target, _action)
+            # ``warn_explicit_below_floor=False``: a present ``--timeout`` here
+            # is the engine-pinned RECOVERY TIMER (D+G, layer 3), not the
+            # observation window D the floor is derived from — the D-owning
+            # layer already warned (see fault_type.ensure_min_duration).
+            _effective = ensure_min_duration(
+                _timeout_value, _scope, _fault_target, _action,
+                warn_explicit_below_floor=False,
+            )
             if _effective != _current_int:
                 _timeout_idx = processed_args.index("--timeout")
                 processed_args[_timeout_idx + 1] = str(_effective)
@@ -1415,7 +1516,7 @@ async def _kubectl_impl(
                     f"for {_scope}-{_fault_target}-{_action}"
                 )
 
-    cmd = build_kubectl_cmd(subcommand, processed_args, kubeconfig)
+    cmd = build_kubectl_cmd(subcommand, processed_args, kubeconfig, target=_target)
 
     # exec/debug subcommands use longer timeout (container commands may be slow;
     # debug needs to pull images and create ephemeral containers)
@@ -1461,6 +1562,20 @@ async def _kubectl_impl(
         )
 
     if result.exit_code != 0:
+        # Probe mode: a non-zero exit is the probe's OWN answer, not a channel
+        # failure. curl speaks in exit codes (7 refused / 28 timeout / 6 DNS)
+        # and still prints its ``-w`` write-out line to stdout on every one of
+        # them, so non-empty stdout is the reliable "the command really ran and
+        # answered" signal — the SAME discriminator as the A4 probe note below.
+        # Return that stdout verbatim (safety-valve governed) so the caller
+        # parses the structured observation instead of an "Error:" wrapper that
+        # would read as a channel fault. A kubectl CLIENT-side failure (pod not
+        # found, exec refused) writes stderr only ⇒ empty stdout ⇒ falls through
+        # to the normal error path, which is correct: that IS a real failure.
+        if probe_mode and result.stdout and result.stdout.strip():
+            return apply_output_safety_valve(
+                result.stdout, kind="success-output",
+            )
         # 通道层已根治（protocol.parse_wiz_output 哨兵展开，失败时远端
         # stderr 回归 result.stderr），但合并双流仍是正确取值：直接模式
         # 报错在 stderr；kubewiz 无哨兵的旧回执错误仍在 stdout；jsonpath
@@ -1635,6 +1750,7 @@ async def _kubectl_impl(
                     _target_pod, _debug_ns, kubeconfig,
                     pre_existing=_pre_ec_names,
                     dispatch_ts=_debug_start_ts,
+                    target=_target,
                 )
             )
             if not container_name:
@@ -1765,18 +1881,18 @@ async def _kubectl_impl(
         # report the COMMAND's exit code instead (task-29848471 false alarm).
         if _debug_has_oneshot_command(processed_args):
             terminal, metadata, terminal_error = await _wait_for_debug_pod_terminal(
-                _debug_pod, _debug_ns, kubeconfig,
+                _debug_pod, _debug_ns, kubeconfig, target=_target,
             )
             if metadata.get("namespace"):
                 _debug_ns = metadata["namespace"]
             logs_tail = await _debug_pod_logs_tail(
-                _debug_pod, _debug_ns, kubeconfig,
+                _debug_pod, _debug_ns, kubeconfig, target=_target,
             )
             # A finished one-shot has served its purpose — remove it whether
             # the command succeeded or not; task-level cleanup remains the
             # second safety net.
             cleaned = await _delete_created_debug_pod(
-                _debug_pod, _debug_ns, kubeconfig,
+                _debug_pod, _debug_ns, kubeconfig, target=_target,
             )
             if terminal:
                 _exit = metadata.get("exit_code")
@@ -1855,14 +1971,14 @@ async def _kubectl_impl(
         # ---- INTERACTIVE mode (`debug ... -- sleep N` style, or no `--`):
         # the pod must become Ready so the caller can exec into it.
         ready, metadata, ready_error = await _wait_for_created_debug_pod(
-            _debug_pod, _debug_ns, kubeconfig,
+            _debug_pod, _debug_ns, kubeconfig, target=_target,
         )
         if metadata.get("namespace"):
             _debug_ns = metadata["namespace"]
         cleaned = False
         if not ready:
             cleaned = await _delete_created_debug_pod(
-                _debug_pod, _debug_ns, kubeconfig,
+                _debug_pod, _debug_ns, kubeconfig, target=_target,
             )
         # _profile was extracted above the oneshot branch; debug-pod-meta
         # carries it for carrier resolution and diagnostics.
@@ -1950,7 +2066,9 @@ async def kubectl_read(
         "exec", "debug",
     ],
     v_args: str = "",
-    kubeconfig: str = "",
+    kubeconfig: Annotated[str, InjectedToolArg] = "",
+    *,
+    state: Annotated[dict | None, InjectedState] = None,
 ) -> str:
     """READ-ONLY kubectl — the observation tool for every read-only phase.
 
@@ -1972,12 +2090,14 @@ async def kubectl_read(
       - v_args: same shape as ``kubectl``; single-quote any arg containing
         spaces — especially a whole ``-o jsonpath=...`` template (unquoted
         literal text like ``capacity={...}`` gets word-split remotely).
-      - kubeconfig: path override. No context/cluster parameters —
-        connection identity is owned by the runtime channel.
+      - Connection identity is runtime-owned (kubeconfig is framework-
+        injected, never an LLM parameter); no context/cluster parameters.
 
     Output: same as the full ``kubectl`` tool (stdout / "Error: ...").
 
-    Side effects: none on cluster state (`debug`'s probe Pod auto-cleaned).
+    Side effects: none on cluster state — a one-shot `debug -- CMD` Pod is
+    tool-deleted; a `-- sleep N` keep-alive Pod is NOT (only removed at
+    planning exit — prefer one-shot for a single capability probe).
 
     Constraints:
       - exec inner: a read-only probe — one command, a pipeline, or a
@@ -2017,4 +2137,7 @@ async def kubectl_read(
             )
     # Call the shared implementation directly — NOT kubectl.ainvoke(), which
     # would emit a nested on_tool_start event (duplicate TUI tool card).
-    return await _kubectl_impl(subcommand, v_args, kubeconfig)
+    return await _kubectl_impl(
+        subcommand, v_args, kubeconfig,
+        target=resolve_transport_target(state or {}),
+    )
