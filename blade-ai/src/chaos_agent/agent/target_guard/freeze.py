@@ -21,7 +21,7 @@ field names + defaults.
 from __future__ import annotations
 
 import logging
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 from chaos_agent.agent.spec.fault_registry import is_host_scope, is_workload_scope
 from chaos_agent.agent.spec.fault_spec import FaultSpec
@@ -36,6 +36,9 @@ from .mechanism_writes import (
 )
 from .types import ApprovedTarget
 
+if TYPE_CHECKING:
+    from chaos_agent.transports import TransportTarget
+
 logger = logging.getLogger(__name__)
 
 def freeze_approved_target_from_spec(
@@ -47,6 +50,7 @@ def freeze_approved_target_from_spec(
     pvc_claims: tuple[str, ...] = (),
     mechanism_entries: tuple[MechanismWriteEntry, ...] = (),
     recovery_channel: str = "",
+    deterministic_verdict: Optional[dict] = None,
     widening_pending_approval: bool = False,
 ) -> Optional[dict]:
     """Build the ``approved_target`` snapshot from a FaultSpec.
@@ -82,8 +86,12 @@ def freeze_approved_target_from_spec(
         pvc_claims=pvc_claims,
         mechanism_entries=mechanism_entries,
         recovery_channel=recovery_channel,
+        deterministic_verdict=deterministic_verdict,
         widening_pending_approval=widening_pending_approval,
         duration_seconds=int(getattr(spec_obj, "duration_seconds", 0) or 0),
+        # Fix4 authority source: the verbatim entry intent rides the SPEC, so
+        # this single funnel carries it into every re-freeze site's snapshot.
+        user_description=str(getattr(spec_obj, "user_description", "") or ""),
     )
 
 
@@ -100,8 +108,10 @@ def freeze_approved_target(
     pvc_claims: tuple[str, ...] = (),
     mechanism_entries: tuple[MechanismWriteEntry, ...] = (),
     recovery_channel: str = "",
+    deterministic_verdict: Optional[dict] = None,
     widening_pending_approval: bool = False,
     duration_seconds: int = 0,
+    user_description: str = "",
 ) -> Optional[dict]:
     """Build the ``approved_target`` dict to store in AgentState.
 
@@ -235,6 +245,18 @@ def freeze_approved_target(
     # namespace/selector. The guard's host branch compares this directly.
     host_name = names[0] if is_host_scope(scope) and names else ""
 
+    # Case-file verdict-binding legislation (openspec mechanism-invariant-
+    # trust-boundary, decision C). Normalised + shape-validated through the
+    # SAME fail-safe helper the hydration path uses (single source of truth
+    # for the {target, action, expected} shape — guards a non-dict
+    # ``expected``, stringifies values, drops blanks, and rejects a
+    # declaration missing target/action). Empty when absent or malformed,
+    # so the key is written ONLY for a well-formed declaration and every
+    # legacy snapshot stays byte-identical (golden-locked); the verify
+    # layer's fallback ("no declaration → LLM-triple rule resolution") then
+    # reads off key absence, never a sentinel value.
+    _dv = _hydrate_deterministic_verdict(deterministic_verdict)
+
     return {
         "scope": scope,
         "namespace": namespace,
@@ -263,6 +285,7 @@ def freeze_approved_target(
         # read off key absence, not a sentinel value.
         **({"recovery_channel": str(recovery_channel).strip().lower()}
            if str(recovery_channel or "").strip() else {}),
+        **({"deterministic_verdict": _dv} if _dv else {}),
         # Pending-approval marker — present ONLY while the widened
         # contract awaits its knowing human, so both the no-manifest and
         # the post-approval snapshots stay byte-identical. Cleared by
@@ -277,7 +300,41 @@ def freeze_approved_target(
         # a duration, keeping the no-duration snapshot byte-identical.
         **({"duration_seconds": int(duration_seconds)}
            if duration_seconds else {}),
+        # Fix4 identity-degradation authority (openspec
+        # generalize-nonnode-victim-identity-correction): the verbatim entry
+        # intent, frozen so the drift policy can tell a degraded victim
+        # identity from a genuine unauthorized cross-kind drift. Key present
+        # ONLY when the caller supplied text, so the low-level path (no spec)
+        # and every legacy snapshot stay byte-identical (golden-locked).
+        **({"user_description": str(user_description)}
+           if str(user_description or "").strip() else {}),
     }
+
+
+def _hydrate_deterministic_verdict(raw) -> dict:
+    """Fail-safe re-validation of the frozen ``deterministic_verdict`` shape.
+
+    Returns ``{}`` for anything malformed (non-mapping, missing/blank
+    ``target`` or ``action``); otherwise normalises to
+    ``{"target", "action", "expected"}`` with ``expected`` coerced to a
+    ``str``→``str`` map (blank values dropped). Never raises — a corrupted
+    snapshot degrades to the LLM-triple fallback path, never a partial
+    declaration the verify layer could trust.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    target = str(raw.get("target") or "").strip()
+    action = str(raw.get("action") or "").strip()
+    if not target or not action:
+        return {}
+    expected_raw = raw.get("expected") or {}
+    expected: dict[str, str] = {}
+    if isinstance(expected_raw, dict):
+        for k, v in expected_raw.items():
+            if v is None or str(v).strip() == "":
+                continue
+            expected[str(k)] = str(v)
+    return {"target": target, "action": action, "expected": expected}
 
 
 def approved_from_dict(d: Optional[dict]) -> Optional[ApprovedTarget]:
@@ -318,8 +375,17 @@ def approved_from_dict(d: Optional[dict]) -> Optional[ApprovedTarget]:
             if str(d.get("recovery_channel") or "").strip().lower()
             in KNOWN_RECOVERY_CHANNELS else ""
         ),
+        # Fail-safe hydration: a hand-edited or malformed snapshot must not
+        # smuggle a partial declaration into the verify layer. Re-validate
+        # the SHAPE (non-empty target+action, expected coerced to str map);
+        # anything malformed → ``{}`` (the LLM-triple fallback path), so the
+        # field either arrives whole or not at all.
+        deterministic_verdict=_hydrate_deterministic_verdict(
+            d.get("deterministic_verdict"),
+        ),
         widening_pending_approval=bool(d.get("widening_pending_approval") or False),
         duration_seconds=int(d.get("duration_seconds") or 0),
+        user_description=str(d.get("user_description") or ""),
     )
 
 
@@ -359,6 +425,8 @@ async def _controller_reference_of(
     name: str,
     namespace: str,
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> Optional[tuple[str, str]]:
     """One ownerReferences query → the object's controller (kind, name).
 
@@ -375,6 +443,7 @@ async def _controller_reference_of(
         ),
         kubeconfig,
         log_name=f"controller-ref {kind}/{name}",
+        target=target,
     )
     pairs = _parse_controller_references(out.text)
     return pairs[0] if pairs else None
@@ -384,6 +453,8 @@ async def _discover_owners_by_names(
     namespace: str,
     pod_names: tuple[str, ...],
     kubeconfig: str,
+    *,
+    target: TransportTarget | None = None,
 ) -> list[str]:
     """Resolve each named pod's controller owner chain (≤2 hops).
 
@@ -402,7 +473,7 @@ async def _discover_owners_by_names(
             continue
         seen.add(pod_name)
         direct = await _controller_reference_of(
-            "pod", pod_name, namespace, kubeconfig,
+            "pod", pod_name, namespace, kubeconfig, target=target,
         )
         if direct is None:
             continue
@@ -410,7 +481,7 @@ async def _discover_owners_by_names(
         owners.append(direct_name)
         if direct_kind in _OWNER_CHAIN_INTERMEDIATE:
             upper = await _controller_reference_of(
-                direct_kind, direct_name, namespace, kubeconfig,
+                direct_kind, direct_name, namespace, kubeconfig, target=target,
             )
             if upper is not None:
                 owners.append(upper[1])
@@ -423,6 +494,8 @@ async def discover_owner_names(
     labels: dict[str, str],
     kubeconfig: str = "",
     names: tuple[str, ...] = (),
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[str, ...]:
     """Query the cluster for owner resources of the approved target.
 
@@ -433,24 +506,44 @@ async def discover_owner_names(
       whose ``spec.selector.matchLabels`` are a subset of the given
       labels, so the guard can validate owner-scope operations at the
       instance level.
-    - **names channel** (the generation anchor, case #39): ``scope=pod``
-      (or ``container``) with explicit pod names resolves each pod's
+    - **names channel** (the generation anchor, case #39): a ``pod``-scoped
+      approval carries POD names, each resolved through its
       ``ownerReferences`` chain into the frozen owner set. A pod whose
       mechanism deletes it and lets the controller recreate it ALWAYS
       changes name (``<deployment>-<rs-hash>-<pod-hash>``) — the
       persistent identity is the owner chain, not the name, and the
       approval must freeze the chain so the guard can recognise the
-      recreated successor instead of rejecting it as drift.
+      recreated successor instead of rejecting it as drift. A
+      ``container``-scoped approval carries CONTAINER names (the
+      finish_planning schema fills ``fault_names`` with instance names of
+      the declared scope kind), which are NOT pod names — so the owning
+      pod(s) are resolved from the label selector first and the chain is
+      anchored on those (B87).
 
-    Best-effort: returns empty tuple on any failure (guard falls back
-    to namespace-only anchoring — fail closed).
+    ``container`` is not an identity scope: a container lives inside a pod
+    and the guard tracks the POD identity, so it canonicalises to ``pod``
+    here exactly as it does in ``freeze_approved_target`` /
+    ``discover_names_by_labels`` / ``discover_victim_nodes`` and in the
+    single-source ``canonicalise_kind``. Best-effort: returns empty tuple
+    on any failure (guard falls back to namespace-only anchoring — fail
+    closed).
     """
     scope_l = (scope or "").strip().lower()
+    # Canonicalise through the single-source kind normaliser (container →
+    # pod, plus every singular/plural/short alias) so the labels channel's
+    # OWNER_SCOPES gate sees the same canonical scope the rest of the guard
+    # compares on. discover_owner_names was the ONE resolver that matched the
+    # RAW scope against OWNER_SCOPES — which has no ``container`` key — so a
+    # container-scope target silently missed the labels channel while its
+    # names channel mistook the container name for a pod name; owner_names
+    # froze empty and the generation-successor anchor a pod-renaming mechanism
+    # depends on could never fire (B87 → spurious REJECT_DRIFT).
+    owner_scope = canonicalise_kind(scope_l) or scope_l
 
-    # ---- labels channel (unchanged behaviour) --------------------------
+    # ---- labels channel -------------------------------------------------
     found: list[str] = []
-    if scope in OWNER_SCOPES and labels and namespace:
-        owner_kinds = OWNER_SCOPES[scope]
+    if owner_scope in OWNER_SCOPES and labels and namespace:
+        owner_kinds = OWNER_SCOPES[owner_scope]
         for kind in sorted(owner_kinds):
             out = await query_kubectl(
                 _jsonpath_get_args(
@@ -459,14 +552,32 @@ async def discover_owner_names(
                 ),
                 kubeconfig,
                 log_name=f"owner-names {kind}",
+                target=target,
             )
             found.extend(out.words)
 
     # ---- names channel (generation anchor) -----------------------------
-    if scope_l in ("pod", "container") and namespace and names:
-        found.extend(await _discover_owners_by_names(
-            namespace, tuple(names), kubeconfig,
-        ))
+    # ``_discover_owners_by_names`` resolves POD names via ownerReferences.
+    # A pod-scope approval's ``names`` ARE pod names → use directly. A
+    # container-scope approval's ``names`` are CONTAINER names → resolve the
+    # owning pod(s) from the label selector instead (pods always carry their
+    # selector labels, so this anchors reliably even when the owner workload
+    # does not carry the label itself). Feeding a container name to the pod
+    # resolver is a category error that only ever yields NotFound.
+    if owner_scope == "pod" and namespace:
+        if scope_l == "container":
+            pod_names = (
+                await discover_names_by_labels(
+                    "pod", namespace, labels, kubeconfig, target=target,
+                )
+                if labels else ()
+            )
+        else:
+            pod_names = tuple(names)
+        if pod_names:
+            found.extend(await _discover_owners_by_names(
+                namespace, tuple(pod_names), kubeconfig, target=target,
+            ))
 
     if found:
         unique = tuple(sorted(set(found)))
@@ -484,6 +595,8 @@ async def discover_names_by_labels(
     namespace: str,
     labels: dict[str, str],
     kubeconfig: str = "",
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[str, ...]:
     """Resolve a LABEL selector to the concrete resource names it matches.
 
@@ -521,6 +634,7 @@ async def discover_names_by_labels(
         ),
         kubeconfig,
         log_name=f"names-by-labels {kind}",
+        target=target,
     )
     found = out.words
     if found:
@@ -533,6 +647,8 @@ async def discover_pod_pvc_claims(
     namespace: str,
     pod_names: tuple[str, ...],
     kubeconfig: str = "",
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[str, ...]:
     """Resolve the PVC claim names referenced by concrete pods.
 
@@ -554,6 +670,7 @@ async def discover_pod_pvc_claims(
             ),
             kubeconfig,
             log_name=f"pod-claims {pod_name}",
+            target=target,
         )
         claims.update(out.words)
 
@@ -573,6 +690,7 @@ async def discover_victim_nodes(
     kubeconfig: str = "",
     *,
     resolved_names: tuple[str, ...] = (),
+    target: TransportTarget | None = None,
 ) -> tuple[str, ...]:
     """Resolve the node name(s) hosting the victim pod(s) — the anchor for a
     derived ``name_from: victim_node`` mechanism write (W-56-1).
@@ -595,6 +713,17 @@ async def discover_victim_nodes(
     from, so the entry stays unmaterialized and authorises nothing (fail
     closed). Best-effort: any query failure yields an empty tuple (the derived
     entry is then dropped at materialization — fail closed at the guard).
+
+    DELIBERATELY NOT delegated to the ``target_identity`` seam (#83 audit):
+    the seam's node primitives resolve a SINGLE node (``resolve_node_of_pod``
+    → one pod's node; ``resolve_node_by_selector`` → ``items[0]``'s node) for
+    the observers that sample one carrier. This guard needs the SET of every
+    victim node — a name_from: victim_node write must be authorised against
+    ALL nodes the victim pods run on, so collapsing to ``items[0]`` would let
+    a mechanism write drift onto an un-approved node undetected (a security
+    regression, not a dedup opportunity). It therefore keeps its own
+    multi-target ``{.spec.nodeName}`` / ``{.items[*].spec.nodeName}`` reads
+    via ``query_kubectl``; the completeness sentinel allowlists this file.
     """
     scope_l = (scope or "").strip().lower()
     if scope_l == "container":
@@ -613,6 +742,7 @@ async def discover_victim_nodes(
                 ),
                 kubeconfig,
                 log_name=f"victim-node {pod_name}",
+                target=target,
             )
             nodes.update(w for w in out.words if w)
     elif labels:
@@ -623,6 +753,7 @@ async def discover_victim_nodes(
             ),
             kubeconfig,
             log_name="victim-nodes by labels",
+            target=target,
         )
         nodes.update(w for w in out.words if w)
 
@@ -738,6 +869,8 @@ async def discover_workload_pvc_claims(
     names: tuple[str, ...],
     labels: dict[str, str],
     kubeconfig: str = "",
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[str, ...]:
     """Resolve PVC claim names from a workload's pod template (B79).
 
@@ -763,6 +896,7 @@ async def discover_workload_pvc_claims(
                 ),
                 kubeconfig,
                 log_name=f"workload-claims {kind}/{name}",
+                target=target,
             )
             claims.update(out.words)
     else:
@@ -772,6 +906,7 @@ async def discover_workload_pvc_claims(
             ),
             kubeconfig,
             log_name=f"workload-claims {kind} by labels",
+            target=target,
         )
         claims.update(out.words)
     if claims:
@@ -788,6 +923,8 @@ async def discover_statefulset_pvc_claims(
     names: tuple[str, ...],
     labels: dict[str, str],
     kubeconfig: str = "",
+    *,
+    target: TransportTarget | None = None,
 ) -> tuple[str, ...]:
     """Resolve PVC claims for a StatefulSet approval via its live pods (B79).
 
@@ -812,6 +949,7 @@ async def discover_statefulset_pvc_claims(
             ),
             kubeconfig,
             log_name="sts-claims sts by labels",
+            target=target,
         )
         sts_names = list(out.words)
     claims: set[str] = set()
@@ -823,6 +961,7 @@ async def discover_statefulset_pvc_claims(
             ),
             kubeconfig,
             log_name=f"sts-claims {sts_name} selector",
+            target=target,
         )
         selector = _parse_match_labels_map(raw.text)
         if not selector:
@@ -834,11 +973,12 @@ async def discover_statefulset_pvc_claims(
             ),
             kubeconfig,
             log_name=f"sts-claims pods of {sts_name}",
+            target=target,
         )
         pod_names = pods_out.words
         if pod_names:
             claims.update(await discover_pod_pvc_claims(
-                namespace, pod_names, kubeconfig,
+                namespace, pod_names, kubeconfig, target=target,
             ))
     if claims:
         logger.info(

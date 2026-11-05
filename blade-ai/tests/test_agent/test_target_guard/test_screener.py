@@ -2924,6 +2924,127 @@ def _cr_apply_call(sub: str = "apply") -> AIMessage:
     )
 
 
+class TestArmedBeforeInjectCarrierRbacPatchExemption:
+    """openspec carrier-rbac-patch-armed-exemption: the two-step carrier
+    RBAC build (``create role`` then ``patch role`` to append a second
+    resource family's verbs) must bypass the armed-before-inject gate as
+    CARRIER CONSTRUCTION, symmetric to the teardown-delete exemption.
+
+    The #71 LimitRange deadlock: a restore payload spanning two families
+    with non-uniform verbs (``deployments/scale:[get,patch]`` +
+    ``limitranges:[get,delete]``) cannot be built by one ``create role``;
+    B85 refuses to arm until the Role grants ``delete``; ``delete`` can
+    only arrive via the pre-arming patch; the gate forbade that patch —
+    circular, injection never landed. Every case here drives the REAL
+    ``tool_screener`` node (memory 10e7b96e: no reimplemented gate
+    helper) and reverse-asserts the pre-fix ``armed-before-inject`` reject
+    on the fail-closed side (memory 779169a1).
+    """
+
+    @staticmethod
+    def _active_carrier_with_role() -> dict:
+        # ``active`` NOT ``recovery_armed`` — the deadlock precondition:
+        # the carrier exists but its timer is not yet armed.
+        carrier = _carrier_artifact("active")
+        carrier["rbac_family"] = [
+            {"kind": "role", "name": "drill-rc-x", "namespace": "ns",
+             "verbs": ["get", "patch"]},
+        ]
+        return carrier
+
+    @pytest.mark.asyncio
+    async def test_two_step_role_verb_patch_passes_unarmed(self):
+        """放行侧（死锁解除）：载体已登记但未武装时，patch 载体自身 Role
+        追加第二族恢复动词（delete limitranges）判为载具构造、PASS。pre-fix
+        这条撞 armed_before_inject 而 B85 又要求武装前已含 delete → 死锁。"""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "patch",
+                    "v_args": (
+                        'role drill-rc-x -n ns --type=json -p '
+                        '\'[{"op":"add","path":"/rules/-","value":'
+                        '{"apiGroups":[""],"resources":["limitranges"],'
+                        '"verbs":["get","delete"]}}]\''
+                    ),
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._active_carrier_with_role()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_victim_object_patch_still_rejected_unarmed(self):
+        """fail-closed（5.1）：豁免不泄漏到受害靶/故障对象——未武装时 patch
+        受害 deployment 仍撞 armed_before_inject（故障绝不裸落地不变式保持）。"""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "patch",
+                    "v_args": (
+                        'deployment deploy-a -n ns --type=merge -p '
+                        '\'{"spec":{"replicas":0}}\''
+                    ),
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._active_carrier_with_role()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "armed-before-inject" in delta["messages"][0].content
+
+    @pytest.mark.asyncio
+    async def test_unregistered_sibling_role_patch_still_rejected(self):
+        """fail-closed（5.2）：#71 workaround 形态——patch 打向未登记的兄弟
+        Role（drill-rc-x-lr，name≠载体名、不在 rbac_family）→ 不豁免，仍撞门。"""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "patch",
+                    "v_args": (
+                        'role drill-rc-x-lr -n ns --type=json -p '
+                        '\'[{"op":"add","path":"/rules/-","value":'
+                        '{"resources":["limitranges"],"verbs":["delete"]}}]\''
+                    ),
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._active_carrier_with_role()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "armed-before-inject" in delta["messages"][0].content
+
+    @pytest.mark.asyncio
+    async def test_carrier_role_remove_patch_still_rejected(self):
+        """fail-closed（5.3）：对载体自身 Role 的 remove（收缩授权）不豁免
+        ——豁免仅覆盖 add-only 扩权追加，非 add 操作落回 fail-closed。"""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "patch",
+                    "v_args": (
+                        'role drill-rc-x -n ns --type=json -p '
+                        '\'[{"op":"remove","path":"/rules/0"}]\''
+                    ),
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._active_carrier_with_role()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "armed-before-inject" in delta["messages"][0].content
+
+
 class TestCrChannelRouteGate:
     """D3 source 3 (write-set 审批门三分类程序化校验): a FaultDrill CR
     creation that already passed write-set admission (case-manifest
@@ -3186,10 +3307,14 @@ class TestCarrierImageAdmissionRefresh:
         monkeypatch.setattr(
             preplan_probe, "refresh_carrier_image_discovery", mock_refresh,
         )
-        delta = await tool_screener(self._state(
+        state = self._state(
             subcommand=subcommand, v_args="carrier-x --image=busybox:1.36 -n ns",
-        ))
-        mock_refresh.assert_awaited_once_with("/fake/kubeconfig")
+        )
+        delta = await tool_screener(state)
+        from chaos_agent.transports import resolve_transport_target
+        mock_refresh.assert_awaited_once_with(
+            "/fake/kubeconfig", target=resolve_transport_target(state),
+        )
         assert delta["screener_route"] == SCREENER_ROUTE_PASS
 
     @pytest.mark.asyncio

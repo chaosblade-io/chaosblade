@@ -116,6 +116,16 @@ KIND_ALIASES: dict[str, str] = {
     # positional as neither kind nor name and collapses to __unknown__ —
     # the drill step becomes unexecutable-by-construction.
     "resourcequota": "resourcequota", "resourcequotas": "resourcequota", "quota": "resourcequota", "quotas": "resourcequota",
+    # Admission-control drill target (LimitRange误配 → Pod Pending): the
+    # LimitRanger admission plugin mutates new Pods' requests from a
+    # namespace LimitRange's ``defaultRequest``. Same singular/plural
+    # convergence every other whitelisted manifest kind carries — without
+    # it the plural ``limitranges`` (the kubectl resource form an LLM may
+    # emit for get/delete) fails to canonicalise to the ``limitrange``
+    # scope the case's ``mechanism_writes`` entry declares, so a plural
+    # recovery delete would silently drift-mismatch. The injection itself
+    # rides the singular manifest ``kind: LimitRange``.
+    "limitrange": "limitrange", "limitranges": "limitrange",
     "persistentvolumeclaim": "pvc", "pvc": "pvc", "pvcs": "pvc",
     "persistentvolume": "pv", "pv": "pv", "pvs": "pv",
     "serviceaccount": "serviceaccount", "serviceaccounts": "serviceaccount", "sa": "serviceaccount",
@@ -133,6 +143,29 @@ KIND_ALIASES: dict[str, str] = {
     # networking
     "ingress": "ingress", "ingresses": "ingress", "ing": "ingress",
     "networkpolicy": "networkpolicy", "networkpolicies": "networkpolicy", "netpol": "networkpolicy",
+    # policy — PodDisruptionBudget (排空被PDB阻塞, expand-k8s-case-coverage 4.1):
+    # singular/plural/abbrev convergence every whitelisted manifest kind
+    # carries — without it the plural ``poddisruptionbudgets`` (the kubectl
+    # resource form an LLM emits on get/delete) fails to canonicalise to the
+    # ``poddisruptionbudget`` scope the case's mechanism_writes declares, so a
+    # plural recovery DELETE would silently drift-mismatch.
+    "poddisruptionbudget": "poddisruptionbudget", "poddisruptionbudgets": "poddisruptionbudget",
+    "pdb": "poddisruptionbudget", "pdbs": "poddisruptionbudget",
+    # scheduling — PriorityClass (被高优先级抢占, expand-k8s-case-coverage 4.6):
+    # the drill's high-value preemptor prop. Cluster-scoped — see
+    # CLUSTER_SCOPED_KINDS below (the drift namespace comparison treats its
+    # namespace dimension as ABSENT).
+    "priorityclass": "priorityclass", "priorityclasses": "priorityclass", "pc": "priorityclass",
+    # admission — ValidatingWebhookConfiguration (回调服务不可达, expand-k8s-case-coverage 2.1):
+    # the drill's cluster-scoped admission prop (failurePolicy=Fail + unreachable
+    # callback backend). Cluster-scoped — see CLUSTER_SCOPED_KINDS below. The
+    # plural ``validatingwebhookconfigurations`` is the REST resource form an LLM
+    # emits on get/delete; without it a plural recovery DELETE fails to
+    # canonicalise to the ``validatingwebhookconfiguration`` scope the case's
+    # mechanism_writes declares, so it would silently drift-mismatch.
+    "validatingwebhookconfiguration": "validatingwebhookconfiguration",
+    "validatingwebhookconfigurations": "validatingwebhookconfiguration",
+    "vwc": "validatingwebhookconfiguration",
     # autoscaling
     "horizontalpodautoscaler": "hpa", "horizontalpodautoscalers": "hpa", "hpa": "hpa",
     # rbac
@@ -160,6 +193,21 @@ KIND_ALIASES: dict[str, str] = {
 CLUSTER_SCOPED_KINDS: frozenset[str] = frozenset({
     "node", "pv", "namespace", "clusterrole",
     "clusterrolebinding", "storageclass",
+    # ``priorityclass`` (expand-k8s-case-coverage 4.6, 被高优先级抢占): the
+    # scheduling-plane drill prop is cluster-scoped — the drift namespace
+    # comparison must treat its namespace dimension as ABSENT so the
+    # mechanism_writes entry (``scope: priorityclass``, no namespace axis)
+    # matches the effective write. The seven-kind current set (the six above
+    # are the historical inline copies; priorityclass is a later per-case
+    # addition) is the SINGLE source — the spec layer keeps its own.
+    "priorityclass",
+    # ``validatingwebhookconfiguration`` (expand-k8s-case-coverage 2.1, 回调服务
+    # 不可达): the admission-plane drill prop is cluster-scoped — the drift
+    # namespace comparison must treat its namespace dimension as ABSENT so the
+    # mechanism_writes entry (``scope: validatingwebhookconfiguration``, no
+    # namespace axis) matches the effective write. Same per-case addition pattern
+    # as priorityclass above; the spec layer keeps its own declaration.
+    "validatingwebhookconfiguration",
 })
 
 
@@ -531,7 +579,49 @@ def infer_effective_target(
                      # guard answered the prompt-taught STOP call with
                      # REJECT_UNKNOWN and the model had to improvise a
                      # update_progress phase-write downgrade).
-                     "update_progress", "finish_execution"):
+                     "update_progress", "finish_execution",
+                     # Typed L7 HTTP probe (planning / verify / recover-verify
+                     # phases). Classified READONLY BY NAME — safely, and unlike
+                     # ``kubectl_read``: kubectl_read accepts arbitrary
+                     # LLM-authored ``v_args`` so the provider hook MUST inspect
+                     # the inner command, whereas ``http_probe`` accepts only
+                     # validated semantic params (origin_pod / namespace /
+                     # url / max_time / capture) and interpolates them into a
+                     # SINGLE framework-owned canonical read-only ``curl -s … GET``
+                     # resolved through the typed-probe registry. Every capture
+                     # mode stays read-only by construction (measured against
+                     # ``readonly.kubectl_exec_rejection_reason``): metadata /
+                     # headers route the body to the ``-o /dev/null`` discard
+                     # sink, body / all stream the body to stdout ahead of a
+                     # sentinel — always a SINGLE shell-free plain curl (no pipe:
+                     # the exec-form channel runs no shell, so body size is
+                     # governed by the framework output layer), a single bounded
+                     # GET either way,
+                     # never a ``-D``/``-X``/``-d``/``-T`` mutation. The tool
+                     # validates every param fail-closed (RFC1123 names, a
+                     # metacharacter-free http(s) URL allowlist, a bounded int
+                     # max_time, a closed capture enum) BEFORE building the
+                     # command, so there is no shell-injection path and no
+                     # mutation the guard would need to inspect args to catch.
+                     # The read-only guarantee lives in the tool; the classifier
+                     # trusts it. This is what lets the planning / verify phases
+                     # observe HTTP status/latency/headers/body without an
+                     # LLM-written curl tripping the read-only screen (Case #84:
+                     # a hand-written ``curl -D -`` was rejected and, via
+                     # whole-batch retry, burned a verify iteration).
+                     #
+                     # ``host_http_probe`` is the HOST-delivered sibling of
+                     # ``http_probe``: the same framework-owned canonical
+                     # read-only ``curl -s … GET`` (resolved through the same
+                     # typed-probe registry), the same fail-closed param
+                     # allowlists (imported from ``http_probe_cli``), delivered on
+                     # the host the transport addresses instead of a client pod.
+                     # Its read-only guarantee likewise lives in the tool, so the
+                     # classifier trusts the name — this is what lets a bare-host
+                     # or python-app HTTP fault be verified through a structured
+                     # probe without an LLM-written ``host_read`` curl tripping
+                     # the read-only screen.
+                     "http_probe", "host_http_probe"):
         return EffectiveTarget(
             scope=SCOPE_READONLY,
             namespace="",

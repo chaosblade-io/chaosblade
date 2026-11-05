@@ -39,6 +39,7 @@ from chaos_agent.agent.target_guard.classifier import (
     SCOPE_ESCAPE,
     SCOPE_READONLY,
     SCOPE_UNKNOWN,
+    canonicalise_kind,
     infer_effective_target,
 )
 from chaos_agent.agent.target_guard.guard import target_drift_guard
@@ -977,6 +978,96 @@ class TestBannedRejectionSeparatesCauseFromWayForward:
         fb = decision_to_feedback(self._decide(tool, args))
         assert fb.is_hard_floor is False
         assert fb.compliant_form
+
+
+def _single_kind_manifest(kind: str) -> str:
+    """A minimal single-document manifest whose only ``kind`` is ``kind``.
+
+    ``_classify_kubectl_stdin_manifest`` gates on the extracted ``kind`` alone
+    (apiVersion is not consulted for the whitelist), so this is enough to drive
+    the admission branch for every whitelisted kind.
+    """
+    return (
+        f"kind: {kind}\n"
+        "metadata:\n"
+        "  name: drill-x\n"
+        "  namespace: default\n"
+    )
+
+
+class TestApplyManifestAllowlistAdmission:
+    """apply-allowlist-limitrange: the manifest-kind whitelist admits exactly
+    the non-workload ``ALLOWED_MANIFEST_KINDS`` family, and ``limitrange`` is
+    now a member.
+
+    Task 2.1 (limitrange ALLOW form), 3.1 (B81 full-set admission anchor),
+    3.2 (workload kinds never admitted), 3.4 (mixed-kind still refused).
+    These pin the CLASSIFIER verdict (``infer_effective_target``), not the
+    downstream drift policy — the drift face is the #71 real-machine concern.
+    """
+
+    def _classify(self, stdin_data: str):
+        return infer_effective_target(
+            "kubectl",
+            {"subcommand": "apply", "v_args": "-f -", "stdin_data": stdin_data},
+        )
+
+    def test_limitrange_apply_is_admitted(self):
+        # Task 2.1: a single-kind LimitRange apply returns the ALLOW form with
+        # scope canonicalised to ``limitrange`` (before the whitelist entry it
+        # was SCOPE_BANNED — [destructive_floor] non-whitelisted kind).
+        eff = self._classify(_single_kind_manifest("LimitRange"))
+        assert eff.scope == "limitrange"
+        assert eff.scope != SCOPE_BANNED
+        assert eff.namespace == "default"
+        assert eff.names == ("drill-x",)
+
+    def test_limitrange_is_a_whitelist_member(self):
+        # Deletion-red anchor: removing ``limitrange`` from the set turns this
+        # (and the parametrized admission below) red.
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            ALLOWED_MANIFEST_KINDS,
+        )
+
+        assert "limitrange" in ALLOWED_MANIFEST_KINDS
+
+    def test_every_whitelisted_kind_is_admitted(self):
+        # B81 full-set anchor (memory d9be1cc8): iterate the LIVE set, assert
+        # each member admits with scope == canonicalise_kind(member). Adding a
+        # kind extends coverage automatically; the set is never hardcoded here.
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            ALLOWED_MANIFEST_KINDS,
+        )
+
+        for kind in ALLOWED_MANIFEST_KINDS:
+            eff = self._classify(_single_kind_manifest(kind))
+            assert eff.scope != SCOPE_BANNED, kind
+            assert eff.scope == canonicalise_kind(kind), kind
+
+    def test_workload_kinds_are_never_whitelisted(self):
+        # Task 3.2: the whitelist stays non-workload — adding limitrange must
+        # not let any container-running kind slip in.
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _IMPERATIVE_WORKLOAD_KINDS,
+            ALLOWED_MANIFEST_KINDS,
+        )
+
+        assert ALLOWED_MANIFEST_KINDS.isdisjoint(_IMPERATIVE_WORKLOAD_KINDS)
+        for workload in _IMPERATIVE_WORKLOAD_KINDS:
+            eff = self._classify(_single_kind_manifest(workload))
+            assert eff.scope == SCOPE_BANNED, workload
+
+    def test_limitrange_mixed_with_other_kind_still_refused(self):
+        # Task 3.4: the existing multi-kind ban is not regressed by the new
+        # member — a LimitRange riding alongside a Deployment is still BANNED
+        # (kubectl would create every doc while the approval anchors one).
+        mixed = (
+            _single_kind_manifest("LimitRange")
+            + "---\n"
+            + _single_kind_manifest("Deployment")
+        )
+        eff = self._classify(mixed)
+        assert eff.scope == SCOPE_BANNED
 
 
 class TestApplyWithoutFileInputNamesTheRealCause:

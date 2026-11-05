@@ -68,6 +68,37 @@ class TestCanonicaliseKind:
             ("sc", "storageclass"),
             ("no", "node"),
             ("nodes", "node"),
+            # apply-allowlist-limitrange (design D6): every whitelisted kind
+            # has a singular+plural KIND_ALIASES entry. The plural
+            # ``limitranges`` (the kubectl resource form an LLM emits on
+            # get/delete) MUST canonicalise to ``limitrange`` or it silently
+            # fails to match mechanism_writes ``scope: limitrange`` at drift.
+            # Deleting the KIND_ALIASES entry turns these red.
+            ("limitrange", "limitrange"),
+            ("limitranges", "limitrange"),
+            ("LimitRange", "limitrange"),
+            ("limitranges.v1", "limitrange"),
+            # expand-k8s-case-coverage 4.1/4.6: every whitelisted manifest kind
+            # carries a singular+plural(+abbrev) KIND_ALIASES entry so the
+            # plural kubectl resource form canonicalises to the scope the
+            # case's mechanism_writes declares (a plural recovery DELETE would
+            # otherwise silently drift-mismatch). Deleting either KIND_ALIASES
+            # entry turns these red.
+            ("poddisruptionbudget", "poddisruptionbudget"),
+            ("poddisruptionbudgets", "poddisruptionbudget"),
+            ("pdb", "poddisruptionbudget"),
+            ("priorityclass", "priorityclass"),
+            ("priorityclasses", "priorityclass"),
+            ("pc", "priorityclass"),
+            # expand-k8s-case-coverage 2.1: ValidatingWebhookConfiguration (the
+            # cluster-scoped admission drill prop, 回调服务不可达) — singular+plural+
+            # abbrev so the plural REST resource form canonicalises to the scope the
+            # case's mechanism_writes declares (a plural recovery DELETE would
+            # otherwise silently drift-mismatch). Deleting either KIND_ALIASES entry
+            # turns these red.
+            ("validatingwebhookconfiguration", "validatingwebhookconfiguration"),
+            ("validatingwebhookconfigurations", "validatingwebhookconfiguration"),
+            ("vwc", "validatingwebhookconfiguration"),
         ],
     )
     def test_canonical_form(self, raw, expected):
@@ -191,6 +222,20 @@ class TestKnownReadOnlyTools:
             "propose_plan_change",
             "submit_verification",
             "submit_recover_verification",
+            # Typed L7 HTTP probe (verify / recover-verify). READONLY BY NAME:
+            # unlike kubectl_read (arbitrary LLM v_args → provider hook must
+            # inspect the inner command), http_probe takes only validated
+            # semantic params and interpolates them into a single framework-
+            # owned canonical GET curl. The read-only guarantee lives in the
+            # tool's fail-closed input validation; the classifier trusts it.
+            # Locked here so a future removal fails red (B81 discipline).
+            "http_probe",
+            # Host-delivered sibling of ``http_probe``: the same framework-owned
+            # canonical read-only GET curl, the same imported fail-closed param
+            # allowlists, run on the host instead of a client pod. READONLY BY
+            # NAME on identical ground — the read-only guarantee lives in the
+            # tool. Locked here so a future removal fails red (B81 discipline).
+            "host_http_probe",
         ],
     )
     def test_known_readonly_tools(self, tool):
@@ -198,6 +243,39 @@ class TestKnownReadOnlyTools:
         assert et.scope == SCOPE_READONLY
         # raw_command is always populated for audit logs
         assert et.raw_command
+
+
+class TestHttpProbeCaptureIsReadonlyByName:
+    """A5/A7: ``http_probe`` is classified READONLY BY NAME — the ``capture``
+    param (metadata/headers/body/all) changes WHICH evidence layers the
+    framework-owned curl returns, never the classification. Even body/all, which
+    drop ``-o /dev/null`` and stream the body to stdout behind a sentinel, stay
+    a single shell-free bounded GET (no pipe — the exec-form channel runs no
+    shell; size is governed by the framework output layer); the read-only
+    guarantee lives in the tool's fail-closed
+    validation, so the classifier trusts the name regardless of args."""
+
+    @pytest.mark.parametrize("capture", ["metadata", "headers", "body", "all"])
+    def test_every_capture_mode_is_readonly(self, capture):
+        et = infer_effective_target("http_probe", {
+            "origin_pod": "drill-http-client",
+            "url": "http://svc.default.svc.cluster.local/health",
+            "namespace": "default", "max_time": 10, "capture": capture,
+        })
+        assert et.scope == SCOPE_READONLY
+        assert et.raw_command
+
+    @pytest.mark.parametrize("capture", ["metadata", "bogus", "body;rm -rf /", ""])
+    def test_capture_value_does_not_affect_classification(self, capture):
+        # An unknown / hostile capture string STILL classifies READONLY by name —
+        # the tool rejects it fail-closed BEFORE building any command, so the
+        # classifier never needs to inspect it (defence lives in the tool, not
+        # in an arg scan here).
+        et = infer_effective_target("http_probe", {
+            "origin_pod": "client", "url": "http://svc/health",
+            "namespace": "default", "capture": capture,
+        })
+        assert et.scope == SCOPE_READONLY
 
 
 class TestSkillScriptDefaultBan:

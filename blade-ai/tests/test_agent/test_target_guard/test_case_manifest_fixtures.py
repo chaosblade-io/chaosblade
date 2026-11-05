@@ -262,6 +262,13 @@ class TestNodeShapeBackfillAcceptance:
     def test_node_write_end_to_end(self, tmp_path, monkeypatch):
         skill_dir = tmp_path / "demo-skill"
         (skill_dir / "cases").mkdir(parents=True)
+        # A′: resolve_skill_dir keys on the frontmatter ``name`` (mirroring
+        # the registry, which only loads dirs carrying a valid SKILL.md), so
+        # a realistic skill dir must declare its name in SKILL.md.
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
         (skill_dir / "cases" / "node-shape.md").write_text(
             _NODE_SHAPE_CASE, encoding="utf-8",
         )

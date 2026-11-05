@@ -25,6 +25,10 @@ from chaos_agent.agent.target_guard.drift_policy import K8sDriftPolicy
 from chaos_agent.agent.target_guard.mechanism_writes import (
     NAME_FROM_VICTIM_NODE,
     NAMESPACE_FROM_VICTIM,
+    NETWORK_MECHANISM_NETFILTER,
+    NETWORK_MECHANISM_RESOLVER,
+    NETWORK_MECHANISM_USERSPACE_BIND,
+    NON_NETFILTER_NETWORK_MECHANISMS,
     RECOVERY_CHANNEL_APISERVER_WRITE,
     MechanismWriteEntry,
     entries_beyond_victim,
@@ -32,13 +36,17 @@ from chaos_agent.agent.target_guard.mechanism_writes import (
     entries_to_list,
     format_entries_for_payload,
     load_case_mechanism_writes,
+    load_case_network_mechanism,
     load_case_recovery_channel,
+    load_case_deterministic_verdict,
     match_mechanism_entries,
     materialize_derived_entries,
     names_within_entries,
     names_within_entry,
     parse_mechanism_writes,
+    parse_network_mechanism,
     parse_recovery_channel,
+    parse_deterministic_verdict,
 )
 from chaos_agent.agent.target_guard.types import EffectiveTarget
 
@@ -210,6 +218,13 @@ class TestLoadCaseMechanismWrites:
     def test_load_reads_case_file_directly(self, tmp_path, monkeypatch):
         skill_dir = tmp_path / "demo-skill"
         (skill_dir / "cases").mkdir(parents=True)
+        # A′: resolve_skill_dir keys on the frontmatter ``name`` (mirroring
+        # the registry, which only loads dirs carrying a valid SKILL.md), so
+        # a realistic skill dir must declare its name in SKILL.md.
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
         (skill_dir / "cases" / "case.md").write_text(
             _NXDOMAIN_FRONTMATTER, encoding="utf-8",
         )
@@ -272,6 +287,13 @@ class TestLoadCaseRecoveryChannel:
     def test_load_reads_case_file_directly(self, tmp_path, monkeypatch):
         skill_dir = tmp_path / "demo-skill"
         (skill_dir / "cases").mkdir(parents=True)
+        # A′: resolve_skill_dir keys on the frontmatter ``name`` (mirroring
+        # the registry, which only loads dirs carrying a valid SKILL.md), so
+        # a realistic skill dir must declare its name in SKILL.md.
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
         (skill_dir / "cases" / "case.md").write_text(
             "---\nrecovery_channel: apiserver-write\n---\nbody",
             encoding="utf-8",
@@ -294,6 +316,243 @@ class TestLoadCaseRecoveryChannel:
         assert load_case_recovery_channel("", "cases/case.md") == ""
         assert load_case_recovery_channel("demo-skill", "") == ""
         assert load_case_recovery_channel("no-such-skill", "cases/case.md") == ""
+
+
+# ---------------------------------------------------------------------------
+# network_mechanism — the case file's injection-mechanism legislation for
+# ``fault_target == "network"`` faults (single source for the feasibility
+# checker's netfilter-only-probe gate). Same one-directional chain and same
+# escape-proof re-read discipline as recovery_channel.
+# ---------------------------------------------------------------------------
+
+class TestParseNetworkMechanism:
+    def test_userspace_bind_declaration_parses(self):
+        content = "---\nname: x\nnetwork_mechanism: userspace-bind\n---\nbody"
+        assert parse_network_mechanism(content) == NETWORK_MECHANISM_USERSPACE_BIND
+
+    def test_netfilter_and_resolver_declarations_parse(self):
+        assert parse_network_mechanism(
+            "---\nnetwork_mechanism: netfilter\n---\nbody",
+        ) == NETWORK_MECHANISM_NETFILTER
+        assert parse_network_mechanism(
+            "---\nnetwork_mechanism: resolver\n---\nbody",
+        ) == NETWORK_MECHANISM_RESOLVER
+
+    def test_value_is_normalised(self):
+        # Case + surrounding whitespace are stripped, mirroring
+        # parse_recovery_channel: the frontmatter value is author-facing.
+        content = "---\nnetwork_mechanism: ' UserSpace-Bind '\n---\nbody"
+        assert parse_network_mechanism(content) == NETWORK_MECHANISM_USERSPACE_BIND
+
+    def test_unknown_value_is_ignored(self):
+        # A typo must NOT silently widen the gate into skipping netfilter
+        # probes — unknown → "" → the checker FAILS SAFE to netfilter (runs
+        # every probe, byte-identical to pre-declaration behaviour).
+        content = "---\nnetwork_mechanism: userspace-bind-ish\n---\nbody"
+        assert parse_network_mechanism(content) == ""
+
+    def test_missing_key_or_frontmatter_yields_empty(self):
+        assert parse_network_mechanism("# plain markdown") == ""
+        assert parse_network_mechanism("---\nname: x\n---\nbody") == ""
+        assert parse_network_mechanism("") == ""
+
+    def test_malformed_yaml_yields_empty(self):
+        assert parse_network_mechanism("---\n: : :\n  - [\n---\nbody") == ""
+
+    def test_non_netfilter_set_is_single_source(self):
+        # The gate predicate set must contain exactly the two mechanisms that
+        # never touch netfilter; netfilter itself must NOT be a member (else
+        # the gate would skip its own preconditions).
+        assert NON_NETFILTER_NETWORK_MECHANISMS == frozenset({
+            NETWORK_MECHANISM_USERSPACE_BIND, NETWORK_MECHANISM_RESOLVER,
+        })
+        assert NETWORK_MECHANISM_NETFILTER not in NON_NETFILTER_NETWORK_MECHANISMS
+
+
+class TestLoadCaseNetworkMechanism:
+    def test_load_reads_case_file_directly(self, tmp_path, monkeypatch):
+        skill_dir = tmp_path / "demo-skill"
+        (skill_dir / "cases").mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
+        (skill_dir / "cases" / "case.md").write_text(
+            "---\nnetwork_mechanism: userspace-bind\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skills_dir", lambda: tmp_path,
+        )
+        assert load_case_network_mechanism(
+            "demo-skill", "cases/case.md",
+        ) == NETWORK_MECHANISM_USERSPACE_BIND
+
+    def test_load_escapes_and_missing_inputs_are_empty(self, tmp_path, monkeypatch):
+        # Same escape-proof resolver discipline as recovery_channel: any
+        # failure → "" → the checker fails safe to netfilter.
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skills_dir", lambda: tmp_path,
+        )
+        assert load_case_network_mechanism("demo-skill", "../../etc/passwd") == ""
+        assert load_case_network_mechanism("", "cases/case.md") == ""
+        assert load_case_network_mechanism("demo-skill", "") == ""
+        assert load_case_network_mechanism("no-such-skill", "cases/case.md") == ""
+
+
+# ---------------------------------------------------------------------------
+# §1c deterministic_verdict — the case file's frozen verdict-binding
+# declaration (openspec mechanism-invariant-trust-boundary, decision C)
+# ---------------------------------------------------------------------------
+
+_DV_FRONTMATTER = """---
+name: StatefulSet_滚动异常_分区更新卡住
+deterministic_verdict:
+  target: statefulset
+  action: partition-stall
+  expected:
+    Partition: 2
+---
+# Case body — prose the Agent reads, never an authorization input.
+"""
+
+
+class TestParseDeterministicVerdict:
+    def test_full_declaration_parses(self):
+        assert parse_deterministic_verdict(_DV_FRONTMATTER) == {
+            "target": "statefulset",
+            "action": "partition-stall",
+            "expected": {"Partition": "2"},
+        }
+
+    def test_expected_values_are_stringified_and_blanks_dropped(self):
+        content = (
+            "---\ndeterministic_verdict:\n  target: statefulset\n"
+            "  action: partition-stall\n  expected:\n    Partition: 2\n"
+            "    Blank: ''\n    Zero: 0\n---\nbody"
+        )
+        parsed = parse_deterministic_verdict(content)
+        # Zero is a legal value (kept as "0"); only blank/None are dropped.
+        assert parsed["expected"] == {"Partition": "2", "Zero": "0"}
+
+    def test_whitespace_target_action_normalised(self):
+        content = (
+            "---\ndeterministic_verdict:\n  target: ' statefulset '\n"
+            "  action: ' partition-stall '\n---\nbody"
+        )
+        parsed = parse_deterministic_verdict(content)
+        assert (parsed["target"], parsed["action"]) == (
+            "statefulset", "partition-stall",
+        )
+
+    def test_missing_target_or_action_yields_empty(self):
+        # Shape-only validation: a declaration without BOTH keys is inert —
+        # the verify layer falls back to the LLM-triple path.
+        assert parse_deterministic_verdict(
+            "---\ndeterministic_verdict:\n  target: statefulset\n---\nbody",
+        ) == {}
+        assert parse_deterministic_verdict(
+            "---\ndeterministic_verdict:\n  action: partition-stall\n---\nbody",
+        ) == {}
+
+    def test_non_mapping_value_yields_empty(self):
+        assert parse_deterministic_verdict(
+            "---\ndeterministic_verdict: statefulset\n---\nbody",
+        ) == {}
+
+    def test_missing_key_or_frontmatter_yields_empty(self):
+        assert parse_deterministic_verdict("# plain markdown") == {}
+        assert parse_deterministic_verdict("---\nname: x\n---\nbody") == {}
+        assert parse_deterministic_verdict("") == {}
+
+    def test_malformed_yaml_yields_empty(self):
+        assert parse_deterministic_verdict("---\n: : :\n  - [\n---\nbody") == {}
+
+    def test_unknown_rule_key_is_not_validated_here(self):
+        # parse validates SHAPE only (no registry lookup — avoids an import
+        # cycle); an unknown key simply resolves to no rule downstream.
+        content = (
+            "---\ndeterministic_verdict:\n  target: bogus-kind\n"
+            "  action: bogus-action\n  expected:\n    Foo: 1\n---\nbody"
+        )
+        assert parse_deterministic_verdict(content) == {
+            "target": "bogus-kind",
+            "action": "bogus-action",
+            "expected": {"Foo": "1"},
+        }
+
+
+class TestLoadCaseDeterministicVerdict:
+    def test_load_reads_case_file_directly(self, tmp_path, monkeypatch):
+        skill_dir = tmp_path / "demo-skill"
+        (skill_dir / "cases").mkdir(parents=True)
+        # A′: resolve_skill_dir keys on the frontmatter ``name`` (mirroring
+        # the registry, which only loads dirs carrying a valid SKILL.md), so
+        # a realistic skill dir must declare its name in SKILL.md.
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
+        (skill_dir / "cases" / "case.md").write_text(
+            _DV_FRONTMATTER, encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skills_dir", lambda: tmp_path,
+        )
+        assert load_case_deterministic_verdict(
+            "demo-skill", "cases/case.md",
+        ) == {
+            "target": "statefulset",
+            "action": "partition-stall",
+            "expected": {"Partition": "2"},
+        }
+
+    def test_load_escapes_and_missing_inputs_are_empty(self, tmp_path, monkeypatch):
+        # Same escape-proof resolver discipline as recovery_channel:
+        # traversal / missing inputs degrade to {} → LLM-triple fallback.
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skills_dir", lambda: tmp_path,
+        )
+        assert load_case_deterministic_verdict("demo-skill", "../../etc/passwd") == {}
+        assert load_case_deterministic_verdict("", "cases/case.md") == {}
+        assert load_case_deterministic_verdict("demo-skill", "") == {}
+        assert load_case_deterministic_verdict("no-such-skill", "cases/case.md") == {}
+
+
+class TestFreezeDeterministicVerdict:
+    def test_no_declaration_freeze_has_no_key(self):
+        # Byte-identical contract: every legacy snapshot stays untouched —
+        # the key is absent, not empty, so the verify fallback reads off
+        # key absence.
+        snap = freeze_approved_target_from_spec(_victim_pod_spec())
+        assert "deterministic_verdict" not in snap
+
+    def test_declared_verdict_round_trips(self):
+        dv = {"target": "statefulset", "action": "partition-stall",
+              "expected": {"Partition": "2"}}
+        snap = freeze_approved_target_from_spec(
+            _victim_pod_spec(), deterministic_verdict=dv,
+        )
+        assert snap["deterministic_verdict"] == dv
+        assert approved_from_dict(snap).deterministic_verdict == dv
+
+    def test_malformed_declaration_is_not_frozen(self):
+        # Fail-safe: a partial declaration (missing target/action) never
+        # lands in the snapshot — key stays absent.
+        snap = freeze_approved_target_from_spec(
+            _victim_pod_spec(),
+            deterministic_verdict={"target": "", "action": "x"},
+        )
+        assert "deterministic_verdict" not in snap
+
+    def test_hydrated_malformed_verdict_is_dropped(self):
+        # A hand-edited state must not smuggle a partial declaration into
+        # the verify layer — hydration re-validates the shape.
+        snap = freeze_approved_target_from_spec(_victim_pod_spec())
+        snap["deterministic_verdict"] = {"target": "statefulset"}
+        assert approved_from_dict(snap).deterministic_verdict == {}
+        snap["deterministic_verdict"] = "garbage"
+        assert approved_from_dict(snap).deterministic_verdict == {}
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +755,67 @@ class TestManifestMissingGuidance:
         assert "manifest missing" not in d.reason
 
 
+class TestReadOnlyCarveOutW704:
+    """W-70-4 (Case #70 Phase B): the secondary-namespace-drift rejection
+    must state it covers the exec/write ONLY and that read-only observation
+    of the drifted namespace is still cleared — so the model does not
+    over-generalize one write refusal into "the whole namespace is off
+    limits" and abandon collectable evidence (Phase B skipped the read-only
+    ``kubectl logs -n ingress-nginx`` controller-log probe after an ``exec``
+    into the controller pod was refused here; 70-R2 proves the logs passes).
+
+    The carve-out lives in this branch's OWN reason, never in the shared
+    ``_build_suggestion`` — nine rejection paths call it, so leaking there
+    would spread a secondary-ns-only statement across every verb/rejection
+    (b7cd803d: reason and suggestion must point at the same thing, per verb
+    class).
+    """
+
+    def _drift(self, approved, eff_ns="kube-system"):
+        return K8sDriftPolicy().check_identity_drift(
+            approved, _eff("configmap", eff_ns, ["coredns-custom"]),
+        )
+
+    def test_no_manifest_reason_names_readonly_carve_out(self):
+        approved = approved_from_dict(
+            freeze_approved_target_from_spec(_victim_pod_spec()),
+        )
+        eff_ns = "kube-system"
+        d = self._drift(approved, eff_ns)
+        assert d is not None
+        # Phrased as the SCOPE of this rejection, not a new allow rule.
+        assert "this rejection covers the exec/write" in d.reason
+        # ① consistency invariant: the carve-out names the SAME namespace as
+        #    the drift (single-source interpolation of effective_ns), so it
+        #    tracks the runtime value instead of a dead literal.
+        assert f"read-only observation of {eff_ns}" in d.reason
+        # No-manifest branch keeps the manifest-missing suffix alongside.
+        assert "manifest missing" in d.reason
+
+    def test_manifest_present_reason_also_carries_carve_out(self):
+        # The carve-out is unconditional: read-only calls never reach this
+        # drift check regardless of manifest, so both branches state it.
+        entries = (MechanismWriteEntry(
+            scope="secret", namespace="kube-system", names=("s1",),
+        ),)
+        d = self._drift(_frozen_with_entries(entries))
+        assert d is not None
+        assert "read-only observation of kube-system" in d.reason
+        assert "manifest missing" not in d.reason
+
+    def test_carve_out_never_leaks_into_shared_suggestion(self):
+        # ② anti-leak: the shared _build_suggestion describes only the
+        #    approved target; a secondary-ns-only carve-out placed there
+        #    would leak cross-verb / cross-rejection.
+        approved = approved_from_dict(
+            freeze_approved_target_from_spec(_victim_pod_spec()),
+        )
+        d = self._drift(approved)
+        assert d is not None
+        assert "read-only observation" not in d.suggestion
+        assert "this rejection covers" not in d.suggestion
+
+
 # ---------------------------------------------------------------------------
 # §3.2 Boundary predicate
 # ---------------------------------------------------------------------------
@@ -649,6 +969,13 @@ class TestDerivePvcClaimsFromWrites:
         )
         skill_dir = tmp_path / "demo-skill"
         (skill_dir / "cases").mkdir(parents=True)
+        # A′: resolve_skill_dir keys on the frontmatter ``name`` (mirroring
+        # the registry, which only loads dirs carrying a valid SKILL.md), so
+        # a realistic skill dir must declare its name in SKILL.md.
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo-skill\ndescription: demo\n---\nbody",
+            encoding="utf-8",
+        )
         (skill_dir / "cases" / "case.md").write_text(
             _PVC_CASE_FRONTMATTER, encoding="utf-8",
         )

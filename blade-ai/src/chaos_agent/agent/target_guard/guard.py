@@ -166,17 +166,44 @@ def _cross_family_scope_change(
     ).strip():
         # Comparable: ``_fault_type_lock_drift`` renders the verdict.
         return None
+    reason = (
+        f"fault family changed (approved={approved_scope} "
+        f"effective={effective_scope}) and the fault type cannot be "
+        f"compared (approved fault_target="
+        f"{approved.fault_target or '<empty>'}, effective fault_target="
+        f"{effective.fault_target or '<empty>'})"
+    )
+    suggestion = _build_suggestion(approved)
+    # Layer 2 (O-C2-1, b7cd803d cause-fix pairing): when the classifier already
+    # diagnosed WHY this command carries no comparable fault type (a banned verb
+    # / empty family → ``reject_detail``) and paired it with the compliant
+    # read-only shape (``reject_suggestion``), surface BOTH here instead of
+    # dropping them — the model otherwise sees only the approved-target echo and
+    # enumerates alternatives (the python3 -c detour). BRANCH-LOCAL: this appends
+    # to THIS decision's own reason/suggestion; the shared ``_build_suggestion``
+    # above is called unchanged, so the other eight refusal branches — every k8s
+    # path included — render byte-identically (7eb13170/8207f9f1). CARRIER-SCOPED
+    # and k8s-isolated: only the host classifier attaches
+    # ``reject_suggestion=HOST_READONLY_PROBE_HINT``, and this function
+    # structurally never sees a k8s effective (k8s↔host is caught by step 4's
+    # cross-profile gate; k8s↔k8s returns at the same-family check above), so the
+    # hint cannot leak into a k8s refusal. Decision-neutral: verdict stays
+    # REJECT_DRIFT and ``decision_to_feedback`` forces ``is_hard_floor=True`` for
+    # REJECT_DRIFT regardless of ``suggestion`` (guard_gateway.py), so admit/deny
+    # and fail-closed are untouched.
+    if effective.reject_detail:
+        reason = f"{reason} — {effective.reject_detail}"
+    if effective.reject_suggestion:
+        suggestion = (
+            f"{suggestion}\n{effective.reject_suggestion}"
+            if suggestion
+            else effective.reject_suggestion
+        )
     return GuardDecision(
         verdict=GuardVerdict.REJECT_DRIFT,
-        reason=(
-            f"fault family changed (approved={approved_scope} "
-            f"effective={effective_scope}) and the fault type cannot be "
-            f"compared (approved fault_target="
-            f"{approved.fault_target or '<empty>'}, effective fault_target="
-            f"{effective.fault_target or '<empty>'})"
-        ),
+        reason=reason,
         effective=effective,
-        suggestion=_build_suggestion(approved),
+        suggestion=suggestion,
     )
 
 

@@ -1079,15 +1079,18 @@ async def _probe_debug_pod_with_backoff(
     ``NotFound`` short-circuits immediately.
     """
     from chaos_agent.tools.kubectl_cli import _debug_pod_metadata
+    from chaos_agent.transports import resolve_transport_target
 
     kubeconfig = str(state.get("kubeconfig") or "")
+    # Single-authority transport target resolved from THIS caller's state
+    # (replaces the settings side-effect ``sync_kubewiz_runtime`` used to
+    # establish); threaded into the leaf so the metadata read honours
+    # per-session kubewiz values instead of settings-only fallback.
+    _xport_target = resolve_transport_target(state)
     last: tuple[dict, str] = ({}, "")
     for attempt in range(_PROBE_MAX_ATTEMPTS):
-        # Exactly the 3-arg signature (W-56-2/4): connection context rides on
-        # TransportTarget.from_state({}) → settings, synced upstream by
-        # sync_kubewiz_runtime — there is no 4th/5th parameter to pass.
         metadata, error = await _debug_pod_metadata(
-            pod_name, namespace, kubeconfig,
+            pod_name, namespace, kubeconfig, target=_xport_target,
         )
         if metadata and not error:
             return metadata, ""
@@ -1270,17 +1273,20 @@ async def registered_carrier_is_current(artifact: dict, state: dict) -> bool:
     runtime — it is not a scope escape — so liveness is only a degraded signal.
     """
     from chaos_agent.tools.kubectl_cli import _debug_pod_metadata
+    from chaos_agent.transports import resolve_transport_target
 
-    # Exactly the 3-arg signature (W-56-2/4, #56 msg#179): the former 5-arg
-    # call raised TypeError on EVERY re-read, which the fail-closed liveness
-    # gate then rendered as "carrier unavailable" → REJECT_BANNED even while
-    # the carrier was healthy. Connection context rides on
-    # TransportTarget.from_state({}) → settings (sync_kubewiz_runtime), so
-    # there is nothing extra to pass.
+    # Single-authority transport target resolved from THIS caller's state
+    # (replaces the settings side-effect ``sync_kubewiz_runtime`` used to
+    # establish). The former 5-arg call raised TypeError on EVERY re-read
+    # (W-56-2/4, #56 msg#179), which the fail-closed liveness gate then
+    # rendered as "carrier unavailable" → REJECT_BANNED even while the carrier
+    # was healthy; the connection context now rides on the ``target`` kwarg
+    # (a TransportTarget), not on positional args.
     metadata, error = await _debug_pod_metadata(
         str(artifact.get("name") or ""),
         str(artifact.get("namespace") or ""),
         str(state.get("kubeconfig") or ""),
+        target=resolve_transport_target(state),
     )
     if error or not metadata:
         return False

@@ -255,6 +255,22 @@ class ApprovedTarget:
     # (every legacy case — the gate falls back to the verb proxy,
     # behaviour byte-identical to pre-declaration).
     recovery_channel: str = ""
+    # Case-file ``deterministic_verdict`` legislation (openspec
+    # mechanism-invariant-trust-boundary, decision C) — the frozen rule-
+    # binding key + expected effect value N, parsed deterministically from
+    # the settled case frontmatter at freeze time (SAME one-directional chain
+    # as ``recovery_channel``/``mechanism_entries``: code re-reads the file,
+    # no LLM input point) and frozen here so the verify finalize layer can
+    # (a) select a deterministic rule by a STABLE author-declared key instead
+    # of the planner's on-the-fly LLM triple (which drifts), and (b) read the
+    # expected value N the effect must reach. Shape
+    # ``{"target": str, "action": str, "expected": {str: str}}``. It is
+    # ORTHOGONAL to the planner's LLM identity triple and NEVER overrides it
+    # (the triple stays the victim/scope authority — #49 invariant); this
+    # field only binds a rule key. Empty for every case without the
+    # declaration — those runs fall back to the LLM-triple rule resolution
+    # path, keeping freeze output and verify behaviour byte-identical.
+    deterministic_verdict: dict = field(default_factory=dict)
     # Write-set approval state — the in-graph half of the D4 invariant.
     # True means the snapshot still carries manifest entries beyond the
     # victim coverage that NO knowing human has approved yet. Set at the
@@ -280,6 +296,24 @@ class ApprovedTarget:
     # scenario layer 3 exists to bound. Zero when the spec carried no
     # duration (the net then stays silent — no anchor, no comparison).
     duration_seconds: int = 0
+    # Verbatim entry-point intent text (``FaultSpec.user_description``), frozen
+    # at the single spec funnel ``freeze_approved_target_from_spec`` (so every
+    # re-freeze site — safety_check probe/real, confirmation_gate,
+    # tool_screener drift-correction — carries it forward automatically, since
+    # it rides the SPEC rather than being a per-site frontmatter kwarg). Fix4
+    # (openspec generalize-nonnode-victim-identity-correction) reads it in the
+    # drift policy's cross-kind rejection branch: when a write targets a
+    # DIFFERENT kind with no owner/secondary/mechanism authorization, this is
+    # the unforgeable authority that decides whether the FROZEN victim identity
+    # degraded away from what the user actually named (→ attribute as identity
+    # degradation, re-plan the target — never let replan convert it into a
+    # wrong-target mechanism substitution) versus a genuine unauthorized drift.
+    # Empty for every snapshot frozen before this field and for the low-level
+    # ``freeze_approved_target`` path that carries no spec text — the dict key
+    # is written CONDITIONALLY so legacy snapshots stay byte-identical
+    # (golden-locked); Fix4 then reads off its absence and keeps today's
+    # generic scope-drift reason verbatim.
+    user_description: str = ""
 
     def as_target(self):
         """Return the carrier-agnostic :class:`TargetProtocol` view.

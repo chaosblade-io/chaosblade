@@ -310,6 +310,50 @@ class K8sDriftPolicy:
             elif effective_scope in secondary:
                 is_secondary_scope = True
             else:
+                # Fix4 (openspec generalize-nonnode-victim-identity-correction):
+                # a cross-kind write with NO owner / secondary / mechanism
+                # authorization. The 3.6 gate above already returned None for
+                # any case-manifest-authorized mechanism write, so this branch
+                # is structurally unreachable for the mechanism_writes
+                # catalogue — zero false-block. Before emitting the generic
+                # scope-drift reason, ask whether the user's OWN frozen entry
+                # text corroborates the EFFECTIVE identity: if it does, the
+                # FROZEN victim identity degraded away from what the user
+                # named, and this rejection MUST be attributed as identity
+                # degradation so replan re-plans the TARGET (via
+                # propose_plan_change, which Fix1 now auto-approves for a
+                # corroborated non-node identity) instead of letting its "same
+                # effect → switch mechanism" principle convert the refusal into
+                # a wrong-target mechanism substitution (Case #70: patched a
+                # healthy Service selector to fake the same 503, reported
+                # partial). Not corroborated → the write names something the
+                # user never asked for: keep the generic unauthorized-drift
+                # reason. Fail-closed: an absent user_description (legacy
+                # snapshot / low-level freeze) skips corroboration and keeps
+                # today's reason byte-identically. Function-local import:
+                # spec.intent_anchor stays off this module's load edge, same
+                # cycle discipline as the mechanism_writes import above.
+                from chaos_agent.agent.spec.intent_anchor import (
+                    user_text_corroborates,
+                )
+                if approved.user_description and user_text_corroborates(
+                    approved.user_description, effective.scope, effective.names,
+                ):
+                    return GuardDecision(
+                        verdict=GuardVerdict.REJECT_DRIFT,
+                        reason=(
+                            f"target identity degradation: the frozen contract "
+                            f"approves {approved_scope}, but this write targets "
+                            f"{effective_scope} — which IS what the user's own "
+                            f"request named. The approved victim identity is "
+                            f"wrong, NOT the mechanism. Re-plan the target "
+                            f"identity via propose_plan_change; do NOT substitute "
+                            f"a different mechanism on the frozen target to force "
+                            f"a similar effect."
+                        ),
+                        effective=effective,
+                        suggestion=_build_suggestion(approved),
+                    )
                 return GuardDecision(
                     verdict=GuardVerdict.REJECT_DRIFT,
                     reason=f"scope drift: approved={approved_scope} effective={effective_scope}",
@@ -367,6 +411,28 @@ class K8sDriftPolicy:
                             "by the case and approved on the confirmation card "
                             "— manifest missing for this case"
                         )
+                    # W-70-4 (Case #70 Phase B): this rejection covers the
+                    # exec/write into {effective_ns} ONLY. Read-only observation
+                    # of that namespace is cleared upstream as a readonly verdict
+                    # and never reaches this drift check — but the model, seeing
+                    # only a namespace-scoped refusal, over-generalized it into
+                    # "the whole namespace is off limits" and abandoned the
+                    # read-only `kubectl logs -n ingress-nginx` controller-log
+                    # probe (the strongest mechanism-attribution evidence; 70-R2
+                    # proves the read-only logs passes). State the carve-out so a
+                    # write refusal is not misread as an observation refusal.
+                    # Safety-neutral: describes existing readonly clearing,
+                    # grants no new permission. Kept in this branch's own reason
+                    # — _build_suggestion is shared by all nine rejection paths
+                    # and would leak the carve-out cross-verb / cross-rejection.
+                    reason += (
+                        "; this rejection covers the exec/write into "
+                        f"{effective_ns} ONLY — read-only observation of "
+                        f"{effective_ns} (kubectl_read logs/get/describe) is "
+                        "cleared as a readonly verdict, is not subject to this "
+                        "drift rejection, and remains the authorized way to "
+                        "collect mechanism-attribution evidence there"
+                    )
                     return GuardDecision(
                         verdict=GuardVerdict.REJECT_DRIFT,
                         reason=reason,

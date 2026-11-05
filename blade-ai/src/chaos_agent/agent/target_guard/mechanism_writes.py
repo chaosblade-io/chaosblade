@@ -505,9 +505,15 @@ def load_case_recovery_channel(skill_name: str, case_resource_path: str) -> str:
     if not skill_name or not case_resource_path:
         return ""
     try:
-        from chaos_agent.skills.loader import get_skills_dir, load_skill_resource
+        from chaos_agent.skills.loader import load_skill_resource, resolve_skill_dir
 
-        skill_dir = get_skills_dir() / skill_name
+        skill_dir = resolve_skill_dir(skill_name)
+        if skill_dir is None:
+            logger.warning(
+                "recovery_channel: skill dir not found in any root for skill=%s",
+                skill_name,
+            )
+            return ""
         content = load_skill_resource(skill_dir, case_resource_path)
     except (ValueError, FileNotFoundError, OSError) as e:
         logger.warning(
@@ -522,6 +528,249 @@ def load_case_recovery_channel(skill_name: str, case_resource_path: str) -> str:
         )
         return ""
     return parse_recovery_channel(content)
+
+
+# ---------------------------------------------------------------------------
+# ``network_mechanism`` — the case file's injection-mechanism legislation for
+# ``fault_target == "network"`` faults. Same one-directional chain as
+# ``recovery_channel`` / ``deterministic_verdict``: case author legislates →
+# deterministic code parses (here) → the pre-injection feasibility checker
+# consults it BEFORE assuming a mechanism.
+#
+# Why it exists: ``NetworkFeasibilityChecker`` historically probed in-container
+# ``iptables`` + the ``interface`` for EVERY pod-scope network fault, because
+# the tc/netem actions (delay/loss/corrupt/drop/duplicate/reorder) inject via
+# netfilter. But ``network`` is a coarse target that also covers mechanisms
+# which never touch netfilter — ``occupy`` (a userspace ``nc``/``socat`` bind)
+# and dns-class faults (resolver/``/etc/hosts`` mutation). For those, the
+# iptables/interface probes are irrelevant and emitted a factually WRONG
+# advisory ("iptables unavailable — the direct-exec fallback path is closed;
+# prefer the blade operator path / a netadmin debug container"), steering away
+# from the very kubectl-native bind path that works. The mechanism is a
+# case-declared property (the case doc is the legislative source for the
+# fault's own mechanism), NOT derivable from the planner's identity triple —
+# ``occupy`` is not even a declared carrier action verb.
+# ---------------------------------------------------------------------------
+
+#: Injection-mechanism vocabulary for network faults. ``netfilter`` is the
+#: tc/netem family that genuinely needs in-container iptables + interface;
+#: ``userspace-bind`` (port occupy via nc/socat) and ``resolver`` (dns-class
+#: hosts/resolver mutation) need neither. Absent/unknown → ``""`` and the
+#: feasibility checker FAILS SAFE to the netfilter preconditions (byte-identical
+#: to the pre-declaration behaviour), so only an explicit non-netfilter
+#: declaration suppresses the iptables/interface probes.
+NETWORK_MECHANISM_NETFILTER = "netfilter"
+NETWORK_MECHANISM_USERSPACE_BIND = "userspace-bind"
+NETWORK_MECHANISM_RESOLVER = "resolver"
+KNOWN_NETWORK_MECHANISMS = frozenset({
+    NETWORK_MECHANISM_NETFILTER,
+    NETWORK_MECHANISM_USERSPACE_BIND,
+    NETWORK_MECHANISM_RESOLVER,
+})
+#: Mechanisms that do NOT manipulate netfilter/interface — the feasibility
+#: checker skips the iptables + interface probes for these. Single source for
+#: the gate predicate so the checker never hard-codes the enumeration inline.
+NON_NETFILTER_NETWORK_MECHANISMS = frozenset({
+    NETWORK_MECHANISM_USERSPACE_BIND,
+    NETWORK_MECHANISM_RESOLVER,
+})
+
+
+def parse_network_mechanism(content: str) -> str:
+    """Deterministically parse the ``network_mechanism`` frontmatter key.
+
+    Returns ``""`` for: no frontmatter, missing key, empty value, or an
+    unknown value (logged). Never raises — same failure posture as
+    :func:`parse_recovery_channel`. ``""`` means "no declaration", which the
+    feasibility checker treats as fail-safe netfilter (run every probe).
+    """
+    if not content:
+        return ""
+    from chaos_agent.skills.loader import parse_frontmatter
+
+    try:
+        frontmatter = parse_frontmatter(content)
+    except Exception:  # noqa: BLE001 — parse must never raise
+        logger.warning("network_mechanism: frontmatter parse failed — no declaration")
+        return ""
+    if not frontmatter:
+        return ""
+
+    raw = str(frontmatter.get("network_mechanism") or "").strip().lower()
+    if not raw:
+        return ""
+    if raw not in KNOWN_NETWORK_MECHANISMS:
+        logger.warning(
+            "network_mechanism: unknown value %r — declaration ignored "
+            "(known: %s)", raw, sorted(KNOWN_NETWORK_MECHANISMS),
+        )
+        return ""
+    return raw
+
+
+def load_case_network_mechanism(skill_name: str, case_resource_path: str) -> str:
+    """Read the settled case file and return its ``network_mechanism``.
+
+    The AUTHORITATIVE read, same discipline as
+    :func:`load_case_recovery_channel`: code re-reads the case file through
+    the escape-proof resolver, so neither the Agent's prose reading nor any
+    LLM-declared planning field is an input. Any failure → ``""`` (the
+    feasibility checker fails safe to the netfilter preconditions).
+    """
+    skill_name = (skill_name or "").strip()
+    case_resource_path = (case_resource_path or "").strip()
+    if not skill_name or not case_resource_path:
+        return ""
+    try:
+        from chaos_agent.skills.loader import load_skill_resource, resolve_skill_dir
+
+        skill_dir = resolve_skill_dir(skill_name)
+        if skill_dir is None:
+            logger.warning(
+                "network_mechanism: skill dir not found in any root for skill=%s",
+                skill_name,
+            )
+            return ""
+        content = load_skill_resource(skill_dir, case_resource_path)
+    except (ValueError, FileNotFoundError, OSError) as e:
+        logger.warning(
+            "network_mechanism: resource read failed for skill=%s path=%s (%s)",
+            skill_name, case_resource_path, e,
+        )
+        return ""
+    except Exception as e:  # noqa: BLE001 — load must never raise
+        logger.warning(
+            "network_mechanism: unexpected load failure for skill=%s path=%s (%s)",
+            skill_name, case_resource_path, e,
+        )
+        return ""
+    return parse_network_mechanism(content)
+
+
+# ---------------------------------------------------------------------------
+# ``deterministic_verdict`` — the case file's frozen verdict-binding
+# declaration (openspec mechanism-invariant-trust-boundary, decision C).
+# Same one-directional chain as ``recovery_channel``: case author declares →
+# deterministic code parses (here) → approval freezes it into the snapshot →
+# the verify finalize layer consults it to (a) select the deterministic rule
+# by a FROZEN key and (b) read the expected effect value N.
+#
+# It is ORTHOGONAL to the planner's LLM identity triple
+# (fault_target/fault_action/fault_scope) and NEVER overrides it — the triple
+# stays the victim/scope authority (#49 invariant, agent_loop.py "derivation
+# REMOVED … DECLARED by the planner"). This field only binds a rule key that
+# must NOT drift with the LLM's on-the-fly triple. Absent → the verify layer
+# falls back to the LLM triple path, byte-identical to pre-declaration.
+# ---------------------------------------------------------------------------
+
+
+def parse_deterministic_verdict(content: str) -> dict:
+    """Deterministically parse the ``deterministic_verdict`` frontmatter key.
+
+    Expected shape (YAML)::
+
+        deterministic_verdict:
+          target: statefulset          # frozen rule-selection key (stable,
+          action: partition-stall      #   author-declared — NOT the LLM triple)
+          expected:                    # effect value N (a mechanism constant
+            Partition: 2               #   known at authoring time; design D3)
+
+    Returns ``{}`` for: no frontmatter, missing key, malformed value, or a
+    declaration lacking a non-empty ``target``+``action`` (logged). Never
+    raises — same failure posture as :func:`parse_recovery_channel`.
+
+    The key is NOT validated against the rule registry here: an unknown key
+    simply resolves to no rule downstream (fail-safe to the LLM path), so
+    parse validates SHAPE only — which also avoids an import cycle into
+    ``_verification_profiles``. ``expected`` values are coerced to ``str``
+    (blank dropped); the rule layer parses them numerically.
+    """
+    if not content:
+        return {}
+    from chaos_agent.skills.loader import parse_frontmatter
+
+    try:
+        frontmatter = parse_frontmatter(content)
+    except Exception:  # noqa: BLE001 — parse must never raise
+        logger.warning(
+            "deterministic_verdict: frontmatter parse failed — no declaration",
+        )
+        return {}
+    if not frontmatter:
+        return {}
+
+    raw = frontmatter.get("deterministic_verdict")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(
+            "deterministic_verdict: expected a mapping, got %r — ignored",
+            type(raw).__name__,
+        )
+        return {}
+
+    target = str(raw.get("target") or "").strip()
+    action = str(raw.get("action") or "").strip()
+    if not target or not action:
+        logger.warning(
+            "deterministic_verdict: missing target/action (%r/%r) — ignored",
+            target, action,
+        )
+        return {}
+
+    expected_raw = raw.get("expected") or {}
+    expected: dict[str, str] = {}
+    if isinstance(expected_raw, dict):
+        for k, v in expected_raw.items():
+            if v is None or str(v).strip() == "":
+                continue
+            expected[str(k)] = str(v)
+    else:
+        logger.warning(
+            "deterministic_verdict: 'expected' is not a mapping (%r) — dropped",
+            type(expected_raw).__name__,
+        )
+
+    return {"target": target, "action": action, "expected": expected}
+
+
+def load_case_deterministic_verdict(skill_name: str, case_resource_path: str) -> dict:
+    """Read the settled case file and return its ``deterministic_verdict``.
+
+    The AUTHORITATIVE read, same discipline as
+    :func:`load_case_recovery_channel`: code re-reads the case file through
+    the escape-proof resolver, so neither the Agent's prose reading nor any
+    LLM-declared planning field is an input. Any failure → ``{}`` (the
+    verify layer falls back to the LLM triple path).
+    """
+    skill_name = (skill_name or "").strip()
+    case_resource_path = (case_resource_path or "").strip()
+    if not skill_name or not case_resource_path:
+        return {}
+    try:
+        from chaos_agent.skills.loader import load_skill_resource, resolve_skill_dir
+
+        skill_dir = resolve_skill_dir(skill_name)
+        if skill_dir is None:
+            logger.warning(
+                "deterministic_verdict: skill dir not found in any root for skill=%s",
+                skill_name,
+            )
+            return {}
+        content = load_skill_resource(skill_dir, case_resource_path)
+    except (ValueError, FileNotFoundError, OSError) as e:
+        logger.warning(
+            "deterministic_verdict: resource read failed for skill=%s path=%s (%s)",
+            skill_name, case_resource_path, e,
+        )
+        return {}
+    except Exception as e:  # noqa: BLE001 — load must never raise
+        logger.warning(
+            "deterministic_verdict: unexpected load failure for skill=%s path=%s (%s)",
+            skill_name, case_resource_path, e,
+        )
+        return {}
+    return parse_deterministic_verdict(content)
 
 
 def derive_pvc_claims_from_writes(
@@ -663,9 +912,15 @@ def load_case_mechanism_writes(
     if not skill_name or not case_resource_path:
         return ()
     try:
-        from chaos_agent.skills.loader import get_skills_dir, load_skill_resource
+        from chaos_agent.skills.loader import load_skill_resource, resolve_skill_dir
 
-        skill_dir = get_skills_dir() / skill_name
+        skill_dir = resolve_skill_dir(skill_name)
+        if skill_dir is None:
+            logger.warning(
+                "case manifest: skill dir not found in any root for skill=%s",
+                skill_name,
+            )
+            return ()
         content = load_skill_resource(skill_dir, case_resource_path)
     except (ValueError, FileNotFoundError, OSError) as e:
         logger.warning(
@@ -1005,6 +1260,8 @@ __all__ = [
     "format_mechanism_writes_for_display",
     "load_case_mechanism_writes",
     "load_case_recovery_channel",
+    "load_case_deterministic_verdict",
+    "parse_deterministic_verdict",
     "match_mechanism_entries",
     "names_within_entries",
     "names_within_entry",

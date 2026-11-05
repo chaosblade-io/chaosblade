@@ -458,15 +458,63 @@ class TestDiscoverOwnerNamesNamesChannel:
         )
         assert owners == ()
 
-    async def test_container_scope_normalised_to_pod_channel(self, monkeypatch):
+    async def test_container_scope_resolves_owner_via_pod_selector(self, monkeypatch):
+        # B87: a container-scope approval's ``names`` are CONTAINER names, not
+        # pod names. discover_owner_names canonicalises container→pod so the
+        # labels channel fires, and the names channel resolves the owning POD
+        # from the label selector before walking its ownerReferences chain.
         from chaos_agent.agent.target_guard.freeze import discover_owner_names
-        self._make_transport(monkeypatch, {
-            "c-pod-1": "DaemonSet|ds|true;",
-        })
-        owners = await discover_owner_names(
-            "container", "default", {}, names=("c-pod-1",),
+        self._make_transport(
+            monkeypatch,
+            {
+                "web-abc-111": "ReplicaSet|web-abc|true;",
+                "web-abc": "Deployment|web|true;",
+            },
+            label_hits="web-abc-111",  # the app selector resolves to this pod
         )
-        assert owners == ("ds",)
+        owners = await discover_owner_names(
+            "container", "default", {"app": "web"}, names=("sidecar",),
+        )
+        # label → pod web-abc-111 → RS web-abc → Deployment web. The
+        # Deployment name is the generation-successor prefix anchor.
+        assert "web" in owners and "web-abc" in owners
+
+    async def test_b87_container_name_never_queried_as_pod(self, monkeypatch):
+        # B87 regression, with teeth: the CONTAINER name must NEVER be fed to
+        # the pod ownerReferences resolver — that category error (querying
+        # ``controller-ref pod/<container>`` → NotFound) is exactly what froze
+        # owner_names empty and made a pod-renaming mechanism's successor
+        # unrecognisable. Only the label-resolved POD is queried.
+        from chaos_agent.models.command_result import CommandResult
+        from chaos_agent.agent.target_guard.freeze import discover_owner_names
+        cmds: list[list[str]] = []
+
+        async def fake_execute(cmd, target, timeout=0,
+                               expect_profile=None, **kwargs):
+            tokens = [str(t) for t in cmd]
+            cmds.append(tokens)
+            if any("ownerReferences" in t for t in tokens):
+                if "web-abc-111" in tokens:
+                    return CommandResult(
+                        exit_code=0, stdout="Deployment|web|true;", stderr="",
+                    )
+                return CommandResult(exit_code=0, stdout="", stderr="")
+            if "-l" in tokens:
+                return CommandResult(exit_code=0, stdout="web-abc-111", stderr="")
+            return CommandResult(exit_code=0, stdout="", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        owners = await discover_owner_names(
+            "container", "default", {"app": "web"}, names=("drill-sidecar",),
+        )
+        assert "web" in owners
+        owner_ref_cmds = [c for c in cmds if any("ownerReferences" in t for t in c)]
+        assert owner_ref_cmds, "expected the label-resolved pod to be queried"
+        assert all("drill-sidecar" not in c for c in owner_ref_cmds), (
+            "the container name was queried as a pod ownerReferences target"
+        )
 
     async def test_non_pod_scope_skips_names_channel(self, monkeypatch):
         from chaos_agent.agent.target_guard.freeze import discover_owner_names

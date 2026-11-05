@@ -14,8 +14,12 @@ from __future__ import annotations
 import base64
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
+from chaos_agent.agent.execution_artifacts import (
+    collect_execution_artifacts,
+    is_vehicle_rbac_verb_patch,
+)
 from chaos_agent.agent.nodes.planning.tool_screener import (
     _NO_STATE_POST_RESOURCES,
     _carrier_restore_write_verbs,
@@ -471,3 +475,177 @@ class TestNoStatePostReviewExemption:
         assert _carrier_restore_write_verbs(
             f"drill-rc-b85x -n prod -- sh -c '{payload}'"
         ) == {"update", "patch"}
+
+
+def test_two_step_patch_breaks_b85_deadlock_end_to_end():
+    """openspec carrier-rbac-patch-armed-exemption D4 端到端联动（可证伪断言）：
+    同一条两步建栈 patch 命令既被 armed_before_inject 豁免
+    （is_vehicle_rbac_verb_patch=True），又被产物层折叠进 rbac_family
+    （collect_execution_artifacts），使 B85 从「缺 delete 拒绝武装」翻转为
+    「授权齐备放行」。这坐实死锁解除——pre-fix 该 patch 被 armed_before_inject
+    拦死、折叠成死代码、B85 永远缺 delete（#71 LimitRange 实测形态）。"""
+    # 载体只有 create 时的 [get,patch]，武装载荷需 {patch,delete}
+    base_carrier = _carrier(rbac_family=[{
+        "kind": "role", "name": "drill-rc-b85x",
+        "namespace": "prod", "verbs": ["get", "patch"],
+    }])
+    # 死锁的 B85 侧：折叠前武装被拒（缺 delete）
+    assert _screen_carrier_restore_verbs(
+        _arm_exec_args(_FULL_FORM_PAYLOAD), {},
+        {"execution_artifacts": [base_carrier]},
+    ) is not None
+
+    # 两步建栈第二步的 patch 命令（add delete 到 limitranges 族）
+    patch_v_args = (
+        'role drill-rc-b85x -n prod --type=json -p '
+        '\'[{"op":"add","path":"/rules/-","value":{"apiGroups":[""],'
+        '"resources":["limitranges"],"verbs":["get","delete"]}}]\''
+    )
+    # (a) armed_before_inject 豁免侧：同一命令判为载具构造
+    assert is_vehicle_rbac_verb_patch(
+        [base_carrier], v_args=patch_v_args,
+    ) is True
+
+    # (b) 产物层折叠侧：真实 collect 把 delete 折进 rbac_family
+    messages = [
+        AIMessage(content="", tool_calls=[{
+            "name": "kubectl",
+            "args": {"subcommand": "patch", "v_args": patch_v_args},
+            "id": "tc-lr-fold",
+        }]),
+        ToolMessage(
+            content="role.rbac.authorization.k8s.io/drill-rc-b85x patched",
+            name="kubectl", tool_call_id="tc-lr-fold",
+        ),
+    ]
+    folded = collect_execution_artifacts(messages, [base_carrier])
+    role = next(m for m in folded[0]["rbac_family"] if m["kind"] == "role")
+    assert role["verbs"] == ["delete", "get", "patch"]
+
+    # 死锁解除：折叠后 B85 放行武装
+    assert _screen_carrier_restore_verbs(
+        _arm_exec_args(_FULL_FORM_PAYLOAD), {},
+        {"execution_artifacts": folded},
+    ) is None
+
+
+# The #75 live form: the main recovery POSTs to RECREATE the fault
+# target's RoleBinding (verb ``create``), and the carrier appends the §9
+# fail-open self-teardown tail step — a DELETE of its OWN Binding
+# (``drill-rc-*``), granted only after arm. B85 must reconcile ONLY the
+# main verb ``create``; the self-referential delete is exempt (§3 L177).
+_MAIN_RECREATE_POST = (
+    "curl -sf -X POST --cacert $C -H \"Authorization: Bearer $T\" "
+    "-H \"Content-Type: application/json\" -d @/tmp/restore.json "
+    "https://kubernetes.default.svc/apis/rbac.authorization.k8s.io/v1/"
+    "namespaces/prod/rolebindings"
+)
+_SELF_TEARDOWN_DELETE = (
+    "curl -sf -X DELETE --cacert $C -H \"Authorization: Bearer $T\" "
+    "https://kubernetes.default.svc/apis/rbac.authorization.k8s.io/v1/"
+    "namespaces/prod/rolebindings/drill-rc-b85x"
+)
+_RECREATE_WITH_SELF_TEARDOWN = (
+    _MAIN_RECREATE_POST + " && " + _SELF_TEARDOWN_DELETE
+)
+# Same shape, but the DELETE targets the FAULT binding (drill-rb-*), not
+# the carrier's own — a main-recovery delete that MUST still reconcile.
+_MAIN_DELETE_FAULT_BINDING = (
+    "curl -sf -X DELETE --cacert $C -H \"Authorization: Bearer $T\" "
+    "https://kubernetes.default.svc/apis/rbac.authorization.k8s.io/v1/"
+    "namespaces/prod/rolebindings/drill-rb-target"
+)
+_RECREATE_WITH_FAULT_DELETE = (
+    _MAIN_RECREATE_POST + " && " + _MAIN_DELETE_FAULT_BINDING
+)
+
+
+def _bind_carrier() -> dict:
+    """The #75 stack: Role {get,create,bind} + own Binding + SA, all named
+    drill-rc-b85x (the synthetic carrier name the tail step deletes)."""
+    return _carrier(rbac_family=[
+        {"kind": "role", "name": "drill-rc-b85x",
+         "namespace": "prod", "verbs": ["get", "create", "bind"]},
+        {"kind": "rolebinding", "name": "drill-rc-b85x", "namespace": "prod"},
+        {"kind": "serviceaccount", "name": "drill-rc-b85x",
+         "namespace": "prod"},
+    ])
+
+
+class TestSelfTeardownExemption:
+    """The §9 fail-open self-teardown tail step (DELETE of the carrier's
+    OWN Binding) is exempt from B85's reconcile exactly as §3 L177 exempts
+    it from the arm-time SSAR gate — else the two arming gates drift and a
+    create-shaped recovery is refused for a delete it needs only post-arm
+    (the #75 live form). ONLY the self-referential delete is exempt; a
+    main-recovery delete of any other target still reconciles."""
+
+    def test_75_form_admits_with_bind_grant(self):
+        """#75 verbatim: grant {get,create,bind}, main POST=create, tail
+        DELETE of drill-rc-* — admit (pre-fix refused on missing [delete])."""
+        assert _screen_carrier_restore_verbs(
+            _arm_exec_args(_RECREATE_WITH_SELF_TEARDOWN), {},
+            {"execution_artifacts": [_bind_carrier()]},
+        ) is None
+
+    def test_self_teardown_delete_dropped_from_extraction(self):
+        """Extraction level (drives the real extractor, no reimplementation):
+        the exempt set drops ONLY the self-referential DELETE; with no exempt
+        names both verbs surface."""
+        v_args = (
+            f"drill-rc-b85x -n prod -- "
+            f"sh -c '{_RECREATE_WITH_SELF_TEARDOWN}'"
+        )
+        assert _carrier_restore_write_verbs(
+            v_args, exempt_teardown_names={"drill-rc-b85x"},
+        ) == {"create"}
+        assert _carrier_restore_write_verbs(v_args) == {"create", "delete"}
+
+    def test_main_recovery_delete_of_other_target_still_reconciled(self):
+        """Precision (has teeth): a DELETE of a rolebinding that is NOT the
+        carrier's own (the fault target drill-rb-*) is MAIN recovery — still
+        reconciled, still refused when the grant lacks delete. Refutes the
+        over-broad 'any DELETE rolebindings is exempt' design."""
+        result = _screen_carrier_restore_verbs(
+            _arm_exec_args(_RECREATE_WITH_FAULT_DELETE), {},
+            {"execution_artifacts": [_bind_carrier()]},
+        )
+        assert result is not None
+        assert "delete" in result[0]
+
+    def test_name_boundary_not_prefix_matched(self):
+        """A DELETE of drill-rc-b85x-extended (a SUPERSTRING of the carrier
+        name) is not the self-teardown — the URL path-segment boundary
+        lookahead keeps it reconciled."""
+        payload = (
+            _MAIN_RECREATE_POST + " && "
+            "curl -sf -X DELETE --cacert $C "
+            "https://kubernetes.default.svc/apis/rbac.authorization.k8s.io/v1/"
+            "namespaces/prod/rolebindings/drill-rc-b85x-extended"
+        )
+        result = _screen_carrier_restore_verbs(
+            _arm_exec_args(payload), {},
+            {"execution_artifacts": [_bind_carrier()]},
+        )
+        assert result is not None
+        assert "delete" in result[0]
+
+    def test_encoded_self_teardown_exempt_too(self):
+        """The self-teardown DELETE inside a base64-staged blob is exempt
+        too — the decoded reading shares the same extractor + exempt set."""
+        blob = base64.b64encode(
+            _RECREATE_WITH_SELF_TEARDOWN.encode()
+        ).decode()
+        carrier = _carrier(rbac_family=[{
+            "kind": "role", "name": "drill-rc-b85x",
+            "namespace": "prod", "verbs": ["create"],
+        }])
+        assert _screen_carrier_restore_verbs(
+            {
+                "subcommand": "exec",
+                "v_args": (
+                    f"drill-rc-b85x -n prod -- "
+                    f"sh -c 'echo {blob} | base64 -d >/tmp/r.sh; sh /tmp/r.sh'"
+                ),
+            }, {}, {"execution_artifacts": [carrier]},
+        ) is None

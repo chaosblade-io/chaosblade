@@ -24,35 +24,89 @@ classifier → guard path.
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 
+import chaos_agent
 from chaos_agent.agent.target_guard import (
     ApprovedTarget,
     infer_effective_target,
     target_drift_guard,
 )
-from chaos_agent.agent.target_guard import classifier as classifier_mod
-from chaos_agent.agent.providers.chaosblade import (
-    provider as chaosblade_mod,
-    python_provider as chaosblade_python_mod,
-)
-from chaos_agent.agent.providers.host_shell import provider as host_shell_mod
-from chaos_agent.agent.providers.k8s_native import classifier as k8s_classifier_mod
 
-# Phase-7 T5 moved the carrier classifiers into the provider package, so reject
-# sites and their ``_FIX_*`` wording constants are split between the generic
-# classifier and the per-carrier provider modules. Every module that classifies
-# must be walked/scanned, or the completeness rules below would pass vacuously
-# on the moved majority.
-_CLASSIFIER_MODULES = (
-    classifier_mod,
-    k8s_classifier_mod,
-    chaosblade_mod,
-    chaosblade_python_mod,
-    host_shell_mod,
-)
+
+# ---------------------------------------------------------------------------
+# Which modules the pairing rules scan — DERIVED by walking the package source,
+# NOT a hardcoded import list.
+#
+# A fixed tuple drifts silently. The previous one listed five modules but the
+# real reject sites live in seven: it missed ``providers/faultdrill/provider.py``
+# (the fourth carrier) and ``nodes/planning/tool_screener.py``. An unpaired
+# reject reason added to either shipped unguarded — proved by injecting one into
+# faultdrill (the completeness test stayed GREEN) while the identical defect in a
+# listed module was caught (test FAILED). Discovery keeps the enumeration from
+# ever falling behind the code again: every module under ``chaos_agent`` whose
+# AST constructs an ``EffectiveTarget`` reject site or defines a ``_FIX_*`` /
+# ``_SUGGEST_*`` model-facing string is imported and scanned, so adding a
+# carrier, relocating a reject site, or splitting a classifier into private
+# siblings (multiconcern-module-extraction) is covered automatically.
+# ---------------------------------------------------------------------------
+
+_REJECT_SCOPES = ("SCOPE_BANNED", "SCOPE_UNKNOWN", "SCOPE_ESCAPE")
+
+
+def _constructs_reject_site(tree: ast.AST) -> bool:
+    """Does this module build an ``EffectiveTarget`` with a rejecting scope?"""
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "EffectiveTarget"
+        ):
+            continue
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        scope = kw.get("scope")
+        if isinstance(scope, ast.Name) and scope.id in _REJECT_SCOPES:
+            return True
+    return False
+
+
+def _defines_fix_constant(tree: ast.AST) -> bool:
+    """Does this module define a top-level ``_FIX_*`` / ``_SUGGEST_*`` string?"""
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id.startswith(("_FIX_", "_SUGGEST_"))
+        ):
+            return True
+    return False
+
+
+def _discover_classifier_modules() -> tuple[ModuleType, ...]:
+    """Import every package module that classifies or words a fix — derived."""
+    root = Path(chaos_agent.__file__).parent
+    found: list[ModuleType] = []
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError, OSError):
+            continue
+        if not (_constructs_reject_site(tree) or _defines_fix_constant(tree)):
+            continue
+        rel = path.relative_to(root).with_suffix("").as_posix().replace("/", ".")
+        modname = f"chaos_agent.{rel}"
+        if modname.endswith(".__init__"):
+            modname = modname[: -len(".__init__")]
+        found.append(importlib.import_module(modname))
+    return tuple(found)
+
+
+_CLASSIFIER_MODULES = _discover_classifier_modules()
 
 # Bans with no drill form keep an EMPTY suggestion ON PURPOSE: guard_gateway
 # reads that emptiness as "this is a boundary, not a reshapeable call" and
@@ -465,6 +519,41 @@ class TestCapabilityRefusalNamesTheProfiles:
         )
         assert reason == self._OLD_REASON
         assert fix == self._OLD_FIX
+
+    def test_unregistered_scope_names_the_scope_not_kubeconfig(self):
+        # Defect A2 (#34-R): when the profile is UNKNOWN because a NON-EMPTY
+        # fault_spec.scope is not a registered fault domain, the refusal must
+        # name the SCOPE — not misattribute the cause to kubeconfig/transport
+        # (the cluster was healthy; the misleading "fix your kubeconfig"
+        # suggestion sent debugging in the wrong direction).
+        from chaos_agent.agent.capabilities import explain_tool_refusal
+
+        reason, fix = explain_tool_refusal(
+            "kubectl",
+            {"kubeconfig": "/tmp/kc", "fault_spec": {"scope": "workload"}},
+            "execute",
+        )
+        assert "workload" in reason
+        assert "not a" in reason and "registered fault domain" in reason
+        assert "deployment" in reason  # valid vocabulary surfaced
+        # The fix points at the spec authoring, and explicitly clears the
+        # cluster connection so nobody chases kubeconfig again.
+        assert "scope" in fix.lower()
+        assert "kubeconfig change" in fix
+
+    def test_unregistered_scope_refinement_skipped_on_discovery_path(self):
+        # The discovery path resolves the profile from the transport alone and
+        # deliberately ignores a provisional fault_spec.scope (docstring), so a
+        # healthy k8s transport must NOT be reported as an unregistered scope.
+        from chaos_agent.agent.capabilities import explain_tool_refusal
+
+        reason, _fix = explain_tool_refusal(
+            "host_inject",
+            {"kubeconfig": "/tmp/kc", "fault_spec": {"scope": "workload"}},
+            "execute",
+            discovery=True,
+        )
+        assert "registered fault domain" not in reason
 
     @pytest.mark.asyncio
     async def test_screener_surfaces_the_named_profiles(self):
