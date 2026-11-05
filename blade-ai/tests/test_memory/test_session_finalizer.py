@@ -147,9 +147,34 @@ def test_recover_payload_summary_preserves_server_payload_shape():
     assert summary is payload
 
 
-def test_recover_payload_summary_without_payload_stays_empty():
+def test_recover_payload_summary_without_payload_derives_from_durable_state():
+    # a82984a3 root cure: PAYLOAD mode used to persist "" whenever the caller
+    # built no payload — which is exactly EVERY crash/abort arm, because
+    # build_recover_result_payload only runs on normal completion. "" threw away
+    # the durable state (the recover_layer1_cache proof). The card is now derived
+    # from values through the SAME single-source renderer the normal path uses
+    # (build_recover_data_from_state → Route B floor), so the floor is
+    # structurally unavoidable on every PAYLOAD face. A completed recover keeps
+    # its real verdict ("recovered"); the floor never downgrades a live verdict.
     summary = build_recover_session_summary(
         _recover_values(),
+        recover_task_id="task-recover",
+        inject_task_id="task-inject",
+        inject_state_values=_inject_values(),
+        mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+    )
+
+    assert isinstance(summary, dict)
+    assert summary["status"] == "success"
+    assert summary["data"]["task_state"] == "recovered"
+
+
+def test_recover_payload_summary_without_state_stays_empty():
+    # round-64 F1 boundary preserved: empty values (aget_state failed) keep the
+    # honest "" — no evidence, no upgrade. The floor derives from durable state;
+    # with none on record there is nothing honest to spell.
+    summary = build_recover_session_summary(
+        {},
         recover_task_id="task-recover",
         inject_task_id="task-inject",
         inject_state_values=_inject_values(),
@@ -331,6 +356,183 @@ async def test_finalize_cancelled_inject_keeps_summary_but_marks_cancelled():
     assert store.finalized["result_summary"] is not None
 
 
+# ---------------------------------------------------------------------------
+# Structural terminal-row chokepoint (the zombie-row root cure).
+#
+# finalize_inject_session is the single un-bypassable finally EVERY inject
+# exit routes through, so it — not each per-path abort handler — owns the
+# TaskStore row's terminal word. It stamps the SAME floor-aware word the
+# session record and the crash envelope carry (data["task_state"] via
+# terminal_task_state), or the abort status_override when the run was still
+# mid-flight, through write_aborted_task_row (update_task_state with
+# skip_if_terminal=True). These tests drive the REAL finalizer and assert the
+# row write, so a regression that drops the stamp — or fires it on a paused /
+# unreadable run — turns red.
+# ---------------------------------------------------------------------------
+
+
+class _RowStore:
+    """Fake TaskStore recording the chokepoint's terminal-word writes."""
+
+    def __init__(self):
+        self.writes: list[tuple] = []
+
+    async def update_task_state(
+        self, task_id, task_state, *, recover_verification=None,
+        skip_if_terminal=False,
+    ):
+        self.writes.append((task_id, task_state, skip_if_terminal))
+        return True
+
+
+def _patch_row_store():
+    from unittest.mock import AsyncMock, patch
+
+    row_store = _RowStore()
+    return row_store, patch(
+        "chaos_agent.persistence.task_store.get_task_store",
+        new=AsyncMock(return_value=row_store),
+    )
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_stamps_terminal_row_with_reached_verdict():
+    """A run that reached its own verdict: the row is stamped with THAT
+    word (the same one the session record carries), skip_if_terminal=True
+    so a clean run whose final upsert already landed the word is an
+    idempotent no-op at the store layer."""
+    store = _SessionStore()
+    row_store, row_patch = _patch_row_store()
+
+    with row_patch:
+        await finalize_inject_session(
+            store,
+            _Graph(_inject_values()),
+            {"configurable": {"thread_id": "task-1"}},
+            "task-1",
+        )
+
+    assert row_store.writes == [("task-1", "injected", True)]
+    # The row word and the session record's word are ONE fact: both derive
+    # from data["task_state"] (terminal_task_state) in the same call.
+    assert store.finalized["result_summary"]["data"]["task_state"] == "injected"
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_stamps_verdictless_crash_row_failed():
+    """The #20 zombie-row cure: a verdict-less run that ENDED (crash, no
+    durable Layer-1 floor) is stamped "failed" — never left frozen at the
+    node-level upsert's "injecting". Before the chokepoint this path wrote
+    no row at all on the CLI/non-stream server exits."""
+    store = _SessionStore()
+    row_store, row_patch = _patch_row_store()
+    values = {
+        **_inject_values(),
+        "experiment_uid": "",
+        "verification": None,
+        "error": "internal_error: Inject failed: ReadTimeout",
+        "failure_reason": "internal_error: Inject failed: ReadTimeout",
+    }
+
+    with row_patch:
+        await finalize_inject_session(
+            store,
+            graph_or_agent=None,
+            config=None,
+            session_id="task-crash",
+            precomputed_values=values,
+        )
+
+    assert row_store.writes == [("task-crash", "failed", True)]
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_stamps_abort_override_on_midflight_run():
+    """An interrupt of a still-mid-flight run (infer == "injecting") stamps
+    the abort word "cancelled" on the row — the override survives the
+    round-62 P8 verdict-yield gate because no verdict was reached."""
+    store = _SessionStore()
+    row_store, row_patch = _patch_row_store()
+    values = {**_inject_values(), "experiment_uid": "", "verification": None}
+
+    with row_patch:
+        await finalize_inject_session(
+            store,
+            graph_or_agent=None,
+            config=None,
+            session_id="task-cancel",
+            precomputed_values=values,
+            status_override="cancelled",
+        )
+
+    assert row_store.writes == [("task-cancel", "cancelled", True)]
+    assert store.finalized["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_override_yields_to_reached_verdict():
+    """An abort racing a run that ALREADY reached its verdict must not
+    rewrite the word: the P8 gate nullifies the override, so the row keeps
+    "injected" (not "cancelled") — the row surface's skip_if_terminal is the
+    same rule, both surfaces hold."""
+    store = _SessionStore()
+    row_store, row_patch = _patch_row_store()
+
+    with row_patch:
+        await finalize_inject_session(
+            store,
+            _Graph(_inject_values()),
+            {"configurable": {"thread_id": "task-1"}},
+            "task-1",
+            status_override="cancelled",
+        )
+
+    assert row_store.writes == [("task-1", "injected", True)]
+    assert store.finalized["status"] != "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_does_not_stamp_paused_run():
+    """Round-64 F3 preserved: a run parked at the confirmation gate has NOT
+    ended — the resumable_pause guard returns before the stamp, so the row
+    stays active for the resume path (no terminal word, no session write)."""
+    store = _SessionStore()
+    row_store, row_patch = _patch_row_store()
+
+    with row_patch:
+        await finalize_inject_session(
+            store,
+            _PausedGraph(_paused_inject_values()),
+            {"configurable": {"thread_id": "task-paused"}},
+            "task-paused",
+        )
+
+    assert row_store.writes == []
+    assert store.finalized is None
+
+
+@pytest.mark.asyncio
+async def test_chokepoint_skips_out_of_domain_word():
+    """An unreadable graph state yields data["task_state"] == "unknown" (the
+    absence of a verdict, not one). "unknown" is outside the task_state
+    column domain, so the chokepoint skips the stamp rather than raising —
+    update_task_state's closed-set gate would reject it."""
+    store = _SessionStore()
+    row_store, row_patch = _patch_row_store()
+
+    with row_patch:
+        await finalize_inject_session(
+            store,
+            graph_or_agent=None,
+            config=None,
+            session_id="task-unreadable",
+            precomputed_values=None,
+        )
+
+    assert row_store.writes == []
+
+
+
 @pytest.mark.asyncio
 async def test_finalize_recover_session_uses_payload_status_for_server_mode():
     store = _SessionStore()
@@ -394,7 +596,15 @@ async def test_finalize_recover_failed_fallback_does_not_write_success_summary()
     )
 
     assert store.finalized["status"] == "failed"
-    assert store.finalized["result_summary"] == ""
+    # a82984a3 root cure: the summary is no longer "" — PAYLOAD mode derives the
+    # card from durable state through the floor. The CONTRACT this test guards
+    # (a failed fallback must NOT write a FALSE SUCCESS) still holds: a
+    # verdict-less, cache-less recover fail-closes to task_state="failed" /
+    # status="fail", never a success card. "" was a bug snapshot of the floor
+    # bypass, not the contract.
+    summary = store.finalized["result_summary"]
+    assert summary["status"] == "fail"
+    assert summary["data"]["task_state"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -958,3 +1168,259 @@ async def test_finalize_override_lands_when_run_is_midflight():
     )
 
     assert store.finalized["status"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Reason channel (error_override): the harness-testimony fix.
+#
+# The graph state is the single authoritative source of WHY a run ended, but
+# an UNCAUGHT exception is the one ending the run cannot record itself — the
+# node dies before writing failure_reason/error, the checkpoint freezes at the
+# prior superstep, and the projection carries an empty reason that
+# build_inject_envelope's fail-closed branch collapses to the bare
+# "Injection failed" (code 4002). error_override lets the surviving
+# orchestrator (the CLI/server except arm) deposit the cause it witnessed.
+# Contract: graph state ALWAYS wins — the override fills ONLY a reason-less
+# projection.
+# ---------------------------------------------------------------------------
+
+_OVERRIDE = "internal_error: Inject failed: RuntimeError: Connection error."
+
+
+def _reason_less_failed_values() -> dict:
+    """The exact projection an early-abort crash leaves: a plan/spec on
+    record but NO verdict, NO uid, NO error — terminal_task_state maps it to
+    "failed" (fail-closed) and build_inject_envelope's empty-reason branch
+    renders the bare "Injection failed"."""
+    return {**_inject_values(), "experiment_uid": "", "verification": None}
+
+
+@pytest.mark.asyncio
+async def test_error_override_fills_reason_less_crash_projection():
+    """The defect: a reason-less failed projection persisted the bare
+    "Injection failed". With the orchestrator's testimony the durable record
+    carries the actual cause instead of a false-certainty generic string."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-crash",
+        precomputed_values=_reason_less_failed_values(),
+        error_override=_OVERRIDE,
+    )
+
+    assert store.finalized["status"] == "failed"
+    summary = store.finalized["result_summary"]
+    assert summary["message"] == _OVERRIDE
+    assert summary["message"] != "Injection failed"
+    assert summary["data"]["error"] == _OVERRIDE
+
+
+@pytest.mark.asyncio
+async def test_error_override_yields_to_graph_state_reason():
+    """Contrapositive (precedence): a run that recorded its OWN reason keeps
+    it — the override fills the participant's silence, never overwrites its
+    last words. Every normal terminal exit (reject / loop-exhausted /
+    wall-clock / victim-absent) writes a reason and must be untouched."""
+    store = _SessionStore()
+    values = {
+        **_inject_values(),
+        "experiment_uid": "",
+        "verification": None,
+        "error": "execution_failed: iptables not found",
+        "failure_reason": "execution_failed: iptables not found",
+    }
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-graph-reason",
+        precomputed_values=values,
+        error_override="internal_error: SHOULD NOT APPEAR",
+    )
+
+    summary = store.finalized["result_summary"]
+    assert summary["message"] == "execution_failed: iptables not found"
+    assert "SHOULD NOT APPEAR" not in summary["message"]
+
+
+@pytest.mark.asyncio
+async def test_error_override_none_keeps_bare_fallback():
+    """Contrapositive (no testimony): with no override the projection is
+    unchanged — the pre-fix bare "Injection failed" still renders. The fix is
+    strictly additive; a caller with nothing to say behaves exactly as
+    before."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-no-override",
+        precomputed_values=_reason_less_failed_values(),
+    )
+
+    assert store.finalized["result_summary"]["message"] == "Injection failed"
+
+
+@pytest.mark.asyncio
+async def test_error_override_fills_data_envelope_mode():
+    """The server inject_stream crash arm persists DATA_ENVELOPE: the cause
+    lands in data["error"] verbatim (the audit record's reason field)."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-data-env",
+        precomputed_values=_reason_less_failed_values(),
+        result_summary_mode=RESULT_SUMMARY_DATA_ENVELOPE,
+        error_override=_OVERRIDE,
+    )
+
+    assert store.finalized["result_summary"]["data"]["error"] == _OVERRIDE
+
+
+@pytest.mark.asyncio
+async def test_error_override_fills_status_envelope_mode():
+    """The server inject.py crash arm persists STATUS_ENVELOPE: the cause
+    lands in the status envelope's error field."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-status-env",
+        precomputed_values=_reason_less_failed_values(),
+        result_summary_mode=RESULT_SUMMARY_STATUS_ENVELOPE,
+        error_override=_OVERRIDE,
+    )
+
+    assert store.finalized["result_summary"]["data"]["error"] == _OVERRIDE
+
+
+@pytest.mark.asyncio
+async def test_error_override_fills_unknown_projection():
+    """The worst crash shape: aget_state itself failed, so there is NO graph
+    state at all (build_unknown_inject_data). The orchestrator's testimony is
+    the ONLY cause on record — it must still land."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-unknown",
+        precomputed_values=None,
+        result_summary_mode=RESULT_SUMMARY_DATA_ENVELOPE,
+        error_override=_OVERRIDE,
+    )
+
+    assert store.finalized["status"] == "failed"
+    assert store.finalized["result_summary"]["data"]["error"] == _OVERRIDE
+
+
+@pytest.mark.asyncio
+async def test_recover_cli_envelope_error_override_fills_reason_less():
+    """Recover edition: the CLI recover except arm persists
+    RECOVER_CLI_ENVELOPE, which routes through build_inject_envelope and hits
+    the same bare fallback. A reason-less failed recovery takes the cause."""
+    store = _SessionStore()
+    values = {
+        "operation": "recover",
+        "recover_verification": {"level": "failed", "layer1": {"status": "failed"}},
+    }
+    override = "internal_error: Recovery failed: RuntimeError: boom"
+
+    await finalize_recover_session(
+        store,
+        _Graph(values),
+        {"configurable": {"thread_id": "task-recover-crash"}},
+        "task-recover-crash",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+        default_status="failed",
+        error_override=override,
+    )
+
+    assert store.finalized["status"] == "failed"
+    assert store.finalized["result_summary"]["message"] == override
+
+
+@pytest.mark.asyncio
+async def test_recover_cli_envelope_error_override_yields_to_state_reason():
+    """Contrapositive (recover precedence): a recover graph that recorded its
+    own reason keeps it."""
+    store = _SessionStore()
+    values = {
+        "operation": "recover",
+        "recover_verification": {"level": "failed", "layer1": {"status": "failed"}},
+        "error": "recover_graph_reason",
+        "failure_reason": "recover_graph_reason",
+    }
+
+    await finalize_recover_session(
+        store,
+        _Graph(values),
+        {"configurable": {"thread_id": "task-recover-graphreason"}},
+        "task-recover-graphreason",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+        default_status="failed",
+        error_override="internal_error: SHOULD NOT APPEAR",
+    )
+
+    summary = store.finalized["result_summary"]
+    assert summary["message"] == "recover_graph_reason"
+    assert "SHOULD NOT APPEAR" not in summary["message"]
+
+
+def test_recover_payload_mode_ignores_error_override():
+    """Scope boundary: PAYLOAD mode is NOT a consumer of the reason channel —
+    error_override must not reshape its summary. a82984a3 root cure: when the
+    caller built no payload, PAYLOAD mode now DERIVES the card from durable
+    state (floor) instead of persisting ""; that derivation reads ONLY the graph
+    state (build_recover_data_from_state takes no error_override), so the reason
+    channel still cannot leak in. The recover_stream / l4 / turn recover
+    fallbacks all run this mode."""
+    summary = build_recover_session_summary(
+        {"operation": "recover"},
+        recover_task_id="task-recover",
+        inject_task_id="task-inject",
+        inject_state_values=_inject_values(),
+        mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+        error_override="internal_error: SHOULD NOT RESHAPE",
+    )
+
+    # A verdict-less, cache-less recover fail-closes to "failed", and the
+    # override string appears NOWHERE in the state-derived card.
+    assert summary["status"] == "fail"
+    assert summary["data"]["task_state"] == "failed"
+    assert "SHOULD NOT RESHAPE" not in str(summary)
+
+
+def test_every_envelope_crash_arm_wires_error_override():
+    """Mechanical closure (穷举消费面): every ENVELOPE-mode crash finalize
+    call site must pass error_override, or the reason channel has a hole. A
+    new crash arm that forgets the wiring turns this red — the regression
+    guard does not rely on author diligence."""
+    checked_files = [
+        PROJECT_ROOT / "src/chaos_agent/cli/runner.py",
+        PROJECT_ROOT / "src/chaos_agent/server/routes/inject.py",
+        PROJECT_ROOT / "src/chaos_agent/server/routes/inject_stream.py",
+        PROJECT_ROOT / "src/chaos_agent/server/routes/turn_event_stream.py",
+    ]
+    missing = [
+        path.name
+        for path in checked_files
+        if "error_override=" not in path.read_text(encoding="utf-8")
+    ]
+
+    assert missing == []

@@ -346,8 +346,15 @@ class TuiSessionStore:
                 session.setdefault("messages", []).extend(new_entries)
                 session["stats"]["message_count"] = len(session["messages"])
                 self._existing_keys[tui_session_id] = existing_keys
+                # .jsonl is the sole per-append write (O(K)). The .json snapshot
+                # is refreshed atomically at compaction / finalize / metadata
+                # writes, and read() reconstructs the full list from snapshot +
+                # increments. Rewriting the full .json here too was a drift from
+                # this documented design (and from SessionStore): it made every
+                # append O(N) and — being non-atomic — could corrupt the very
+                # file read() trusts. Messages are never lost by dropping it:
+                # they live in .jsonl until the next snapshot folds them in.
                 self._append_to_jsonl(tui_session_id, new_entries)
-                self._write_json(tui_session_id)
                 if self._needs_compaction(tui_session_id):
                     self._compact(tui_session_id)
 
@@ -426,15 +433,33 @@ class TuiSessionStore:
                 return
         session["finished_at"] = now_iso()
         session["status"] = status
-        self._atomic_write_json(tui_session_id)
+        # Snapshot-gated cleanup: delete the .jsonl increment log ONLY once the
+        # final .json is confirmed written. If the atomic snapshot fails (disk
+        # full etc.) the .jsonl is the only surviving copy of the
+        # un-snapshotted increments, so we leave it for read() to replay rather
+        # than unlink it (probe-confirmed data loss otherwise). Mirrors
+        # SessionStore.finalize_session's snapshot_ok gate.
+        snapshot_ok = True
+        try:
+            self._atomic_write_json(tui_session_id)
+        except OSError as e:
+            snapshot_ok = False
+            logger.warning(
+                f"Finalize snapshot failed for session {tui_session_id}; "
+                f"leaving .jsonl intact so the record is still recoverable "
+                f"via read(): {e}"
+            )
 
         # Clean up JSONL — the final .json is the complete archival record
-        jsonl_path = self._jsonl_path(tui_session_id)
-        try:
-            if jsonl_path.exists():
-                jsonl_path.unlink()
-        except OSError as e:
-            logger.warning(f"Failed to delete JSONL for session {tui_session_id}: {e}")
+        if snapshot_ok:
+            jsonl_path = self._jsonl_path(tui_session_id)
+            try:
+                if jsonl_path.exists():
+                    jsonl_path.unlink()
+            except OSError as e:
+                logger.warning(
+                    f"Failed to delete JSONL for session {tui_session_id}: {e}"
+                )
 
         # Remove from in-memory buffers
         self._active_sessions.pop(tui_session_id, None)
@@ -491,8 +516,10 @@ class TuiSessionStore:
             return data
 
         # Replay JSONL increments onto the snapshot, deduplicating entries
-        # that already exist in the snapshot (append_dialogue writes both
-        # .json and .jsonl, so they overlap in the normal non-crash path).
+        # that already exist in the snapshot. append_dialogue writes only the
+        # .jsonl; the .json snapshot is refreshed at compaction / finalize /
+        # metadata writes (each dumps the full in-memory message list), so the
+        # two overlap and dedup keeps the reconstruction idempotent.
         try:
             from chaos_agent.memory.session_store import _message_dedup_key
 
@@ -516,6 +543,12 @@ class TuiSessionStore:
                         existing_keys.add(key)
             if incremental_messages:
                 data["messages"] = data.get("messages", []) + incremental_messages
+                # Keep the derived count consistent with the reconstructed list:
+                # the snapshot's message_count only reflects the last
+                # compaction / metadata write, not the increments replayed here.
+                stats = data.get("stats")
+                if isinstance(stats, dict):
+                    stats["message_count"] = len(data["messages"])
         except OSError as e:
             logger.warning(f"Failed to read JSONL for session {tui_session_id}: {e}")
 
@@ -707,8 +740,25 @@ class TuiSessionStore:
         return self._jsonl_counts.get(tui_session_id, 0) >= self._compaction_threshold
 
     def _compact(self, tui_session_id: str) -> None:
-        """Write a full snapshot atomically and truncate the JSONL log."""
-        self._atomic_write_json(tui_session_id)
+        """Snapshot the full session atomically, then truncate the JSONL log.
+
+        Crash-safe: the ``.jsonl`` is truncated ONLY after the snapshot write
+        is confirmed. If ``_atomic_write_json`` raises (disk full etc.) we
+        return early, leaving ``.jsonl`` intact and ``_jsonl_counts`` NOT
+        reset so the next append retries compaction — ``read()`` still reconstructs the
+        full message list from the older ``.json`` snapshot plus the surviving
+        ``.jsonl`` increments (deduped). Truncating before a confirmed
+        snapshot would destroy the only copy of the un-snapshotted increments
+        (probe-confirmed data loss).
+        """
+        try:
+            self._atomic_write_json(tui_session_id)
+        except OSError as e:
+            logger.warning(
+                f"Compaction snapshot failed for session {tui_session_id}; "
+                f"leaving .jsonl intact so increments are not lost: {e}"
+            )
+            return
         jsonl_path = self._jsonl_path(tui_session_id)
         try:
             jsonl_path.write_text("", encoding="utf-8")
@@ -734,35 +784,55 @@ class TuiSessionStore:
         return data
 
     def _write_json(self, tui_session_id: str) -> None:
-        """Write session data to JSON file (non-atomic, for skeleton/updates)."""
-        session = self._active_sessions.get(tui_session_id)
-        if session is None:
-            return
-        file_path = self._file_path(tui_session_id)
+        """Best-effort atomic snapshot write for skeleton / metadata updates.
+
+        Atomic (tempfile + os.replace) via ``_atomic_write_json``: ``read()``
+        loads ``.json`` with a bare ``json.loads`` and returns ``None`` on any
+        parse error, so the old non-atomic ``write_text`` could — on a crash
+        mid-write — leave a torn ``.json`` that discards the whole session even
+        though the ``.jsonl`` increments survive (probe-confirmed total loss).
+        Failures are logged, not raised: these are create / metadata / eviction
+        writes whose callers have no recovery path — but a failed write now
+        leaves the previous ``.json`` intact instead of a corrupt half-file.
+        """
         try:
-            file_path.write_text(
-                json.dumps(session, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
+            self._atomic_write_json(tui_session_id)
         except OSError as e:
             logger.warning(f"Failed to write session {tui_session_id}: {e}")
 
     def _atomic_write_json(self, tui_session_id: str) -> None:
-        """Write session data using atomic tempfile + rename (for finalization)."""
+        """Write session data using atomic tempfile + rename.
+
+        Mirrors ``SessionStore._atomic_write_json``'s hardening so the two
+        sibling stores cannot drift apart on crash-safety:
+
+        - Raises ``OSError`` on disk failure (was silently log + return).
+          Callers that destroy the ``.jsonl`` increment log afterwards
+          (``_compact`` / ``finalize``) MUST catch it and skip the destroy —
+          otherwise a failed snapshot leaves the increments as the only
+          surviving copy and they get deleted anyway (probe-confirmed data
+          loss: UNIQUE increment present in neither ``.json`` nor ``.jsonl``).
+        - Any raise path (``json.dump`` error, ``os.replace`` error, disk
+          full mid-write) cleans up the ``.json.tmp`` tempfile via
+          try/finally + success flag, so orphans don't accumulate across
+          compaction retries.
+        """
         session = self._active_sessions.get(tui_session_id)
         if session is None:
             return
         file_path = self._file_path(tui_session_id)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.session_dir), suffix=".json.tmp"
+        )
+        success = False
         try:
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(self.session_dir), suffix=".json.tmp"
-            )
-            try:
-                with open(fd, "w", encoding="utf-8") as f:
-                    json.dump(session, f, ensure_ascii=False, indent=2, default=str)
-            except Exception:
-                os.unlink(tmp_path)
-                raise
+            with open(fd, "w", encoding="utf-8") as f:
+                json.dump(session, f, ensure_ascii=False, indent=2, default=str)
             os.replace(tmp_path, str(file_path))
-        except OSError as e:
-            logger.warning(f"Failed to atomic-write session {tui_session_id}: {e}")
+            success = True
+        finally:
+            if not success:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass

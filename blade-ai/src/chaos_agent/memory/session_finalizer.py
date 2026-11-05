@@ -198,13 +198,59 @@ def build_recover_session_summary(
     inject_state_values: dict[str, Any],
     result_payload: dict[str, Any] | None = None,
     mode: str = RESULT_SUMMARY_RECOVER_PAYLOAD,
+    error_override: str | None = None,
 ) -> dict[str, Any] | str:
     """Build the persisted session ``result_summary`` for a recover run."""
 
     if mode == RESULT_SUMMARY_RECOVER_PAYLOAD:
         if result_payload is not None:
             return result_payload
-        return ""
+        # a82984a3 root cure (PAYLOAD arm — the LAST recover persistence face
+        # that bypassed the durable-evidence floor). PAYLOAD mode echoes a
+        # caller-pre-built card, and the ONLY caller that builds one
+        # (build_recover_result_payload, server NORMAL completion) never runs
+        # on a crash — so the recover_stream / turn_event_stream abort arms and
+        # every l4 fallback landed here with result_payload=None and persisted
+        # "", discarding the recover_layer1_cache proof that the destroy DID
+        # land. That is the same provenance inversion the inject arm already
+        # cured: finalize_inject_session ALWAYS rebuilds ``data`` from values_fin
+        # through build_inject_data_from_state → terminal_task_state (floor)
+        # BEFORE mode dispatch, so no inject mode can bypass it. Mirror that
+        # invariant here — derive the card from the DURABLE final state through
+        # the SAME single-source renderer the normal path uses
+        # (build_recover_data_from_state → recover_task_state_from_values →
+        # Route B floor) — so the floor is structurally unavoidable for EVERY
+        # PAYLOAD-mode caller, present and future, instead of resting on each
+        # crash arm remembering to pre-build a payload (round-64 F1 boundary
+        # preserved: empty values, i.e. aget_state failed, keep the honest "" —
+        # no evidence, no upgrade; the floor never claims "recovered", a
+        # verdict-less crash WITH Layer-1 proof spells "unverified", WITHOUT
+        # proof "failed"). Fail-soft: finalize_recover_session's outer except
+        # aborts the WHOLE persist, so a builder error must degrade to the old
+        # "" rather than lose the session row entirely.
+        if not recover_values:
+            return ""
+        try:
+            from chaos_agent.agent.result.operation_result import (
+                build_recover_data_from_state,
+            )
+
+            data = build_recover_data_from_state(
+                recover_values, recover_task_id, inject_state_values,
+            )
+        except Exception:
+            logger.debug(
+                "Recover PAYLOAD summary floor-derive failed for %s",
+                recover_task_id, exc_info=True,
+            )
+            return ""
+        # Polarity matches build_inject_envelope / _recover_status_from_payload:
+        # only a "failed" verdict lands fail; unverified / partial_recovered /
+        # recovered are session-level completions (round-64 F1).
+        return {
+            "status": "fail" if data.get("task_state") == "failed" else "success",
+            "data": data,
+        }
 
     if mode == RESULT_SUMMARY_RECOVER_CLI_ENVELOPE:
         from chaos_agent.agent.result.operation_outcome import read_operation_outcome
@@ -221,13 +267,50 @@ def build_recover_session_summary(
             if recover_values
             else TaskState.UNVERIFIED.value
         )
+        outcome = read_operation_outcome(recover_values)
+        # Position face (round-64 F1) meets the durable-evidence floor
+        # (a82984a3 root cure, recover arm). With no verdict infer_task_state
+        # answers "recovering" — the run's POSITION. But a crash AFTER the
+        # destroy landed leaves durable Layer-1 proof in the checkpoint, and the
+        # honest position then is "unverified" (the run ended mid-adjudication
+        # AFTER the recovery action, not mid-flight), not the optimistic
+        # in-progress word. Lift ONLY on that durable proof; with no proof keep
+        # "recovering" verbatim — round-64 F1's no-evidence-no-upgrade boundary
+        # (session status "failed" vs envelope "recovering", the two faces not
+        # contradicting) is untouched. The floor never claims "recovered".
+        #
+        # The lift fills ONLY the silence a CRASH leaves, so it is gated on the
+        # ABSENCE of a deliberate terminal classification (``failure_reason``) —
+        # the SAME gate ``recover_task_state_from_values`` (Route B) applies. A
+        # budget-cut recovery writes RECOVERY_VERIFICATION_TIMEOUT /
+        # WALL_CLOCK_TIMEOUT (W-56-8): the node has spoken "failure", and both
+        # faces must honour it rather than one lifting to "unverified" while the
+        # other stays "failed". A crashed node writes no reason at all.
+        if (
+            recover_values
+            and inferred_state == TaskState.RECOVERING.value
+            and not outcome.failure_reason
+        ):
+            from chaos_agent.agent.result.operation_outcome import (
+                synthesize_recover_verification_floor,
+            )
+
+            if synthesize_recover_verification_floor(recover_values) is not None:
+                inferred_state = TaskState.UNVERIFIED.value
         result_data = build_recover_cli_data_from_state(
             recover_values,
             inject_task_id,
             inject_state_values,
         )
         result_data["result"] = inferred_state
-        result_data["error"] = read_operation_outcome(recover_values).error
+        result_data["error"] = outcome.error
+        # Reason channel (recover edition of finalize_inject_session's
+        # error_override): the recover graph is the single source of WHY the
+        # recovery ended, but an uncaught exception kills the node before it
+        # writes — the surviving CLI/server except arm deposits the cause it
+        # already built. Graph state wins: fill only a reason-less projection.
+        if error_override and not result_data["error"]:
+            result_data["error"] = error_override
         return build_inject_envelope(
             result_data,
             inferred_state,
@@ -247,6 +330,7 @@ async def finalize_inject_session(
     precomputed_values: dict | None = None,
     result_summary_mode: str = RESULT_SUMMARY_INJECT_ENVELOPE,
     status_override: str | None = None,
+    error_override: str | None = None,
 ) -> None:
     """Finalize an inject-type session by reading final graph state.
 
@@ -266,6 +350,22 @@ async def finalize_inject_session(
     override passed. Callers may pre-gate (the turn stream does, because
     its row-write arm needs the same predicate); this function enforces
     the rule for every caller unconditionally.
+
+    Reason channel (``error_override``): the graph state is the single
+    authoritative source of WHY a run ended — every normal terminal exit
+    (reject, mark_loop_exhausted, mark_wall_clock_timeout, planning extract,
+    safety_check victim-absent) writes failure_reason/error into it. An
+    UNCAUGHT exception is the one ending the run cannot record itself: the
+    node dies before writing, the checkpoint freezes at the prior superstep,
+    and the projection carries an empty reason that build_inject_envelope's
+    fail-closed branch collapses to the bare "Injection failed" (code 4002)
+    — the durable record loses a cause the surviving orchestrator actually
+    witnessed. ``error_override`` is that orchestrator's testimony: the
+    CLI/server except arm deposits the reason it already built for the user.
+    Graph state ALWAYS wins — the override fills ONLY a reason-less
+    projection (same precedence as status_override: harness testimony fills
+    the participant's silence, never overwrites its last words), so any run
+    that recorded its own verdict is untouched.
     """
 
     _ = kwargs  # Kept for API compatibility with existing CLI callers.
@@ -357,6 +457,55 @@ async def finalize_inject_session(
             if values_fin
             else build_unknown_inject_data(session_id)
         )
+        # Reason channel (see the error_override contract above): fill the
+        # participant's silence, never its last words — only a reason-less
+        # projection takes the orchestrator's testimony. Every mode below
+        # (inject_envelope / data_envelope / status_envelope) consumes
+        # data["error"], and inject_session_status reads it too, so this one
+        # point carries the cause into the message, the persisted data, and
+        # the status word alike.
+        if error_override and not data.get("error"):
+            data["error"] = error_override
+
+        # Structural terminal-row stamp (single un-bypassable chokepoint).
+        # EVERY inject exit — clean finish, uncaught-exception crash,
+        # cancel/disconnect abort — routes through THIS finally, and
+        # ``data["task_state"]`` is already the floor-aware terminal word
+        # (build_inject_data_from_state → terminal_task_state). Stamping the
+        # durable TaskStore row HERE closes it by construction on every path,
+        # so no exit has to remember its own row write. That per-path
+        # hand-wiring was the defect: the CLI's generic-exception crash arm
+        # and the server's non-stream inject route both forgot it, leaving a
+        # zombie "injecting" row (the node-level upsert froze at the last
+        # successful superstep; no later writer ever came). The word is the
+        # SAME one the session record and the crash envelope already carry —
+        # one event, one word, all surfaces (rounds 55-57 contract, now
+        # structural instead of per-site). Ordering matches the aborted-row
+        # rationale: the row is the user-facing fact (boot card / /tasks read
+        # it), the session record is derived, so a failure in the latter must
+        # not swallow the former.
+        #
+        # Guards, all pre-existing and preserved:
+        #  • resumable_pause returned above → a run parked at the
+        #    confirmation gate is never stamped (its row stays active for the
+        #    resume path, round-64 F3).
+        #  • status_override already yielded to a reached verdict above
+        #    (round-62 P8), so an abort racing a finished run cannot rewrite
+        #    its word; skip_if_terminal is the row surface's same rule
+        #    (round-54 G6) and also makes the clean path an idempotent no-op
+        #    (the final node's upsert already landed the terminal word).
+        #  • a word outside the column domain ("unknown" — the graph state
+        #    could not be read) is not a verdict: skip, never reject.
+        from chaos_agent.agent.state import TASK_STATE_COLUMN_VALUES
+
+        _row_word = status_override or str(data.get("task_state") or "")
+        if _row_word in TASK_STATE_COLUMN_VALUES:
+            from chaos_agent.server.routes.stream_abort import (
+                write_aborted_task_row,
+            )
+
+            await write_aborted_task_row(session_id, _row_word)
+
         session_store.finalize_session(
             session_id,
             remaining_messages=remaining,
@@ -385,6 +534,7 @@ async def finalize_recover_session(
     default_status: str | None = None,
     error_log_level: str = "warning",
     precomputed_values: dict[str, Any] | None = None,
+    error_override: str | None = None,
 ) -> None:
     """Finalize a recover session and preserve caller-specific summary shape.
 
@@ -493,6 +643,7 @@ async def finalize_recover_session(
                 inject_state_values=dict(inject_state_values or {}),
                 result_payload=result_payload,
                 mode=result_summary_mode,
+                error_override=error_override,
             ),
             status=status,
             progress_ledger=values_fin.get("progress_ledger") if values_fin else None,

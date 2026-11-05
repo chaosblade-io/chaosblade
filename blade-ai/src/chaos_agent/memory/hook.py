@@ -41,6 +41,55 @@ logger = logging.getLogger(__name__)
 
 _AUTO_EXTRACTED_MARKER = "[Auto-extracted:"
 
+# Provenance allowlist for the deterministic-metric timeline.
+#
+# ``extract_metrics`` is COMMAND-substring driven and tool-agnostic: it fires
+# on any content whose reconstructed "command" merely CONTAINS a trigger
+# substring (``jsonpath=``, ``logs``, ``get`` …). For the cluster-observation
+# tools below, that content is the raw stdout of a read command actually run
+# against the environment — an INDEPENDENT fact, which is exactly what the
+# deterministic verdict layer's cross-check needs as ground truth.
+#
+# Every OTHER tool is default-DENIED. The agent-internal tools
+# (``save_fault_plan`` / ``submit_verification`` / ``update_progress`` /
+# ``finish_*`` / ``activate_skill`` / ``baseline_collector`` / …) carry the
+# LLM's OWN narrative as their args — plans, specs, verdict prose that QUOTE
+# jsonpath templates and write ``key=value`` phrases. ``_command_from_parent``
+# flattens those args into a "command", the substring gates open on the quoted
+# template, and ``_parse_labeled_jsonpath`` / ``_parse_kubectl_logs`` then
+# harvest the prose as if it were observed fact. Live run inject-6129a6da
+# (Case #81): ``submit_verification`` yielded a spurious ``Suspend=true``
+# (the sibling-case contrast prose; every real probe read ``suspend=false``),
+# and ``save_fault_plan`` fabricated ``Log: CrashLoopBackOff count=2`` from the
+# plan's expected-symptom text — a false side-effect signal on the very channel
+# E4 trusts. That is a self-referential pollution loop: the checker's ground
+# truth gets seeded from the thing it is supposed to check.
+#
+# Default-deny (an allowlist, not a blocklist) is the trust-boundary semantic:
+# only provenance-clean environment observation may enter the timeline, and a
+# newly added internal tool is denied until it is explicitly proven to be an
+# observation source. ``tests/test_memory/test_hook_metric_extraction.py``
+# pins this membership so removing/adding a name fails loudly.
+#
+# ``http_probe`` qualifies on the same ground as the kubectl family: its result
+# is the raw, framework-built ``curl -w`` measurement of a real request against
+# the cluster (born-structured JSON the tool itself produced), NOT LLM
+# narrative. It is the verify phase's typed L7 probe — the whole point of
+# admitting it is to close the extractor coverage gap that left http_code /
+# time_connect off the timeline (Case #84). It routes through ``extract_metrics``
+# by TOOL NAME (not command substring), so its JSON is never mistaken for prose.
+#
+# ``host_http_probe`` qualifies on IDENTICAL ground: it is ``http_probe``'s
+# host-delivered sibling — the same framework-built ``curl -w`` measurement of a
+# real request (born-structured JSON the tool produced), just run on the host the
+# transport addresses instead of a client pod. It routes through
+# ``extract_metrics`` by TOOL NAME too, so a bare-host / python-app L7
+# observation reaches the timeline instead of starving the cross-check as an
+# unparseable hand-written ``host_read`` curl.
+_OBSERVATION_TOOLS = frozenset({
+    "kubectl", "kubectl_read", "host_read", "http_probe", "host_http_probe",
+})
+
 
 def _find_tool_command(target_msg, all_messages: list) -> str:
     """Find the command string for a ToolMessage by index-then-extract.
@@ -181,12 +230,62 @@ def _command_from_parent(parent_msg, tool_call_id: str) -> str:
     return ""
 
 
-def _extract_tool_metrics(messages: list) -> None:
+def _parent_tool_arg(parent_msg, tool_call_id: str, key: str) -> str:
+    """Extract a SINGLE named arg (e.g. ``command``) from a tool_call's args.
+
+    Unlike :func:`_command_from_parent` — which value-joins EVERY arg so the
+    extractor's substring dispatch sees one contiguous command — this returns
+    the exact value of ``key`` alone. The read-only shape classifier must judge
+    the command the tool actually ran (``args['command']``); feeding it the
+    value-join would append ``task_id`` and misrepresent the invocation.
+    """
+    if parent_msg is None:
+        return ""
+    for tc in getattr(parent_msg, "tool_calls", None) or []:
+        if isinstance(tc, dict):
+            tc_id = tc.get("id", "") or ""
+            args = tc.get("args", {}) or {}
+        else:
+            tc_id = getattr(tc, "id", "") or ""
+            args = getattr(tc, "args", {}) or {}
+        if tc_id == tool_call_id and isinstance(args, dict):
+            return str(args.get(key, "") or "")
+    return ""
+
+
+def _target_paths_from_state(state: dict) -> tuple:
+    """Declared disk-fault target mount path(s) for target-driven df
+    extraction (D4/B2), delegated to the ``FaultSpec`` — the single authority
+    for this fact (it resolves params["path"] → names absolute paths; the
+    real NL host disk-fill stores the mount in names, not params). Empty for
+    a non-disk fault / missing spec, so the timeline stays byte-identical.
+    Never raises: the memory hook must not break the graph (lazy import
+    dodges the hook↔agent.nodes cycle)."""
+    try:
+        from chaos_agent.agent.nodes.verify._metric_extractor import (
+            disk_target_paths,
+        )
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        spec = read_fault_spec(state) if isinstance(state, dict) else None
+        return disk_target_paths(spec)
+    except Exception as e:  # pragma: no cover - defensive, hook must not raise
+        logger.debug("disk target path derivation failed: %s", e)
+        return ()
+
+
+def _extract_tool_metrics(messages: list, target_paths: tuple = ()) -> None:
     """For each ToolMessage that hasn't been processed yet, run the
     metric extractor and (a) store the dict in
     ``msg.additional_kwargs['extracted_metrics']``, (b) prepend a
     ``[Auto-extracted: …]`` line to the message content (skipped for
     JSON-shaped content — see ``_is_json_shaped``).
+
+    ``target_paths`` (D4/B2) is the declared disk-fault mount path (from
+    ``read_fault_spec(state).params`` via ``disk_target_paths``), threaded
+    to the extractor so a dedicated partition target (``/drill-disk``) is
+    keyed on its OWN df row instead of being dropped for the root overlay.
+    Empty for a non-disk fault — the timeline then stays byte-identical.
 
     Idempotent: messages whose ``additional_kwargs`` already carries
     ``extracted_metrics`` are skipped, so the hook can be called
@@ -198,7 +297,14 @@ def _extract_tool_metrics(messages: list) -> None:
     # Lazy import to avoid a circular import (hook is imported by graph
     # construction; the extractor lives under agent.nodes which itself
     # transitively pulls in fault_spec and other graph-adjacent modules).
-    from chaos_agent.agent.nodes.verify._metric_extractor import extract_metrics
+    from chaos_agent.agent.nodes.verify._metric_extractor import (
+        extract_metrics,
+        harvest_evidence_fingerprint,
+    )
+    # Single-source read-only shape classifier — the SAME authority host_inject's
+    # skip_guard branch uses to admit its observation channel. Lazy for the same
+    # circular-import reason as the extractor above.
+    from chaos_agent.tools.readonly import is_readonly_host_command
 
     parent_index: dict[str, object] | None = None  # built lazily on first need
 
@@ -226,6 +332,33 @@ def _extract_tool_metrics(messages: list) -> None:
             akw["extracted_metrics"] = {}  # mark as processed
             continue
 
+        # Provenance gate (default-deny): only cluster-observation tools
+        # produce independent facts. Every agent-internal tool carries the
+        # LLM's own narrative as args — running the command-substring-driven
+        # extractor on it harvests that prose as fake metrics, seeding the
+        # cross-check timeline from the thing it is supposed to check (see
+        # _OBSERVATION_TOOLS). Mark {} so the message is never re-walked.
+        #
+        # host_inject is the ONE shape-dependent case. It is host_read's
+        # SUPERSET (cfd89b32 方向A): a clean read-only diagnostic (channel 2,
+        # admitted with skip_guard) is the ONLY in-window observation channel
+        # for a host drill, because host_read is not bound to the EXECUTE
+        # phase. Harvesting that channel keeps D17's value corpus exhaustive
+        # over what the LLM could legitimately have read in-window — without
+        # it, T3 anchors a self-recovering fault's in-window value (e.g.
+        # ``pgrep -c stress-ng``→206) to the post-recovery re-read (→0) and
+        # false-flags the genuinely-observed number as a fabrication, wrongly
+        # downgrading a correct ``verified``. Its fault-command channel
+        # (``blade`` / ``stress-ng --fork``) is a MUTATION whose receipt is not
+        # an observation and stays excluded, so injection output never seeds
+        # the corpus. Gated by the SAME single-source shape classifier the
+        # guard's skip_guard branch uses, so observation-vs-mutation is decided
+        # in exactly one place.
+        tool_name = getattr(msg, "name", "") or ""
+        if tool_name not in _OBSERVATION_TOOLS and tool_name != "host_inject":
+            akw["extracted_metrics"] = {}
+            continue
+
         # Lazy-build the parent index on first ToolMessage that needs
         # it — saves the O(M) scan when all ToolMessages are already
         # flag-marked.
@@ -233,9 +366,14 @@ def _extract_tool_metrics(messages: list) -> None:
             parent_index = _build_tool_call_index(messages)
         tc_id = getattr(msg, "tool_call_id", "") or ""
         command = _command_from_parent(parent_index.get(tc_id), tc_id)
-        tool_name = getattr(msg, "name", "") or ""
+        if tool_name == "host_inject" and not is_readonly_host_command(
+            _parent_tool_arg(parent_index.get(tc_id), tc_id, "command")
+        ):
+            # Fault-injection invocation (channel 1), not an observation.
+            akw["extracted_metrics"] = {}
+            continue
         try:
-            metrics = extract_metrics(tool_name, command, content)
+            metrics = extract_metrics(tool_name, command, content, target_paths)
         except Exception as e:  # extractor must never raise, but guard anyway
             logger.debug("metric extractor failed: %s", e)
             metrics = {}
@@ -243,6 +381,21 @@ def _extract_tool_metrics(messages: list) -> None:
         # Always set the flag (even when {}) so we don't re-walk this
         # message on every subsequent hook invocation.
         akw["extracted_metrics"] = metrics
+        # D17 — format-agnostic value fingerprint, harvested UNCONDITIONALLY
+        # (independent of whether ``metrics`` is empty) from the FULL output,
+        # BEFORE the 1KB compactor truncation below. This is exactly the case
+        # the timeline misses: a free-form exec read (ping / ``tc -s qdisc``)
+        # yields ``metrics == {}`` so it never enters metric_observations, yet
+        # cross_check needs its raw numbers to corroborate the LLM's claim by
+        # value-presence. Same provenance gate as extracted_metrics — only
+        # cluster-observation tools reach here (non-observation tools continued
+        # above), so the fingerprint never harvests the LLM's own narrative.
+        try:
+            akw["evidence_fingerprint"] = harvest_evidence_fingerprint(
+                content, tool_name, command,
+            )
+        except Exception as e:  # fingerprinting must never kill the hook
+            logger.debug("evidence fingerprint harvest failed: %s", e)
         # JSON-shaped content: skip the head prepend to preserve
         # ``smart_strip_k8s_json`` validity. See ``_is_json_shaped``
         # for the full rationale. Metrics still travel via
@@ -346,6 +499,34 @@ def _build_budget_warning(
     )
 
 
+def _merge_turn_accumulators(
+    obs_update: dict, retired_update: dict, payload: dict | None = None,
+) -> dict:
+    """Single funnel for EVERY per-turn state write ``_manage`` emits.
+
+    ``_manage`` has several return branches (no-op, budget-warning,
+    strip-only, compaction-success, compaction-exception) that bypass each
+    other, so the mandatory cross-turn accumulators cannot be appended at a
+    shared tail. They are computed ONCE up front — ``obs_update`` carries
+    ``metric_observations`` + ``evidence_fingerprints``; ``retired_update``
+    carries absorbed experiment UIDs — and MUST ride on whichever branch
+    fires, or the field is lost for that turn.
+
+    Hand-spreading ``{**obs_update, **retired_update, ...}`` at each branch
+    is the fragility this collapses. A future branch that forgets a spread
+    silently drops that cross-turn field: it never reaches its consumer (the
+    verification timeline / D17 value-presence oracle) and NO test notices,
+    because the builders are correct in isolation — the loss is at the
+    emission site, not the computation. Routing every return through this
+    helper makes the merge the single source of truth. The active tooth is
+    ``test_hook_turn_accumulator_funnel``: it machine-scans ``_manage`` via
+    AST and fails if any branch returns a raw dict instead of calling this,
+    so the invariant is enforced by construction rather than by the next
+    author remembering it.
+    """
+    return {**obs_update, **retired_update, **(payload or {})}
+
+
 class PreReasoningHook:
     """Unified memory management hook called before each LLM reasoning step."""
 
@@ -433,6 +614,44 @@ class PreReasoningHook:
         if not new_obs:
             return {}
         return {"metric_observations": current + new_obs}
+
+    def _build_fingerprint_update(self, messages: list, state: dict) -> dict:
+        """D17 — collect per-observation value fingerprints into
+        ``state.evidence_fingerprints`` (parallel to metric_observations).
+
+        ``_extract_tool_metrics`` stored
+        ``additional_kwargs['evidence_fingerprint']`` on each cluster-observation
+        ToolMessage this turn. Promote the ones we haven't seen (by
+        ``tool_call_id``) into a dict on state. DELIBERATELY INDEPENDENT of
+        ``_build_observation_update``: a free-form exec output (ping / ``tc -s
+        qdisc``) yields ``extract_metrics() == {}`` so it never enters
+        metric_observations, yet its fingerprint is exactly what cross_check
+        needs to corroborate the LLM's claim by value-presence. Gating this on
+        a non-empty metric dict would re-create the very blindness D17 fixes.
+
+        ``evidence_fingerprints`` has no reducer (last-write-wins, mirrors
+        metric_observations), so the write is the FULL merged view. Survives
+        compaction for the same reason: it lives on state, not on the message
+        list. Idempotent: returns ``{}`` when every fingerprint is already on
+        state, so steady-state turns bump no state version.
+        """
+        current = dict(state.get("evidence_fingerprints") or {})
+        changed = False
+        for msg in messages:
+            if getattr(msg, "type", None) != "tool":
+                continue
+            akw = getattr(msg, "additional_kwargs", {}) or {}
+            fp = akw.get("evidence_fingerprint")
+            if not isinstance(fp, dict):
+                continue  # non-observation tool, or not yet harvested
+            tc_id = getattr(msg, "tool_call_id", "") or ""
+            if not tc_id or tc_id in current:
+                continue
+            current[tc_id] = fp
+            changed = True
+        if not changed:
+            return {}
+        return {"evidence_fingerprints": current}
 
     def _build_retired_update(self, state: dict, messages: list) -> dict:
         """Durable death absorption, BEFORE compaction can destroy the proof.
@@ -643,17 +862,33 @@ class PreReasoningHook:
         # message object until the message itself is removed). The
         # state-side accumulator below reads from these
         # additional_kwargs to build the verification timeline.
-        _extract_tool_metrics(messages)
-        # Build the state-side append to metric_observations
-        # ONCE here, then spread it into whichever return branch fires
-        # below. We can't accumulate at each branch because they
-        # bypass each other — the strip-only branch never reaches the
-        # compaction branch's append.
+        # ``target_paths`` (D4/B2) makes the df parser target-driven: the
+        # declared disk-fault mount path keys the metric, so a dedicated
+        # partition (/drill-disk) is no longer dropped for the root overlay.
+        _extract_tool_metrics(messages, _target_paths_from_state(state))
+        # Build the state-side append to metric_observations ONCE here, then
+        # ride it out through _merge_turn_accumulators() — the single funnel
+        # every return branch below must emit through. The branches bypass
+        # each other (the strip-only branch never reaches the compaction
+        # branch), so the accumulators cannot be appended at a shared tail;
+        # the funnel + its AST guard (test_hook_turn_accumulator_funnel) make
+        # "no branch drops them" a machine-enforced invariant, not a
+        # per-branch obligation the next author must remember.
         obs_update = self._build_observation_update(messages, state)
+        # D17 — harvest value fingerprints INDEPENDENTLY of metric_observations
+        # (the netem-class case this fixes has extract_metrics()=={} → no
+        # timeline entry, yet still needs a fingerprint). Merged INTO obs_update
+        # so the single _merge_turn_accumulators() funnel every return branch
+        # emits through carries it — no per-branch spread to keep in sync. When
+        # obs_update is {} (no new metric) but a fingerprint was harvested, the
+        # merge still surfaces it.
+        fp_update = self._build_fingerprint_update(messages, state)
+        if fp_update:
+            obs_update = {**obs_update, **fp_update}
 
-        # Death absorption (B76 review K1/K2): same one-shot-then-spread
-        # pattern as obs_update — every return branch below must carry it,
-        # because every branch is a state write that compaction-free turns
+        # Death absorption (B76 review K1/K2): rides the SAME funnel as
+        # obs_update (_merge_turn_accumulators) — every return branch carries
+        # it, because every branch is a state write that compaction-free turns
         # (and the recover graph's Layer-2 timeout/error exits) must not
         # silently drop. Runs BEFORE tool-output truncation so the scan
         # reads the raw destroy receipts, not their truncated heads.
@@ -731,8 +966,10 @@ class PreReasoningHook:
                 self.context_manager.compact_ratio,
             )
             if budget_warning is not None:
-                return {**obs_update, **retired_update, "messages": [budget_warning]}
-            return {**obs_update, **retired_update}
+                return _merge_turn_accumulators(
+                    obs_update, retired_update, {"messages": [budget_warning]},
+                )
+            return _merge_turn_accumulators(obs_update, retired_update)
 
         # --- Intermediate route: try aggressive tool output truncation first ---
         # If we can get below the compaction threshold by just truncating tool
@@ -780,7 +1017,9 @@ class PreReasoningHook:
                 # dropped, and we'd hit the same threshold again next turn,
                 # paying the strip cost over and over with zero effect.
                 self._emit_context_size_snapshot(task_id, combined_tokens, len(combined))
-                return {**obs_update, **retired_update, "messages": stripped}
+                return _merge_turn_accumulators(
+                    obs_update, retired_update, {"messages": stripped},
+                )
 
         # Calculate total tokens before compression for observability.
         # Single-message observability — use raw .count (not safe_count)
@@ -968,7 +1207,7 @@ class PreReasoningHook:
                 f"skipping this turn (failures: {tracking.consecutive_failures}/"
                 f"{MAX_CONSECUTIVE_COMPACT_FAILURES}): {e}"
             )
-            return {**obs_update, **retired_update}
+            return _merge_turn_accumulators(obs_update, retired_update)
 
         # 5. Build LangGraph-compatible state update:
         #    Remove compacted messages + add the new summary message.
@@ -1006,16 +1245,18 @@ class PreReasoningHook:
         if new_boundary is not None:
             epoch_update = {"attribution_epoch_index": new_boundary}
 
-        return {
-            **obs_update,
-            **retired_update,
-            **epoch_update,
-            # The notice rides in the same update as the summary so the model
-            # first sees them together — the data and how to treat it.
-            "messages": remove_messages
-            + [summary_message, _build_compaction_notice()],
-            "compressed_summary": summary,
-        }
+        return _merge_turn_accumulators(
+            obs_update,
+            retired_update,
+            {
+                **epoch_update,
+                # The notice rides in the same update as the summary so the
+                # model first sees them together — the data and how to treat it.
+                "messages": remove_messages
+                + [summary_message, _build_compaction_notice()],
+                "compressed_summary": summary,
+            },
+        )
 
     async def _async_session_append(self, task_id: str, messages: list) -> None:
         """Append messages to appropriate store based on execution phase.

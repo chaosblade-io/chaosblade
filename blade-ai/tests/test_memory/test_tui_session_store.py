@@ -426,3 +426,184 @@ class TestListResumableSessions:
         r = store.list_resumable_sessions()[0]
         assert r["event_count"] == 2
         assert r["first_input"] == "real input"
+
+
+# ----------------------------------------------------------------------
+# Crash-safety parity with SessionStore (probe-confirmed data-loss fixes)
+#
+# TuiSessionStore drifted from its hardened sibling SessionStore: it wrote
+# .json non-atomically on every append and truncated/unlinked .jsonl without
+# confirming the snapshot landed. A single os.replace ENOSPC failure then
+# destroyed the only surviving copy of the dialogue. These tests pin the
+# re-aligned discipline so the two stores cannot drift apart again.
+# ----------------------------------------------------------------------
+
+
+class TestAtomicWriteTempCleanup:
+    """Round-4 parity: ``_atomic_write_json`` must clean its ``.json.tmp`` on
+    EVERY raise path (incl. ``os.replace`` failure) and must RAISE ``OSError``
+    so snapshot-gated callers (``_compact`` / ``finalize``) can skip destroying
+    the ``.jsonl``. Without the raise the callers can't tell the snapshot
+    failed; without try/finally the tempfile leaks forever."""
+
+    def test_os_replace_failure_raises_and_cleans_tempfile(
+        self, store, session_dir, monkeypatch
+    ):
+        store.create("ses-aw-1")
+        import os as os_mod
+
+        def _fail_replace(*args, **kwargs):
+            raise OSError("simulated cross-device link")
+
+        monkeypatch.setattr(os_mod, "replace", _fail_replace)
+        # Round-3 contract: raises instead of silently logging.
+        with pytest.raises(OSError, match="simulated"):
+            store._atomic_write_json("ses-aw-1")
+        # Restore os.replace before globbing so cleanup itself works.
+        monkeypatch.undo()
+        orphans = list(session_dir.glob("*.json.tmp"))
+        assert orphans == [], (
+            f"Round-4 regression: os.replace failure leaked tempfile(s): {orphans}"
+        )
+
+    def test_json_dump_failure_also_cleans_tempfile(
+        self, store, session_dir, monkeypatch
+    ):
+        store.create("ses-aw-2")
+        import chaos_agent.memory.tui_session_store as tss_mod
+
+        def _fail_dump(*args, **kwargs):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(tss_mod.json, "dump", _fail_dump)
+        with pytest.raises(OSError, match="disk full"):
+            store._atomic_write_json("ses-aw-2")
+        assert list(session_dir.glob("*.json.tmp")) == []
+
+
+class TestSnapshotFailurePreservesJsonl:
+    """Round-3 parity: when the atomic snapshot fails, ``_compact`` must NOT
+    truncate the ``.jsonl`` and ``finalize`` must NOT unlink it — the
+    increments are the only surviving on-disk copy of the dialogue."""
+
+    def test_compact_preserves_jsonl_on_snapshot_failure(
+        self, store, session_dir, monkeypatch
+    ):
+        store.create("ses-cmp-1")
+        store.append_dialogue(
+            "ses-cmp-1", [HumanMessage(content="surviving", id="s1")]
+        )
+        jsonl_path = session_dir / "ses-cmp-1.jsonl"
+        assert "surviving" in jsonl_path.read_text(encoding="utf-8")
+
+        # Force the snapshot write to fail, then compact. In-memory still holds
+        # the message; the disk write fails — the exact scenario where the old
+        # unconditional truncate lost the increments.
+        def _fail_write(sid):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(store, "_atomic_write_json", _fail_write)
+        store._compact("ses-cmp-1")  # must not raise
+
+        after = jsonl_path.read_text(encoding="utf-8")
+        assert "surviving" in after, (
+            "Round-3 regression: _compact truncated .jsonl despite snapshot "
+            "write failing; increments lost."
+        )
+        # Counter must NOT have been reset, so the next append retries compact.
+        assert store._jsonl_counts.get("ses-cmp-1", 0) > 0
+
+    def test_finalize_preserves_jsonl_on_snapshot_failure(
+        self, store, session_dir, monkeypatch
+    ):
+        store.create("ses-fin-1")
+        store.append_dialogue(
+            "ses-fin-1", [HumanMessage(content="surviving", id="s1")]
+        )
+
+        def _fail_write(sid):
+            raise OSError("simulated")
+
+        monkeypatch.setattr(store, "_atomic_write_json", _fail_write)
+        # finalize must not raise (graph/CLI caller would abort otherwise).
+        store.finalize("ses-fin-1", status="completed")
+
+        jsonl_path = session_dir / "ses-fin-1.jsonl"
+        assert jsonl_path.exists(), (
+            "Round-3 regression: finalize unlinked .jsonl despite snapshot "
+            "write failing; message data lost from disk."
+        )
+
+
+class TestNonAtomicWriteCorruptionFixed:
+    """Bug-2 root fix: ``_write_json`` is now atomic, so a failed metadata
+    write leaves the previous ``.json`` byte-for-byte intact instead of a torn
+    half-file. ``read()`` does a bare ``json.loads`` and returns ``None`` on any
+    parse error, so a torn ``.json`` used to discard the whole session even
+    though the ``.jsonl`` survived."""
+
+    def test_failed_metadata_write_leaves_json_intact(
+        self, store, session_dir, monkeypatch
+    ):
+        store.create("ses-md-1")
+        json_path = session_dir / "ses-md-1.json"
+        skeleton = json.loads(json_path.read_text(encoding="utf-8"))
+
+        import os as os_mod
+
+        def _fail_replace(*args, **kwargs):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(os_mod, "replace", _fail_replace)
+        # Best-effort path: swallows the OSError, must NOT raise, must NOT
+        # corrupt the existing .json.
+        store.update_stats("ses-md-1", {"injection_count": 9})
+        monkeypatch.undo()
+
+        after = json.loads(json_path.read_text(encoding="utf-8"))
+        # Atomic = all-or-nothing: the failed write changed nothing on disk.
+        assert after["tui_session_id"] == skeleton["tui_session_id"]
+        assert after["stats"]["injection_count"] == skeleton["stats"]["injection_count"]
+        assert list(session_dir.glob("*.json.tmp")) == []
+
+
+class TestDiskReconstructionAfterAppend:
+    """Design contract for dropping the per-append full-``.json`` rewrite:
+    ``append_dialogue`` now writes ONLY ``.jsonl``, so a fresh process (empty
+    in-memory cache) must still reconstruct the full dialogue from the ``.json``
+    skeleton + ``.jsonl`` increments, with a consistent ``message_count``. No
+    pre-existing test forced a disk read after append — this pins the exact
+    reconstruction path the change relies on."""
+
+    def test_fresh_store_reconstructs_from_jsonl(self, store, session_dir):
+        store.create("ses-disk-1")
+        store.append_dialogue(
+            "ses-disk-1",
+            [HumanMessage(content="你好", id="d1"), AIMessage(content="hi", id="d2")],
+        )
+        # A brand-new store on the same dir has NO in-memory entry, so read()
+        # must take the disk path: .json skeleton + .jsonl replay.
+        fresh = TuiSessionStore(session_dir)
+        data = fresh.read("ses-disk-1")
+        assert data is not None
+        assert len(data["messages"]) == 2
+        # The skeleton's message_count is 0; the replay recompute must lift it
+        # to match the reconstructed list.
+        assert data["stats"]["message_count"] == 2
+        assert fresh.read_dialogue("ses-disk-1")[0]["type"] == "human"
+
+    def test_disk_reconstruct_dedups_after_metadata_snapshot(
+        self, store, session_dir
+    ):
+        # A metadata write snapshots the in-memory messages into .json while
+        # the .jsonl still holds the same increments. Disk read must dedup, not
+        # double-count.
+        store.create("ses-disk-2")
+        store.append_dialogue(
+            "ses-disk-2", [HumanMessage(content="msg-a", id="a")]
+        )
+        store.update_stats("ses-disk-2", {"injection_count": 1})  # writes full .json
+        fresh = TuiSessionStore(session_dir)
+        data = fresh.read("ses-disk-2")
+        assert len(data["messages"]) == 1
+        assert data["stats"]["message_count"] == 1
