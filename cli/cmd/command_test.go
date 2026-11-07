@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -292,4 +293,43 @@ func (*MockSource) QueryExperimentModelsByCommand(command, subCommand string, fl
 
 func (*MockSource) DeleteExperimentModelByUid(uid string) error {
 	return nil
+}
+
+func Test_createExpModel_excludesLogLevel(t *testing.T) {
+	// NewCli binds --log-level to the process-global util.LogLevel; restore it so
+	// the test is hermetic.
+	origLogLevel := util.LogLevel
+	defer func() { util.LogLevel = origLogLevel }()
+
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"default level", []string{"add", "--filepath", "/tmp/test"}},
+		{"explicit level", []string{"--log-level", "warn", "add", "--filepath", "/tmp/test"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got map[string]string
+			action := &cobra.Command{
+				Use: "add",
+				Run: func(cmd *cobra.Command, args []string) {
+					got = createExpModel("file", "", "add", cmd).ActionFlags
+				},
+			}
+			action.Flags().String("filepath", "", "")
+
+			root := NewCli().rootCmd
+			root.AddCommand(action)
+			root.SetArgs(tt.args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("execute %v: %v", tt.args, err)
+			}
+
+			want := map[string]string{"filepath": "/tmp/test"}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("ActionFlags = %v, want %v", got, want)
+			}
+		})
+	}
 }

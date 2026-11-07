@@ -24,6 +24,9 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
+// LogLevelFlag is the name of the global flag that sets the log level of the blade CLI.
+const LogLevelFlag = "log-level"
+
 type Cli struct {
 	rootCmd *cobra.Command
 }
@@ -46,7 +49,7 @@ func NewCli() *Cli {
 func (cli *Cli) setFlags() {
 	flags := cli.rootCmd.PersistentFlags()
 	flags.BoolVarP(&util.Debug, "debug", "d", false, "Set client to DEBUG mode")
-	flags.StringVarP(&util.LogLevel, "log-level", "l", "info", "Level of logging wanted: debug|info|warn|error")
+	flags.StringVarP(&util.LogLevel, LogLevelFlag, "l", "info", "Level of logging wanted: debug|info|warn|error")
 }
 
 // Run command
