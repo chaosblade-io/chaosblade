@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -212,6 +213,53 @@ func Test_parseCommandPath(t *testing.T) {
 		if (err != nil) != tt.expect.err {
 			t.Errorf("unexpected result: %t, expected: %t", err != nil, tt.expect.err)
 		}
+	}
+}
+
+func Test_createExpModel_falseFlagValues(t *testing.T) {
+	newCommand := func(args ...string) *cobra.Command {
+		command := &cobra.Command{Use: "return"}
+		command.PersistentFlags().String("value", "", "")
+		command.PersistentFlags().String("mode", "false", "")
+		command.PersistentFlags().Bool("refresh", false, "")
+		if err := command.ParseFlags(args); err != nil {
+			t.Fatalf("parse flags %v: %v", args, err)
+		}
+		return command
+	}
+	tests := []struct {
+		name string
+		args []string
+		want map[string]string
+	}{
+		{
+			name: "string flag explicitly set to false is kept",
+			args: []string{"--value", "false"},
+			want: map[string]string{"value": "false"},
+		},
+		{
+			name: "bool flag explicitly set to false is dropped",
+			args: []string{"--value", "true", "--refresh=false"},
+			want: map[string]string{"value": "true"},
+		},
+		{
+			name: "bool flag set to true is kept",
+			args: []string{"--refresh"},
+			want: map[string]string{"value": "", "refresh": "true"},
+		},
+		{
+			name: "string flag only defaulting to false is dropped",
+			args: nil,
+			want: map[string]string{"value": ""},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := createExpModel("jvm", "", "return", newCommand(tt.args...)).ActionFlags
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ActionFlags = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
