@@ -443,6 +443,12 @@ func createExpModel(target, scope, actionName string, cmd *cobra.Command) *spec.
 		if flag.Value.String() == "false" {
 			return
 		}
+		// The log level configures the blade CLI itself, it is not an experiment parameter.
+		// Executors reject it: chaos_os exits on unknown flags and the java agent uses every
+		// flag it receives as a matcher, so the experiment would fail or never take effect.
+		if flag.Name == LogLevelFlag {
+			return
+		}
 		expModel.ActionFlags[flag.Name] = flag.Value.String()
 	})
 	return expModel
