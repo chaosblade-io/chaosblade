@@ -157,7 +157,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 				args = fmt.Sprintf("create k8s %s-%s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)
 			}
 			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
-				if flag.Value.String() == "false" {
+				if isDisabledFlag(flag) {
 					return
 				}
 				if flag.Name == AsyncFlag || flag.Name == UidFlag {

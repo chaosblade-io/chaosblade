@@ -440,12 +440,19 @@ func createExpModel(target, scope, actionName string, cmd *cobra.Command) *spec.
 	}
 
 	cmd.Flags().VisitAll(func(flag *pflag.Flag) {
-		if flag.Value.String() == "false" {
+		if isDisabledFlag(flag) {
 			return
 		}
 		expModel.ActionFlags[flag.Name] = flag.Value.String()
 	})
 	return expModel
+}
+
+// isDisabledFlag reports whether a flag whose value is "false" only means "not enabled", so it
+// can be left out of the experiment. A string flag explicitly set to "false" is a real value,
+// such as the return value in `blade create jvm return --value false`, and must be kept.
+func isDisabledFlag(flag *pflag.Flag) bool {
+	return flag.Value.String() == "false" && (flag.Value.Type() == "bool" || !flag.Changed)
 }
 
 func createExecutorKey(target, actionTarget, action string) string {

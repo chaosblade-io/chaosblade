@@ -184,7 +184,7 @@ func (e *Executor) createUrl(ctx context.Context, port string, model *spec.ExpMo
 	bodyMap["action"] = model.ActionName
 
 	for k, v := range model.ActionFlags {
-		if v == "" || v == "false" {
+		if v == "" {
 			continue
 		}
 		// filter timeout because of the java agent implementation by all matchers
