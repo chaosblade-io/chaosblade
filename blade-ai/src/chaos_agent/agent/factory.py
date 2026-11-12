@@ -3,6 +3,10 @@
 import logging
 
 from chaos_agent.agent.graph import build_inject_graph, build_recover_graph
+from chaos_agent.agent.llm_compat import (
+    ProviderCompatMixin,
+    patch_openai_message_conversion,
+)
 from chaos_agent.config.settings import settings
 from chaos_agent.skills.registry import SkillRegistry
 from chaos_agent.tools import (
@@ -72,6 +76,10 @@ def _patch_langchain_for_reasoning_content() -> None:
     _lc_base._convert_delta_to_message_chunk = _patched_convert_delta_to_message_chunk
 
     logger.debug("Patched langchain-openai to preserve reasoning_content")
+
+    # Outgoing direction: echo reasoning_content back to thinking models
+    # (DeepSeek reasoning mode requires it on continuation turns).
+    patch_openai_message_conversion()
 
 
 # Apply the patch at import time so all ChatOpenAI instances benefit
@@ -149,7 +157,17 @@ def make_llm(
     _thinking = enable_thinking if enable_thinking is not None else settings.llm_enable_thinking
     if _thinking:
         llm_kwargs["extra_body"] = {"enable_thinking": True}
-    return ChatOpenAI(**llm_kwargs)
+
+    class BladeChatOpenAI(ProviderCompatMixin, ChatOpenAI):
+        """ChatOpenAI with blade-ai's provider-compatibility behaviour.
+
+        Sanitizes the tool-message sequence before each call, retries once
+        without ``enable_thinking`` when the provider rejects it, and turns
+        unexplained provider 400s into actionable
+        :class:`LLMProviderIncompatibilityError` messages.
+        """
+
+    return BladeChatOpenAI(**llm_kwargs)
 
 
 def _build_skill_tools(registry: SkillRegistry):
