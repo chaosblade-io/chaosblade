@@ -226,22 +226,22 @@ _build_platform:
 		fi; \
 		for component in $$components; do \
 			case "$$component" in \
-				"cli") $(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"os") $(MAKE) os GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"cloud") $(MAKE) cloud GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"middleware") $(MAKE) middleware GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"java") $(MAKE) java GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"cplus") $(MAKE) cplus GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"cri") $(MAKE) cri GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"kubernetes") $(MAKE) kubernetes GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"upx") $(MAKE) upx GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"check_yaml") $(MAKE) check_yaml; ;; \
-				*) echo "Unknown component: $$component"; ;; \
+				"cli") $(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"os") $(MAKE) os GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"cloud") $(MAKE) cloud GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"middleware") $(MAKE) middleware GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"java") $(MAKE) java GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"cplus") $(MAKE) cplus GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"cri") $(MAKE) cri GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"kubernetes") $(MAKE) kubernetes GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"upx") $(MAKE) upx GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"check_yaml") $(MAKE) check_yaml || exit 1; ;; \
+				*) echo "Unknown component: $$component"; exit 1; ;; \
 			esac; \
 		done; \
 	else \
-		$(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH); \
+		$(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; \
 	fi
 	@$(MAKE) _package_$(GOOS)_$(GOARCH) PLATFORM_DIR_NAME=$(PLATFORM_DIR_NAME)
 
@@ -429,9 +429,9 @@ else
 endif
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
 	@if [ -z "$(GOOS)" ]; then \
-		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri; \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri JVM_SPEC_PATH=$(abspath $(OUTPUT_DIR)/yaml); \
 	else \
-		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri $(GOOS)_$(GOARCH); \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri $(GOOS)_$(GOARCH) JVM_SPEC_PATH=$(abspath $(OUTPUT_DIR)/yaml); \
 	fi
 	@cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-cri/target/$(call get_platform_dir_name,$(GOOS),$(GOARCH))/* $(OUTPUT_DIR)/
 
@@ -443,9 +443,9 @@ else
 endif
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
 	@if [ "$(GOOS)_$(GOARCH)" = "linux_amd64" ] || [ "$(GOOS)_$(GOARCH)" = "linux_arm64" ]; then \
-		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator $(GOOS)_$(GOARCH); \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator $(GOOS)_$(GOARCH) JVM_SPEC_PATH=$(abspath $(OUTPUT_DIR)/yaml); \
 	else \
-		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator only_yaml; \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator only_yaml JVM_SPEC_PATH=$(abspath $(OUTPUT_DIR)/yaml); \
 	fi; \
 	cp -R $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)/* $(OUTPUT_DIR)/
 
