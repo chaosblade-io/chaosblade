@@ -146,23 +146,57 @@ jobs:
     - name: Verify build output
       run: |
         echo "Verifying build output for ${{ matrix.target }}..."
-        if [[ -d "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}" ]]; then
-          echo "✅ Build directory exists"
-          echo "Directory contents:"
-          ls -la "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}/"
-          
-          # 检查关键文件
-          if [[ -f "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}/blade" ]]; then
-            echo "✅ blade binary exists"
-            file "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}/blade"
-          else
-            echo "❌ blade binary not found"
-            exit 1
-          fi
-        else
-          echo "❌ Build directory not found"
+        BUILD_DIR="target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+        if [[ ! -d "$BUILD_DIR" ]]; then
+          echo "❌ Build directory not found: $BUILD_DIR"
           exit 1
         fi
+        echo "✅ Build directory exists"
+        echo "Directory contents:"
+        ls -la "$BUILD_DIR/"
+
+        # 检查关键文件
+        if [[ -f "$BUILD_DIR/blade" ]]; then
+          echo "✅ blade binary exists"
+          file "$BUILD_DIR/blade"
+        else
+          echo "❌ blade binary not found"
+          exit 1
+        fi
+
+        # 发布产物清单门：按模块断言全部声明组件的关键产物，缺一即失败。
+        # 防止单组件构建失败被吞掉后仍发布缺组件的包（如 1.7.6 丢失整个 java 组件）。
+        VERSION="${{ steps.version.outputs.version }}"
+        MISSING=0
+        for spec in os cloud middleware jvm cri k8s check; do
+          f="$BUILD_DIR/yaml/chaosblade-${spec}-spec-${VERSION}.yaml"
+          if [[ -s "$f" ]]; then
+            echo "✅ $f"
+          else
+            echo "❌ missing or empty: $f"
+            MISSING=1
+          fi
+        done
+        shopt -s nullglob
+        jars=("$BUILD_DIR"/lib/sandbox/module/chaosblade-java-agent-*.jar)
+        shopt -u nullglob
+        if [[ ${#jars[@]} -eq 1 && -s "${jars[0]}" ]]; then
+          echo "✅ ${jars[0]}"
+        else
+          echo "❌ expected exactly 1 non-empty chaosblade-java-agent-*.jar under lib/sandbox/module/, found ${#jars[@]}"
+          MISSING=1
+        fi
+        if [[ -d "$BUILD_DIR/lib/sandbox/bin" ]]; then
+          echo "✅ sandbox directory exists"
+        else
+          echo "❌ missing: $BUILD_DIR/lib/sandbox/bin"
+          MISSING=1
+        fi
+        if [[ "$MISSING" -ne 0 ]]; then
+          echo "❌ Release manifest gate failed: component artifacts missing"
+          exit 1
+        fi
+        echo "✅ All component artifacts verified"
 
     - name: Generate package
       id: package

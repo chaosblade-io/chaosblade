@@ -92,7 +92,7 @@ BLADE_OPERATOR_BRANCH=v1.7.5
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=v1.7.5
+BLADE_EXEC_JVM_BRANCH=v1.7.6
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
@@ -210,22 +210,22 @@ _build_platform:
 		fi; \
 		for component in $$components; do \
 			case "$$component" in \
-				"cli") $(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"os") $(MAKE) os GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"cloud") $(MAKE) cloud GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"middleware") $(MAKE) middleware GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"java") $(MAKE) java GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"cplus") $(MAKE) cplus GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"cri") $(MAKE) cri GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"kubernetes") $(MAKE) kubernetes GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"upx") $(MAKE) upx GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
-				"check_yaml") $(MAKE) check_yaml; ;; \
-				*) echo "Unknown component: $$component"; ;; \
+				"cli") $(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"os") $(MAKE) os GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"cloud") $(MAKE) cloud GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"middleware") $(MAKE) middleware GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"java") $(MAKE) java GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"cplus") $(MAKE) cplus GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"cri") $(MAKE) cri GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"kubernetes") $(MAKE) kubernetes GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"upx") $(MAKE) upx GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; ;; \
+				"check_yaml") $(MAKE) check_yaml || exit 1; ;; \
+				*) echo "Unknown component: $$component"; exit 1; ;; \
 			esac; \
 		done; \
 	else \
-		$(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH); \
+		$(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH) || exit 1; \
 	fi
 	@$(MAKE) _package_$(GOOS)_$(GOARCH) PLATFORM_DIR_NAME=$(PLATFORM_DIR_NAME)
 
