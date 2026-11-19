@@ -60,7 +60,7 @@ class TurnRequest(BaseModel):
     # plan-preview AIMessage instead of pausing on ``interrupt()`` and
     # the post-gate router skips straight to END. Lets ``/plan <NL>``
     # produce a "what would happen" summary the user can iterate on
-    # before commiting via ``/run``. Whole flow is read-only — no
+    # before committing via ``/run``. Whole flow is read-only — no
     # blade_create runs, no checkpoint mutation that survives past
     # turn-end. Default False so legacy callers and the existing
     # ``/run`` path keep their current behaviour unchanged.
