@@ -259,11 +259,17 @@ See [CHANGELOG](CHANGELOG.md) for detailed changes.
 ### 🐛 Bug Reports
 If you encounter any issues, please report them on [GitHub Issues](https://github.com/chaosblade-io/chaosblade/issues)."
     
+    # gh takes --draft and --prerelease as switches: a value after them would be
+    # read as an asset file to upload.
+    local release_flags=()
+    if [ "${PRE_RELEASE}" = "true" ]; then
+        release_flags+=(--prerelease)
+    fi
+
     gh release create "$tag_name" \
         --title "ChaosBlade $version" \
         --notes "$release_body" \
-        --draft false \
-        --prerelease false
+        ${release_flags[@]+"${release_flags[@]}"}
     
     print_success "GitHub Release $tag_name 已创建"
 }
